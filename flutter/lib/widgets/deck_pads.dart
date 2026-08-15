@@ -129,11 +129,11 @@ class _CueButtonState extends State<CueButton> {
             height: 30,
             decoration: BoxDecoration(
               color: armed
-                  ? const Color(0xFFFF7043)
-                  : (_held ? const Color(0x66FF7043) : Colors.transparent),
+                  ? const Color(0xFFFFB300)
+                  : (_held ? const Color(0x66FFB300) : Colors.transparent),
               borderRadius: BorderRadius.circular(4),
               border: Border.all(
-                color: cue != null ? const Color(0xFFFF7043) : Colors.white24,
+                color: cue != null ? const Color(0xFFFFB300) : Colors.white24,
               ),
             ),
             alignment: Alignment.center,

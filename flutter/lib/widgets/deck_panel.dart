@@ -1,6 +1,6 @@
 //! Deck 面板（左右 deck 列）：四段纵向布局。
 //! 行1：封面（点击载曲）+ title/artist（左）；时间、key/bpm、tempo（右，
-//! 同排）、keylock（最右；P19 起 sync 移入 transport 行）。
+//! 同排）、SYNC/keylock（P22.4 用户要求 SYNC 加回 info 列，与 KEY 并列）。
 //! 行2：全区半波预览（OverviewWave，h64）。
 //! 行3（P18 重构，P21 调整）：loop/jump（预览下、pad 上，宽度平分）+
 //! 打击垫区 + DeckFx（pad 右 tempo 左）；TempoFader 跨整列高。
@@ -245,7 +245,8 @@ class _DeckPanelState extends State<DeckPanel> {
   }
 
   Widget _infoColumn(DeckController dc, EngineController engine) {
-    // P19：sync 移入 transport 行（TransportRow），信息列只留 KEY。
+    // P19：sync 移入 transport 行（TransportRow）；P22.4 用户要求加回
+    // ——SYNC（teal，同 transport 行色）/ KEY（蓝）并列于信息列。
     return Column(
       mainAxisSize: MainAxisSize.min,
       mainAxisAlignment: MainAxisAlignment.center,
@@ -292,6 +293,14 @@ class _DeckPanelState extends State<DeckPanel> {
             const SizedBox(width: 6),
             _toggle(
               dc: dc,
+              notifier: dc.syncOn,
+              label: 'SYNC',
+              activeColor: const Color(0xFF00897B),
+              onChanged: (v) => engine.setSync(dc.deck, v),
+            ),
+            const SizedBox(width: 6),
+            _toggle(
+              dc: dc,
               notifier: dc.keylockOn,
               label: 'KEY',
               onChanged: (v) => engine.setKeylock(dc.deck, v),
@@ -307,6 +316,7 @@ class _DeckPanelState extends State<DeckPanel> {
     required ValueListenable<bool> notifier,
     required String label,
     required void Function(bool) onChanged,
+    Color activeColor = const Color(0xFF3949AB),
   }) {
     return ValueListenableBuilder<bool>(
       valueListenable: notifier,
@@ -316,7 +326,7 @@ class _DeckPanelState extends State<DeckPanel> {
           style: TextButton.styleFrom(
             padding: const EdgeInsets.symmetric(horizontal: 8),
             minimumSize: const Size(48, 28),
-            backgroundColor: on ? const Color(0xFF3949AB) : Colors.transparent,
+            backgroundColor: on ? activeColor : Colors.transparent,
             foregroundColor: on ? Colors.white : Colors.white38,
           ),
           child: Text(

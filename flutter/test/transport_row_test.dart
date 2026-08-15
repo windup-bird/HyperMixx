@@ -42,15 +42,15 @@ void main() {
     await tester.pumpWidget(_wrap(dc, fake));
     await tester.pump();
 
-    for (final t in ['PLAY', 'CUE', 'SYNC', 'SHIFT', '<<', '>>']) {
+    for (final t in ['▶', 'CUE', 'SYNC', 'SHIFT', '<<', '>>']) {
       expect(find.text(t), findsOneWidget, reason: '按钮 $t 应存在');
     }
-    // P20 顺序：PLAY 在 CUE 左、SYNC 在 SHIFT 左（x 递增）
+    // P20 顺序：▶（PLAY）在 CUE 左、SYNC 在 SHIFT 左（x 递增）
     final rects = {
-      for (final t in ['PLAY', 'CUE', 'SYNC', 'SHIFT'])
+      for (final t in ['▶', 'CUE', 'SYNC', 'SHIFT'])
         t: tester.getCenter(find.text(t)).dx,
     };
-    expect(rects['PLAY']!, lessThan(rects['CUE']!));
+    expect(rects['▶']!, lessThan(rects['CUE']!));
     expect(rects['CUE']!, lessThan(rects['SYNC']!));
     expect(rects['SYNC']!, lessThan(rects['SHIFT']!));
     // 6 按钮等分：每按钮宽 ≈ (353 − 5×4) / 6
@@ -87,24 +87,24 @@ void main() {
     expect(fake.syncs, [true, false], reason: '再点关闭 sync');
   });
 
-  testWidgets('PLAY：点击 setPlaying 切换 + 文字 PLAY/PAUSE（P20 英文化）', (tester) async {
+  testWidgets('PLAY：点击 setPlaying 切换 + 符号 ▶/‖（P22.4 橙底符号）', (tester) async {
     final dc = EngineController.instance.decks[0];
     addTearDown(() => dc.playing.value = false);
     final fake = _FakeActions();
     await tester.pumpWidget(_wrap(dc, fake));
 
-    await tester.tap(find.text('PLAY'));
+    await tester.tap(find.text('▶'));
     await tester.pump();
     expect(fake.plays, [true]);
     dc.playing.value = true;
     await tester.pump();
-    expect(find.text('PAUSE'), findsOneWidget, reason: '播放中显示 PAUSE');
-    await tester.tap(find.text('PAUSE'));
+    expect(find.text('‖'), findsOneWidget, reason: '播放中显示 ‖');
+    await tester.tap(find.text('‖'));
     await tester.pump();
     expect(fake.plays, [true, false]);
     dc.playing.value = false;
     await tester.pump();
-    expect(find.text('PLAY'), findsOneWidget, reason: '停播恢复显示 PLAY');
+    expect(find.text('▶'), findsOneWidget, reason: '停播恢复显示 ▶');
   });
 
   testWidgets('<< >> 按住 nudge ±1、松开 0（P17.1 互换）', (tester) async {

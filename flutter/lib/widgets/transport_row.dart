@@ -1,11 +1,12 @@
 //! P19/P20 transport 行（playpanel）：6 等分按钮，统一样式（高 30、圆角 4、
 //! Expanded 平分横向空间，文字 FittedBox 防窄窗溢出）。
-//! P20 顺序：PLAY / CUE / SYNC / SHIFT / << / >>（PLAY 英文化）：
-//! - PLAY：播放/暂停切换（播放中绿底，文字 PLAY/PAUSE）；
-//! - CUE：主 cue 按钮（原功能；P19 起播放时点击 = 暂停并回到 cue 点，
-//!   hotcue 保持"召回继续播"）；
-//! - SYNC：点击切换（开 = 蓝底）；leader（master deck）轨 amber 边框
-//!   （P16 判定规则，从 deckinfo 列移来）；
+//! P20 顺序：PLAY / CUE / SYNC / SHIFT / << / >>：
+//! - PLAY：播放/暂停切换（P22.4 实心橙色 0xFFFF7043——原 CUE 色，
+//!   文字改符号：播放 ▶ / 暂停 ‖）；
+//! - CUE：主 cue 按钮（P22.4 改 amber 0xFFFFB300——让出橙色给 PLAY；
+//!   P19 起播放时点击 = 暂停并回到 cue 点，hotcue 保持"召回继续播"）；
+//! - SYNC：点击切换（P22.4 改 teal 0xFF00897B；P22.4 deckinfo 列加回
+//!   同名按钮——此处保留 P16 leader（master deck）amber 边框判定）；
 //! - SHIFT：占位死键（未来 shift 组合功能预留，灰死不可点）；
 //! - <<：加速（nudge +1，按住语义）；>>：减速（nudge −1，P17.1 互换）。
 //! 前四个状态色，<< >> 中性灰。全部动作经 PadActions 出口（测试注入假实现）。
@@ -46,15 +47,15 @@ class TransportRow extends StatelessWidget {
       height: 30,
       child: Row(
         children: [
-          // P20 顺序：PLAY CUE SYNC SHIFT << >>（PLAY 英文化）
+          // P20 顺序：PLAY CUE SYNC SHIFT << >>（P22.4 PLAY 改橙底符号）
           Expanded(
             child: ValueListenableBuilder<bool>(
               valueListenable: dc.playing,
               builder: (_, playing, _) {
                 return _TransportButton(
-                  label: playing ? 'PAUSE' : 'PLAY',
+                  label: playing ? '‖' : '▶',
                   active: playing,
-                  activeColor: const Color(0xFF2E7D32),
+                  activeColor: const Color(0xFFFF7043),
                   onTap: () => actions.setPlaying(dc.deck, !playing),
                 );
               },
@@ -76,7 +77,7 @@ class TransportRow extends StatelessWidget {
                 return _TransportButton(
                   label: 'SYNC',
                   active: on,
-                  activeColor: const Color(0xFF3949AB),
+                  activeColor: const Color(0xFF00897B),
                   isLeader: isSyncLeader(dc.deck),
                   onTap: () => actions.setSync(dc.deck, !on),
                 );
