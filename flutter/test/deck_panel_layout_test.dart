@@ -63,7 +63,7 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('P21: DeckFx 填满右侧（pads:fx = 3:2，右缘与行尾对齐）', (tester) async {
+  testWidgets('P21: DeckFx 填满右侧（fx 右缘与行尾对齐）', (tester) async {
     final dc = DeckController(0);
     dc.title = 'fx 平分测试';
     await tester.pumpWidget(
@@ -80,7 +80,7 @@ void main() {
     await tester.pump();
 
     // DeckFx 与 DeckPads 的左右边界：pads 左侧 = 面板内容左缘；
-    // fx 右缘应贴近面板右缘（不再留白）。3:2 平分 + 2px 间距。
+    // fx 右缘应贴近面板右缘（不再留白）。+ 2px 间距。
     final fx = find.byType(DeckFx);
     final pads = find.byType(DeckPads);
     expect(fx, findsOneWidget);
@@ -94,6 +94,39 @@ void main() {
     // padding 10 + margin 6 = 96（fx 填满左侧列宽，不留白）
     expect(panelRect.right - fxRect.right, closeTo(96, 2),
         reason: 'fx 应填满左列行尾，实际余量 ${panelRect.right - fxRect.right}');
+    // P22.2 宽窗（700 ≥ 560）：pads:fx = 2:3 → fx 宽 = pads 宽 × 1.5
+    // （按钮宽度拉长 1.5 倍；严格比 0.6C/(0.4C−2) ≈ 1.51）
+    expect(fxRect.width, closeTo(padsRect.width * 1.5, 6),
+        reason: '宽窗 fx 宽应为 pads 1.5 倍，实际 ${fxRect.width} vs ${padsRect.width}');
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('P22.2 响应式：中窗（400px）回退 pads:fx = 3:2', (tester) async {
+    final dc = DeckController(0);
+    dc.title = '中窗回退测试';
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 400,
+            height: 460,
+            child: DeckPanel(deck: dc),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    final fx = find.byType(DeckFx);
+    final pads = find.byType(DeckPads);
+    expect(fx, findsOneWidget);
+    expect(pads, findsOneWidget);
+    final fxRect = tester.getRect(fx);
+    final padsRect = tester.getRect(pads);
+    // 400 < 560 → 3:2：fx 宽 ≈ pads 宽 × 0.4/0.6 ≈ 0.67
+    expect(fxRect.width, closeTo(padsRect.width / 1.5, 6),
+        reason: '中窗 fx 宽应为 pads 的 2/3（回退 3:2），'
+            '实际 ${fxRect.width} vs ${padsRect.width}');
     expect(tester.takeException(), isNull);
   });
 }

@@ -3,8 +3,10 @@
 //! 同排）、keylock（最右；P19 起 sync 移入 transport 行）。
 //! 行2：全区半波预览（OverviewWave，h64）。
 //! 行3（P18 重构，P21 调整）：loop/jump（预览下、pad 上，宽度平分）+
-//! 打击垫区 + DeckFx（pad 右 tempo 左，pads:fx = 3:2 平分填满右侧）；
-//! TempoFader 跨整列高（IntrinsicHeight）。
+//! 打击垫区 + DeckFx（pad 右 tempo 左）；TempoFader 跨整列高。
+//! P22.2 响应式：pads:fx 份额随可用宽度切换——宽窗（≥ kFxWideThreshold）
+//! 2:3（fx 按钮宽 = 40%×1.5，用户要求"宽度拉长 1.5 倍"），窄窗回退
+//! 3:2（fx 60% 会把 pad 格压成竖条）。
 //! 行4（P19 transport 行）：6 等分 SHIFT/SYNC/CUE/播放/<< />>（见
 //! transport_row.dart）。
 //! 音量/增益/EQ/滤波/交叉推子在中心 MixerPanel，变速在 Tempofader。
@@ -41,6 +43,9 @@ const double kLoopJumpPanelHeight = 66;
 const double kDeckFxHeight = kPadsRowHeight;
 const double kPadsRowHeight = 26 + 4 + 40 + 6 + 40;
 const double kTransportRowHeight = 30;
+/// P22.2 fx 份额切换阈值：可用宽 ≥ 560 → pads:fx = 2:3（fx 60%），
+/// 更窄回退 3:2。560 时 pads = 224（4 格 ≈ 48px 近方形）仍可用。
+const double kFxWideThreshold = 560;
 /// TempoFader 高度 = loop/jump + pad 行 + transport + 间距。
 const double kTempoFaderHeight =
     kLoopJumpPanelHeight + 6 + kPadsRowHeight + 6 + kTransportRowHeight;
@@ -109,22 +114,31 @@ class _DeckPanelState extends State<DeckPanel> {
                         ],
                       ),
                       const SizedBox(height: 6),
-                      Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          // P21：pads 3 / fx 2 平分（fx 填满右侧不再留白）。
-                          // 窄窗下 DeckFx 左列 Flexible+FittedBox 等比缩小
-                          // （P20.1），pads 文字 FittedBox（P18.1）。
-                          Expanded(flex: 3, child: DeckPads(deck: dc)),
-                          const SizedBox(width: 2),
-                          Expanded(
-                            flex: 2,
-                            child: SizedBox(
-                              height: kDeckFxHeight,
-                              child: DeckFx(deck: dc),
-                            ),
-                          ),
-                        ],
+                      LayoutBuilder(
+                        builder: (context, c) {
+                          // P22.2 响应式：宽窗 pads:fx = 2:3（fx 按钮宽
+                          // ×1.5），窄窗回退 3:2。窄窗下 DeckFx 左列
+                          // Flexible+FittedBox 等比缩小（P20.1），pads
+                          // 文字 FittedBox（P18.1）。
+                          final wide = c.maxWidth >= kFxWideThreshold;
+                          return Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Expanded(
+                                flex: wide ? 2 : 3,
+                                child: DeckPads(deck: dc),
+                              ),
+                              const SizedBox(width: 2),
+                              Expanded(
+                                flex: wide ? 3 : 2,
+                                child: SizedBox(
+                                  height: kDeckFxHeight,
+                                  child: DeckFx(deck: dc),
+                                ),
+                              ),
+                            ],
+                          );
+                        },
                       ),
                       const SizedBox(height: 6),
                       _transportRow(context, dc, engine),
