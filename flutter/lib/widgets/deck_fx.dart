@@ -1,8 +1,9 @@
 //! P20 DeckFx：deck 主 FX 槽（slot 0）控制，整体放大填满行高
 //! （kDeckFxHeight = kPadsRowHeight，旋钮 44、按钮 28、字号 12）。
-//! P22.1 布局去留空：左右列各撑满 116 高、内部 spaceBetween——左列
-//! 旋钮贴顶 + on/off 开关贴底（删'强度'label，MixerKnob 空 label 不渲染），
-//! 右列行1 贴顶 + 行2 贴底，上下对齐不留空。
+//! P22.1 布局：删'强度'label（MixerKnob 空 label 不渲染）；右列两行按钮
+//! 高度拉长 1.5 倍（28→42，kFxRowHeight）、行间紧贴（SizedBox 6、不撑满），
+//! 左列高度 = 右列高度（2×42+6 = 90，kFxModuleHeight）——旋钮顶/开关底
+//! 与右列行1顶/行2底 上下边界严格对齐，整块垂直居中于 116 行高。
 //! 布局（旧版参照）：左列（强度旋钮 drywet，线性全扫角——0 值在 −150°、
 //! 100% 在 +150°，见 MixerKnob.minAngleDeg + 下方 on/off 开关）+ 右侧
 //! 两行三按钮：
@@ -25,6 +26,12 @@ import '../src/rust/api.dart';
 import 'deck_pads.dart';
 import 'mixer_knob.dart';
 import 'panel_button.dart';
+
+/// P22.1 按钮行高：28 × 1.5（拉长 1.5 倍）。
+const double kFxRowHeight = 42;
+/// P22.1 左右列模块高 = 两行按钮紧贴（42+6+42）；左列旋钮+开关
+/// 的上下边界与右列对齐，不撑满行高。
+const double kFxModuleHeight = kFxRowHeight * 2 + 6;
 
 /// 当前效果类型里 unit=='beats' 的参数（gate.period，p1）与位号；
 /// 无拍参数效果（其余 7 种）返回 null。纯函数（测试直测）。
@@ -140,41 +147,47 @@ class DeckFx extends StatelessWidget {
           children: [
             // 左列：强度旋钮（0 值在 −150°，线性全扫角 300°）+ on/off 开关
             // （P20：enable 由开关负责，名称按钮让位给左键选型菜单）。
-            // P22.1：两列都撑满 116 高、内部 spaceBetween——旋钮贴顶、开关
-            // 贴底，与右列行1/行2 上下对齐，删'强度'label（MixerKnob 空
-            // label 不渲染），不再留空。
+            // P22.1：左列高度 = kFxModuleHeight（与右列严格对齐）——旋钮
+            // 贴顶、开关贴底，删'强度'label（MixerKnob 空 label 不渲染）。
             // P20.1 响应式：Flexible+FittedBox——极端窄窗（240px，DeckFx 只
             // 分到 ~63px）下左列整体等比缩小，不横向溢出。
             Flexible(
               fit: FlexFit.loose,
               child: FittedBox(
                 fit: BoxFit.scaleDown,
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    MixerKnob(
-                      label: '',
-                      min: 0,
-                      max: 1,
-                      minAngleDeg: -150,
-                      initFromBus: '${bus}_drywet',
-                      onChanged: (v) => actions.setFxDrywet(dc.deck, slot, v),
-                      size: 44,
-                      color: const Color(0xFF6A1B9A),
-                    ),
-                    Switch(
-                      value: enabled,
-                      activeThumbColor: const Color(0xFF6A1B9A),
-                      onChanged: (v) => actions.setFxEnable(dc.deck, slot, v),
-                    ),
-                  ],
+                child: SizedBox(
+                  height: kFxModuleHeight,
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      MixerKnob(
+                        label: '',
+                        min: 0,
+                        max: 1,
+                        minAngleDeg: -150,
+                        initFromBus: '${bus}_drywet',
+                        onChanged: (v) => actions.setFxDrywet(dc.deck, slot, v),
+                        size: 44,
+                        color: const Color(0xFF6A1B9A),
+                      ),
+                      Switch(
+                        value: enabled,
+                        // P22.1 shrinkWrap：M3 padded 高 48，44+48=92 > 模块
+                        // 90 会溢出 2px——shrinkWrap 高 32，44+32=76 放进 90
+                        // （spaceBetween 撑开），与右列边界严格对齐。
+                        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        activeThumbColor: const Color(0xFF6A1B9A),
+                        onChanged: (v) => actions.setFxEnable(dc.deck, slot, v),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
             const SizedBox(width: 8),
             Expanded(
               child: Column(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                mainAxisSize: MainAxisSize.min,
                 children: [
                   // 行1：beat ÷2 / 显示（点击回默认拍数）/ ×2（loop 同款样式）
                   Row(
@@ -182,7 +195,7 @@ class DeckFx extends StatelessWidget {
                       Expanded(
                         child: PanelButton(
                           label: '÷2',
-                          height: 28,
+                          height: kFxRowHeight,
                           fontSize: 12,
                           dead: beatsParam == null,
                           onTap: beatsParam == null
@@ -202,7 +215,7 @@ class DeckFx extends StatelessWidget {
                         flex: 2,
                         child: PanelButton(
                           label: beatsParam == null ? '–' : _fmtBeat(beatVal),
-                          height: 28,
+                          height: kFxRowHeight,
                           fontSize: 12,
                           dead: beatsParam == null,
                           onTap: beatsParam == null
@@ -219,7 +232,7 @@ class DeckFx extends StatelessWidget {
                       Expanded(
                         child: PanelButton(
                           label: '×2',
-                          height: 28,
+                          height: kFxRowHeight,
                           fontSize: 12,
                           dead: beatsParam == null,
                           onTap: beatsParam == null
@@ -236,14 +249,16 @@ class DeckFx extends StatelessWidget {
                       ),
                     ],
                   ),
+                  const SizedBox(height: 6),
                   // 行2：◀ 上一个 / 中间（显示效果名，左键单击弹选型菜单——
-                  // P20 右键事件改左键；enable 看左列开关）/ ▶ 下一个
+                  // P20 右键事件改左键；enable 看左列开关）/ ▶ 下一个。
+                  // 行1/行2 紧贴（SizedBox 6，旧方式），不撑满。
                   Row(
                     children: [
                       Expanded(
                         child: PanelButton(
                           label: '◀',
-                          height: 28,
+                          height: kFxRowHeight,
                           fontSize: 12,
                           onTap: () =>
                               _selectType(dc, prevFxType(type, manifests.length)),
@@ -254,7 +269,7 @@ class DeckFx extends StatelessWidget {
                         flex: 2,
                         child: PanelButton(
                           label: _effectLabel(manifests, type),
-                          height: 28,
+                          height: kFxRowHeight,
                           fontSize: 12,
                           onTap: () => _showTypeMenu(context, dc, type),
                         ),
@@ -263,7 +278,7 @@ class DeckFx extends StatelessWidget {
                       Expanded(
                         child: PanelButton(
                           label: '▶',
-                          height: 28,
+                          height: kFxRowHeight,
                           fontSize: 12,
                           onTap: () =>
                               _selectType(dc, nextFxType(type, manifests.length)),

@@ -14,6 +14,7 @@ import 'package:hypermixx/src/rust/api.dart';
 import 'package:hypermixx/widgets/deck_fx.dart';
 import 'package:hypermixx/widgets/deck_pads.dart';
 import 'package:hypermixx/widgets/mixer_knob.dart';
+import 'package:hypermixx/widgets/panel_button.dart';
 
 /// 记录调用的假动作出口。
 class _FakeActions extends PadActions {
@@ -138,15 +139,24 @@ void main() {
     expect(find.text('◀'), findsOneWidget);
     expect(find.text('▶'), findsOneWidget);
     expect(find.byType(Switch), findsOneWidget, reason: 'P20：旋钮下方 on/off 开关');
-    // 开关在旋钮下方（P22.1：旋钮贴顶、开关贴底，spaceBetween 对齐）
+    // 开关在旋钮下方
     final knobY = tester.getCenter(find.byType(MixerKnob)).dy;
     final swY = tester.getCenter(find.byType(Switch)).dy;
     expect(swY, greaterThan(knobY), reason: '开关应在旋钮下方');
-    // P22.1：右列行1/行2 贴顶贴底——◀(行2) 的 y 应大于 ÷2(行1) 的 y 且
-    // 两行都贴住各自边缘（行1 顶 = 容器顶，行2 底 = 容器底）
-    final row1Y = tester.getCenter(find.text('÷2')).dy;
-    final row2Y = tester.getCenter(find.text('◀')).dy;
-    expect(row2Y, greaterThan(row1Y), reason: '行2 在行1 下方');
+    // P22.1：上下边界严格对齐——行1 顶 = 旋钮顶、行2 底 = 开关底；
+    // 行1/行2 紧贴（中心间距 = 行高 42 + 6）。按钮用 PanelButton 定位
+    // （文字在按钮内居中，不能用 find.text 的位置代表按钮位置）。
+    final knobTop = tester.getTopLeft(find.byType(MixerKnob)).dy;
+    final row1Top =
+        tester.getTopLeft(find.widgetWithText(PanelButton, '÷2')).dy;
+    expect((row1Top - knobTop).abs(), lessThan(1), reason: '行1 顶与旋钮顶对齐');
+    final swBottom = tester.getBottomRight(find.byType(Switch)).dy;
+    final row2Bottom =
+        tester.getBottomRight(find.widgetWithText(PanelButton, '◀')).dy;
+    expect((row2Bottom - swBottom).abs(), lessThan(1), reason: '行2 底与开关底对齐');
+    final row1Y = tester.getCenter(find.widgetWithText(PanelButton, '÷2')).dy;
+    final row2Y = tester.getCenter(find.widgetWithText(PanelButton, '◀')).dy;
+    expect(row2Y - row1Y, closeTo(kFxRowHeight + 6, 1), reason: '行1/行2 紧贴');
     expect(tester.takeException(), isNull);
   });
 
