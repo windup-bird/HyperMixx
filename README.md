@@ -80,7 +80,7 @@ HYPERMIXX_BRIDGE_LIB="$(pwd)/HyperMixx/target/release/libhypermixx_bridge.so" \
 
 ## 跨平台编译（Windows / macOS）
 
-现状：仓库目前只带 Linux 桌面 runner（`flutter/linux/`）。Dart UI 与 Rust 引擎本身跨平台，但 Flutter 不支持从 Linux 交叉编译 Windows/macOS 目标——**需在对应主机上操作**：
+在目标平台的主机上安装该平台的 Rust 与 Flutter 工具链，直接在各自平台编译（仓库目前只带 Linux runner，其他平台首次需生成工程）：
 
 ```bash
 cd flutter
@@ -89,10 +89,10 @@ cd flutter
 flutter create --platforms=windows .   # Windows
 flutter create --platforms=macos .     # macOS
 
-# 2. 构建 Rust 桥（本机工具链；产物在 HyperMixx/target/release/）
+# 2. 构建 Rust 桥（产物在 HyperMixx/target/release/）
 cargo build --release -p hypermixx-bridge --manifest-path ../HyperMixx/Cargo.toml
 
-# 3. 运行（桥库必须用 HYPERMIXX_BRIDGE_LIB 指定——自动查找只认 .so）
+# 3. 运行（桥库用 HYPERMIXX_BRIDGE_LIB 指定——自动查找只认 .so）
 # Windows（PowerShell）：
 $env:HYPERMIXX_BRIDGE_LIB = "$(pwd)\..\HyperMixx\target\release\hypermixx_bridge.dll"
 flutter run -d windows
