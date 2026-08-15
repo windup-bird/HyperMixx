@@ -12,10 +12,11 @@ use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 
 use anyhow::Result;
-use timestretch::analysis::beat::detect_beats_multi;
+use timestretch::analysis::beat::detect_beats_with_options;
 use timestretch::analysis::key::detect_key;
 use timestretch::analysis::rigid_grid::refine_grid_rigid;
 use timestretch::core::preanalysis::KeyEstimate;
+use timestretch::TempoTrackingOptions;
 
 use hypermixx_audio::decode::{To48k, TrackDecoder};
 
@@ -292,10 +293,13 @@ fn track_analysis(
         mono48.extend_from_slice(m);
     }
 
-    // 双分辨率：12k 粗链（hint 暂不接——tag BPM 尚未传到分析侧）定
-    // tempo 层级，48k superflux 重放拍位；再对 48k kick 包络做 rigid
-    // 拟合（八度守卫钉在粗链决定的层级上）。
-    let grid = detect_beats_multi(&mono, TRACK_MONO_RATE, &mono48, 48_000, None);
+    // 0.11.0 单分辨率 48k superflux + EDM hint 范围（100–160，crates.io
+    // 版无 master 的双分辨率粗链定层级修复）；再对 48k kick 包络做 rigid
+    // 拟合（八度守卫钉在 tempogram 决定的层级上）。
+    let grid = detect_beats_with_options(&mono48, 48_000, &TempoTrackingOptions {
+        hint_range: Some((100.0, 160.0)),
+        ..Default::default()
+    });
     let (grid, adopted) = refine_grid_rigid(&mono48, 48_000, grid);
     log::debug!(
         "beatgrid：BPM {:.1}，rigid 细化采纳 = {adopted}，置信 {:.2}",

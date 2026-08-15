@@ -48,9 +48,9 @@ hound = "3.5"
 flutter_rust_bridge = "=2.12.0"
 # 曲目元数据/封面提取（MIT OR Apache-2.0）
 lofty = "0.25"
-# 本地克隆的 timestretch master（0.11.0 之后的 DSP/分析修复；
-# 引擎公共 API 与 crates.io 0.11.0 一致，可随时切回版本号依赖）
-timestretch = { path = "../timestretch-rs" }
+# keylock 引擎 + BPM/调性分析（MIT，0.11.0 实测定案；
+# 之前用过本地克隆 master 的 DSP/分析修复，提交 GitHub 时切回 crates.io）
+timestretch = "0.11"
 signalsmith-stretch = "0.1"
 
 [profile.release]
