@@ -94,16 +94,15 @@ void main() {
     // padding 10 + margin 6 = 96（fx 填满左侧列宽，不留白）
     expect(panelRect.right - fxRect.right, closeTo(96, 2),
         reason: 'fx 应填满左列行尾，实际余量 ${panelRect.right - fxRect.right}');
-    // P22.2 宽窗（700 ≥ 560）：pads:fx = 2:3 → fx 宽 = pads 宽 × 1.5
-    // （按钮宽度拉长 1.5 倍；严格比 0.6C/(0.4C−2) ≈ 1.51）
-    expect(fxRect.width, closeTo(padsRect.width * 1.5, 6),
-        reason: '宽窗 fx 宽应为 pads 1.5 倍，实际 ${fxRect.width} vs ${padsRect.width}');
+    // P22.3：pads:fx = 1:1 固定（两列宽相等，±2px 含 2px 间距偏差）
+    expect(fxRect.width, closeTo(padsRect.width, 4),
+        reason: 'pads/fx 应 1:1，实际 ${padsRect.width} vs ${fxRect.width}');
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('P22.2 响应式：中窗（400px）回退 pads:fx = 3:2', (tester) async {
+  testWidgets('P22.3: 中窗（400px）同样 1:1 且不溢出', (tester) async {
     final dc = DeckController(0);
-    dc.title = '中窗回退测试';
+    dc.title = '中窗 1:1 测试';
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
@@ -123,10 +122,8 @@ void main() {
     expect(pads, findsOneWidget);
     final fxRect = tester.getRect(fx);
     final padsRect = tester.getRect(pads);
-    // 400 < 560 → 3:2：fx 宽 ≈ pads 宽 × 0.4/0.6 ≈ 0.67
-    expect(fxRect.width, closeTo(padsRect.width / 1.5, 6),
-        reason: '中窗 fx 宽应为 pads 的 2/3（回退 3:2），'
-            '实际 ${fxRect.width} vs ${padsRect.width}');
+    expect(fxRect.width, closeTo(padsRect.width, 4),
+        reason: '任何宽度下 pads/fx 都 1:1，实际 ${padsRect.width} vs ${fxRect.width}');
     expect(tester.takeException(), isNull);
   });
 }

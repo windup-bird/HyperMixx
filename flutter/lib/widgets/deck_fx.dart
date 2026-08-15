@@ -142,156 +142,189 @@ class DeckFx extends StatelessWidget {
         final beatVal = beatsParam != null
             ? _safeBus('${bus}_p${beatIdx + 1}')
             : 0.0;
-        return Row(
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: [
-            // 左列：强度旋钮（0 值在 −150°，线性全扫角 300°）+ on/off 开关
-            // （P20：enable 由开关负责，名称按钮让位给左键选型菜单）。
-            // P22.1：左列高度 = kFxModuleHeight（与右列严格对齐）——旋钮
-            // 贴顶、开关贴底，删'强度'label（MixerKnob 空 label 不渲染）。
-            // P20.1 响应式：Flexible+FittedBox——极端窄窗（240px，DeckFx 只
-            // 分到 ~63px）下左列整体等比缩小，不横向溢出。
-            Flexible(
-              fit: FlexFit.loose,
-              child: FittedBox(
-                fit: BoxFit.scaleDown,
-                child: SizedBox(
-                  height: kFxModuleHeight,
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      MixerKnob(
-                        label: '',
-                        min: 0,
-                        max: 1,
-                        minAngleDeg: -150,
-                        initFromBus: '${bus}_drywet',
-                        onChanged: (v) => actions.setFxDrywet(dc.deck, slot, v),
-                        size: 44,
-                        color: const Color(0xFF6A1B9A),
+        // P22.3 重做左列宽度。根因：旧 Flexible(flex:1, loose) 参与 flex
+        // 分配——左列约束 = 半列宽，FittedBox 只取 60px 但右列 Expanded
+        // 只拿到一半 → 按钮与左列间留大片空白（220px 宽时 46px，"按钮没
+        // 铺满"）；flex: 0 窄窗约束失效（左列不缩，右列取负溢出 5px）。
+        // 方案：LayoutBuilder 直出（不能包 Row——flex 行给非 flex 子
+        // unbounded 主轴向约束，内层 Expanded 会炸），左列上限 =
+        // min(60, 半列)：宽窗 60 固定（右列 Expanded 拿满剩余全部宽度），
+        // 窄窗两列等比收缩（P20.1 响应式保留，右列恒 ≥ 左列不溢出）。
+        // 左列内容 P22.1：强度旋钮（0 值在 −150°，线性全扫角 300°，
+        // 贴顶）+ on/off 开关（P20 enable 由开关负责，贴底），高度 =
+        // kFxModuleHeight（与右列严格对齐），删'强度'label。
+        return LayoutBuilder(
+          builder: (context, c) {
+            final leftMax = ((c.maxWidth - 8) / 2).clamp(0.0, 60.0);
+            return Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                    ConstrainedBox(
+                      constraints: BoxConstraints(maxWidth: leftMax),
+                      child: FittedBox(
+                        fit: BoxFit.scaleDown,
+                        child: SizedBox(
+                          width: 60,
+                          height: kFxModuleHeight,
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              MixerKnob(
+                                label: '',
+                                min: 0,
+                                max: 1,
+                                minAngleDeg: -150,
+                                initFromBus: '${bus}_drywet',
+                                onChanged: (v) =>
+                                    actions.setFxDrywet(dc.deck, slot, v),
+                                size: 44,
+                                color: const Color(0xFF6A1B9A),
+                              ),
+                              Switch(
+                                value: enabled,
+                                // P22.1 shrinkWrap：M3 padded 高 48，
+                                // 44+48=92 > 模块 90 会溢出 2px——
+                                // shrinkWrap 高 32，44+32=76 放进 90
+                                // （spaceBetween 撑开），边界严格对齐。
+                                materialTapTargetSize:
+                                    MaterialTapTargetSize.shrinkWrap,
+                                activeThumbColor: const Color(0xFF6A1B9A),
+                                onChanged: (v) =>
+                                    actions.setFxEnable(dc.deck, slot, v),
+                              ),
+                            ],
+                          ),
+                        ),
                       ),
-                      Switch(
-                        value: enabled,
-                        // P22.1 shrinkWrap：M3 padded 高 48，44+48=92 > 模块
-                        // 90 会溢出 2px——shrinkWrap 高 32，44+32=76 放进 90
-                        // （spaceBetween 撑开），与右列边界严格对齐。
-                        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                        activeThumbColor: const Color(0xFF6A1B9A),
-                        onChanged: (v) => actions.setFxEnable(dc.deck, slot, v),
-                      ),
-                    ],
-                  ),
+                    ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _fxButtons(context, bus, manifests, type, enabled,
+                      beatsParam, beatIdx, beatVal, dc),
                 ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // ---- P22.3：右列两行按钮（LayoutBuilder 内 Expanded 拿满剩余宽度）----
+  /// beat 行（÷2/拍数/×2）+ select 行（◀/名称/▶）——行内三按钮 Expanded
+  /// 平分，横向铺满 fx 列内容（用户要求）。
+  Widget _fxButtons(
+    BuildContext context,
+    String bus,
+    List<FxEffectWire> manifests,
+    int type,
+    bool enabled,
+    (int, FxParamWire)? beatsParam,
+    int beatIdx,
+    double beatVal,
+    DeckController dc,
+  ) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // 行1：beat ÷2 / 显示（点击回默认拍数）/ ×2（loop 同款样式）
+        Row(
+          children: [
+            Expanded(
+              child: PanelButton(
+                label: '÷2',
+                height: kFxRowHeight,
+                fontSize: 12,
+                dead: beatsParam == null,
+                onTap: beatsParam == null
+                    ? null
+                    : () {
+                        actions.setFxParam(
+                          dc.deck,
+                          slot,
+                          beatIdx,
+                          fxBeatSnap(beatVal / 2, beatsParam.$2),
+                        );
+                      },
               ),
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: 4),
             Expanded(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  // 行1：beat ÷2 / 显示（点击回默认拍数）/ ×2（loop 同款样式）
-                  Row(
-                    children: [
-                      Expanded(
-                        child: PanelButton(
-                          label: '÷2',
-                          height: kFxRowHeight,
-                          fontSize: 12,
-                          dead: beatsParam == null,
-                          onTap: beatsParam == null
-                              ? null
-                              : () {
-                                  actions.setFxParam(
-                                    dc.deck,
-                                    slot,
-                                    beatIdx,
-                                    fxBeatSnap(beatVal / 2, beatsParam.$2),
-                                  );
-                                },
-                        ),
+              flex: 2,
+              child: PanelButton(
+                label: beatsParam == null ? '–' : _fmtBeat(beatVal),
+                height: kFxRowHeight,
+                fontSize: 12,
+                dead: beatsParam == null,
+                onTap: beatsParam == null
+                    ? null
+                    : () => actions.setFxParam(
+                        dc.deck,
+                        slot,
+                        beatIdx,
+                        beatsParam.$2.defaultValue,
                       ),
-                      const SizedBox(width: 4),
-                      Expanded(
-                        flex: 2,
-                        child: PanelButton(
-                          label: beatsParam == null ? '–' : _fmtBeat(beatVal),
-                          height: kFxRowHeight,
-                          fontSize: 12,
-                          dead: beatsParam == null,
-                          onTap: beatsParam == null
-                              ? null
-                              : () => actions.setFxParam(
-                                  dc.deck,
-                                  slot,
-                                  beatIdx,
-                                  beatsParam.$2.defaultValue,
-                                ),
-                        ),
-                      ),
-                      const SizedBox(width: 4),
-                      Expanded(
-                        child: PanelButton(
-                          label: '×2',
-                          height: kFxRowHeight,
-                          fontSize: 12,
-                          dead: beatsParam == null,
-                          onTap: beatsParam == null
-                              ? null
-                              : () {
-                                  actions.setFxParam(
-                                    dc.deck,
-                                    slot,
-                                    beatIdx,
-                                    fxBeatSnap(beatVal * 2, beatsParam.$2),
-                                  );
-                                },
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 6),
-                  // 行2：◀ 上一个 / 中间（显示效果名，左键单击弹选型菜单——
-                  // P20 右键事件改左键；enable 看左列开关）/ ▶ 下一个。
-                  // 行1/行2 紧贴（SizedBox 6，旧方式），不撑满。
-                  Row(
-                    children: [
-                      Expanded(
-                        child: PanelButton(
-                          label: '◀',
-                          height: kFxRowHeight,
-                          fontSize: 12,
-                          onTap: () =>
-                              _selectType(dc, prevFxType(type, manifests.length)),
-                        ),
-                      ),
-                      const SizedBox(width: 4),
-                      Expanded(
-                        flex: 2,
-                        child: PanelButton(
-                          label: _effectLabel(manifests, type),
-                          height: kFxRowHeight,
-                          fontSize: 12,
-                          onTap: () => _showTypeMenu(context, dc, type),
-                        ),
-                      ),
-                      const SizedBox(width: 4),
-                      Expanded(
-                        child: PanelButton(
-                          label: '▶',
-                          height: kFxRowHeight,
-                          fontSize: 12,
-                          onTap: () =>
-                              _selectType(dc, nextFxType(type, manifests.length)),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
+              ),
+            ),
+            const SizedBox(width: 4),
+            Expanded(
+              child: PanelButton(
+                label: '×2',
+                height: kFxRowHeight,
+                fontSize: 12,
+                dead: beatsParam == null,
+                onTap: beatsParam == null
+                    ? null
+                    : () {
+                        actions.setFxParam(
+                          dc.deck,
+                          slot,
+                          beatIdx,
+                          fxBeatSnap(beatVal * 2, beatsParam.$2),
+                        );
+                      },
               ),
             ),
           ],
-        );
-      },
+        ),
+        const SizedBox(height: 6),
+        // 行2：◀ 上一个 / 中间（显示效果名，左键单击弹选型菜单——
+        // P20 右键事件改左键；enable 看左列开关）/ ▶ 下一个。
+        // 行1/行2 紧贴（SizedBox 6，旧方式），不撑满。
+        Row(
+          children: [
+            Expanded(
+              child: PanelButton(
+                label: '◀',
+                height: kFxRowHeight,
+                fontSize: 12,
+                onTap: () =>
+                    _selectType(dc, prevFxType(type, manifests.length)),
+              ),
+            ),
+            const SizedBox(width: 4),
+            Expanded(
+              flex: 2,
+              child: PanelButton(
+                label: _effectLabel(manifests, type),
+                height: kFxRowHeight,
+                fontSize: 12,
+                onTap: () => _showTypeMenu(context, dc, type),
+              ),
+            ),
+            const SizedBox(width: 4),
+            Expanded(
+              child: PanelButton(
+                label: '▶',
+                height: kFxRowHeight,
+                fontSize: 12,
+                onTap: () =>
+                    _selectType(dc, nextFxType(type, manifests.length)),
+              ),
+            ),
+          ],
+        ),
+      ],
     );
   }
 

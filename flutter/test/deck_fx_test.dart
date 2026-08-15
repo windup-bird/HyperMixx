@@ -157,6 +157,14 @@ void main() {
     final row1Y = tester.getCenter(find.widgetWithText(PanelButton, '÷2')).dy;
     final row2Y = tester.getCenter(find.widgetWithText(PanelButton, '◀')).dy;
     expect(row2Y - row1Y, closeTo(kFxRowHeight + 6, 1), reason: '行1/行2 紧贴');
+    // P22.3：beat（行1）与 select（行2）按钮横向铺满 fx 列——行尾按钮
+    // ×2 / ▶ 的右缘都贴近 DeckFx 右缘（Expanded 填满，不留白）
+    final fxRight = tester.getRect(find.byType(DeckFx)).right;
+    final x2Right = tester.getRect(find.widgetWithText(PanelButton, '×2')).right;
+    final selRight =
+        tester.getRect(find.widgetWithText(PanelButton, '▶')).right;
+    expect(fxRight - x2Right, lessThan(1), reason: '行1（beat）按钮应铺满 fx 列宽');
+    expect(fxRight - selRight, lessThan(1), reason: '行2（select）按钮应铺满 fx 列宽');
     expect(tester.takeException(), isNull);
   });
 
