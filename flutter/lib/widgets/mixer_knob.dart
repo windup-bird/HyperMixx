@@ -205,17 +205,19 @@ class _MixerKnobState extends State<MixerKnob> {
             ),
           ),
         ),
-        // 单行文字：变动时显值、平时显标签
-        Text(
-          _showValue ? _fmt(v) : widget.label,
-          style: _showValue
-              ? TextStyle(
-                  color: widget.color.withValues(alpha: 0.9),
-                  fontSize: 10,
-                  fontFeatures: const [FontFeature.tabularFigures()],
-                )
-              : const TextStyle(color: Colors.white54, fontSize: 9),
-        ),
+        // 单行文字：变动时显值、平时显标签；label 为空则不渲染
+        // （DeckFx 删'强度'后由布局对齐代替文字说明，P22.1）。
+        if (widget.label.isNotEmpty)
+          Text(
+            _showValue ? _fmt(v) : widget.label,
+            style: _showValue
+                ? TextStyle(
+                    color: widget.color.withValues(alpha: 0.9),
+                    fontSize: 10,
+                    fontFeatures: const [FontFeature.tabularFigures()],
+                  )
+                : const TextStyle(color: Colors.white54, fontSize: 9),
+          ),
       ],
     );
   }

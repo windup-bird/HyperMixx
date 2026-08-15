@@ -134,14 +134,19 @@ void main() {
 
     expect(find.text('FX'), findsOneWidget, reason: 'type 0 名称');
     expect(find.text('–'), findsOneWidget, reason: 'type 0 无拍参数 → 禁用');
-    expect(find.text('强度'), findsOneWidget, reason: '强度旋钮');
+    expect(find.text('强度'), findsNothing, reason: 'P22.1：强度 label 已删');
     expect(find.text('◀'), findsOneWidget);
     expect(find.text('▶'), findsOneWidget);
     expect(find.byType(Switch), findsOneWidget, reason: 'P20：旋钮下方 on/off 开关');
-    // 开关在旋钮下方
-    final knobY = tester.getCenter(find.text('强度')).dy;
+    // 开关在旋钮下方（P22.1：旋钮贴顶、开关贴底，spaceBetween 对齐）
+    final knobY = tester.getCenter(find.byType(MixerKnob)).dy;
     final swY = tester.getCenter(find.byType(Switch)).dy;
     expect(swY, greaterThan(knobY), reason: '开关应在旋钮下方');
+    // P22.1：右列行1/行2 贴顶贴底——◀(行2) 的 y 应大于 ÷2(行1) 的 y 且
+    // 两行都贴住各自边缘（行1 顶 = 容器顶，行2 底 = 容器底）
+    final row1Y = tester.getCenter(find.text('÷2')).dy;
+    final row2Y = tester.getCenter(find.text('◀')).dy;
+    expect(row2Y, greaterThan(row1Y), reason: '行2 在行1 下方');
     expect(tester.takeException(), isNull);
   });
 

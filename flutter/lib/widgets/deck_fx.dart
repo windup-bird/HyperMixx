@@ -1,7 +1,11 @@
 //! P20 DeckFx：deck 主 FX 槽（slot 0）控制，整体放大填满行高
 //! （kDeckFxHeight = kPadsRowHeight，旋钮 44、按钮 28、字号 12）。
-//! 布局：左列（强度旋钮 drywet，线性全扫角——0 值在 −150°、100% 在 +150°，
-//! 见 MixerKnob.minAngleDeg + 下方 on/off 开关）+ 右侧两行三按钮：
+//! P22.1 布局去留空：左右列各撑满 116 高、内部 spaceBetween——左列
+//! 旋钮贴顶 + on/off 开关贴底（删'强度'label，MixerKnob 空 label 不渲染），
+//! 右列行1 贴顶 + 行2 贴底，上下对齐不留空。
+//! 布局（旧版参照）：左列（强度旋钮 drywet，线性全扫角——0 值在 −150°、
+//! 100% 在 +150°，见 MixerKnob.minAngleDeg + 下方 on/off 开关）+ 右侧
+//! 两行三按钮：
 //! - 行1（beat，参考 ManualLoop 行1 样式）：÷2 / 拍数显示（点击回 manifest
 //!   默认拍数）/ ×2。仅 unit=="beats" 的参数（目前只有 gate.period）启用，
 //!   其余效果禁用显示 '–'；
@@ -134,8 +138,11 @@ class DeckFx extends StatelessWidget {
         return Row(
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            // 左列：强度旋钮（0 值在 −150°，线性全扫角 300°）+ 下方 on/off
-            // 开关（P20：enable 由开关负责，名称按钮让位给左键选型菜单）。
+            // 左列：强度旋钮（0 值在 −150°，线性全扫角 300°）+ on/off 开关
+            // （P20：enable 由开关负责，名称按钮让位给左键选型菜单）。
+            // P22.1：两列都撑满 116 高、内部 spaceBetween——旋钮贴顶、开关
+            // 贴底，与右列行1/行2 上下对齐，删'强度'label（MixerKnob 空
+            // label 不渲染），不再留空。
             // P20.1 响应式：Flexible+FittedBox——极端窄窗（240px，DeckFx 只
             // 分到 ~63px）下左列整体等比缩小，不横向溢出。
             Flexible(
@@ -143,10 +150,10 @@ class DeckFx extends StatelessWidget {
               child: FittedBox(
                 fit: BoxFit.scaleDown,
                 child: Column(
-                  mainAxisSize: MainAxisSize.min,
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     MixerKnob(
-                      label: '强度',
+                      label: '',
                       min: 0,
                       max: 1,
                       minAngleDeg: -150,
@@ -155,7 +162,6 @@ class DeckFx extends StatelessWidget {
                       size: 44,
                       color: const Color(0xFF6A1B9A),
                     ),
-                    const SizedBox(height: 6),
                     Switch(
                       value: enabled,
                       activeThumbColor: const Color(0xFF6A1B9A),
@@ -168,7 +174,7 @@ class DeckFx extends StatelessWidget {
             const SizedBox(width: 8),
             Expanded(
               child: Column(
-                mainAxisSize: MainAxisSize.min,
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   // 行1：beat ÷2 / 显示（点击回默认拍数）/ ×2（loop 同款样式）
                   Row(
@@ -230,7 +236,6 @@ class DeckFx extends StatelessWidget {
                       ),
                     ],
                   ),
-                  const SizedBox(height: 6),
                   // 行2：◀ 上一个 / 中间（显示效果名，左键单击弹选型菜单——
                   // P20 右键事件改左键；enable 看左列开关）/ ▶ 下一个
                   Row(
