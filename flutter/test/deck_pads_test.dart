@@ -1,5 +1,8 @@
 // DeckPads / CueButton widget 测试：注入假 PadActions，脱离桥验证
 // 按压语义、翻页窗口与删除交互。
+//
+// P22-D：loop pad 已改 onTapDown（按下即激活，同 beatjump P12 先例）——
+// `tester.tap` 含按下+抬起，用例与断言均不变。
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';

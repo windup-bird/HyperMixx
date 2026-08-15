@@ -296,7 +296,10 @@ class _DeckPadsState extends State<DeckPads> {
         final isActive = active && (cur - beats).abs() < 0.05;
         return GestureDetector(
           behavior: HitTestBehavior.opaque,
-          onTap: () {
+          // onTapDown 按下即激活（P22-D）：loop 激活瞬间的播放头位置决定
+          // 捕获起点，onTap 要等手势仲裁（~数十毫秒）才触发——晚了首圈
+          // 就不完整（P22 卡顿源 2），同 beatjump P12 先例。
+          onTapDown: (_) {
             if (isActive) {
               widget.actions.setLoopActive(dc.deck, false);
             } else {

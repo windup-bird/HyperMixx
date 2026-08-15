@@ -1,5 +1,9 @@
 //! ManualLoop widget 测试（PadActions 注入，不碰桥）：中间按钮激活/取消、
 //! ÷2/×2 本地拍数 + 激活中立即重设、In/Out 写 loop 总线并激活。
+//!
+//! P22-D：_toggle/_setIn/_setOut 已改 onTapDown（按下即触发，不等待手势
+//! 仲裁）——`tester.tap` 含按下+抬起，用例与断言均不变，语义注释见
+//! manual_loop.dart 头部。
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';

@@ -1,20 +1,27 @@
 # HyperMixx
 
-开源 DJ 混音软件 —— Rust 实时音频引擎 + Flutter 桌面界面。
-
-> 目标平台：香橙派 4 一体机（RK3399 / aarch64）与 Linux PC。轻量、性能优先，全依赖宽松许可（MIT OR Apache-2.0）。
+轻量、性能优先的跨平台DJ混音软件，使用Rust+Flutter构建。
 
 ## 功能
 
-- 双 deck 播放（keylock 变调不变速 / 变速不变调）
-- BPM 检测 + 调性检测 + beatgrid 自动网格
-- beat sync 同步（leader 判定、临时加减速、推子软接管）
-- 手动 loop（In/Out 手动定界 + 整拍量化）、beatloop、beatjump
-- 主 CUE + 16 槽 hotcue（落点 / 试听 / 召回）
-- 每 deck 主 FX 通道（echo / gate 等，旋钮 + 开关 + 选型菜单）
-- 三段 EQ / 滤波 / 增益 / 交叉推子混音台
-- RGB 与 3-bands 双模式滚动波形 + 全区预览（loop / cue 标记、拍轴网格）
-- 曲库（进行中）、MIDI（进行中）
+已实现
+
+- 2 deck load and play
+- keylock
+- BPM/key analysis
+- beat sync
+- loop / beatjump
+- cue / hotcue
+- deck fx / filter
+- RGB / 3-bands
+
+开发中
+
+- more fx / color fx
+- library management
+- midi control
+- import from rkb/serato/vdj
+
 
 ## 架构
 
@@ -38,16 +45,14 @@ flutter/                  # Flutter 桌面界面（当前主 UI）
 依赖：Rust（edition 2024）、Flutter（Linux 桌面）、CMake、systemd 依赖库。
 
 ```bash
-# 一键构建桥并启动 Flutter（真引擎）
-scripts/run_flutter.sh [可选曲目路径]
+# 一键构建桥并启动(Linux)
+scripts/run_flutter.sh
 
 # 或手动分步
 cargo build --release -p hypermixx-bridge --manifest-path HyperMixx/Cargo.toml
 export HYPERMIXX_BRIDGE_LIB="$(pwd)/HyperMixx/target/release/libhypermixx_bridge.so"
 cd flutter && flutter run -d linux
 ```
-
-`HYPERMIXX_TRACK=路径` 可指定启动自动载入的曲目。
 
 ## 测试
 
@@ -69,4 +74,4 @@ HYPERMIXX_BRIDGE_LIB="$(pwd)/HyperMixx/target/release/libhypermixx_bridge.so" \
 
 ## 许可
 
-MIT OR Apache-2.0（自研代码；依赖栈全宽松许可，零 GPL）。
+MIT

@@ -326,10 +326,15 @@ mod tests {
         run_blocks(&mut state, 8); // warm_start priming + 收敛
 
         let q0 = state.decks[0].ctl.playhead.get();
-        // P14 最小预卷（无 priming 丢弃偏移）：播头 = 落点 − 560 帧引擎
-        // 延迟补偿 + 推进（与常规 seek 稳态语义一致）
-        let expect0 = want0 - 560.0 / 48000.0 + 8.0 * 256.0 / 48000.0;
-        assert!((q0 - expect0).abs() < 0.005, "deck0 未跳到落点：{q0} vs {expect0}");
+        // P22-C 动态延迟契约：播头 = 落点 + 推进 − 引擎延迟，不再硬编码
+        // 560 帧（全排停滞路径延迟 ~560、保留窗口连续喂入路径 ~272，
+        // 跳后 feed 动态不同）。延迟 = expect − 播头 ∈ (0, 0.03]。
+        let expect0 = want0 + 8.0 * 256.0 / 48000.0;
+        let lag = expect0 - q0;
+        assert!(
+            lag > 0.0 && lag <= 0.03,
+            "deck0 未跳到落点：{q0} vs {expect0}（lag={lag}）"
+        );
 
         // deck1 不联动：9 块（跳后共 1+8）按 sync 速率锁继续推进
         //（grid 124 锁 leader 120 BPM → 音轨速率 120/124）
@@ -357,9 +362,14 @@ mod tests {
         test_refill_after_seek(&mut state.decks[0], &mut prod0, want0);
         run_blocks(&mut state, 8); // priming + 收敛
         let q0 = state.decks[0].ctl.playhead.get();
-        // P14 最小预卷：播头 = 落点 − 560 帧延迟补偿 + 推进
-        let expect0 = want0 - 560.0 / 48000.0 + 8.0 * 256.0 / 48000.0;
-        assert!((q0 - expect0).abs() < 0.005, "deck0 未跳到落点：{q0} vs {expect0}");
+        // P22-C 动态延迟契约：播头 = 落点 + 推进 − 引擎延迟（560 硬编码
+        // 只对全排 refill 停滞路径成立；保留窗口路径连续喂入 ~272）。
+        let expect0 = want0 + 8.0 * 256.0 / 48000.0;
+        let lag = expect0 - q0;
+        assert!(
+            lag > 0.0 && lag <= 0.03,
+            "deck0 未跳到落点：{q0} vs {expect0}（lag={lag}）"
+        );
 
         // deck1 无 sync 不联动：9 块（跳后共 1+8）正常推进
         let q1 = state.decks[1].ctl.playhead.get();

@@ -8,6 +8,10 @@
 //! 默认拍数 4（Out 无有效 in 回拉时用）；÷2/×2 修改本地拍数，激活中修改
 //! 立即经 beatloop 重设（同 pad 语义）。
 //! 动作经 `PadActions` 出口（默认走 EngineController/桥），测试注入假实现。
+//!
+//! P22-D：_toggle/_setIn/_setOut 用 onTapDown（同 beatjump P12 先例）——
+//! In/Out/激活对时序敏感（激活瞬间的播放头位置即定界点），onTap 等手势
+//! 仲裁延迟数十毫秒，位置就偏了。÷2/×2 改本地拍数不敏感，保持 onTap。
 
 import 'package:flutter/material.dart';
 
@@ -136,7 +140,7 @@ class _ManualLoopState extends State<ManualLoop> {
                     label: fmtBeats(beats),
                     lit: active,
                     litColor: const Color(0xFF2E7D32),
-                    onTap: _toggle,
+                    onTapDown: _toggle,
                   );
                 },
               ),
@@ -153,9 +157,9 @@ class _ManualLoopState extends State<ManualLoop> {
         const SizedBox(height: 6),
         Row(
           children: [
-            Expanded(child: PanelButton(label: 'In', onTap: _setIn)),
+            Expanded(child: PanelButton(label: 'In', onTapDown: _setIn)),
             const SizedBox(width: 4),
-            Expanded(child: PanelButton(label: 'Out', onTap: _setOut)),
+            Expanded(child: PanelButton(label: 'Out', onTapDown: _setOut)),
           ],
         ),
       ],

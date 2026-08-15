@@ -64,6 +64,11 @@ const FADER_STEP_MAX: f64 = 3.0;
 const LOOP_BUF_MAX_BEATS: f64 = 64.0;
 const LOOP_BUF_MAX_SECS: f64 = 30.0;
 
+/// P22-A 接缝交叉淡化长度（帧）：4ms@48k。覆盖圈首 wrap 接缝（blend_at=0）
+/// 与 P22-B 偏移入环接缝（blend_at=d）；等功率 cos²+sin²=1 淡入淡出，
+/// 任意波形跳变在 bl 帧内平滑过渡（残余瞬态 ≤ bl·斜率，无感）。
+const LOOP_BLEND_FRAMES: usize = 192;
+
 /// P10.3 loop 喂入状态机（切环不动 keylocker 引擎：缓冲喂入无 reset、
 /// 无欠载缝隙——vendored graph.rs loop_wrap_is_gapless_across_ratios 同款用法）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -78,10 +83,26 @@ enum LoopFeed {
 
 /// P10.3 环缓冲：[loop_in, loop_out) 原始立体声帧（交织 f32）。
 /// 捕获完成 = frames == 环长（复用判定）；cursor = FromBuffer 喂入游标。
+///
+/// P22-A 接缝淡化：blend 是 data 中 [blend_at, blend_at+blend_len)
+/// 区域的替代切片——圈首 wrap 接缝（blend_at=0）或 P22-B 偏移入环
+/// 接缝（blend_at=d）处喂 blend 而非 data。cursor 语义不变：一圈仍
+/// 恰好喂 frames 帧，播头公式与 P11.1 退出锚点不受影响。
 struct LoopBuf {
     data: Vec<f32>,
     frames: usize,
     cursor: usize,
+    blend: Vec<f32>,
+    blend_len: usize,
+    blend_at: usize,
+    /// P22-B 未排空回填帧数：>0 时 data 前区 [frames − pending, frames)
+    ///（或全圈布防时整个 data）等侧环回填；排空到 0 才允许入环判定
+    ///（loop_wrap 守卫 / 偏移入环）。seek/load/去激活清 0。
+    backfill_pending: usize,
+    /// P22-B 回填布防型（arm 时定）：true = 全圈回填（feed ≥ out 的等待
+    /// 窗，回填完成即偏移入环）；false = 部分回填。仅 pending > 0 时有
+    /// 意义；回填停滞兜底的放行阈值按此分流（全圈 2s / 部分 1 chunk）。
+    backfill_full: bool,
 }
 
 impl LoopBuf {
@@ -90,6 +111,11 @@ impl LoopBuf {
             data: Vec::new(),
             frames: 0,
             cursor: 0,
+            blend: Vec::new(),
+            blend_len: 0,
+            blend_at: 0,
+            backfill_pending: 0,
+            backfill_full: false,
         }
     }
 
@@ -98,7 +124,49 @@ impl LoopBuf {
             data: Vec::with_capacity(frames * 2),
             frames: 0,
             cursor: 0,
+            blend: Vec::with_capacity(LOOP_BLEND_FRAMES * 2),
+            blend_len: 0,
+            blend_at: 0,
+            backfill_pending: 0,
+            backfill_full: false,
         }
+    }
+
+    /// P22-A：cursor 是否落在 blend 区（区内喂 blend 切片）。
+    fn blend_covers(&self, cursor: usize) -> bool {
+        cursor >= self.blend_at && cursor < self.blend_at + self.blend_len
+    }
+
+    /// P22-A：cursor 所在喂入段的终点——blend 区边界或圈尾
+    ///（cursor 在区前/区内/区后三段的界限）。
+    fn segment_end(&self, cursor: usize) -> usize {
+        if cursor < self.blend_at {
+            self.blend_at
+        } else if cursor < self.blend_at + self.blend_len {
+            self.blend_at + self.blend_len
+        } else {
+            self.frames
+        }
+    }
+
+    /// P22-A：预计算圈首接缝 blend——圈尾 [n−bl, n) 等功率淡出 ×
+    /// 圈头 [0, bl) 淡入。blend 替代 data[0..bl)，每圈仍喂 n 帧；
+    /// 捕获内容恒定 → 计算一次全程复用（含首圈 Capturing→FromBuffer
+    /// 接缝）。短环钳半（blend 区不得与圈尾区重叠取错样本）。
+    fn rebuild_wrap_blend(&mut self, n_frames: usize) {
+        let bl = LOOP_BLEND_FRAMES.min(n_frames / 2);
+        self.blend.clear();
+        for i in 0..bl {
+            let t = ((i as f32 + 0.5) / bl as f32) * (std::f32::consts::PI / 2.0);
+            let (g_out, g_in) = (t.cos(), t.sin());
+            for ch in 0..2 {
+                let v = self.data[(n_frames - bl + i) * 2 + ch] * g_out
+                    + self.data[i * 2 + ch] * g_in;
+                self.blend.push(v);
+            }
+        }
+        self.blend_len = bl;
+        self.blend_at = 0;
     }
 }
 
@@ -148,6 +216,13 @@ pub struct Deck {
     feed_pos: u64, // 下一个待喂入的音轨帧
     feed_base: u64, // 引擎 fed 0 对应的音轨帧（reset 时重锚定）
     feed_chunk: Option<(u64, Box<[f32]>, usize)>, // (start, data, 帧游标)
+    /// P22-B 回填侧环（reader 回填 [loop_in, feed_pos) 时推这里，deck 每块
+    /// 排空到环缓冲前区）。load/respawn 时随 reader 重建，stop_reader 置 None。
+    side_rx: Option<ringbuf::HeapCons<Chunk>>,
+    /// P22-B 最近喂入尾部（LOOP_BLEND_FRAMES 帧交织 f32，每次 push 尾随
+    /// 更新）：偏移入环 entry blend 的淡出分量——自然尾已在 keylocker
+    /// 内不可撤回，用尾部缓冲重建。
+    feed_tail: [f32; LOOP_BLEND_FRAMES * 2],
     eof_fed: bool,  // finish() 已成功推入冲刷 padding
     eof_stall: u32, // eof_fed 后连续 position 冻结块数
     last_sp: f64,
@@ -204,10 +279,27 @@ pub struct Deck {
     /// 切环瞬间 kl.source_position()：FromBuffer 显示播头折返基准。
     loop_sp_anchor: f64,
     /// P11.1 收尾圈完成后的线性显示锚点：pos = pos_base + source_position()。
-    /// 环绕期间引擎位置标签每圈累计 len（缓冲喂入不重打标签），锚点 =
-    /// 折返显示值 − 当前标签值，吸收 k×len 偏移 → 播头从 loop_out 无缝
-    /// 续进。seek/load/引擎重建清空（坐标系重建）。
+    /// 退出瞬间锚点 = feed_pos − feed_pos_at_loop_start − loop_pushed
+    /// （P22-B 改：引擎标签 = 原始喂入计数 − 管线延迟，set_track_position
+    /// 只重锚工件不锚标签；Δ = feed_pos − pushed_total 吸收环喂入与
+    /// feed_pos 推进的差——常规环 Δ = −W×len、偏移入环 Δ = +d，同式
+    /// 覆盖，延迟精确抵消 → 播头 = 正在出声的内容位置）。seek/load/
+    /// 引擎重建清空（坐标系重建）。
     pos_base: Option<f64>,
+    /// P22-B 偏移入环的圈内偏移（帧）：d = (feed_pos − loop_out×sr) mod n。
+    /// 播头公式映射入环相位；退出续点每圈 +n（P + k×n）。非偏移入环
+    /// 恒 0（loop_wrap 常规路径）；seek/load/去激活清 0。
+    loop_offset: u64,
+    /// P22-B FromBuffer 起点 feed_pos（退出锚点 Δ 的基准；常规 = loop_out、
+    /// 偏移 = 入环位置 P）。与 loop_pushed 一起恢复环期间 pushed_total。
+    feed_pos_at_loop_start: u64,
+    /// P22-B 自 FromBuffer 起累计的环喂入帧数（feed_from_loop_buf 每次
+    /// 接受 +accepted；FromBuffer 进入时清零）。
+    loop_pushed: u64,
+    /// P22-C 保留窗口的旧世代：seek_internal 落点命中 ring 已解码窗口时
+    /// 记窗口尾块世代——接受规则同时认 self.epoch 与 preserve，首块新
+    /// 世代 chunk 接受后清空（reader 已续推到窗口尾，之后世代对齐）。
+    preserve: Option<u32>,
 
     // DSP
     eq: ThreeBandEq,
@@ -333,6 +425,8 @@ impl Deck {
             feed_pos: 0,
             feed_base: 0,
             feed_chunk: None,
+            side_rx: None,
+            feed_tail: [0.0; LOOP_BLEND_FRAMES * 2],
             eof_fed: false,
             eof_stall: 0,
             last_sp: 0.0,
@@ -359,6 +453,10 @@ impl Deck {
             loop_buf_anchor: 0,
             loop_sp_anchor: 0.0,
             pos_base: None,
+            loop_offset: 0,
+            feed_pos_at_loop_start: 0,
+            loop_pushed: 0,
+            preserve: None,
             eq: ThreeBandEq::new(sr as f32),
             filter: DeckFilter::new(sr as f32),
             gain: Smoother::new(1.0, coeff as f32),
@@ -418,31 +516,11 @@ impl Deck {
         {
             let li_frames = (self.loop_in * self.sr) as u64;
             let loop_frames = ((self.loop_out - self.loop_in) * self.sr) as u64;
-            let grid_bpm = self.ctl.grid_bpm.get();
-            if loop_frames <= loop_buf_cap_frames(grid_bpm, self.sr) {
-                if self.loop_buf_anchor != li_frames
-                    || self.loop_buf.frames != loop_frames as usize
-                {
-                    self.loop_buf = LoopBuf::with_capacity(loop_frames as usize);
-                    self.loop_buf_anchor = li_frames;
-                }
-                // 同环重设且缓冲完整 → 保持 FromBuffer 环绕（不重捕）；
-                // 否则进入捕获（buffer 容量已就位）。
-                if !(self.loop_feed == LoopFeed::FromBuffer
-                    && self.loop_buf.frames == loop_frames as usize)
-                {
-                    self.loop_feed = LoopFeed::Capturing;
-                }
-            } else {
-                self.loop_feed = LoopFeed::Idle;
-                self.loop_buf = LoopBuf::empty();
-                self.loop_buf_anchor = 0;
-            }
-            // 激活沿且播头已越出 loop_out：立即回跳（块首检查通常已
-            // 覆盖，这里兜底激活瞬间恰好已出环的情况）
-            if !loop_active_was && self.playing && self.pos >= self.loop_out * self.sr {
-                self.seek_internal(self.loop_in, false);
-            }
+            // P22-B：prepare_loop_capture 抽共用逻辑（set_beat_loop 同款），
+            // 进入捕获时按 feed 相对 loop 的位置布防回填（三路）；
+            // 激活瞬间已过 loop_out 由 arm 的全圈回填 + 偏移入环处理
+            //（不再全预卷 seek 回跳；超限环仍由块首检查回跳）。
+            self.prepare_loop_capture(li_frames, loop_frames);
         }
         // P14：sync 边沿检测（rate 段用上一块状态）。
         let sync_was_on = self.sync;
@@ -579,6 +657,14 @@ impl Deck {
         if !self.loop_active && self.loop_feed == LoopFeed::Capturing {
             self.loop_feed = LoopFeed::Idle;
             self.loop_buf.cursor = 0;
+            // 捕获中途中止：缓冲作废（frames 归零——含 P22-B out_past
+            // 等待窗的"完整帧数"，否则同环二次激活会误判已完整而喂陈旧
+            // 内容）；回填一并作废（侧环残留由下次 arm 清空/位置钳制）。
+            self.loop_buf.frames = 0;
+            self.loop_buf.backfill_pending = 0;
+            self.loop_offset = 0;
+            self.feed_pos_at_loop_start = 0;
+            self.loop_pushed = 0;
         }
     }
 
@@ -850,7 +936,10 @@ impl Deck {
         let sp = kl.source_position();
         self.pos = if self.loop_feed == LoopFeed::FromBuffer {
             let len = (self.loop_out - self.loop_in) * self.sr;
-            self.loop_in * self.sr + (sp - self.loop_sp_anchor).rem_euclid(len)
+            // P22-B：偏移入环时锚点 = li + loop_offset（入环相位起点），
+            // 折返公式映射入环相位；非偏移入环 loop_offset == 0 恒不变。
+            self.loop_in * self.sr + self.loop_offset as f64
+                + (sp - self.loop_sp_anchor).rem_euclid(len)
         } else if let Some(base) = self.pos_base {
             base + sp
         } else {
@@ -937,16 +1026,199 @@ impl Deck {
         }
     }
 
+    /// P22-B 捕获准备（set_beat_loop 与 P18 总线边沿共用）：容量就位 +
+    /// 同环复用判定 + 进入捕获时布防回填。返回是否走缓冲路径。
+    fn prepare_loop_capture(&mut self, li_frames: u64, loop_frames: u64) -> bool {
+        let grid_bpm = self.ctl.grid_bpm.get();
+        if loop_frames <= loop_buf_cap_frames(grid_bpm, self.sr) {
+            if self.loop_buf_anchor != li_frames
+                || self.loop_buf.frames != loop_frames as usize
+            {
+                self.loop_buf = LoopBuf::with_capacity(loop_frames as usize);
+                self.loop_buf_anchor = li_frames;
+            }
+            // 同环重设且缓冲完整 → 保持 FromBuffer 环绕（不重捕）；
+            // 否则进入捕获（buffer 容量已就位）并按 feed 位置布防回填。
+            if !(self.loop_feed == LoopFeed::FromBuffer
+                && self.loop_buf.frames == loop_frames as usize)
+            {
+                self.loop_feed = LoopFeed::Capturing;
+                self.arm_loop_capture(li_frames, loop_frames);
+            }
+            true
+        } else {
+            // 超限环不缓冲：切环回退 reset 路径（块首检查越界回跳）
+            self.loop_feed = LoopFeed::Idle;
+            self.loop_buf = LoopBuf::empty();
+            self.loop_buf_anchor = 0;
+            false
+        }
+    }
+
+    /// P22-B：进入捕获时按 feed 相对 loop 的位置布防回填（三路）。
+    /// 覆盖 P21 的 In/Out 手动定界 UX：
+    /// - 0 < backfill < loop_frames 且 feed < lo（Out 在前）：部分回填
+    ///   [li, feed_pos) 补前区，捕获续写尾部——播到 Out 量化点才回绕。
+    /// - feed ≥ lo（Out 已过/恰拍）：全圈回填 [li, lo)，捕获空转（feed
+    ///   已过 Out 无帧可拷）——回填完成即带偏移入环，不跳回、不等圈界。
+    /// - 否则（backfill == 0，beatloop 常态）：现语义，捕获即完整。
+    ///   回填经 reader_cmd 发给读取线程（侧环 + Backfill 命令）；测试
+    ///   deck 无 reader，由测试直接推侧环模拟。epoch 恒不变（回填不动
+    ///   世代）。
+    fn arm_loop_capture(&mut self, li_frames: u64, loop_frames: u64) {
+        let feed_pos = self.feed_pos;
+        let lo = li_frames + loop_frames;
+        let backfill = feed_pos.saturating_sub(li_frames);
+        let out_past = feed_pos >= lo;
+        // 清上次未完成回填的残留（位置钳制本就保证内容有效，清空只为腾侧环）
+        if let Some(rx) = self.side_rx.as_mut() {
+            while rx.try_pop().is_some() {}
+        }
+        if backfill > 0 && backfill < loop_frames {
+            // Out 在前：部分回填补 [li, feed_pos)，捕获从尾部续写。
+            // 容量 = 全环（捕获续写尾区要 room），len 截到 backfill
+            //（extend_from_slice 从 frames 处续写，frames = backfill）。
+            self.loop_buf.data.resize(loop_frames as usize * 2, 0.0);
+            self.loop_buf.data.truncate(backfill as usize * 2);
+            self.loop_buf.frames = backfill as usize;
+            self.loop_buf.backfill_pending = backfill as usize;
+            self.loop_buf.backfill_full = false;
+            self.send_backfill_or_respawn(li_frames, feed_pos);
+        } else if out_past {
+            // Out 已过/恰拍：全圈回填 [li, lo)；回填完成即偏移入环
+            self.loop_buf.data.resize(loop_frames as usize * 2, 0.0);
+            self.loop_buf.frames = loop_frames as usize;
+            self.loop_buf.backfill_pending = loop_frames as usize;
+            self.loop_buf.backfill_full = true;
+            self.send_backfill_or_respawn(li_frames, lo);
+        }
+        // else：backfill == 0（激活于 loop_in 之前/恰在 in）→ 捕获即完整
+    }
+
+    /// P22-C：发回填命令；reader 已死（短曲 EOF 提前退出）时 send 失败 →
+    /// 重生读取线程（从当前 feed_pos 续推主环）后重发。回填完成后 reader
+    /// 从到达时解码位置续主环（= feed_pos 附近），主环无断点。
+    fn send_backfill_or_respawn(&mut self, from: u64, to: u64) {
+        let epoch = self.epoch;
+        let tx = self.reader_cmd.clone();
+        if tx.is_some_and(|tx| {
+            tx.send(ReaderCmd::Backfill { epoch, from, to }).is_ok()
+        }) {
+            return;
+        }
+        log::warn!("回填命令发送失败（reader 已退出？），重生读取线程");
+        self.respawn_reader(epoch, self.feed_pos);
+        if let Some(tx) = self.reader_cmd.as_ref() {
+            let _ = tx.send(ReaderCmd::Backfill { epoch, from, to });
+        }
+    }
+
+    /// P22-B：排空侧环回填到环缓冲前区。非阻塞 try_pop；epoch 不符丢弃
+    /// （seek/load 后陈旧）。内容按位置寻址：拷 [chunk 区间] ∩ [li,
+    /// li+backfill_pending) 到 data 前区（偏移 = 帧位置 − li）——陈旧 arm
+    /// chunk 无害（范围钳制）。每块喂入前调一次：量少块小，无分配。
+    fn drain_backfill(&mut self) {
+        let Some(rx) = self.side_rx.as_mut() else {
+            return;
+        };
+        let li = (self.loop_in * self.sr) as u64;
+        let cap = self.loop_buf.data.capacity() / 2;
+        // 窗口上界用 frames（回填总量）而非 pending（剩余量）：chunk 按
+        // 绝对位置寻址，多 chunk 排空时剩余 < 下一块起点（如 6×2048 后
+        // pending=11712 < chunk@12288），用 pending 会误跳过全部后续块。
+        // 两路 arm 的 frames == 回填总量（全圈 = 环长；部分 = 激活位−li）。
+        // 部分回填时 frames 随捕获续写增长：晚到 chunk 可能越入已捕获区，
+        // 内容同源（同一解码区间）覆盖无害。
+        let total = li + self.loop_buf.frames as u64;
+        while self.loop_buf.backfill_pending > 0 {
+            let Some(chunk) = rx.try_pop() else {
+                break;
+            };
+            if chunk.epoch != self.epoch {
+                continue;
+            }
+            let chunk_end = chunk.start_frame + (chunk.data.len() / 2) as u64;
+            let a = chunk.start_frame.max(li);
+            let b = chunk_end.min(total);
+            if a >= b {
+                continue;
+            }
+            let n = ((b - a) as usize).min(cap); // 容量应已就位（arm resize），双保险防越界
+            let dst = (a - li) as usize;
+            let src = (a - chunk.start_frame) as usize;
+            self.loop_buf.data[dst * 2..(dst + n) * 2]
+                .copy_from_slice(&chunk.data[src * 2..(src + n) * 2]);
+            self.loop_buf.backfill_pending -= n;
+        }
+    }
+
+    /// P22-B：偏移入环判定（drain_backfill 后、喂入前）——Capturing 且
+    /// 全圈回填完成（backfill_pending == 0、frames == 环长）且 feed 已过
+    /// loop_out → 立即带偏移进入循环：不跳回、不等圈界，音频从当前相位
+    /// 无缝映射入环。d = (feed_pos − lo) mod n；entry blend = feed_tail
+    /// × data[d..d+bl)（自然尾已在 keylocker 内不可撤回，用尾部缓冲重建
+    /// 淡出分量），blend_at = d 与圈首 wrap 接缝同构（首个 wrap 重算回
+    /// 标准圈首 blend）。loop_offset = d：播头公式映射入环相位、退出续点
+    /// 每圈 +n。feed_pos 停在 P（入环位置）——退出续点。feed_pos == lo
+    /// 走 loop_wrap（圈界精确切环，避免 entry blend 与 wrap blend 双写）。
+    fn maybe_enter_loop(&mut self) {
+        let loop_frames = ((self.loop_out - self.loop_in) * self.sr) as u64;
+        if !(self.loop_active
+            && self.loop_feed == LoopFeed::Capturing
+            && self.loop_buf.backfill_pending == 0
+            && self.loop_buf.frames as u64 == loop_frames)
+        {
+            return;
+        }
+        let lo = (self.loop_out * self.sr) as u64;
+        let li = (self.loop_in * self.sr) as u64;
+        if self.feed_pos <= lo {
+            return; // 未到量化 Out：等圈界 loop_wrap 切换
+        }
+        let d = ((self.feed_pos - lo) % loop_frames) as usize;
+        let n_frames = self.loop_buf.frames;
+        let bl = LOOP_BLEND_FRAMES.min(n_frames.saturating_sub(d));
+        if bl > 0 {
+            let blend = &mut self.loop_buf.blend;
+            blend.clear();
+            for i in 0..bl {
+                let t = ((i as f32 + 0.5) / bl as f32) * (std::f32::consts::PI / 2.0);
+                let (g_out, g_in) = (t.cos(), t.sin());
+                for ch in 0..2 {
+                    let v = self.feed_tail[i * 2 + ch] * g_out
+                        + self.loop_buf.data[(d + i) * 2 + ch] * g_in;
+                    blend.push(v);
+                }
+            }
+            self.loop_buf.blend_len = bl;
+            self.loop_buf.blend_at = d;
+        }
+        self.loop_offset = d as u64;
+        self.loop_buf.cursor = d;
+        // P22-B 退出锚点基准：feed_pos 停在 P（入环位置，此后每圈 +n）
+        self.feed_pos_at_loop_start = self.feed_pos;
+        self.loop_pushed = 0;
+        let kl = self.keylocker.as_mut().unwrap();
+        kl.set_track_position(li + d as u64);
+        self.loop_sp_anchor = kl.source_position();
+        self.loop_feed = LoopFeed::FromBuffer;
+    }
+
     /// 喂入引擎：按 demand_hint（基于本块渲染帧数）补源帧；曲尾 finish() 冲刷。
     ///
     /// P10.3 loop 缓冲喂入：Capturing 时把 [loop_in, loop_out) 帧拷入
     /// loop_buf；feed 到达 loop_out（推送不越界、精确到帧）→ loop_wrap()
     /// 切 FromBuffer 无 reset 回喂（捕获不完整则回退 reset 重捕）；
     /// FromBuffer 时从缓冲循环喂入（reader 因 ring 满自然停驻）。
+    ///
+    /// P22-B：每块喂入前先排空侧环回填 + 偏移入环判定（feed 已过
+    /// loop_out 且全圈回填完成 → 立即带偏移入环，不跳回不等圈界）。
     fn feed_keylocker(&mut self, engine_frames: usize) {
         if self.keylocker.is_none() {
             return;
         }
+        self.drain_backfill();
+        self.maybe_enter_loop();
         let n = self.track_frames.load(Ordering::Relaxed);
         let want = self
             .keylocker
@@ -954,10 +1226,27 @@ impl Deck {
             .unwrap()
             .demand_hint(engine_frames, MAX_ENGINE_RATE);
         while self.keylocker.as_ref().unwrap().occupied_frames() < want && !self.eof_fed {
-            // P10.3 切环：feed 到达 loop_out → 缓冲喂入（无 reset）或回退
+            // P10.3 切环：feed 到达 loop_out → 缓冲喂入（无 reset）或回退。
+            // P22-B 守卫：全圈布防（frames == loop_frames 且回填未排空）
+            // 时让位偏移入环路径（maybe_enter_loop 先处理）；部分回填
+            // 未排空时也放行 loop_wrap——其内部守卫兜底 reset（回填迟到
+            // /reader 死亡安全网，= 今日行为）。
+            // P22-B 停滞兜底：pending 卡住（reader 死亡/极慢）且 feed 已
+            // 越过 out → 回兜底 reset 路径，播放头不得永久逃出 out。
+            // 部分回填收紧到 1 chunk（43ms，其初始量 ≤ 环长，正常解码
+            // 远快于此）；全圈回填放行 2s（长环回填在慢解码设备上可超
+            // 1s，RK3399 余量）。
             if self.loop_active && self.loop_feed == LoopFeed::Capturing {
                 let lo = (self.loop_out * self.sr) as u64;
-                if self.feed_pos >= lo {
+                let loop_frames = ((self.loop_out - self.loop_in) * self.sr) as u64;
+                if self.feed_pos >= lo
+                    && (self.loop_buf.backfill_pending == 0
+                        || (self.loop_buf.frames as u64) < loop_frames
+                        || (self.loop_buf.backfill_full
+                            && self.feed_pos - lo >= (2.0 * self.sr) as u64)
+                        || (!self.loop_buf.backfill_full
+                            && self.feed_pos - lo >= CHUNK_FRAMES as u64))
+                {
                     self.loop_wrap();
                 }
             }
@@ -996,11 +1285,17 @@ impl Deck {
                 *cursor = (self.feed_pos - *start) as usize;
             }
             let rem = data.len() / 2 - *cursor;
-            // P10.3 环边界：Capturing 时不喂出 loop_out（切环在下一轮
-            // 迭代精确发生）
+            // P10.3 环边界：Capturing 时喂不越出 loop_out（切环在下一轮
+            // 迭代精确发生）。P22-B：feed 已过 loop_out（全圈回填布防的
+            // 等待窗）不钳——播放继续线性推进，入环瞬间的 feed 相位即
+            // 偏移基准。
             let limit = if self.loop_active && self.loop_feed == LoopFeed::Capturing {
                 let lo = (self.loop_out * self.sr) as u64;
-                lo.saturating_sub(self.feed_pos).min(rem as u64) as usize
+                if self.feed_pos < lo {
+                    (lo - self.feed_pos).min(rem as u64) as usize
+                } else {
+                    rem
+                }
             } else {
                 rem
             };
@@ -1016,6 +1311,17 @@ impl Deck {
             let seg_start = *start + *cursor as u64;
             *cursor += accepted;
             self.feed_pos = *start + *cursor as u64;
+            // P22-B 尾部缓冲：最近喂入 LOOP_BLEND_FRAMES 帧（偏移入环
+            // entry blend 的淡出分量）。左移保留尾段 + 新帧写尾。
+            if accepted > 0 {
+                let n_keep = accepted.min(LOOP_BLEND_FRAMES);
+                let tail_len = self.feed_tail.len();
+                let tail = &mut self.feed_tail;
+                tail.copy_within(n_keep * 2..tail_len, 0);
+                let seg = &data[*cursor * 2 - accepted * 2..*cursor * 2];
+                let from = seg.len() - n_keep * 2;
+                tail[tail_len - n_keep * 2..].copy_from_slice(&seg[from..]);
+            }
             // P10.3 捕获：把喂过的 [loop_in, loop_out) 帧拷入缓冲
             //（完整性在 loop_wrap 校验——帧数 == 环长 ⇔ 恰好覆盖全环）。
             // 须在 feed_chunk 释放前做（借 data 段）。
@@ -1043,17 +1349,25 @@ impl Deck {
     /// P10.3 切环：缓冲完整（帧数 == 环长 ⇔ 恰好覆盖 [loop_in, loop_out)）
     /// → set_track_position 重锚 + FromBuffer 无 reset 回喂（引擎连续，
     /// 接缝零 click——vendored graph.rs loop_wrap_is_gapless_across_ratios
-    /// 同款宿主用法）；不完整 → 回退 seek_internal reset，下一圈从
-    /// loop_in 起重新捕获。
+    /// 同款宿主用法）；不完整/回填未排空 → 回退 seek_internal reset，
+    /// 下一圈从 loop_in 起重新捕获（P22-B：回填迟到/reader 死亡安全网，
+    /// = 今日行为）。
     fn loop_wrap(&mut self) {
         let loop_frames = ((self.loop_out - self.loop_in) * self.sr) as u64;
-        if self.loop_buf.frames as u64 == loop_frames {
+        if self.loop_buf.frames as u64 == loop_frames && self.loop_buf.backfill_pending == 0 {
+            // P22-A：预计算圈首接缝 blend（尾×头等功率淡化）。捕获内容
+            // 恒定 → 一份 blend 全程复用（含首圈 Capturing→FromBuffer
+            // 接缝与每圈 wrap 接缝同源）。
+            self.loop_buf.rebuild_wrap_blend(self.loop_buf.frames);
             let kl = self.keylocker.as_mut().unwrap();
             kl.set_track_position((self.loop_in * self.sr) as u64);
             self.loop_sp_anchor = kl.source_position();
             self.loop_buf.cursor = 0;
             self.loop_feed = LoopFeed::FromBuffer;
             self.feed_pos = (self.loop_out * self.sr) as u64;
+            // P22-B 退出锚点基准：feed_pos 恒停 loop_out（常规路径）
+            self.feed_pos_at_loop_start = self.feed_pos;
+            self.loop_pushed = 0;
             // feed_chunk 保留原位（游标已停在 loop_out）：退出时无缝续喂；
             // reader 因 ring 满自然停驻，epoch/世代不变。
         } else {
@@ -1066,45 +1380,144 @@ impl Deck {
 
     /// P10.3 FromBuffer 喂入：从环缓冲循环取帧（游标 mod 环长环绕）。
     /// 返回 false = 引擎 ring 满（调用方 break 防忙旋）。
+    ///
+    /// P22-A 接缝淡化：cursor 落在 blend 区时喂 blend 切片（data 该处
+    /// bl 帧的柔和替代），否则照旧喂 data——cursor/圈长语义不变（一圈
+    /// 仍恰好喂 n 帧），播头公式与 P11.1 退出锚点不受影响；部分接受时
+    /// cursor 停在 blend 区内续推 ✓。
     fn feed_from_loop_buf(&mut self) -> bool {
         let n_frames = self.loop_buf.frames;
         if n_frames == 0 {
             return true; // 空缓冲（不应发生：loop_wrap 已校验完整性）
         }
-        let rem = n_frames - self.loop_buf.cursor;
+        let seg_end = self.loop_buf.segment_end(self.loop_buf.cursor);
+        let use_blend = self.loop_buf.blend_covers(self.loop_buf.cursor);
+        let rem = seg_end - self.loop_buf.cursor;
+        // blend 切片以 blend_at 为基（圈首 blend_at=0；偏移入环 blend_at=d，
+        // blend 缓冲只有 bl 帧，绝对下标越界）。data 基 = 0。
+        let (src, base) = if use_blend {
+            (&self.loop_buf.blend, self.loop_buf.blend_at)
+        } else {
+            (&self.loop_buf.data, 0usize)
+        };
         let accepted = self
             .keylocker
             .as_mut()
             .unwrap()
-            .push(&self.loop_buf.data[self.loop_buf.cursor * 2..n_frames * 2])
+            .push(&src[(self.loop_buf.cursor - base) * 2..(seg_end - base) * 2])
             .min(rem);
         self.loop_buf.cursor += accepted;
+        // P22-B 退出锚点：环喂入累计（Δ = feed_pos − 基准 − 累计）
+        self.loop_pushed += accepted as u64;
+        if accepted > 0 {
+            // P22-B 尾部缓冲（同 feed_keylocker push 侧，含 loop 喂入）：
+            // 偏移入环的淡出分量须跟随实际出声内容（环内圈圈不同）。
+            let n_keep = accepted.min(LOOP_BLEND_FRAMES);
+            let tail_len = self.feed_tail.len();
+            let tail = &mut self.feed_tail;
+            tail.copy_within(n_keep * 2..tail_len, 0);
+            let lo = (self.loop_buf.cursor - base) * 2 - accepted * 2;
+            let seg = &src[lo..(self.loop_buf.cursor - base) * 2];
+            let from = seg.len() - n_keep * 2;
+            tail[tail_len - n_keep * 2..].copy_from_slice(&seg[from..]);
+        }
         if self.loop_buf.cursor >= n_frames {
             self.loop_buf.cursor = 0;
+            // P22-B：偏移入环后每圈推进退出续点（feed_pos 停在入环位置
+            // P，每圈 +n——退出时 ring 续喂位置 = P + k×n）。仅偏移入环
+            // （loop_offset > 0）生效；常规路径 feed_pos 恒停 loop_out。
+            if self.loop_offset > 0 {
+                self.feed_pos += n_frames as u64;
+            }
+            // P22-A：偏移入环（P22-B 的 blend_at=d）后首个 wrap 重算
+            // 标准圈首 blend（blend_at → 0）；常规路径 blend_at 恒 0，
+            // 计算幂等（内容恒定，192 帧便宜）。
+            if self.loop_buf.blend_at != 0 {
+                self.loop_buf.rebuild_wrap_blend(n_frames);
+            }
             // P11.1 收尾圈完成（loop 已关）：切回 ring（feed_pos/feed_chunk
             // 停在 loop_out）并锚定线性显示。锚点由折返公式与当前标签反解：
             // 引擎位置标签自切环起累计 k×len（不重打标签，避免标签断层
             // 显示反跳），pos_base 吸收该偏移 → 播头从 loop_out 无缝续进，
             // 不再出现释放跳 N×len 的旧 bug（pos = feed_base + sp）。
+            // P22-B：偏移入环时锚点 = li + loop_offset（入环相位起点），
+            // 折返公式 + loop_offset 吸收 → 播头从入环位置线性续进
+            //（非偏移入环 loop_offset == 0，公式不变）。
             if !self.loop_active {
                 self.loop_feed = LoopFeed::Idle;
-                let kl = self.keylocker.as_ref().unwrap();
-                let sp = kl.source_position();
-                let len = (self.loop_out - self.loop_in) * self.sr;
-                let folded = (sp - self.loop_sp_anchor).rem_euclid(len);
-                self.pos_base = Some(self.loop_in * self.sr + folded - sp);
+                // P22-B 退出锚点分路：
+                // - 常规环（loop_offset == 0）：音频 = 环相位连续续进
+                //   （loop 内容 = 音轨 [li, lo)，接 ring 于 lo 内容无缝），
+                //   播头相位续进无跳变——P11.1 原锚点：折返公式与当前
+                //   标签反解（标签 = 原始喂入计数 − 管线延迟，不重打
+                //   标签避免标签断层反跳），相位 ≡ 标签折叠，精确抵消。
+                // - 偏移入环（loop_offset > 0）：音频切回 ring 续点
+                //   P + k×len（内容跳变 k×len + d，设计如此），播头必须
+                //   随声音跳——锚 Δ = feed_pos − 基准 − 环喂入 = +d（首
+                //   圈只喂 n−d 帧），显示 = 标签 + Δ = 正在出声的 ring
+                //   内容位置；旧相位公式会让播头永久落后音频 k×len。
+                //   （有符号中间量：偏移路径 feed_pos − 基准 = W×len，
+                //   常规路径 0 − 累计为负，u64 直减溢出。）
+                if self.loop_offset > 0 {
+                    self.pos_base = Some(
+                        (self.feed_pos as i64 - self.feed_pos_at_loop_start as i64
+                            - self.loop_pushed as i64) as f64,
+                    );
+                } else {
+                    let kl = self.keylocker.as_ref().unwrap();
+                    let sp = kl.source_position();
+                    let len = (self.loop_out - self.loop_in) * self.sr;
+                    let folded = (sp - self.loop_sp_anchor).rem_euclid(len);
+                    self.pos_base = Some(self.loop_in * self.sr + folded - sp);
+                }
+                // P22-B 退出续点安全网：偏移入环超圈后退出（k×n > ring
+                // 解码窗口）→ 续点超出已解码内容，min-preroll 重锚替代
+                // 无缝续喂（常规路径续点恒在 loop_out，窗口必覆盖）。
+                let resume = self.feed_pos;
+                let mut covered = false;
+                if let Some((start, data, cursor)) = self.feed_chunk.as_mut() {
+                    if *start <= resume && resume < *start + (data.len() / 2) as u64 {
+                        *cursor = (resume - *start) as usize;
+                        covered = true;
+                    } else {
+                        self.feed_chunk = None; // 陈旧（超窗）
+                    }
+                }
+                if !covered
+                    && let Some(rx) = self.chunk_rx.as_mut()
+                {
+                    // ring 前 chunk 窥视（不弹出）：内容恒连续 [front.start,
+                    // front.start + n×2048)（reader 顺序解码、满则停驻），
+                    // 覆盖 resume 即续喂可行；否则重锚。
+                    let (a, b) = rx.as_slices();
+                    let n_chunks = (a.len() + b.len()) as u64;
+                    covered = a.first().is_some_and(|c| {
+                        c.start_frame <= resume
+                            && resume < c.start_frame + n_chunks * CHUNK_FRAMES as u64
+                    });
+                }
+                if !covered {
+                    // 超窗：min-preroll 重锚（seek_internal 顺带清缓存/回填）
+                    self.seek_internal(resume as f64 / self.sr, true);
+                }
+                self.loop_offset = 0;
             }
         }
         accepted > 0
     }
 
     /// 从 ring 弹下一个当前世代 chunk。
+    /// P22-C：保留窗口（preserve）内的旧世代 chunk 一并接受——seek 时
+    /// 已滤净落点之前的陈旧数据，窗口连续且位置正确。
     fn next_feed_chunk(&mut self) -> Option<(u64, Box<[f32]>)> {
         let rx = self.chunk_rx.as_mut()?;
         loop {
             let chunk = rx.try_pop()?;
-            if chunk.epoch != self.epoch {
+            if chunk.epoch != self.epoch && self.preserve != Some(chunk.epoch) {
                 continue; // 过期数据（seek 前残留）
+            }
+            if chunk.epoch == self.epoch {
+                self.preserve = None; // 世代已对齐，窗口使命结束
             }
             return Some((chunk.start_frame, chunk.data));
         }
@@ -1138,8 +1551,11 @@ impl Deck {
         let rx = self.chunk_rx.as_mut()?;
         loop {
             let chunk = rx.try_pop()?;
-            if chunk.epoch != self.epoch {
+            if chunk.epoch != self.epoch && self.preserve != Some(chunk.epoch) {
                 continue; // 过期数据（seek 前残留）
+            }
+            if chunk.epoch == self.epoch {
+                self.preserve = None; // 世代已对齐，窗口使命结束
             }
             let start = chunk.start_frame;
             if idx >= start && idx < start + CHUNK_FRAMES as u64 {
@@ -1193,13 +1609,21 @@ impl Deck {
 
         let (prod, cons) =
             ringbuf::HeapRb::<Chunk>::new(crate::caching_reader::RING_CAPACITY).split();
+        // P22-B 回填侧环（reader 回填推这里，deck 每块排空到环缓冲前区）
+        let (side_prod, side_cons) =
+            ringbuf::HeapRb::<Chunk>::new(crate::caching_reader::SIDE_RING_CAPACITY).split();
         self.epoch = self.epoch.wrapping_add(1);
         let epoch = self.epoch;
         self.track_frames.store(0, Ordering::Relaxed);
 
         self.chunk_rx = Some(cons);
+        self.side_rx = Some(side_cons);
+        self.loop_offset = 0; // 换曲：偏移入环量清零（坐标重建）
+        self.feed_pos_at_loop_start = 0;
+        self.loop_pushed = 0;
+        self.preserve = None; // P22-C：ring 已换新，旧窗口世代作废
         self.path = Some(path.clone());
-        self.reader_cmd = Some(self.spawn_reader(path, prod, epoch));
+        self.reader_cmd = Some(self.spawn_reader(path, prod, side_prod, epoch));
         self.loaded = true;
         self.pos = 0.0;
         self.clear_cache();
@@ -1231,6 +1655,7 @@ impl Deck {
         &mut self,
         path: std::path::PathBuf,
         prod: ringbuf::HeapProd<Chunk>,
+        side_prod: ringbuf::HeapProd<Chunk>,
         epoch: u32,
     ) -> Sender<ReaderCmd> {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<ReaderCmd>();
@@ -1244,6 +1669,7 @@ impl Deck {
                     path,
                     sr_out,
                     cmd_rx,
+                    side_prod,
                     prod,
                     epoch,
                     track_frames,
@@ -1267,12 +1693,22 @@ impl Deck {
         // 新 ring：旧 prod 半部已随死线程丢弃，无法复用旧 ring
         let (prod, cons) =
             ringbuf::HeapRb::<Chunk>::new(crate::caching_reader::RING_CAPACITY).split();
-        let tx = self.spawn_reader(path, prod, epoch);
+        // P22-B：侧环随 reader 重建（旧 prod 已随死线程丢弃）
+        let (side_prod, side_cons) =
+            ringbuf::HeapRb::<Chunk>::new(crate::caching_reader::SIDE_RING_CAPACITY).split();
+        let tx = self.spawn_reader(path, prod, side_prod, epoch);
         self.chunk_rx = Some(cons);
+        self.side_rx = Some(side_cons);
         self.reader_cmd = Some(tx.clone());
         // 新线程从曲首起跑，loop 顶 try_recv 优先于解码 → Seek 立即生效；
         // 竞态窗口内先推出的曲首 chunk 由 feed_keylocker 按位置丢弃。
-        if tx.send(ReaderCmd::Seek { epoch, frame }).is_err() {
+        if tx.send(ReaderCmd::Seek {
+            epoch,
+            frame,
+            resume: None,
+        })
+        .is_err()
+        {
             log::error!("读取线程重生后立即退出（解码失败？）");
         }
     }
@@ -1353,30 +1789,11 @@ impl Deck {
         // P10.3 缓冲喂入准备：环长 ≤ min(64 拍, 30s) 才捕获；与现有
         // [loop_in, loop_out) 完全一致的缓冲直接复用（跳过捕获），否则
         // 清空重捕。超限环 loop_feed 置 Idle（切环回退 reset 路径）。
+        // P22-B：激活瞬间已过 loop_out 由 arm 的全圈回填 + 偏移入环
+        // 处理（不再全预卷 seek 回跳；超限环仍由块首检查回跳）。
         let li_frames = (loop_in * self.sr) as u64;
         let loop_frames = ((loop_out - loop_in) * self.sr) as u64;
-        if loop_frames <= loop_buf_cap_frames(grid.bpm, self.sr) {
-            if self.loop_buf_anchor != li_frames || self.loop_buf.frames != loop_frames as usize {
-                self.loop_buf = LoopBuf::with_capacity(loop_frames as usize);
-                self.loop_buf_anchor = li_frames;
-            }
-            // 同环重设且缓冲完整 → 保持 FromBuffer 继续环绕（不重捕、
-            // 不 reset）；否则进入捕获。
-            if !(self.loop_feed == LoopFeed::FromBuffer
-                && self.loop_buf.frames == loop_frames as usize)
-            {
-                self.loop_feed = LoopFeed::Capturing;
-            }
-        } else {
-            self.loop_feed = LoopFeed::Idle;
-            self.loop_buf = LoopBuf::empty();
-            self.loop_buf_anchor = 0;
-        }
-        // 播放中且已越过 loop_out：立即回跳（块首检查通常已覆盖，
-        // 这里兜底激活瞬间恰好已出环的情况）
-        if self.playing && self.pos >= loop_out * self.sr {
-            self.seek_internal(loop_in, false);
-        }
+        self.prepare_loop_capture(li_frames, loop_frames);
     }
 
     /// 引擎操作：按拍跳跃（P10.1 起源拍域整拍距离；P17 已否决落点 snap）。
@@ -1420,14 +1837,19 @@ impl Deck {
             self.loop_feed = LoopFeed::Capturing;
             self.loop_buf.frames = 0;
             self.loop_buf.cursor = 0;
+            // P22-A：缓冲作废 → blend 一并失效（重捕完成后 loop_wrap
+            // 重算，喂入侧只读 blend_len > 0 且 FromBuffer 态的 blend）
+            self.loop_buf.blend_len = 0;
+            self.loop_buf.blend_at = 0;
+            // P22-B：回填未排空数据随缓冲作废（侧环残留由 drain 按位置
+            // 钳制丢弃）；偏移入环量清零（坐标重建）
+            self.loop_buf.backfill_pending = 0;
+            self.loop_offset = 0;
+            self.feed_pos_at_loop_start = 0;
+            self.loop_pushed = 0;
         } else if !self.loop_active {
             self.loop_feed = LoopFeed::Idle;
             self.loop_buf.cursor = 0;
-        }
-        self.epoch = self.epoch.wrapping_add(1);
-        let epoch = self.epoch;
-        if let Some(rx) = self.chunk_rx.as_mut() {
-            while rx.try_pop().is_some() {}
         }
         self.clear_cache();
         self.pos = frame as f64;
@@ -1466,6 +1888,36 @@ impl Deck {
         } else {
             frame
         };
+        self.epoch = self.epoch.wrapping_add(1);
+        let epoch = self.epoch;
+        // P22-C 智能排水：落点之前的陈旧前缀弹出；余环窗口含落点 →
+        // 整环保留（resume = 窗口尾 end，reader 续推零欠载）。环空或
+        // 落点超窗 → 全排 refill（旧行为）。保留仅按位置判定——环内
+        // 新旧混排（seek 竞态残留）时 preserve 记尾块世代，过期残留
+        // 由接受规则丢弃、位置规则消化。
+        let resume = if let Some(rx) = self.chunk_rx.as_mut() {
+            loop {
+                let stale = rx
+                    .first()
+                    .is_some_and(|c| c.start_frame + CHUNK_FRAMES as u64 <= read_frame);
+                if stale {
+                    let _ = rx.try_pop();
+                } else {
+                    break;
+                }
+            }
+            if rx.first().is_some_and(|c| c.start_frame <= read_frame) {
+                let tail = rx.iter().last();
+                self.preserve = tail.map(|c| c.epoch);
+                tail.map(|c| c.start_frame + CHUNK_FRAMES as u64)
+            } else {
+                while rx.try_pop().is_some() {}
+                self.preserve = None;
+                None
+            }
+        } else {
+            None
+        };
         // 读取线程可能已退出（EOF 排空后 reader_main return）：
         // is_finished 预检 + send 失败双保险，任一命中 → 重生线程。
         // （is_finished 与 send 之间线程恰好死亡的理论窗口内 send 仍会
@@ -1480,6 +1932,7 @@ impl Deck {
                 tx.send(ReaderCmd::Seek {
                     epoch,
                     frame: read_frame,
+                    resume,
                 })
                 .is_ok()
             });
@@ -1503,6 +1956,7 @@ impl Deck {
             let _ = tx.send(ReaderCmd::Shutdown);
         }
         self.chunk_rx = None;
+        self.side_rx = None; // P22-B：侧环随 reader 停
         self.path = None;
         if let Some(h) = self._reader_handle.take() {
             let _ = h.join();
@@ -1552,6 +2006,10 @@ pub(crate) fn test_deck_with_ring_and_prod(
         prod.try_push(c).ok().expect("ring 容量足够");
     }
     d.chunk_rx = Some(cons);
+    // P22-B：侧环常驻（arm 时清残留；无 reader 线程时永远收不到数据）
+    let (_, side_cons) =
+        ringbuf::HeapRb::<Chunk>::new(crate::caching_reader::SIDE_RING_CAPACITY).split();
+    d.side_rx = Some(side_cons);
     d.epoch = 1;
     d.loaded = true;
     d.ctl.play.set(1.0);
@@ -1562,6 +2020,25 @@ pub(crate) fn test_deck_with_ring_and_prod(
         .ok()
         .map(|k| Box::new(k) as Box<dyn Keylocker>);
     (d, prod)
+}
+
+/// P22-B：同 test_deck_with_ring_and_prod，另返回侧环 prod——回填测试
+/// 直接推侧环模拟 reader 对 Backfill 命令的响应。
+#[cfg(test)]
+pub(crate) fn test_deck_with_rings_and_prods(
+    bus: &hypermixx_core::ControlBus,
+    chunks: Vec<Chunk>,
+    rate_pct: f64,
+) -> (
+    Deck,
+    ringbuf::HeapProd<Chunk>,
+    ringbuf::HeapProd<Chunk>,
+) {
+    let (mut d, prod) = test_deck_with_ring_and_prod(bus, chunks, rate_pct);
+    let (side_prod, side_cons) =
+        ringbuf::HeapRb::<Chunk>::new(crate::caching_reader::SIDE_RING_CAPACITY).split();
+    d.side_rx = Some(side_cons);
+    (d, prod, side_prod)
 }
 
 /// 从任意帧开始的 440Hz 正弦 chunk（seek 后模拟 reader 推送）。
@@ -1608,6 +2085,7 @@ mod tests {
     use super::*;
     use ringbuf::traits::Producer;
     use super::test_deck_with_ring_and_prod as deck_with_ring_and_prod;
+    use super::test_deck_with_rings_and_prods as deck_with_rings_and_prods;
     use super::test_sine_chunk_at as sine_chunk_at;
     use super::test_sine_chunks as sine_chunks;
 
@@ -3333,10 +3811,12 @@ mod tests {
     #[test]
     fn loop_back_jumps_to_loop_in() {
         // P10.3 重写：切环走 deck 侧缓冲喂入（kl.set_track_position 重锚，
-        // 无 reset、无 epoch 变化、无欠载）。激活时已过 loop_in → 首圈
-        // 捕获不完整 → 回退一次 reset 重捕（epoch+1，测试架补推新世代
-        // chunk，模拟真实 reader 的 seek 响应）；之后每圈 FromBuffer
-        // 无缝环绕，不再动引擎/世代。
+        // 无 reset、无 epoch 变化、无欠载）。P22-B：激活时已过 loop_in →
+        // 部分回填布防，但本 rig 的侧环 prod 无人推数据（回填永不完成）
+        // → 停滞兜底：feed 越过 out 一个 chunk 后 loop_wrap 悬挂 → 回退
+        // 一次 reset 重捕（epoch+1，测试架补推新世代 chunk，模拟真实
+        // reader 的 seek 响应）；之后每圈 FromBuffer 无缝环绕，不再动
+        // 引擎/世代。此即"回填迟到/reader 死亡"安全网 = 今日行为。
         let bus = hypermixx_core::ControlBus::default();
         let (mut d, mut prod) = deck_with_ring_and_prod(&bus, sine_chunks(64), 0.0);
         d.ctl.grid_bpm.set(120.0);
@@ -3425,25 +3905,83 @@ mod tests {
         );
     }
 
+    /// P22-A：圈首接缝等功率交叉淡化——锯齿波 fixture（周期 = 环长，
+    /// 圈界跳变 0.5）整拍 loop 跑 3 圈，逐采样 |Δ2| < 0.1（无 blend 时
+    /// 接缝跳变 0.5 必爆；fx_type_change 同款 max_delta 手法）。blend
+    /// 把接缝位移摊到 192 帧（Δ≈0.005），残余瞬态 ≤ bl·斜率（≈0.004）。
+    #[test]
+    fn loop_wrap_seam_blend_no_click() {
+        let bus = hypermixx_core::ControlBus::default();
+        let period = 24000usize; // 0.5s @120BPM = loop 长度（in=0, out=0.5s）
+        let chunks: Vec<Chunk> = (0..64)
+            .map(|k| {
+                let start = k * CHUNK_FRAMES;
+                let mut data = Vec::with_capacity(CHUNK_FRAMES * 2);
+                for f in 0..CHUNK_FRAMES {
+                    let phase = ((start + f) % period) as f32 / period as f32;
+                    let s = phase * 0.5; // [0, 0.5)：圈界跳变恰 0.5
+                    data.push(s);
+                    data.push(s);
+                }
+                Chunk {
+                    epoch: 1,
+                    start_frame: start as u64,
+                    data: data.into_boxed_slice(),
+                }
+            })
+            .collect();
+        let (mut d, _prod) = deck_with_ring_and_prod(&bus, chunks, 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        d.set_beat_loop(1.0); // 激活在喂入前 → 首圈捕获完整，无兜底 reset
+        assert!(d.ctl.loop_active.get() > 0.5);
+        let rec = run_capture(&mut d, 1.6); // 3.2 圈：覆盖 ≥2 次 wrap 接缝
+        assert!(rec.iter().all(|v| v.is_finite()), "无 NaN");
+        assert!(
+            d.loop_feed == LoopFeed::FromBuffer,
+            "应处于缓冲喂入态，实际 {:?}",
+            d.loop_feed
+        );
+        assert!(
+            d.keylocker.as_ref().unwrap().underrun_frames() == 0,
+            "环绕不得欠载，实际 {}",
+            d.keylocker.as_ref().unwrap().underrun_frames()
+        );
+        let mut max_delta = 0.0f32;
+        for i in 2..rec.len() {
+            max_delta = max_delta.max((rec[i] - rec[i - 2]).abs());
+        }
+        assert!(max_delta < 0.1, "圈首接缝逐采样 Δ 过大（blend 未生效）: {max_delta}");
+    }
+
     /// P18：ManualLoop 控件经总线激活（loop_in/loop_out/loop_active 全
-    /// 走 bus，零桥改动）→ 引擎边沿检测进入捕获（非线性回跳路径）：
-    /// 与 set_beat_loop 激活等效——播头不逃环、首圈兜底 reset 一次、
-    /// 之后 FromBuffer 环绕无欠载。
+    /// 走 bus，零桥改动）→ 引擎边沿检测进入捕获。P22-B 重写：激活时
+    /// feed 已过 loop_in（In 按下后播放头越过 in 是常态）→ 部分回填
+    /// [li, feed_pos) 布防；侧环数据推入即排空 → 播到量化 Out 圈界无缝
+    /// 切 FromBuffer——epoch 不变、underrun 0（首圈兜底 reset 33ms 静音
+    /// 不再出现）。
     #[test]
     fn manual_loop_bus_activation_enters_capture() {
         let bus = hypermixx_core::ControlBus::default();
-        let (mut d, mut prod) = deck_with_ring_and_prod(&bus, sine_chunks(64), 0.0);
+        let (mut d, _prod, mut side_prod) =
+            deck_with_rings_and_prods(&bus, sine_chunks(64), 0.0);
         d.ctl.grid_bpm.set(120.0);
         d.ctl.grid_offset.set(0.0);
         let _ = run_frames(&mut d, 256);
+        let epoch_before = d.epoch;
         // P18：全走总线（ManualLoop 的 In/Out/激活按钮即写这三路）
         bus.set(&hypermixx_core::paths::deck_loop_in(0), 0.0);
         bus.set(&hypermixx_core::paths::deck_loop_out(0), 0.5);
         bus.set(&hypermixx_core::paths::deck_loop_active(0), 1.0);
+        // 先跑一块让激活边沿布防（Backfill 命令发出），再模拟 reader 响应
+        d.update_params();
+        d.process(&mut vec![0.0; 512], 256);
+        let backfill_to = d.feed_pos;
+        side_prod
+            .try_push(sine_chunk_at(0, CHUNK_FRAMES, d.epoch))
+            .ok()
+            .expect("侧环容量足够");
         let loop_out = d.ctl.loop_out.get();
-        let preroll = d.keylocker.as_ref().unwrap().warm_start_preroll_frames() as u64;
-        let epoch_before = d.epoch;
-        let mut last_epoch = d.epoch;
         let mut out = vec![0.0; 256 * 2];
         for _ in 0..(4.0 * 48000.0 / 256.0) as usize {
             d.update_params();
@@ -3454,22 +3992,14 @@ mod tests {
                 "播头不得逃出环, head={head}"
             );
             assert!(out.iter().all(|v| v.is_finite()));
-            if d.epoch != last_epoch {
-                // 首圈兜底 reset 发生（feed 内 epoch++）：补推新世代 chunk
-                refill_ring_after_reset(&mut d, &mut prod, preroll);
-                last_epoch = d.epoch;
-            }
         }
         assert_eq!(
-            d.epoch,
-            epoch_before + 1,
-            "bus 激活应走 set_beat_loop 同款捕获（首圈兜底 reset 一次），epoch {} → {}",
-            epoch_before,
-            d.epoch
+            d.epoch, epoch_before,
+            "回填完成路径不得 reset（epoch 不变）"
         );
         assert!(
-            d.keylocker.as_ref().unwrap().underrun_frames() <= 256,
-            "环绕本身不应欠载（仅兜底 reset 块允许 1 块静音），实际 {}",
+            d.keylocker.as_ref().unwrap().underrun_frames() == 0,
+            "部分回填无缝入环不得欠载，实际 {}",
             d.keylocker.as_ref().unwrap().underrun_frames()
         );
         assert!(
@@ -3477,6 +4007,380 @@ mod tests {
             "4s 后应处于缓冲喂入态，实际 {:?}",
             d.loop_feed
         );
+        // 播到量化 Out 才回绕：feed 停在 loop_out（非偏移入环不推进）
+        assert!(
+            backfill_to > 0 && backfill_to < 24000,
+            "激活点应在环内（部分回填前置），实际 {backfill_to}"
+        );
+        assert_eq!(
+            d.feed_pos,
+            (d.loop_out * d.sr) as u64,
+            "常规路径 feed_pos 应停在 loop_out，实际 {}",
+            d.feed_pos
+        );
+    }
+
+    /// P22-B：Out 已过量化点（激活时 feed > out）→ 全圈回填布防 +
+    /// 排空即**偏移入环**——不等圈界、不跳回：epoch 不变、underrun 0、
+    /// loop_offset == (feed_pos − out) mod len（feed_pos 停激活位 P，
+    /// 每圈 +len）、播头映射入环相位（li + offset + folded ∈ [0.1, 0.6)）。
+    #[test]
+    fn manual_loop_out_past_enters_with_offset_immediately() {
+        let bus = hypermixx_core::ControlBus::default();
+        let (mut d, _prod, mut side_prod) =
+            deck_with_rings_and_prods(&bus, sine_chunks(64), 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let _ = run_frames(&mut d, 256);
+        // 播到 0.6s（feed 28800 > out 24000）
+        let epoch_before = d.epoch;
+        for _ in 0..(0.6 * 48000.0 / 256.0) as usize {
+            d.update_params();
+            d.process(&mut vec![0.0; 512], 256);
+        }
+        assert!(d.feed_pos > 24000, "feed 应已过 out，实际 {}", d.feed_pos);
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 0.0);
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 0.5);
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 1.0);
+        // 先跑一块让激活边沿布防（Backfill 命令发出），再模拟 reader 响应
+        d.update_params();
+        d.process(&mut vec![0.0; 512], 256);
+        // 模拟 reader 对 Backfill[0, 24000) 的响应：12 个整 chunk 覆盖全圈
+        for k in 0..12 {
+            side_prod
+                .try_push(sine_chunk_at(k as u64 * CHUNK_FRAMES as u64, CHUNK_FRAMES, d.epoch))
+                .ok()
+                .expect("侧环容量足够");
+        }
+        let mut out = vec![0.0; 256 * 2];
+        for _ in 0..(2.0 * 48000.0 / 256.0) as usize {
+            d.update_params();
+            d.process(&mut out, 256);
+            let head = d.ctl.playhead.get();
+            assert!(
+                (0.0..0.65).contains(&head),
+                "偏移入环播头应映射入环相位 [offset, offset+len)，head={head}"
+            );
+            assert!(out.iter().all(|v| v.is_finite()));
+        }
+        assert_eq!(d.epoch, epoch_before, "全圈回填路径不得 reset");
+        assert!(
+            d.keylocker.as_ref().unwrap().underrun_frames() == 0,
+            "偏移入环不得欠载，实际 {}",
+            d.keylocker.as_ref().unwrap().underrun_frames()
+        );
+        assert!(
+            d.loop_feed == LoopFeed::FromBuffer,
+            "排空后应立即进入缓冲喂入态，实际 {:?}",
+            d.loop_feed
+        );
+        // loop_offset = (feed−out) mod len；feed_pos 停激活位 P（每圈 +len），
+        // P mod len == loop_offset 恒成立
+        let n = 24000u64;
+        assert!(
+            d.loop_offset > 0 && d.feed_pos % n == d.loop_offset,
+            "loop_offset = (feed−out) mod len（feed={}，offset={}）",
+            d.feed_pos,
+            d.loop_offset
+        );
+    }
+
+    /// P22-B：偏移入环跑 ≥3 圈后释放 → 收尾圈退出，播头 = 正在出声的
+    /// ring 内容位置（= 引擎标签 + Δ，Δ = feed_pos − feed_pos_at_loop_
+    /// start − loop_pushed，常规环 Δ=−W×len、偏移入环 Δ=+d，同式覆盖，
+    /// 延迟精确抵消——偏移入环时内容本身在退出处跳至续点 P+k×len，
+    /// 播头必须随声音走，不能虚拟续进）；epoch 不变、underrun 不变、
+    /// loop_offset 清 0。
+    #[test]
+    fn loop_offset_entry_exit_resumes_at_advanced_feed_pos() {
+        let bus = hypermixx_core::ControlBus::default();
+        // 140 chunk ≈ 5.97s：0.6 预播 + 1.5 环 + 2.0 退出线性续喂都在窗内
+        let (mut d, _prod, mut side_prod) =
+            deck_with_rings_and_prods(&bus, sine_chunks(140), 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let _ = run_frames(&mut d, 256);
+        for _ in 0..(0.6 * 48000.0 / 256.0) as usize {
+            d.update_params();
+            d.process(&mut vec![0.0; 512], 256);
+        }
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 0.0);
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 0.5);
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 1.0);
+        // 先跑一块让激活边沿布防（Backfill 命令发出），再模拟 reader 响应
+        d.update_params();
+        d.process(&mut vec![0.0; 512], 256);
+        // 侧环模拟全圈回填（12 chunk）
+        for k in 0..12 {
+            side_prod
+                .try_push(sine_chunk_at(k as u64 * CHUNK_FRAMES as u64, CHUNK_FRAMES, d.epoch))
+                .ok()
+                .expect("侧环容量足够");
+        }
+        // 环内跑 1.5s（≥3 圈，FromBuffer 稳定）
+        let mut out = vec![0.0; 256 * 2];
+        let mut entry_feed = None;
+        let mut entry_offset = 0u64;
+        for _ in 0..(1.5 * 48000.0 / 256.0) as usize {
+            d.update_params();
+            d.process(&mut out, 256);
+            if entry_feed.is_none() && d.loop_feed == LoopFeed::FromBuffer {
+                entry_feed = Some(d.feed_pos); // 入环位置 P（退出续点基准）
+                entry_offset = d.loop_offset; // 退出锚点 Δ = +d（清 0 前捕获）
+            }
+        }
+        assert!(
+            d.loop_feed == LoopFeed::FromBuffer,
+            "1.5s 后应在环绕态，实际 {:?}（feed={}，pending={}，frames={}）",
+            d.loop_feed,
+            d.feed_pos,
+            d.loop_buf.backfill_pending,
+            d.loop_buf.frames
+        );
+        assert!(d.loop_offset > 0, "应处于偏移入环，offset={}", d.loop_offset);
+        let epoch_before = d.epoch;
+        let underrun_before = d.keylocker.as_ref().unwrap().underrun_frames();
+        let head_at_release = d.ctl.playhead.get();
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 0.0);
+        // 退出契约（P22-B）：圈界退出后播头跟引擎标签（source_position =
+        // 正在出声的 ring 内容位置 = 退出续点 P + k×len），不再从释放相位
+        // 虚拟续进——音频内容本身在退出时跳至续点，播头必须随声音走。
+        let mut exit_feed = None;
+        let mut head_prev = head_at_release;
+        for _ in 0..(2.0 * 48000.0 / 256.0) as usize {
+            let was_from_buf = d.loop_feed == LoopFeed::FromBuffer;
+            d.update_params();
+            d.process(&mut out, 256);
+            assert!(out.iter().all(|v| v.is_finite()));
+            if was_from_buf && d.loop_feed != LoopFeed::FromBuffer {
+                exit_feed = Some(d.feed_pos); // 圈界退出：续点 = P + k×len
+                head_prev = d.ctl.playhead.get(); // 跳变块（播头随音频跳）跳过
+            } else if d.loop_feed == LoopFeed::Idle && exit_feed.is_some() {
+                // 退出后播头线性续进（跟标签；缓冲回收期标签可略快）
+                let head_now = d.ctl.playhead.get();
+                assert!(
+                    head_now >= head_prev - 1.0 && head_now <= head_prev + 256.0 + 1000.0,
+                    "退出后播头应线性续进：Δ={}",
+                    head_now - head_prev
+                );
+                head_prev = head_now;
+            }
+        }
+        let head = d.ctl.playhead.get();
+        let sp = d.keylocker.as_ref().unwrap().source_position();
+        // 播头（秒）应 = 引擎标签 + 冻结锚点（帧）：退出瞬间锚定
+        // pos_base = Δ = feed_pos − 基准 − 环喂入（偏移入环 = +d），此后
+        // 恒定 → 播头 = 正在出声的内容位置（退出后 feed_pos 继续推进，
+        // 不能重算 Δ）。head 单位秒。
+        let delta = d.pos_base.expect("退出应锚定 pos_base");
+        assert_eq!(delta, entry_offset as f64, "偏移入环退出锚点 Δ = +d");
+        assert!(
+            (head * 48000.0 - (sp + delta)).abs() < 1.0,
+            "播头应跟内容位置（标签+Δ），head={head} sp={sp} Δ={delta}"
+        );
+        // head 秒 → 帧：lag = feed_pos − 播头 = 引擎缓冲延迟（稳态 <12000）
+        let lag = d.feed_pos as f64 - head * 48000.0;
+        assert!(
+            (0.0..12000.0).contains(&lag),
+            "播头应贴近 ring 喂入位置（差=引擎缓冲延迟），feed={} head={head}",
+            d.feed_pos
+        );
+        let ef = exit_feed.expect("退出应在 2s 内发生");
+        let en = entry_feed.expect("应已入环");
+        assert!(
+            ef - en >= 3 * 24000,
+            "退出续点应随圈推进（P + k×len），entry_feed={en} exit_feed={ef}"
+        );
+        assert_eq!(d.epoch, epoch_before, "退出不应触发任何 seek");
+        assert_eq!(
+            d.keylocker.as_ref().unwrap().underrun_frames(),
+            underrun_before,
+            "退出续喂不应产生欠载"
+        );
+        assert_eq!(d.loop_offset, 0, "退出后 loop_offset 应清 0");
+    }
+
+    /// P22-B 安全网：长偏移循环（20+ 圈）释放时 feed_pos 已超 ring 已解码
+    /// 窗口（522240 = 预填 255 chunk 末端）→ 无缝续喂不可行 → seek_internal
+    /// min-preroll 兜底（epoch+1）；测试补推新世代 chunk 后线性续进、
+    /// 播头 ≈ 退出位置。
+    #[test]
+    fn loop_offset_exit_beyond_window_uses_min_preroll() {
+        let bus = hypermixx_core::ControlBus::default();
+        let (mut d, mut prod, mut side_prod) =
+            deck_with_rings_and_prods(&bus, sine_chunks(255), 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let _ = run_frames(&mut d, 256);
+        for _ in 0..(0.6 * 48000.0 / 256.0) as usize {
+            d.update_params();
+            d.process(&mut vec![0.0; 512], 256);
+        }
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 0.0);
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 0.5);
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 1.0);
+        // 先跑一块让激活边沿布防（Backfill 命令发出），再模拟 reader 响应
+        d.update_params();
+        d.process(&mut vec![0.0; 512], 256);
+        for k in 0..12 {
+            side_prod
+                .try_push(sine_chunk_at(k as u64 * CHUNK_FRAMES as u64, CHUNK_FRAMES, d.epoch))
+                .ok()
+                .expect("侧环容量足够");
+        }
+        // 环内跑直到 feed_pos > 528000（~10.4s，20+ 圈）：入环偏移沿 + 每圈
+        // +len 推进 feed_pos，远超 ring 预填窗（255 chunk = 522240）
+        let mut out = vec![0.0; 256 * 2];
+        let mut blocks = 0;
+        while d.feed_pos <= 528000 && blocks < 5000 {
+            d.update_params();
+            d.process(&mut out, 256);
+            blocks += 1;
+        }
+        assert!(d.loop_feed == LoopFeed::FromBuffer, "长循环应稳定环绕");
+        let epoch_before = d.epoch;
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 0.0);
+        // 退出在下一圈界：feed = 28672 + 21×24000 + 24000 = 556672 > 522240
+        // → 安全网 seek。epoch 变化后补推新世代 chunk。
+        let mut blocks = 0;
+        let mut last_epoch = d.epoch;
+        while d.loop_feed != LoopFeed::Idle && blocks < 200 {
+            d.update_params();
+            d.process(&mut out, 256);
+            blocks += 1;
+            if d.epoch != last_epoch {
+                let target = d.feed_pos as f64 / 48000.0;
+                test_refill_after_seek(&mut d, &mut prod, target);
+                last_epoch = d.epoch;
+            }
+        }
+        assert!(d.loop_feed == LoopFeed::Idle, "应已退出循环");
+        assert_eq!(d.epoch, epoch_before + 1, "超窗退出应走 min-preroll 兜底 seek");
+        assert_eq!(d.loop_offset, 0, "退出后 loop_offset 应清 0");
+        // 续播 0.3s：线性续进到 ≈ 退出位置 + 0.3
+        let exit_pos = d.feed_pos as f64 / 48000.0;
+        for _ in 0..(0.3 * 48000.0 / 256.0) as usize {
+            d.update_params();
+            d.process(&mut out, 256);
+        }
+        let head = d.ctl.playhead.get();
+        assert!(
+            (head - (exit_pos + 0.3)).abs() < 0.05,
+            "兜底 seek 后应从退出位置线性续进（exit={exit_pos:.3}），head={head:.3}"
+        );
+    }
+
+    /// P22-B 真 reader 路径：真实解码线程 + 部分回填（激活时 out 在前，
+    /// feed=0.1s）→ 排空 + 捕获续写 → 播到量化 Out 圈界无缝入环。
+    /// epoch 不变（无 33ms reset 兜底）、欠载 ≤ 1 chunk（启动瞬态容差）。
+    #[test]
+    fn manual_loop_backfill_with_real_reader() {
+        let bus = hypermixx_core::ControlBus::default();
+        let path = std::env::temp_dir()
+            .join(format!("hypermixx_loop_backfill_{}.wav", std::process::id()));
+        write_sine_wav(&path, 10.0);
+        let mut d = Deck::new(0, 48000, &bus);
+        d.ctl.volume.set(1.0);
+        d.load(path.clone());
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let mut out = vec![0.0f32; 256 * 2];
+        // 播到 0.1s（feed ≈4800 < out 24000）→ 部分回填布防。启动瞬态
+        // 下 reader 追平前可能有短暂欠载（累积计数器），激活后才是断言区
+        let mut blocks = 0;
+        while d.feed_pos < 4800 && blocks < 600 {
+            d.update_params();
+            d.process(&mut out, 256);
+            blocks += 1;
+        }
+        assert!(d.feed_pos >= 4800, "0.1s 内 reader 应追平，实际 {}", d.feed_pos);
+        let epoch_before = d.epoch;
+        let underrun_before = d.keylocker.as_ref().unwrap().underrun_frames();
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 0.0);
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 0.5);
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 1.0);
+        // 等排空 + 捕获续写 + 圈界入环（0.1 激活 + 0.5 播到 out + 解码余量）
+        let mut blocks = 0;
+        while d.loop_feed != LoopFeed::FromBuffer && blocks < 600 {
+            d.update_params();
+            d.process(&mut out, 256);
+            blocks += 1;
+        }
+        assert!(
+            d.loop_feed == LoopFeed::FromBuffer,
+            "真实回填路径应无缝入环，实际 {:?}",
+            d.loop_feed
+        );
+        assert_eq!(d.epoch, epoch_before, "真实回填路径不得 reset");
+        assert_eq!(d.feed_pos, 24000, "常规路径 feed_pos 停量化 Out");
+        assert!(
+            d.keylocker.as_ref().unwrap().underrun_frames() - underrun_before <= 2048,
+            "激活后欠载应 ≤ 1 chunk（仅启动瞬态在前），实际 {}",
+            d.keylocker.as_ref().unwrap().underrun_frames() - underrun_before
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P22-B 真 reader 路径 + 全圈回填：激活时 feed 已过 out（0.6s）→
+    /// Backfill[0, 24000) 真实解码排空 → 偏移入环。epoch 不变、loop_offset
+    /// 与 feed_pos 同余、播头映射入环相位。
+    #[test]
+    fn manual_loop_out_past_with_real_reader() {
+        let bus = hypermixx_core::ControlBus::default();
+        let path = std::env::temp_dir()
+            .join(format!("hypermixx_loop_out_past_{}.wav", std::process::id()));
+        write_sine_wav(&path, 10.0);
+        let mut d = Deck::new(0, 48000, &bus);
+        d.ctl.volume.set(1.0);
+        d.load(path.clone());
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let mut out = vec![0.0f32; 256 * 2];
+        // 播过 0.5s（feed > out 24000）。启动瞬态下 reader 追平前欠载，
+        // feed 推进会慢——按位置等待而非固定块数
+        let mut blocks = 0;
+        while d.feed_pos <= 24000 && blocks < 600 {
+            d.update_params();
+            d.process(&mut out, 256);
+            blocks += 1;
+        }
+        assert!(d.feed_pos > 24000, "feed 应已过 out，实际 {}", d.feed_pos);
+        let epoch_before = d.epoch;
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 0.0);
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 0.5);
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 1.0);
+        // 等全圈回填排空 → 偏移入环
+        let mut blocks = 0;
+        while d.loop_feed != LoopFeed::FromBuffer && blocks < 600 {
+            d.update_params();
+            d.process(&mut out, 256);
+            blocks += 1;
+        }
+        assert!(
+            d.loop_feed == LoopFeed::FromBuffer,
+            "全圈回填排空后应偏移入环，实际 {:?}",
+            d.loop_feed
+        );
+        assert_eq!(d.epoch, epoch_before, "真实回填路径不得 reset");
+        let n = 24000u64;
+        assert_eq!(
+            d.feed_pos % n,
+            d.loop_offset,
+            "loop_offset 与 feed_pos 同余（feed={}，offset={}）",
+            d.feed_pos,
+            d.loop_offset
+        );
+        // 入环后播头映射入环相位（li + offset + folded ∈ [0.1, 0.6)）
+        for _ in 0..(0.5 * 48000.0 / 256.0) as usize {
+            d.update_params();
+            d.process(&mut out, 256);
+            let head = d.ctl.playhead.get();
+            assert!(
+                (0.0..0.65).contains(&head),
+                "偏移入环播头应映射入环相位，head={head}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     /// P18：激活中改边界（ManualLoop Out/×2/÷2 写 loop_out bus）→
@@ -3990,6 +4894,114 @@ mod tests {
         d.set_beat_loop(1.0); // in=0，out=0.5
         d.beatjump(4.0); // 2s → 出环
         assert!(d.ctl.loop_active.get() < 0.5, "beatjump 出环应取消 loop");
+    }
+
+    /// P22-C：落点命中 ring 已解码窗口 → seek 保留窗口（零拷贝零分配），
+    /// 不补喂也零欠载——跳后直接从窗口续喂，无 refill 停滞。
+    #[test]
+    fn beatjump_lands_in_preserved_window_no_underrun() {
+        let bus = hypermixx_core::ControlBus::default();
+        // 128 chunk = 5.46s 预解码窗口
+        let mut d = deck_with_ring(&bus, sine_chunks(128), 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let _ = run_frames(&mut d, 256 * 100); // 播 ~0.53s，窗口余 [0.53, 5.46]
+        let p0 = d.ctl.playhead.get();
+        let underrun_before = d.keylocker.as_ref().unwrap().underrun_frames();
+        d.beatjump(4.0); // +2s → ~2.5s，落在余窗内
+        let target = p0 + 2.0;
+        assert!(
+            d.preserve.is_some(),
+            "落点在窗内应保留窗口（preserve={:?}）",
+            d.preserve
+        );
+        let (_, q0) = run_frames(&mut d, 256 * 30);
+        assert_eq!(
+            d.keylocker.as_ref().unwrap().underrun_frames(),
+            underrun_before,
+            "保留窗口跳后应零欠载（无 refill）"
+        );
+        // 连续喂入：播头 = 落点 + 推进 − 引擎延迟（延迟补偿动态契约）
+        let lag = (target + 30.0 * 256.0 / 48000.0) - q0;
+        assert!(
+            lag > 0.0 && lag <= 0.03,
+            "播头应跟内容位置：q0={q0} target={target} lag={lag}"
+        );
+    }
+
+    /// P22-C 负控：落点超窗（64 chunk = 2.73s，跳 5 拍 → ~3.0s 出窗）→
+    /// 全排 refill 旧行为——无保留、无补喂时 feed 冻结（引擎停在预卷
+    /// 静音态，欠载计数器不涨）、补喂后从落点续进。
+    #[test]
+    fn beatjump_beyond_window_still_requires_refill() {
+        let bus = hypermixx_core::ControlBus::default();
+        let (mut d, mut prod) = deck_with_ring_and_prod(&bus, sine_chunks(64), 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let _ = run_frames(&mut d, 256 * 100); // 播 ~0.53s，余窗 [0.53, 2.73]
+        let p0 = d.ctl.playhead.get();
+        d.beatjump(5.0); // +2.5s → ~3.0s 超窗
+        assert!(d.preserve.is_none(), "超窗不得保留窗口");
+        let feed_frozen = d.feed_pos;
+        let _ = run_frames(&mut d, 256 * 8); // 不补喂：无数据可喂
+        assert_eq!(
+            d.feed_pos, feed_frozen,
+            "超窗无 refill feed 不得推进（旧行为依赖 refill）"
+        );
+        // 补喂后恢复：播头从落点续进（旧行为完整路径）
+        test_refill_after_seek(&mut d, &mut prod, p0 + 2.5);
+        let (_, q) = run_frames(&mut d, 256 * 8);
+        let lag = (p0 + 2.5 + 8.0 * 256.0 / 48000.0) - q;
+        assert!(
+            lag > 0.0 && lag <= 0.03,
+            "refill 后播头应续进：q={q} p0={p0} lag={lag}"
+        );
+    }
+
+    /// P22-C 真 reader：落点命中预解码窗口 → Seek{resume} 送达活 reader，
+    /// 保留窗口喂完后无缝续推（窗口尾 → reader 续推），全程零欠载。
+    #[test]
+    fn beatjump_preserve_with_real_reader() {
+        let bus = hypermixx_core::ControlBus::default();
+        let path = std::env::temp_dir()
+            .join(format!("hypermixx_beatjump_preserve_{}.wav", std::process::id()));
+        write_sine_wav(&path, 30.0);
+        let mut d = Deck::new(0, 48000, &bus);
+        d.ctl.volume.set(1.0);
+        d.load(path.clone());
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let mut out = vec![0.0f32; 256 * 2];
+        // 播到 ~1s（reader 预解码窗口建立：ring 256 chunk ≈ 10.9s）
+        let mut blocks = 0;
+        while d.ctl.playhead.get() < 1.0 && blocks < 600 {
+            d.update_params();
+            d.process(&mut out, 256);
+            blocks += 1;
+        }
+        let p0 = d.ctl.playhead.get();
+        let underrun_before = d.keylocker.as_ref().unwrap().underrun_frames();
+        d.beatjump(4.0); // +2s → ~3s，落在预解码窗口内
+        assert!(d.preserve.is_some(), "真 reader 落点窗内应保留窗口");
+        // 推进越过窗口尾（~11.9s）→ reader 续推接管
+        let past = ((p0 + 11.0) * 48000.0) as u64;
+        let mut blocks = 0;
+        while d.feed_pos < past && blocks < 3000 {
+            d.update_params();
+            d.process(&mut out, 256);
+            blocks += 1;
+        }
+        assert!(
+            d.feed_pos >= past,
+            "feed 应推进过保留窗口并续推，实际 {}",
+            d.feed_pos
+        );
+        assert_eq!(
+            d.keylocker.as_ref().unwrap().underrun_frames(),
+            underrun_before,
+            "跳后全程零欠载（保留窗口 + reader 续推）"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     // -----------------------------------------------------------------------
