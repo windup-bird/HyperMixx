@@ -1,0 +1,19 @@
+[package]
+name = "hypermixx-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hypermixx-core.workspace = true
+cpal.workspace = true
+symphonia.workspace = true
+rubato.workspace = true
+timestretch.workspace = true
+ringbuf.workspace = true
+anyhow.workspace = true
+log.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+hound.workspace = true

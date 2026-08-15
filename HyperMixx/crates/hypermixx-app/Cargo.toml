@@ -1,0 +1,13 @@
+[package]
+name = "hypermixx-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hypermixx-core.workspace = true
+hypermixx-audio.workspace = true
+hypermixx-ui.workspace = true
+env_logger.workspace = true
+log.workspace = true
+anyhow.workspace = true

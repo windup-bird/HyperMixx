@@ -1,0 +1,4 @@
+rust_input: crate::api
+rust_root: ../hypermixx/crates/hypermixx-bridge
+dart_output: lib/src/rust
+auto_upgrade_dependency: false

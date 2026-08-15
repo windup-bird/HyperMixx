@@ -1,0 +1,23 @@
+[package]
+name = "hypermixx-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "keylock_spike"
+path = "src/bin/keylock_spike.rs"
+
+[[bin]]
+name = "playback_sim"
+path = "src/bin/playback_sim.rs"
+
+[dependencies]
+hypermixx-analysis.workspace = true
+hypermixx-audio.workspace = true
+hypermixx-core.workspace = true
+anyhow.workspace = true
+env_logger.workspace = true
+hound.workspace = true
+timestretch.workspace = true
+signalsmith-stretch.workspace = true

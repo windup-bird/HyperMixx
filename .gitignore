@@ -1,0 +1,21 @@
+# Rust 构建产物
+HyperMixx/target/
+
+# Flutter 构建产物
+flutter/build/
+flutter/.dart_tool/
+flutter/.flutter-plugins
+flutter/.flutter-plugins-dependencies
+flutter/linux/flutter/ephemeral/
+
+# 本地桥库（构建时生成）
+*.so
+
+# 日志与临时文件
+*.log
+*~
+
+# IDE
+.idea/
+.vscode/
+*.iml

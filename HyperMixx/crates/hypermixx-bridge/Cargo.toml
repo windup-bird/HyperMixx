@@ -1,0 +1,28 @@
+[package]
+name = "hypermixx-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# rlib：cargo test 用；cdylib：Flutter 加载 libhypermixx_bridge.so
+crate-type = ["cdylib", "rlib"]
+
+[lints.rust]
+# FRB codegen 用 frb_expand cfg 展开解析（cargo expand），正式构建不存在
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(frb_expand)"] }
+
+[dependencies]
+hypermixx-core = { workspace = true }
+hypermixx-audio = { workspace = true }
+hypermixx-analysis = { workspace = true }
+flutter_rust_bridge = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+lofty = { workspace = true }
+# 系统文件选择对话框（复刻 Slint 加载按钮，XDG portal）
+rfd = { workspace = true }
+
+[dev-dependencies]
+# 测试合成 WAV（BPM 咔嗒轨）
+hound = { workspace = true }

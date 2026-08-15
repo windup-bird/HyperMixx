@@ -1,0 +1,10 @@
+[package]
+name = "hypermixx-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+seqlock.workspace = true
+
+[dev-dependencies]

@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hypermixx-core",
+    "crates/hypermixx-audio",
+    "crates/hypermixx-analysis",
+    "crates/hypermixx-ui",
+    "crates/hypermixx-app",
+    "crates/hypermixx-bench",
+    "crates/hypermixx-bridge",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+hypermixx-core = { path = "crates/hypermixx-core" }
+hypermixx-audio = { path = "crates/hypermixx-audio" }
+hypermixx-analysis = { path = "crates/hypermixx-analysis" }
+hypermixx-ui = { path = "crates/hypermixx-ui" }
+
+# audio io / decode / dsp
+cpal = "0.18"
+symphonia = { version = "0.6", default-features = false, features = [
+    "aac", "alac", "flac", "mp3", "isomp4", "ogg", "pcm", "vorbis", "wav",
+] }
+rubato = "5.0"
+biquad = "0.6"
+ringbuf = "0.5"
+
+# ui
+slint = "1.17"
+slint-build = "1.17"
+rfd = "0.17"
+
+# util
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"
+seqlock = "0.2"
+
+# bench only
+hound = "3.5"
+# flutter 桥（两侧钉同版本，gen_bridge.sh 配套）
+flutter_rust_bridge = "=2.12.0"
+# 曲目元数据/封面提取（MIT OR Apache-2.0）
+lofty = "0.25"
+# 本地克隆的 timestretch master（0.11.0 之后的 DSP/分析修复；
+# 引擎公共 API 与 crates.io 0.11.0 一致，可随时切回版本号依赖）
+timestretch = { path = "../timestretch-rs" }
+signalsmith-stretch = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

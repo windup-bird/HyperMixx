@@ -1,0 +1,17 @@
+[package]
+name = "hypermixx-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hypermixx-core.workspace = true
+hypermixx-audio.workspace = true
+hypermixx-analysis.workspace = true
+slint.workspace = true
+rfd.workspace = true
+log.workspace = true
+anyhow.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true

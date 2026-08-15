@@ -1,0 +1,284 @@
+// MixBox 主界面：两行波形置顶（指针恒居中）→ 总输出/统一缩放 →
+// 下方左右两个 deck 面板。所有控件通过 root 属性双向绑定，Rust 侧只读写 root 属性。
+
+import { Button, CheckBox, Slider } from "std-widgets.slint";
+
+/// 单行波形条：整窗波形 + 居中播放头 + 点击跳转。
+/// playhead-frac 是窗口内比例（恒 0.5 居中；窗口钳制到尾端时向右偏移）。
+component WaveStrip {
+    in property <image> wave;
+    in property <float> playhead-frac;
+
+    callback seek-frac(float);
+
+    Rectangle {
+        background: #101418;
+        Image {
+            source: wave;
+            image-fit: ImageFit.fill;
+            width: parent.width;
+            height: parent.height;
+        }
+        Rectangle {
+            x: parent.width * playhead-frac - 1px;
+            width: 2px;
+            height: parent.height;
+            background: #ffffff;
+        }
+        TouchArea {
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down) {
+                    seek-frac(self.mouse-x / self.width);
+                }
+            }
+        }
+    }
+}
+
+/// 单 deck 控制面板（波形之外的传输/性能/EQ/音量控件）。
+component DeckPanel {
+    in property <string> title;
+    in property <bool> playing;
+    in property <float> vu;
+    in property <string> info;
+    in-out property <float> rate;
+    in-out property <float> eq-low;
+    in-out property <float> eq-mid;
+    in-out property <float> eq-high;
+    in-out property <float> volume;
+    in-out property <float> pitch;
+    in-out property <bool> keylock;
+    in-out property <bool> sync;
+    in-out property <bool> quantize;
+    in-out property <float> nudge;
+
+    callback play-toggle();
+    callback load();
+
+    VerticalLayout {
+        padding: 6px;
+        spacing: 4px;
+
+        // 传输行
+        HorizontalLayout {
+            spacing: 6px;
+            Text {
+                text: title + (playing ? "  ▶" : "  ⏸");
+                vertical-alignment: center;
+                min-width: 100px;
+            }
+            Button { text: "播放"; clicked => { play-toggle(); } }
+            Button { text: "加载"; clicked => { load(); } }
+            Text { text: "速率"; vertical-alignment: center; }
+            Slider { minimum: -8; maximum: 8; value <=> rate; }
+            Text { text: info; vertical-alignment: center; }
+        }
+
+        // 性能行：key shift / keylock / sync / quantize / 对拍加减速
+        HorizontalLayout {
+            spacing: 6px;
+            Text { text: "Pitch"; vertical-alignment: center; }
+            Slider { minimum: -12; maximum: 12; width: 90px; value <=> pitch; }
+            CheckBox { text: "Keylock"; checked <=> keylock; }
+            CheckBox { text: "Sync"; checked <=> sync; }
+            CheckBox { text: "量化"; checked <=> quantize; }
+            // 对拍：按住期间临时加减速（松手恢复滑杆速率）
+            Rectangle {
+                width: 64px;
+                height: 24px;
+                background: #2a2f36;
+                Text {
+                    text: "对拍−";
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                TouchArea {
+                    pointer-event(e) => {
+                        if (e.kind == PointerEventKind.down) { nudge = -1; }
+                        if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) { nudge = 0; }
+                    }
+                }
+            }
+            Rectangle {
+                width: 64px;
+                height: 24px;
+                background: #2a2f36;
+                Text {
+                    text: "对拍+";
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                TouchArea {
+                    pointer-event(e) => {
+                        if (e.kind == PointerEventKind.down) { nudge = 1; }
+                        if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) { nudge = 0; }
+                    }
+                }
+            }
+        }
+
+        // EQ 行
+        HorizontalLayout {
+            spacing: 6px;
+            Text { text: "低"; vertical-alignment: center; }
+            Slider { minimum: -40; maximum: 6; value <=> eq-low; }
+            Text { text: "中"; vertical-alignment: center; }
+            Slider { minimum: -40; maximum: 6; value <=> eq-mid; }
+            Text { text: "高"; vertical-alignment: center; }
+            Slider { minimum: -40; maximum: 6; value <=> eq-high; }
+        }
+
+        // 音量 / VU
+        HorizontalLayout {
+            spacing: 6px;
+            Text { text: "音量"; vertical-alignment: center; }
+            Slider { minimum: 0; maximum: 1; value <=> volume; }
+            Rectangle {
+                width: 160px;
+                height: 14px;
+                background: #202020;
+                Rectangle {
+                    x: 0px;
+                    y: 0px;
+                    height: parent.height;
+                    width: parent.width * vu;
+                    background: vu < 0.8 ? #2ecc71 : #e74c3c;
+                }
+            }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "MixBox";
+    width: 1180px;
+    height: 720px;
+    background: #1a1e24;
+
+    // Deck 1 波形
+    in property <image> deck1-wave;
+    in property <float> deck1-playhead;
+    // Deck 2 波形
+    in property <image> deck2-wave;
+    in property <float> deck2-playhead;
+    // Deck 1 面板
+    in-out property <float> deck1-rate: 0;
+    in-out property <float> deck1-eq-low: 0;
+    in-out property <float> deck1-eq-mid: 0;
+    in-out property <float> deck1-eq-high: 0;
+    in-out property <float> deck1-volume: 0.8;
+    in-out property <float> deck1-pitch: 0;
+    in-out property <bool> deck1-keylock: true;
+    in-out property <bool> deck1-sync: false;
+    in-out property <bool> deck1-quantize: false;
+    in-out property <float> deck1-nudge: 0;
+    in property <string> deck1-info;
+    in property <bool> deck1-playing;
+    in property <float> deck1-vu;
+    // Deck 2 面板
+    in-out property <float> deck2-rate: 0;
+    in-out property <float> deck2-eq-low: 0;
+    in-out property <float> deck2-eq-mid: 0;
+    in-out property <float> deck2-eq-high: 0;
+    in-out property <float> deck2-volume: 0.8;
+    in-out property <float> deck2-pitch: 0;
+    in-out property <bool> deck2-keylock: true;
+    in-out property <bool> deck2-sync: false;
+    in-out property <bool> deck2-quantize: false;
+    in-out property <float> deck2-nudge: 0;
+    in property <string> deck2-info;
+    in property <bool> deck2-playing;
+    in property <float> deck2-vu;
+    // 总输出 + 统一缩放
+    in-out property <float> master-volume: 0.8;
+    in property <float> master-vu;
+    in-out property <float> master-zoom: 1;
+
+    callback deck1-play-toggle();
+    callback deck1-load();
+    callback deck1-seek-frac(float);
+    callback deck2-play-toggle();
+    callback deck2-load();
+    callback deck2-seek-frac(float);
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 6px;
+
+        // 两行波形置顶
+        WaveStrip {
+            height: 190px;
+            wave: root.deck1-wave;
+            playhead-frac: root.deck1-playhead;
+            seek-frac(f) => { root.deck1-seek-frac(f); }
+        }
+        WaveStrip {
+            height: 190px;
+            wave: root.deck2-wave;
+            playhead-frac: root.deck2-playhead;
+            seek-frac(f) => { root.deck2-seek-frac(f); }
+        }
+
+        // 总输出 + 统一缩放（两 deck 共用）
+        HorizontalLayout {
+            spacing: 8px;
+            Text { text: "总输出"; vertical-alignment: center; }
+            Slider { minimum: 0; maximum: 1; value <=> root.master-volume; }
+            Rectangle {
+                width: 300px;
+                height: 14px;
+                background: #202020;
+                Rectangle {
+                    x: 0px;
+                    y: 0px;
+                    height: parent.height;
+                    width: parent.width * root.master-vu;
+                    background: root.master-vu < 0.8 ? #2ecc71 : #e74c3c;
+                }
+            }
+            Text { text: "缩放"; vertical-alignment: center; }
+            Slider { minimum: 0.25; maximum: 8; width: 150px; value <=> root.master-zoom; }
+        }
+
+        // 左右两个 deck 面板
+        HorizontalLayout {
+            spacing: 6px;
+            DeckPanel {
+                title: "Deck 1";
+                playing: root.deck1-playing;
+                vu: root.deck1-vu;
+                info: root.deck1-info;
+                rate <=> root.deck1-rate;
+                eq-low <=> root.deck1-eq-low;
+                eq-mid <=> root.deck1-eq-mid;
+                eq-high <=> root.deck1-eq-high;
+                volume <=> root.deck1-volume;
+                pitch <=> root.deck1-pitch;
+                keylock <=> root.deck1-keylock;
+                sync <=> root.deck1-sync;
+                quantize <=> root.deck1-quantize;
+                nudge <=> root.deck1-nudge;
+                play-toggle() => { root.deck1-play-toggle(); }
+                load() => { root.deck1-load(); }
+            }
+            DeckPanel {
+                title: "Deck 2";
+                playing: root.deck2-playing;
+                vu: root.deck2-vu;
+                info: root.deck2-info;
+                rate <=> root.deck2-rate;
+                eq-low <=> root.deck2-eq-low;
+                eq-mid <=> root.deck2-eq-mid;
+                eq-high <=> root.deck2-eq-high;
+                volume <=> root.deck2-volume;
+                pitch <=> root.deck2-pitch;
+                keylock <=> root.deck2-keylock;
+                sync <=> root.deck2-sync;
+                quantize <=> root.deck2-quantize;
+                nudge <=> root.deck2-nudge;
+                play-toggle() => { root.deck2-play-toggle(); }
+                load() => { root.deck2-load(); }
+            }
+        }
+    }
+}
