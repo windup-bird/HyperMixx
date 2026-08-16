@@ -8,6 +8,7 @@ pub mod dsp;
 pub mod engine;
 pub mod fx;
 pub mod keylocker;
+pub mod track_cache;
 
 pub use fx::{EffectId, EffectManifest, EffectProcessor, FxContext, FxRack};
 pub use keylocker::{Keylocker, TimestretchLocker};

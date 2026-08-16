@@ -227,35 +227,28 @@ impl EngineState {
 #[cfg(test)]
 mod tests {
     use super::{crossfade_factors, Engine, EngineHandle, EngineState};
-    use crate::deck::{
-        test_deck_with_ring_and_prod, test_refill_after_seek, test_sine_chunks,
-    };
+    use crate::deck::test_deck_with_cache;
     use hypermixx_core::paths;
 
     /// 双 deck 测试台：deck0（grid 120，bus_a）+ deck1（grid 124，bus_b）。
     /// 独立 bus 使两轨可设不同 grid；deck1 的 sync 经 bus_b 控制。
-    /// 返回 prod：测试 deck 无 reader 线程，beatjump seek 清空 ring 后
-    /// 须补推新世代 chunk 模拟 reader（否则欠载、播头冻结）。
+    /// 8.53s 全填缓存：beatjump seek 数据即时可用，无 reader 补推。
     fn dual_deck_rig() -> (
         EngineState,
         EngineHandle,
         hypermixx_core::ControlBus,
         hypermixx_core::ControlBus,
-        ringbuf::HeapProd<crate::caching_reader::Chunk>,
-        ringbuf::HeapProd<crate::caching_reader::Chunk>,
     ) {
         let bus_a = hypermixx_core::ControlBus::default();
         let bus_b = hypermixx_core::ControlBus::default();
         let (mut state, handle) = Engine::core(&bus_a);
-        let (deck0, prod0) = test_deck_with_ring_and_prod(&bus_a, test_sine_chunks(64), 0.0);
-        let (deck1, prod1) = test_deck_with_ring_and_prod(&bus_b, test_sine_chunks(64), 0.0);
-        state.decks[0] = deck0;
-        state.decks[1] = deck1;
+        state.decks[0] = test_deck_with_cache(&bus_a, 8.53, 0.0);
+        state.decks[1] = test_deck_with_cache(&bus_b, 8.53, 0.0);
         bus_a.control(&paths::deck_grid_bpm(0)).set(120.0);
         bus_a.control(&paths::deck_grid_offset(0)).set(0.0);
         bus_b.control(&paths::deck_grid_bpm(0)).set(124.0);
         bus_b.control(&paths::deck_grid_offset(0)).set(0.0);
-        (state, handle, bus_a, bus_b, prod0, prod1)
+        (state, handle, bus_a, bus_b)
     }
 
     /// 跑 blocks 块（256 帧/块）。
@@ -308,7 +301,7 @@ mod tests {
     /// 继续推进（grid 124 锁 leader 120 BPM → 音轨速率 120/124）。
     #[test]
     fn beatjump_with_sync_jumps_only_target_deck() {
-        let (mut state, handle, _bus_a, bus_b, mut prod0, _prod1) = dual_deck_rig();
+        let (mut state, handle, _bus_a, bus_b) = dual_deck_rig();
         bus_b.control(&paths::deck_sync(0)).set(1.0); // deck1 sync 跟随
         run_blocks(&mut state, 240); // 预热 1.28s：一次性对齐完成、速率锁
 
@@ -320,9 +313,7 @@ mod tests {
         let want0 = p0 + 4.0 * 60.0 / 120.0;
 
         handle.beatjump(0, 4.0); // 跳 deck0（leader）→ 不联动 deck1
-        run_blocks(&mut state, 1); // 应用 op：deck0 seek、ring 清空
-        // 补喂（模拟 reader 响应 Seek）：不补则欠载、播头冻结在 feed_base
-        test_refill_after_seek(&mut state.decks[0], &mut prod0, want0);
+        run_blocks(&mut state, 1); // 应用 op：deck0 缓存直读 seek
         run_blocks(&mut state, 8); // warm_start priming + 收敛
 
         let q0 = state.decks[0].ctl.playhead.get();
@@ -349,7 +340,7 @@ mod tests {
     /// P12：sync 全关时不联动——只跳目标轨，另一轨继续正常推进。
     #[test]
     fn beatjump_without_sync_jumps_only_target() {
-        let (mut state, handle, _, _, mut prod0, _prod1) = dual_deck_rig();
+        let (mut state, handle, _, _) = dual_deck_rig();
         run_blocks(&mut state, 60);
 
         let p0 = state.decks[0].ctl.playhead.get();
@@ -358,8 +349,7 @@ mod tests {
         let want0 = p0 + 4.0 * 60.0 / 120.0;
 
         handle.beatjump(0, 4.0);
-        run_blocks(&mut state, 1); // 应用 op：deck0 seek、ring 清空
-        test_refill_after_seek(&mut state.decks[0], &mut prod0, want0);
+        run_blocks(&mut state, 1); // 应用 op：deck0 缓存直读 seek
         run_blocks(&mut state, 8); // priming + 收敛
         let q0 = state.decks[0].ctl.playhead.get();
         // P22-C 动态延迟契约：播头 = 落点 + 推进 − 引擎延迟（560 硬编码
@@ -384,7 +374,7 @@ mod tests {
     /// 后半验证无网格 fallback 下滑杆仍可调速（回归防护）。
     #[test]
     fn sync_follower_rate_holds_after_leader_stops() {
-        let (mut state, _handle, bus_a, bus_b, _prod0, _prod1) = dual_deck_rig();
+        let (mut state, _handle, bus_a, bus_b) = dual_deck_rig();
         bus_b.control(&paths::deck_sync(0)).set(1.0);
         run_blocks(&mut state, 120); // 预热 + sync 收敛
 
