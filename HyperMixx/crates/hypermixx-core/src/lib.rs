@@ -102,6 +102,10 @@ pub mod paths {
     pub fn deck_loop_out(deck: usize) -> String {
         format!("Deck{}.loop_out", deck + 1)
     }
+    /// 缓存填充进度（0..1；引擎写 UI 读，未加载/未知总长时为 0）。
+    pub fn deck_cache_filled(deck: usize) -> String {
+        format!("Deck{}.cache_filled", deck + 1)
+    }
     /// FX 槽位类型（0=空，1..=8 对应 EffectId）。
     pub fn deck_fx_type(deck: usize, slot: usize) -> String {
         format!("Deck{}.fx{}_type", deck + 1, slot + 1)

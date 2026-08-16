@@ -1,5 +1,6 @@
 //! 曲目分析：RGB 波形、BPM、调性检测（M2 加入后两者）。
 
+pub mod energy;
 pub mod mono;
 pub mod segment;
 pub mod waveform;

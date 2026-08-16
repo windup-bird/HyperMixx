@@ -128,6 +128,8 @@ pub struct DeckSnapshotWire {
     pub eq_low: f64,
     pub eq_mid: f64,
     pub eq_high: f64,
+    /// 缓存填充进度（0..1）。
+    pub cache_filled: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -178,6 +180,8 @@ pub enum AnalysisEventWire {
         beats_secs: Vec<f64>,
         downbeats_secs: Vec<f64>,
         confidence: f32,
+        /// 分段网格初值（自研算法参考）：(起点秒, bpm, 刚性 0..1)。
+        tempo_segments: Vec<(f64, f64, f32)>,
     },
     /// 全曲分析完成：全局归一化数据（渐进分段由它整体替换）。
     Done {

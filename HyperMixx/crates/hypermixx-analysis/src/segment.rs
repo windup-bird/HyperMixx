@@ -48,6 +48,10 @@ pub enum AnalysisEvent {
         beats_secs: Box<[f64]>,
         downbeats_secs: Box<[f64]>,
         confidence: f32,
+        /// 分段网格初值（自研算法的参考输入）：(起点秒, bpm, 刚性 0..1)。
+        /// 取自 timestretch detect 的分段列表（refine_grid_rigid 采纳时
+        /// 会丢弃它，故在 refine 之前捕获）。
+        tempo_segments: Vec<(f64, f64, f32)>,
     },
     /// 全曲分析完成：与 analyze() 相同的全局归一化数据。
     Done {
@@ -228,6 +232,7 @@ fn analyzer_main(
             beats_secs: a.beats_secs,
             downbeats_secs: a.downbeats_secs,
             confidence: a.confidence,
+            tempo_segments: a.tempo_segments,
         });
     }
 
@@ -267,11 +272,37 @@ struct TrackAnalysisData {
     beats_secs: Box<[f64]>,
     downbeats_secs: Box<[f64]>,
     confidence: f32,
+    tempo_segments: Vec<(f64, f64, f32)>,
 }
 
 /// 置信低于此值不发布 BPM（grid 事件仍发 beats，但 bpm=0 防引擎
 /// sync/loop 建在劣质网格上；bridge 侧另有同阈值兜底不写 grid 总线）。
 const GRID_MIN_CONFIDENCE: f32 = 0.25;
+
+/// 段刚性初值：段内相邻拍间隔的变异系数 → 1/(1+CV) ∈ (0.5, 1]。
+/// 恒定拍距 → 1.0（完全刚性）；拍距漂移越大越接近 0.5。拍不足两拍
+/// 无法估 CV，直接取 1.0。
+fn segment_rigidity(beats: &[f64], start_beat: usize, end_beat: usize) -> f32 {
+    if end_beat <= start_beat + 1 {
+        return 1.0;
+    }
+    let mut sum = 0.0;
+    let mut sumsq = 0.0;
+    let mut n = 0usize;
+    for i in start_beat..end_beat - 1 {
+        let d = beats[i + 1] - beats[i];
+        sum += d;
+        sumsq += d * d;
+        n += 1;
+    }
+    let mean = sum / n as f64;
+    if mean <= 0.0 {
+        return 1.0;
+    }
+    let var = (sumsq / n as f64 - mean * mean).max(0.0);
+    let cv = var.sqrt() / mean;
+    (1.0 / (1.0 + cv)).clamp(0.0, 1.0) as f32
+}
 
 /// 拼接各段 mono → timestretch 检测：12k 粗链定 tempo + 48k superflux
 /// 细链定拍位 + 48k rigid 拟合，key 用 12k。
@@ -300,13 +331,38 @@ fn track_analysis(
         hint_range: Some((100.0, 160.0)),
         ..Default::default()
     });
+    // 分段初值在 refine 之前捕获：refine_grid_rigid 采纳时会把 segments
+    // 替换成单一 rigid 段（丢弃 detect 的分段列表）。空列表（如 detect
+    // 无拍）回退为单段 [0, bpm]。
+    let sr = 48_000u32;
+    let tempo_segments: Vec<(f64, f64, f32)> = if grid.segments.is_empty() {
+        vec![(0.0, grid.bpm, 1.0)]
+    } else {
+        let mut out = Vec::with_capacity(grid.segments.len());
+        for (i, seg) in grid.segments.iter().enumerate() {
+            let end = grid
+                .segments
+                .get(i + 1)
+                .map(|n| n.start_beat)
+                .unwrap_or(grid.beats.len());
+            out.push((
+                grid.beats
+                    .get(seg.start_beat)
+                    .map(|&b| b / sr as f64)
+                    .unwrap_or(0.0),
+                seg.bpm,
+                segment_rigidity(&grid.beats, seg.start_beat, end),
+            ));
+        }
+        out
+    };
     let (grid, adopted) = refine_grid_rigid(&mono48, 48_000, grid);
     log::debug!(
-        "beatgrid：BPM {:.1}，rigid 细化采纳 = {adopted}，置信 {:.2}",
+        "beatgrid：BPM {:.1}，rigid 细化采纳 = {adopted}，置信 {:.2}，分段 {} 个",
         grid.bpm,
-        grid.confidence
+        grid.confidence,
+        tempo_segments.len()
     );
-    let sr = 48_000u32;
     let to_secs = |samples: f64| samples / sr as f64;
     let beats_secs: Box<[f64]> = grid.beats.iter().map(|&b| to_secs(b)).collect();
     let downbeats_secs: Box<[f64]> = grid
@@ -330,6 +386,7 @@ fn track_analysis(
         beats_secs,
         downbeats_secs,
         confidence: grid.confidence,
+        tempo_segments,
     })
 }
 
@@ -526,6 +583,25 @@ mod tests {
         assert!(
             (bpm - 120.0).abs() <= 0.3,
             "BPM 应 ≈120（实得 {bpm}，置信 {confidence}）"
+        );
+        // tempo_segments 透传：合成恒定拍距 → 首段 bpm ≈ 检测 BPM、刚性 ≈1
+        let segs = evs
+            .iter()
+            .find_map(|e| match e {
+                AnalysisEvent::TrackAnalysis { tempo_segments, .. } => Some(tempo_segments),
+                _ => None,
+            })
+            .expect("应有 tempo_segments");
+        assert!(!segs.is_empty(), "恒定拍距应产生至少一个分段");
+        assert!(
+            (segs[0].1 - bpm).abs() <= 0.5,
+            "首段 bpm 应 ≈ 检测 bpm：{} vs {bpm}",
+            segs[0].1
+        );
+        assert!(
+            segs[0].2 > 0.99,
+            "恒定拍距段刚性应 ≈1：{}",
+            segs[0].2
         );
         let _ = std::fs::remove_file(&p);
     }

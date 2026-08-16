@@ -122,6 +122,9 @@ sealed class AnalysisEventWire with _$AnalysisEventWire {
     required Float64List beatsSecs,
     required Float64List downbeatsSecs,
     required double confidence,
+
+    /// 分段网格初值（自研算法参考）：(起点秒, bpm, 刚性 0..1)。
+    required List<(double, double, double)> tempoSegments,
   }) = AnalysisEventWire_TrackAnalysis;
 
   /// 全曲分析完成：全局归一化数据（渐进分段由它整体替换）。
@@ -163,6 +166,9 @@ class DeckSnapshotWire {
   final double eqMid;
   final double eqHigh;
 
+  /// 缓存填充进度（0..1）。
+  final double cacheFilled;
+
   const DeckSnapshotWire({
     required this.playhead,
     required this.duration,
@@ -181,6 +187,7 @@ class DeckSnapshotWire {
     required this.eqLow,
     required this.eqMid,
     required this.eqHigh,
+    required this.cacheFilled,
   });
 
   static Future<DeckSnapshotWire> default_() =>
@@ -204,7 +211,8 @@ class DeckSnapshotWire {
       loopOut.hashCode ^
       eqLow.hashCode ^
       eqMid.hashCode ^
-      eqHigh.hashCode;
+      eqHigh.hashCode ^
+      cacheFilled.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -227,7 +235,8 @@ class DeckSnapshotWire {
           loopOut == other.loopOut &&
           eqLow == other.eqLow &&
           eqMid == other.eqMid &&
-          eqHigh == other.eqHigh;
+          eqHigh == other.eqHigh &&
+          cacheFilled == other.cacheFilled;
 }
 
 /// 单效果清单（id = EffectId 判别值 1..=8；params 位对应总线 fxN_p1..p4）。

@@ -134,15 +134,17 @@ impl UiState {
                 beats_secs,
                 downbeats_secs,
                 confidence,
+                tempo_segments,
             } => {
                 if generation != cur {
                     return;
                 }
                 log::info!(
-                    "deck {} 单遍分析：BPM {bpm:.1}（置信 {confidence:.2}），key {}，{} 拍",
+                    "deck {} 单遍分析：BPM {bpm:.1}（置信 {confidence:.2}），key {}，{} 拍，{} 个 tempo 分段",
                     deck + 1,
                     key.as_ref().map(|k| k.name()).unwrap_or_default(),
-                    beats_secs.len()
+                    beats_secs.len(),
+                    tempo_segments.len()
                 );
                 self.meta[deck] = TrackMeta {
                     bpm,

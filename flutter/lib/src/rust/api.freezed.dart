@@ -156,11 +156,11 @@ return failed(_that);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( BigInt generation,  int seg,  List<WireColumn> detail,  List<WireColumn> overview)?  segment,TResult Function( BigInt generation,  double bpm,  String keyName,  String keyCamelot,  double offsetSecs,  Float64List beatsSecs,  Float64List downbeatsSecs,  double confidence)?  trackAnalysis,TResult Function( BigInt generation,  List<WireColumn> detail,  List<WireColumn> overview,  int framesPerCol,  int sampleRate,  BigInt durationFrames)?  done,TResult Function( BigInt generation,  String msg)?  failed,required TResult orElse(),}) {final _that = this;
+@optionalTypeArgs TResult maybeWhen<TResult extends Object?>({TResult Function( BigInt generation,  int seg,  List<WireColumn> detail,  List<WireColumn> overview)?  segment,TResult Function( BigInt generation,  double bpm,  String keyName,  String keyCamelot,  double offsetSecs,  Float64List beatsSecs,  Float64List downbeatsSecs,  double confidence,  List<(double, double, double)> tempoSegments)?  trackAnalysis,TResult Function( BigInt generation,  List<WireColumn> detail,  List<WireColumn> overview,  int framesPerCol,  int sampleRate,  BigInt durationFrames)?  done,TResult Function( BigInt generation,  String msg)?  failed,required TResult orElse(),}) {final _that = this;
 switch (_that) {
 case AnalysisEventWire_Segment() when segment != null:
 return segment(_that.generation,_that.seg,_that.detail,_that.overview);case AnalysisEventWire_TrackAnalysis() when trackAnalysis != null:
-return trackAnalysis(_that.generation,_that.bpm,_that.keyName,_that.keyCamelot,_that.offsetSecs,_that.beatsSecs,_that.downbeatsSecs,_that.confidence);case AnalysisEventWire_Done() when done != null:
+return trackAnalysis(_that.generation,_that.bpm,_that.keyName,_that.keyCamelot,_that.offsetSecs,_that.beatsSecs,_that.downbeatsSecs,_that.confidence,_that.tempoSegments);case AnalysisEventWire_Done() when done != null:
 return done(_that.generation,_that.detail,_that.overview,_that.framesPerCol,_that.sampleRate,_that.durationFrames);case AnalysisEventWire_Failed() when failed != null:
 return failed(_that.generation,_that.msg);case _:
   return orElse();
@@ -180,11 +180,11 @@ return failed(_that.generation,_that.msg);case _:
 /// }
 /// ```
 
-@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( BigInt generation,  int seg,  List<WireColumn> detail,  List<WireColumn> overview)  segment,required TResult Function( BigInt generation,  double bpm,  String keyName,  String keyCamelot,  double offsetSecs,  Float64List beatsSecs,  Float64List downbeatsSecs,  double confidence)  trackAnalysis,required TResult Function( BigInt generation,  List<WireColumn> detail,  List<WireColumn> overview,  int framesPerCol,  int sampleRate,  BigInt durationFrames)  done,required TResult Function( BigInt generation,  String msg)  failed,}) {final _that = this;
+@optionalTypeArgs TResult when<TResult extends Object?>({required TResult Function( BigInt generation,  int seg,  List<WireColumn> detail,  List<WireColumn> overview)  segment,required TResult Function( BigInt generation,  double bpm,  String keyName,  String keyCamelot,  double offsetSecs,  Float64List beatsSecs,  Float64List downbeatsSecs,  double confidence,  List<(double, double, double)> tempoSegments)  trackAnalysis,required TResult Function( BigInt generation,  List<WireColumn> detail,  List<WireColumn> overview,  int framesPerCol,  int sampleRate,  BigInt durationFrames)  done,required TResult Function( BigInt generation,  String msg)  failed,}) {final _that = this;
 switch (_that) {
 case AnalysisEventWire_Segment():
 return segment(_that.generation,_that.seg,_that.detail,_that.overview);case AnalysisEventWire_TrackAnalysis():
-return trackAnalysis(_that.generation,_that.bpm,_that.keyName,_that.keyCamelot,_that.offsetSecs,_that.beatsSecs,_that.downbeatsSecs,_that.confidence);case AnalysisEventWire_Done():
+return trackAnalysis(_that.generation,_that.bpm,_that.keyName,_that.keyCamelot,_that.offsetSecs,_that.beatsSecs,_that.downbeatsSecs,_that.confidence,_that.tempoSegments);case AnalysisEventWire_Done():
 return done(_that.generation,_that.detail,_that.overview,_that.framesPerCol,_that.sampleRate,_that.durationFrames);case AnalysisEventWire_Failed():
 return failed(_that.generation,_that.msg);}
 }
@@ -200,11 +200,11 @@ return failed(_that.generation,_that.msg);}
 /// }
 /// ```
 
-@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( BigInt generation,  int seg,  List<WireColumn> detail,  List<WireColumn> overview)?  segment,TResult? Function( BigInt generation,  double bpm,  String keyName,  String keyCamelot,  double offsetSecs,  Float64List beatsSecs,  Float64List downbeatsSecs,  double confidence)?  trackAnalysis,TResult? Function( BigInt generation,  List<WireColumn> detail,  List<WireColumn> overview,  int framesPerCol,  int sampleRate,  BigInt durationFrames)?  done,TResult? Function( BigInt generation,  String msg)?  failed,}) {final _that = this;
+@optionalTypeArgs TResult? whenOrNull<TResult extends Object?>({TResult? Function( BigInt generation,  int seg,  List<WireColumn> detail,  List<WireColumn> overview)?  segment,TResult? Function( BigInt generation,  double bpm,  String keyName,  String keyCamelot,  double offsetSecs,  Float64List beatsSecs,  Float64List downbeatsSecs,  double confidence,  List<(double, double, double)> tempoSegments)?  trackAnalysis,TResult? Function( BigInt generation,  List<WireColumn> detail,  List<WireColumn> overview,  int framesPerCol,  int sampleRate,  BigInt durationFrames)?  done,TResult? Function( BigInt generation,  String msg)?  failed,}) {final _that = this;
 switch (_that) {
 case AnalysisEventWire_Segment() when segment != null:
 return segment(_that.generation,_that.seg,_that.detail,_that.overview);case AnalysisEventWire_TrackAnalysis() when trackAnalysis != null:
-return trackAnalysis(_that.generation,_that.bpm,_that.keyName,_that.keyCamelot,_that.offsetSecs,_that.beatsSecs,_that.downbeatsSecs,_that.confidence);case AnalysisEventWire_Done() when done != null:
+return trackAnalysis(_that.generation,_that.bpm,_that.keyName,_that.keyCamelot,_that.offsetSecs,_that.beatsSecs,_that.downbeatsSecs,_that.confidence,_that.tempoSegments);case AnalysisEventWire_Done() when done != null:
 return done(_that.generation,_that.detail,_that.overview,_that.framesPerCol,_that.sampleRate,_that.durationFrames);case AnalysisEventWire_Failed() when failed != null:
 return failed(_that.generation,_that.msg);case _:
   return null;
@@ -302,7 +302,7 @@ as List<WireColumn>,
 
 
 class AnalysisEventWire_TrackAnalysis extends AnalysisEventWire {
-  const AnalysisEventWire_TrackAnalysis({required this.generation, required this.bpm, required this.keyName, required this.keyCamelot, required this.offsetSecs, required this.beatsSecs, required this.downbeatsSecs, required this.confidence}): super._();
+  const AnalysisEventWire_TrackAnalysis({required this.generation, required this.bpm, required this.keyName, required this.keyCamelot, required this.offsetSecs, required this.beatsSecs, required this.downbeatsSecs, required this.confidence, required final  List<(double, double, double)> tempoSegments}): _tempoSegments = tempoSegments,super._();
   
 
 @override final  BigInt generation;
@@ -314,6 +314,15 @@ class AnalysisEventWire_TrackAnalysis extends AnalysisEventWire {
  final  Float64List beatsSecs;
  final  Float64List downbeatsSecs;
  final  double confidence;
+/// 分段网格初值（自研算法参考）：(起点秒, bpm, 刚性 0..1)。
+ final  List<(double, double, double)> _tempoSegments;
+/// 分段网格初值（自研算法参考）：(起点秒, bpm, 刚性 0..1)。
+ List<(double, double, double)> get tempoSegments {
+  if (_tempoSegments is EqualUnmodifiableListView) return _tempoSegments;
+  // ignore: implicit_dynamic_type
+  return EqualUnmodifiableListView(_tempoSegments);
+}
+
 
 /// Create a copy of AnalysisEventWire
 /// with the given fields replaced by the non-null parameter values.
@@ -325,16 +334,16 @@ $AnalysisEventWire_TrackAnalysisCopyWith<AnalysisEventWire_TrackAnalysis> get co
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is AnalysisEventWire_TrackAnalysis&&(identical(other.generation, generation) || other.generation == generation)&&(identical(other.bpm, bpm) || other.bpm == bpm)&&(identical(other.keyName, keyName) || other.keyName == keyName)&&(identical(other.keyCamelot, keyCamelot) || other.keyCamelot == keyCamelot)&&(identical(other.offsetSecs, offsetSecs) || other.offsetSecs == offsetSecs)&&const DeepCollectionEquality().equals(other.beatsSecs, beatsSecs)&&const DeepCollectionEquality().equals(other.downbeatsSecs, downbeatsSecs)&&(identical(other.confidence, confidence) || other.confidence == confidence));
+  return identical(this, other) || (other.runtimeType == runtimeType&&other is AnalysisEventWire_TrackAnalysis&&(identical(other.generation, generation) || other.generation == generation)&&(identical(other.bpm, bpm) || other.bpm == bpm)&&(identical(other.keyName, keyName) || other.keyName == keyName)&&(identical(other.keyCamelot, keyCamelot) || other.keyCamelot == keyCamelot)&&(identical(other.offsetSecs, offsetSecs) || other.offsetSecs == offsetSecs)&&const DeepCollectionEquality().equals(other.beatsSecs, beatsSecs)&&const DeepCollectionEquality().equals(other.downbeatsSecs, downbeatsSecs)&&(identical(other.confidence, confidence) || other.confidence == confidence)&&const DeepCollectionEquality().equals(other._tempoSegments, _tempoSegments));
 }
 
 
 @override
-int get hashCode => Object.hash(runtimeType,generation,bpm,keyName,keyCamelot,offsetSecs,const DeepCollectionEquality().hash(beatsSecs),const DeepCollectionEquality().hash(downbeatsSecs),confidence);
+int get hashCode => Object.hash(runtimeType,generation,bpm,keyName,keyCamelot,offsetSecs,const DeepCollectionEquality().hash(beatsSecs),const DeepCollectionEquality().hash(downbeatsSecs),confidence,const DeepCollectionEquality().hash(_tempoSegments));
 
 @override
 String toString() {
-  return 'AnalysisEventWire.trackAnalysis(generation: $generation, bpm: $bpm, keyName: $keyName, keyCamelot: $keyCamelot, offsetSecs: $offsetSecs, beatsSecs: $beatsSecs, downbeatsSecs: $downbeatsSecs, confidence: $confidence)';
+  return 'AnalysisEventWire.trackAnalysis(generation: $generation, bpm: $bpm, keyName: $keyName, keyCamelot: $keyCamelot, offsetSecs: $offsetSecs, beatsSecs: $beatsSecs, downbeatsSecs: $downbeatsSecs, confidence: $confidence, tempoSegments: $tempoSegments)';
 }
 
 
@@ -345,7 +354,7 @@ abstract mixin class $AnalysisEventWire_TrackAnalysisCopyWith<$Res> implements $
   factory $AnalysisEventWire_TrackAnalysisCopyWith(AnalysisEventWire_TrackAnalysis value, $Res Function(AnalysisEventWire_TrackAnalysis) _then) = _$AnalysisEventWire_TrackAnalysisCopyWithImpl;
 @override @useResult
 $Res call({
- BigInt generation, double bpm, String keyName, String keyCamelot, double offsetSecs, Float64List beatsSecs, Float64List downbeatsSecs, double confidence
+ BigInt generation, double bpm, String keyName, String keyCamelot, double offsetSecs, Float64List beatsSecs, Float64List downbeatsSecs, double confidence, List<(double, double, double)> tempoSegments
 });
 
 
@@ -362,7 +371,7 @@ class _$AnalysisEventWire_TrackAnalysisCopyWithImpl<$Res>
 
 /// Create a copy of AnalysisEventWire
 /// with the given fields replaced by the non-null parameter values.
-@override @pragma('vm:prefer-inline') $Res call({Object? generation = null,Object? bpm = null,Object? keyName = null,Object? keyCamelot = null,Object? offsetSecs = null,Object? beatsSecs = null,Object? downbeatsSecs = null,Object? confidence = null,}) {
+@override @pragma('vm:prefer-inline') $Res call({Object? generation = null,Object? bpm = null,Object? keyName = null,Object? keyCamelot = null,Object? offsetSecs = null,Object? beatsSecs = null,Object? downbeatsSecs = null,Object? confidence = null,Object? tempoSegments = null,}) {
   return _then(AnalysisEventWire_TrackAnalysis(
 generation: null == generation ? _self.generation : generation // ignore: cast_nullable_to_non_nullable
 as BigInt,bpm: null == bpm ? _self.bpm : bpm // ignore: cast_nullable_to_non_nullable
@@ -372,7 +381,8 @@ as String,offsetSecs: null == offsetSecs ? _self.offsetSecs : offsetSecs // igno
 as double,beatsSecs: null == beatsSecs ? _self.beatsSecs : beatsSecs // ignore: cast_nullable_to_non_nullable
 as Float64List,downbeatsSecs: null == downbeatsSecs ? _self.downbeatsSecs : downbeatsSecs // ignore: cast_nullable_to_non_nullable
 as Float64List,confidence: null == confidence ? _self.confidence : confidence // ignore: cast_nullable_to_non_nullable
-as double,
+as double,tempoSegments: null == tempoSegments ? _self._tempoSegments : tempoSegments // ignore: cast_nullable_to_non_nullable
+as List<(double, double, double)>,
   ));
 }
 

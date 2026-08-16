@@ -785,6 +785,7 @@ impl SseDecode for crate::api::AnalysisEventWire {
                 let mut var_beatsSecs = <Vec<f64>>::sse_decode(deserializer);
                 let mut var_downbeatsSecs = <Vec<f64>>::sse_decode(deserializer);
                 let mut var_confidence = <f32>::sse_decode(deserializer);
+                let mut var_tempoSegments = <Vec<(f64, f64, f32)>>::sse_decode(deserializer);
                 return crate::api::AnalysisEventWire::TrackAnalysis {
                     generation: var_generation,
                     bpm: var_bpm,
@@ -794,6 +795,7 @@ impl SseDecode for crate::api::AnalysisEventWire {
                     beats_secs: var_beatsSecs,
                     downbeats_secs: var_downbeatsSecs,
                     confidence: var_confidence,
+                    tempo_segments: var_tempoSegments,
                 };
             }
             2 => {
@@ -854,6 +856,7 @@ impl SseDecode for crate::api::DeckSnapshotWire {
         let mut var_eqLow = <f64>::sse_decode(deserializer);
         let mut var_eqMid = <f64>::sse_decode(deserializer);
         let mut var_eqHigh = <f64>::sse_decode(deserializer);
+        let mut var_cacheFilled = <f64>::sse_decode(deserializer);
         return crate::api::DeckSnapshotWire {
             playhead: var_playhead,
             duration: var_duration,
@@ -872,6 +875,7 @@ impl SseDecode for crate::api::DeckSnapshotWire {
             eq_low: var_eqLow,
             eq_mid: var_eqMid,
             eq_high: var_eqHigh,
+            cache_filled: var_cacheFilled,
         };
     }
 }
@@ -978,6 +982,18 @@ impl SseDecode for Vec<u8> {
     }
 }
 
+impl SseDecode for Vec<(f64, f64, f32)> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<(f64, f64, f32)>::sse_decode(deserializer));
+        }
+        return ans_;
+    }
+}
+
 impl SseDecode for Vec<crate::api::WireColumn> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1010,6 +1026,16 @@ impl SseDecode for Option<String> {
         } else {
             return None;
         }
+    }
+}
+
+impl SseDecode for (f64, f64, f32) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_field0 = <f64>::sse_decode(deserializer);
+        let mut var_field1 = <f64>::sse_decode(deserializer);
+        let mut var_field2 = <f32>::sse_decode(deserializer);
+        return (var_field0, var_field1, var_field2);
     }
 }
 
@@ -1181,6 +1207,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::AnalysisEventWire {
                 beats_secs,
                 downbeats_secs,
                 confidence,
+                tempo_segments,
             } => [
                 1.into_dart(),
                 generation.into_into_dart().into_dart(),
@@ -1191,6 +1218,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::AnalysisEventWire {
                 beats_secs.into_into_dart().into_dart(),
                 downbeats_secs.into_into_dart().into_dart(),
                 confidence.into_into_dart().into_dart(),
+                tempo_segments.into_into_dart().into_dart(),
             ]
             .into_dart(),
             crate::api::AnalysisEventWire::Done {
@@ -1251,6 +1279,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::DeckSnapshotWire {
             self.eq_low.into_into_dart().into_dart(),
             self.eq_mid.into_into_dart().into_dart(),
             self.eq_high.into_into_dart().into_dart(),
+            self.cache_filled.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -1424,6 +1453,7 @@ impl SseEncode for crate::api::AnalysisEventWire {
                 beats_secs,
                 downbeats_secs,
                 confidence,
+                tempo_segments,
             } => {
                 <i32>::sse_encode(1, serializer);
                 <u64>::sse_encode(generation, serializer);
@@ -1434,6 +1464,7 @@ impl SseEncode for crate::api::AnalysisEventWire {
                 <Vec<f64>>::sse_encode(beats_secs, serializer);
                 <Vec<f64>>::sse_encode(downbeats_secs, serializer);
                 <f32>::sse_encode(confidence, serializer);
+                <Vec<(f64, f64, f32)>>::sse_encode(tempo_segments, serializer);
             }
             crate::api::AnalysisEventWire::Done {
                 generation,
@@ -1490,6 +1521,7 @@ impl SseEncode for crate::api::DeckSnapshotWire {
         <f64>::sse_encode(self.eq_low, serializer);
         <f64>::sse_encode(self.eq_mid, serializer);
         <f64>::sse_encode(self.eq_high, serializer);
+        <f64>::sse_encode(self.cache_filled, serializer);
     }
 }
 
@@ -1571,6 +1603,16 @@ impl SseEncode for Vec<u8> {
     }
 }
 
+impl SseEncode for Vec<(f64, f64, f32)> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <(f64, f64, f32)>::sse_encode(item, serializer);
+        }
+    }
+}
+
 impl SseEncode for Vec<crate::api::WireColumn> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -1596,6 +1638,15 @@ impl SseEncode for Option<String> {
         if let Some(value) = self {
             <String>::sse_encode(value, serializer);
         }
+    }
+}
+
+impl SseEncode for (f64, f64, f32) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <f64>::sse_encode(self.0, serializer);
+        <f64>::sse_encode(self.1, serializer);
+        <f32>::sse_encode(self.2, serializer);
     }
 }
 

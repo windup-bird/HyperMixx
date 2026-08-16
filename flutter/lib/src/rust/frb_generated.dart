@@ -732,6 +732,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           beatsSecs: dco_decode_list_prim_f_64_strict(raw[6]),
           downbeatsSecs: dco_decode_list_prim_f_64_strict(raw[7]),
           confidence: dco_decode_f_32(raw[8]),
+          tempoSegments: dco_decode_list_record_f_64_f_64_f_32(raw[9]),
         );
       case 2:
         return AnalysisEventWire_Done(
@@ -762,8 +763,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   DeckSnapshotWire dco_decode_deck_snapshot_wire(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 17)
-      throw Exception('unexpected arr length: expect 17 but see ${arr.length}');
+    if (arr.length != 18)
+      throw Exception('unexpected arr length: expect 18 but see ${arr.length}');
     return DeckSnapshotWire(
       playhead: dco_decode_f_64(arr[0]),
       duration: dco_decode_f_64(arr[1]),
@@ -782,6 +783,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       eqLow: dco_decode_f_64(arr[14]),
       eqMid: dco_decode_f_64(arr[15]),
       eqHigh: dco_decode_f_64(arr[16]),
+      cacheFilled: dco_decode_f_64(arr[17]),
     );
   }
 
@@ -854,6 +856,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<(double, double, double)> dco_decode_list_record_f_64_f_64_f_32(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>)
+        .map(dco_decode_record_f_64_f_64_f_32)
+        .toList();
+  }
+
+  @protected
   List<WireColumn> dco_decode_list_wire_column(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return (raw as List<dynamic>).map(dco_decode_wire_column).toList();
@@ -875,6 +887,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   String? dco_decode_opt_String(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_String(raw);
+  }
+
+  @protected
+  (double, double, double) dco_decode_record_f_64_f_64_f_32(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 3) {
+      throw Exception('Expected 3 elements, got ${arr.length}');
+    }
+    return (
+      dco_decode_f_64(arr[0]),
+      dco_decode_f_64(arr[1]),
+      dco_decode_f_32(arr[2]),
+    );
   }
 
   @protected
@@ -995,6 +1021,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         var var_beatsSecs = sse_decode_list_prim_f_64_strict(deserializer);
         var var_downbeatsSecs = sse_decode_list_prim_f_64_strict(deserializer);
         var var_confidence = sse_decode_f_32(deserializer);
+        var var_tempoSegments = sse_decode_list_record_f_64_f_64_f_32(
+          deserializer,
+        );
         return AnalysisEventWire_TrackAnalysis(
           generation: var_generation,
           bpm: var_bpm,
@@ -1004,6 +1033,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           beatsSecs: var_beatsSecs,
           downbeatsSecs: var_downbeatsSecs,
           confidence: var_confidence,
+          tempoSegments: var_tempoSegments,
         );
       case 2:
         var var_generation = sse_decode_u_64(deserializer);
@@ -1058,6 +1088,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_eqLow = sse_decode_f_64(deserializer);
     var var_eqMid = sse_decode_f_64(deserializer);
     var var_eqHigh = sse_decode_f_64(deserializer);
+    var var_cacheFilled = sse_decode_f_64(deserializer);
     return DeckSnapshotWire(
       playhead: var_playhead,
       duration: var_duration,
@@ -1076,6 +1107,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       eqLow: var_eqLow,
       eqMid: var_eqMid,
       eqHigh: var_eqHigh,
+      cacheFilled: var_cacheFilled,
     );
   }
 
@@ -1172,6 +1204,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<(double, double, double)> sse_decode_list_record_f_64_f_64_f_32(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <(double, double, double)>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_record_f_64_f_64_f_32(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
   List<WireColumn> sse_decode_list_wire_column(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
@@ -1202,6 +1248,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     } else {
       return null;
     }
+  }
+
+  @protected
+  (double, double, double) sse_decode_record_f_64_f_64_f_32(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_field0 = sse_decode_f_64(deserializer);
+    var var_field1 = sse_decode_f_64(deserializer);
+    var var_field2 = sse_decode_f_32(deserializer);
+    return (var_field0, var_field1, var_field2);
   }
 
   @protected
@@ -1343,6 +1400,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         beatsSecs: final beatsSecs,
         downbeatsSecs: final downbeatsSecs,
         confidence: final confidence,
+        tempoSegments: final tempoSegments,
       ):
         sse_encode_i_32(1, serializer);
         sse_encode_u_64(generation, serializer);
@@ -1353,6 +1411,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         sse_encode_list_prim_f_64_strict(beatsSecs, serializer);
         sse_encode_list_prim_f_64_strict(downbeatsSecs, serializer);
         sse_encode_f_32(confidence, serializer);
+        sse_encode_list_record_f_64_f_64_f_32(tempoSegments, serializer);
       case AnalysisEventWire_Done(
         generation: final generation,
         detail: final detail,
@@ -1407,6 +1466,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_f_64(self.eqLow, serializer);
     sse_encode_f_64(self.eqMid, serializer);
     sse_encode_f_64(self.eqHigh, serializer);
+    sse_encode_f_64(self.cacheFilled, serializer);
   }
 
   @protected
@@ -1488,6 +1548,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_list_record_f_64_f_64_f_32(
+    List<(double, double, double)> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_record_f_64_f_64_f_32(item, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_list_wire_column(
     List<WireColumn> self,
     SseSerializer serializer,
@@ -1517,6 +1589,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     if (self != null) {
       sse_encode_String(self, serializer);
     }
+  }
+
+  @protected
+  void sse_encode_record_f_64_f_64_f_32(
+    (double, double, double) self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_f_64(self.$1, serializer);
+    sse_encode_f_64(self.$2, serializer);
+    sse_encode_f_32(self.$3, serializer);
   }
 
   @protected

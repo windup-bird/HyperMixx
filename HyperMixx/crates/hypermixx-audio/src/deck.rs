@@ -227,6 +227,7 @@ pub struct DeckControls {
     pub loop_active: ControlHandle,
     pub loop_in: ControlHandle,
     pub loop_out: ControlHandle,
+    pub cache_filled: ControlHandle,
     pub fx_type: [ControlHandle; 8],
     pub fx_enable: [ControlHandle; 8],
     pub fx_drywet: [ControlHandle; 8],
@@ -260,6 +261,7 @@ impl DeckControls {
             loop_active: bus.control(&paths::deck_loop_active(index)),
             loop_in: bus.control(&paths::deck_loop_in(index)),
             loop_out: bus.control(&paths::deck_loop_out(index)),
+            cache_filled: bus.control(&paths::deck_cache_filled(index)),
             fx_type: std::array::from_fn(|s| bus.control(&paths::deck_fx_type(index, s))),
             fx_enable: std::array::from_fn(|s| bus.control(&paths::deck_fx_enable(index, s))),
             fx_drywet: std::array::from_fn(|s| bus.control(&paths::deck_fx_drywet(index, s))),
@@ -956,6 +958,20 @@ impl Deck {
             if self.ctl.duration.get() != d {
                 self.ctl.duration.set(d);
             }
+            // 缓存填充进度（0..1；总长未知 → 0）
+            let filled = self
+                .cache
+                .as_ref()
+                .map(|c| {
+                    let total = c.total_frames();
+                    if total == 0 {
+                        0.0
+                    } else {
+                        c.filled_frames() as f64 / total as f64
+                    }
+                })
+                .unwrap_or(0.0);
+            self.ctl.cache_filled.set(filled);
         }
         let mut peak = 0.0f32;
         for v in out.iter().step_by(2).chain(out.iter().skip(1).step_by(2)) {
@@ -1581,6 +1597,7 @@ pub(crate) fn test_filled_cache(secs: f64) -> Arc<TrackCache> {
     let cache = TrackCache::test_new_empty(sr);
     let n = (secs * sr as f64) as u64;
     cache.test_set_total(n);
+    cache.test_set_filled(n); // 全填：cache_filled 总线 = 1.0
     let chunks = n.div_ceil(CHUNK_FRAMES as u64) as usize;
     for k in 0..chunks {
         let mut data = Vec::with_capacity(CHUNK_FRAMES * 2);
@@ -1626,6 +1643,20 @@ mod tests {
 
     /// Keylock profile 引擎延迟（560 帧，spike 实测）折算秒。
     const KEYLOCK_LATENCY_S: f64 = 560.0 / 48000.0;
+
+    /// P23-C：cache_filled 总线 = 已填/总长；未加载 deck 恒 0。
+    #[test]
+    fn cache_filled_reports_progress() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache(&bus, 4.0, 0.0);
+        run_frames(&mut d, 256);
+        assert_eq!(d.ctl.cache_filled.get(), 1.0, "全填缓存应 1.0");
+        // 未加载 deck（独立 bus 防总线残留）：loaded=false 不写，初值 0
+        let bus2 = hypermixx_core::ControlBus::default();
+        let mut d0 = Deck::new(0, 48_000, &bus2);
+        d0.process(&mut [0.0f32; 512], 256);
+        assert_eq!(d0.ctl.cache_filled.get(), 0.0, "未加载应 0.0");
+    }
 
     /// 处理 frames 帧，返回 (输出峰值, 播放头秒数)。
     fn run_frames(d: &mut Deck, frames: usize) -> (f32, f64) {

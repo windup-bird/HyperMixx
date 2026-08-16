@@ -67,6 +67,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
 
   @protected
+  List<(double, double, double)> dco_decode_list_record_f_64_f_64_f_32(
+    dynamic raw,
+  );
+
+  @protected
   List<WireColumn> dco_decode_list_wire_column(dynamic raw);
 
   @protected
@@ -74,6 +79,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   String? dco_decode_opt_String(dynamic raw);
+
+  @protected
+  (double, double, double) dco_decode_record_f_64_f_64_f_32(dynamic raw);
 
   @protected
   TrackMetadataWire dco_decode_track_metadata_wire(dynamic raw);
@@ -144,6 +152,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
 
   @protected
+  List<(double, double, double)> sse_decode_list_record_f_64_f_64_f_32(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   List<WireColumn> sse_decode_list_wire_column(SseDeserializer deserializer);
 
   @protected
@@ -153,6 +166,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
+
+  @protected
+  (double, double, double) sse_decode_record_f_64_f_64_f_32(
+    SseDeserializer deserializer,
+  );
 
   @protected
   TrackMetadataWire sse_decode_track_metadata_wire(
@@ -250,6 +268,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_record_f_64_f_64_f_32(
+    List<(double, double, double)> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_wire_column(
     List<WireColumn> self,
     SseSerializer serializer,
@@ -263,6 +287,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_record_f_64_f_64_f_32(
+    (double, double, double) self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_track_metadata_wire(

@@ -259,6 +259,7 @@ fn deck_snapshot(bus: &ControlBus, deck: usize) -> DeckSnapshotWire {
         eq_low: bus.get(&paths::deck_eq_low(deck)),
         eq_mid: bus.get(&paths::deck_eq_mid(deck)),
         eq_high: bus.get(&paths::deck_eq_high(deck)),
+        cache_filled: bus.get(&paths::deck_cache_filled(deck)),
     }
 }
 
@@ -357,6 +358,7 @@ fn to_wire(ev: AnalysisEvent) -> AnalysisEventWire {
             beats_secs,
             downbeats_secs,
             confidence,
+            tempo_segments,
         } => AnalysisEventWire::TrackAnalysis {
             generation,
             bpm,
@@ -366,6 +368,7 @@ fn to_wire(ev: AnalysisEvent) -> AnalysisEventWire {
             beats_secs: beats_secs.into_vec(),
             downbeats_secs: downbeats_secs.into_vec(),
             confidence,
+            tempo_segments,
         },
         AnalysisEvent::Done {
             generation,
@@ -584,6 +587,7 @@ mod tests {
             beats_secs: Box::new([]),
             downbeats_secs: Box::new([]),
             confidence: 0.0,
+            tempo_segments: Vec::new(),
         })
         .unwrap();
         // 当前代低置信：事件转发但 grid 总线保留旧网格
@@ -595,6 +599,7 @@ mod tests {
             beats_secs: Box::new([]),
             downbeats_secs: Box::new([]),
             confidence: 0.2,
+            tempo_segments: Vec::new(),
         })
         .unwrap();
         assert_eq!(bus.get(&paths::deck_grid_bpm(0)), 120.0, "低置信不写 grid_bpm");
@@ -612,6 +617,7 @@ mod tests {
             beats_secs: Box::new([]),
             downbeats_secs: Box::new([]),
             confidence: 1.0,
+            tempo_segments: Vec::new(),
         })
         .unwrap();
         drop(tx); // 关通道结束转发线程
@@ -702,6 +708,7 @@ mod tests {
             beats_secs: Box::new([]),
             downbeats_secs: Box::new([]),
             confidence: 0.95,
+            tempo_segments: Vec::new(),
         });
         match w {
             AnalysisEventWire::TrackAnalysis {

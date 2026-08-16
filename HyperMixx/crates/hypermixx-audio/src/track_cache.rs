@@ -403,6 +403,10 @@ impl TrackCache {
     pub(crate) fn test_set_total(&self, n: u64) {
         self.total_frames.store(n, Ordering::Relaxed);
     }
+    /// 模拟填充进度（filler 线程的 filled_prefix 更新；测试 rig 手填）。
+    pub(crate) fn test_set_filled(&self, n: u64) {
+        self.filled_prefix.store(n, Ordering::Relaxed);
+    }
     pub(crate) fn test_set_eof(&self, n: u64) {
         self.mark_eof(n);
     }
