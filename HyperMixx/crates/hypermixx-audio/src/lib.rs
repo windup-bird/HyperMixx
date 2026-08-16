@@ -1,7 +1,6 @@
 //! HyperMixx 音频引擎：输出后端、解码/缓存读取、deck 实时处理、DSP。
 
 pub mod backend;
-pub mod caching_reader;
 pub mod deck;
 pub mod decode;
 pub mod dsp;

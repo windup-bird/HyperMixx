@@ -17,9 +17,11 @@ use std::thread::{self, JoinHandle};
 
 use anyhow::{Result, anyhow};
 
-use crate::caching_reader::CHUNK_FRAMES;
 use crate::decode::{To48k, TrackDecoder};
 
+/// 块帧数（P23 Phase B 起由 TrackCache 定义——caching_reader.rs 已删，
+/// 原常量随迁）。
+pub const CHUNK_FRAMES: usize = 2048;
 /// 30 分钟 48k 硬上限（帧数）：超限 open 报错，v1 不做流式降级。
 pub const MAX_TRACK_FRAMES: u64 = 30 * 60 * 48_000;
 /// 块槽数 = ceil(MAX / CHUNK_FRAMES)。空壳 ≈1.4MB/deck，逐块懒分配。

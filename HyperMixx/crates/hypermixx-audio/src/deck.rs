@@ -8,14 +8,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::caching_reader::CHUNK_FRAMES;
 use crate::dsp::deck_filter::DeckFilter;
 use crate::dsp::eq::ThreeBandEq;
 use crate::dsp::pitch::PitchShifter;
 use crate::dsp::smoother::Smoother;
 use crate::fx::{EffectId, FxContext, FxRack, manifest};
 use crate::keylocker::{Keylocker, TimestretchLocker};
-use crate::track_cache::TrackCache;
+use crate::track_cache::{CHUNK_FRAMES, TrackCache};
 use hypermixx_core::{BeatClock, BeatGrid, ControlHandle};
 
 /// 引擎块帧数（与 Engine::BLOCK_FRAMES 一致；deck 侧不依赖 engine 模块）。
@@ -55,11 +54,15 @@ const FADER_TAKEOVER_EPS: f64 = 0.5;
 /// 穿过；触摸跳变（大步）不视为穿过/离开——推子未回位不生效。
 const FADER_STEP_MAX: f64 = 3.0;
 
-// ---- P10.3 loop 无 reset 回绕（deck 侧缓冲喂入）----
-/// P22-A 接缝交叉淡化长度（帧）：4ms@48k。Phase B 重做 loop 时恢复
-///（圈首 blend 用）；Phase A loop 走块首回跳临时降级（LoopBuf/LoopFeed
-/// 捕获状态机已删，见 Phase B 计划）。
-const _LOOP_BLEND_FRAMES: usize = 192;
+// ---- P23 Phase B loop 缓存窗口循环喂入 ----
+/// 接缝交叉淡化长度（帧）：4ms@48k。圈首 blend = 尾(lo−bl..lo) 淡出 ×
+/// 头(li..li+bl) 淡入（等功率）；偏移入环 entry blend = 刚喂内容淡出 ×
+/// 入环位置淡入。固定数组预计算，音频线程零分配。
+const LOOP_BLEND_FRAMES: usize = 192;
+/// sync leader 跳变判定（拍）：连续两块 leader 快照位置差超此值 = 跳转
+///（beatjump/seek/loop 回绕——正常推进每块 <0.02 拍 @200bpm 极限），
+/// follower 重新对齐（P14「操作后不再自动对拍」仅限 follower 自身操作）。
+const SYNC_LEADER_JUMP_BEATS: f64 = 0.5;
 
 
 /// 音轨总帧数（48kHz 时间轴），由读取线程在 EOF 时写入。
@@ -133,13 +136,56 @@ pub struct Deck {
     slider_takeover: bool,
 
     // beat loop（秒；外部跳转出环时引擎清零 active，bus 与字段同步写）
-    // P23 Phase A 临时降级：无捕获状态机，越界走块首回跳（Phase B 重做）。
     loop_active: bool,
     loop_in: f64,
     loop_out: f64,
     /// P11.1 收尾圈完成后的线性显示锚点：pos = pos_base + source_position()。
     /// seek/load/引擎重建清空（坐标系重建）。
     pos_base: Option<f64>,
+
+    // ---- P23 Phase B loop 环状态（缓存窗口循环喂入，无捕获无 reset）----
+    /// 环喂入已初始化（feed 已到 li 且激活沿已处理；此后 feed 走环分支）。
+    loop_ring: bool,
+    /// 关环沿（loop_active true→false）：等当前圈喂完（cursor 回绕）退出。
+    loop_exiting: bool,
+    /// 环长（帧）：(loop_out − loop_in) × sr，激活时冻结（激活中改参数 =
+    /// 退出重建，loop_len 随即更新）。
+    loop_len: u64,
+    /// 入环偏移（帧）：d = (feed_pos − li) mod len——入环瞬间的环内相位。
+    loop_offset: u64,
+    /// 入环判别：true = 偏移入环（feed ≥ lo：内容跳变 + reset 重锚），
+    /// false = 连续入环（feed ∈ [li, lo)：不 reset，折返从入环相位起）。
+    /// finish 退出公式与 wrap 记账在 true 上分派——不能拿 loop_offset > 0
+    /// 判别（连续入环也有 d = 入环相位 > 0，会误入偏移公式）。
+    loop_offset_engage: bool,
+    /// 环内喂入游标（0..len，圈界回绕）。
+    loop_cursor: u64,
+    /// 退出锚点基准：feed_pos 停驻值（常规 = loop_out；偏移 = 入环位置 P）。
+    loop_feed_base: u64,
+    /// 环期间累计喂入帧（偏移路径退出锚点 Δ = feed_pos − base − pushed）。
+    loop_pushed: u64,
+    /// 折返/退出锚点基准：入环瞬间（或 reset 后）source_position。
+    loop_sp_anchor: f64,
+    /// 圈首 blend 段起点（0 = 标准圈首；entry blend 用入环偏移 d）。
+    /// u64::MAX = 当前无 entry 段（wrap blend 每圈从 0 起，无需标记）。
+    loop_entry_at: u64,
+    /// entry blend 长度（帧；0 = 无 entry blend——连续入环不需要）。
+    loop_entry_len: usize,
+    /// 圈首 wrap blend（尾×头等功率，192 帧，入环时预计算全程复用）。
+    loop_wrap_blend: [f32; LOOP_BLEND_FRAMES * 2],
+    loop_wrap_blend_len: usize,
+    /// 环尚未完成首次回绕（入环相位 d < blend 长度时，首圈 cursor<bl
+    /// 区必须喂原始内容——wrap blend 起点接续的是 lo−1 的已听内容，
+    /// 中途入环时接不上，喂 blend 会 click）。
+    loop_first_circle: bool,
+    /// 偏移入环 entry blend（刚喂内容淡出 × 入环位置淡入，一次性）。
+    loop_entry_blend: [f32; LOOP_BLEND_FRAMES * 2],
+    /// P23-B 量化边沿：上次处理的 loop_in/loop_out 总线值（None = 未初始）
+    /// ——写入时 snap 到 beatgrid 拍线并写回总线（起点终点全部对齐）。
+    loop_in_sent: Option<f64>,
+    loop_out_sent: Option<f64>,
+    /// P23-B sync：上一块 leader 快照位置（秒）——跳变检测重新对齐。
+    last_leader_pos: Option<f64>,
 
     // DSP
     eq: ThreeBandEq,
@@ -276,6 +322,24 @@ impl Deck {
             loop_in: 0.0,
             loop_out: 0.0,
             pos_base: None,
+            loop_ring: false,
+            loop_exiting: false,
+            loop_first_circle: false,
+            loop_len: 0,
+            loop_offset: 0,
+            loop_offset_engage: false,
+            loop_cursor: 0,
+            loop_feed_base: 0,
+            loop_pushed: 0,
+            loop_sp_anchor: 0.0,
+            loop_entry_at: u64::MAX,
+            loop_entry_len: 0,
+            loop_wrap_blend: [0.0; LOOP_BLEND_FRAMES * 2],
+            loop_wrap_blend_len: 0,
+            loop_entry_blend: [0.0; LOOP_BLEND_FRAMES * 2],
+            loop_in_sent: None,
+            loop_out_sent: None,
+            last_leader_pos: None,
             eq: ThreeBandEq::new(sr as f32),
             filter: DeckFilter::new(sr as f32),
             gain: Smoother::new(1.0, coeff as f32),
@@ -317,8 +381,13 @@ impl Deck {
         self.loop_active = self.ctl.loop_active.get() > 0.5;
         self.loop_in = self.ctl.loop_in.get().max(0.0);
         self.loop_out = self.ctl.loop_out.get().max(0.0);
-        // P23 Phase A：P18 边沿检测（prepare_loop_capture）已删——loop 统一
-        // 走块首越界回跳临时降级（Phase B 重做捕获/回喂机制）。
+        // P23-B loop 量化（ManualLoop In/Out 起点终点全部对齐 beatgrid）：
+        // 总线 loop_in/out 写入时（值变化边沿）snap 到拍线并写回（UI 快照
+        // 读回一致；引擎自身回写已 snap，幂等）。无网格（bpm≤0）保持原始
+        // 值不量化。引擎写回发生在 update_params 内，快照线程读到的就是
+        // 对齐后的值，Flutter 侧只需传原始 playhead。
+        self.snap_loop_bounds();
+        self.handle_loop_edge();
         // P14：sync 边沿检测（rate 段用上一块状态）。
         let sync_was_on = self.sync;
         self.sync = self.ctl.sync.get() > 0.5;
@@ -435,16 +504,237 @@ impl Deck {
             self.rack.set_slot_params(slot, enabled, drywet, params);
         }
 
-        // beat loop 回跳（仅播放中）。P23 Phase A 临时降级：所有环走块首
-        // 越界回跳（旧超限环 reset 路径，每圈全预卷 seek ≈33ms 静音；
-        // Phase B 重做缓存窗口循环喂入）。
-        if self.loop_active
-            && self.playing
-            && self.loop_out > self.loop_in
-            && self.pos >= self.loop_out * self.sr
-        {
-            self.seek_internal(self.loop_in, false);
+    }
+
+    /// P23-B loop 量化边沿：loop_in/out 总线写入（值变化）→ snap 到
+    /// beatgrid 拍线（无网格不量化），写回总线保持 UI 一致。起点 = 最近
+    /// 拍线（grid.snap）；终点 = 最近拍线，且距起点不足半拍时补足 1 拍
+    /// （保底整拍，P21 语义保留）；起点无效（0 或 ≥ 终点）时回拉起点 =
+    /// 终点 − 4 拍（P21 默认拍数）。全部用 grid 拍长（60/grid_bpm 源拍域
+    /// ——旧 ManualLoop 用输出拍长 60/(grid×rate)，rate≠1 时终点错位）。
+    fn snap_loop_bounds(&mut self) {
+        let grid = BeatGrid {
+            bpm: self.ctl.grid_bpm.get(),
+            offset_secs: self.ctl.grid_offset.get(),
+        };
+        let raw_in = self.loop_in;
+        let raw_out = self.loop_out;
+        if self.loop_in_sent != Some(raw_in) {
+            self.loop_in_sent = Some(raw_in);
+            if raw_in > 0.0 && grid.is_valid() {
+                let snapped = grid.snap(raw_in).max(0.0);
+                if (snapped - raw_in).abs() > 1e-9 {
+                    self.loop_in = snapped;
+                    self.ctl.loop_in.set(snapped);
+                }
+            }
         }
+        if self.loop_out_sent != Some(raw_out) {
+            self.loop_out_sent = Some(raw_out);
+            if raw_out > 0.0 && grid.is_valid() {
+                // 终点 snap 到拍线；起点已 snap（同一块先处理 in 边沿，
+                // 拍线 + 整拍 → 终点必在拍线上）。保底判断用原始 out 距
+                // 起点的拍距（P21 语义：Out 与 In 同拍 → 不足半拍 → 补足
+                // 1 拍——snap 后的 out 距可能已缩到 0，误判无效起点回拉）。
+                let period = grid.period_secs();
+                let mut snapped = grid.snap(raw_out).max(0.0);
+                let in_valid = self.loop_in > 0.0 && self.loop_in < raw_out - 1e-9;
+                if in_valid && raw_out - self.loop_in < 0.5 * period {
+                    snapped = self.loop_in + period; // 保底 1 拍（P21 语义）
+                } else if !in_valid {
+                    // 无有效起点（未设 or 起点 ≥ 终点）：回拉起点 = 终点 −
+                    // 4 拍（P21 默认拍数），snap 到拍线
+                    let in_pull = grid.snap(snapped - 4.0 * period).max(0.0);
+                    self.loop_in = in_pull;
+                    self.ctl.loop_in.set(in_pull);
+                }
+                if (snapped - raw_out).abs() > 1e-9 {
+                    self.loop_out = snapped;
+                    self.ctl.loop_out.set(snapped);
+                }
+            }
+        }
+    }
+
+    // ---- P23 Phase B：环状态机（激活即入，无捕获无 reset）----
+    // 状态：loop_ring（环喂入中）/ loop_exiting（关环沿，收尾圈后退出）。
+    // 事件：激活沿 → init_loop_ring（feed≥li 立即入环，d=(feed−li) mod len；
+    //   feed<li 保持线性喂，feed 推进到 li 后下块 init）；关环沿 → exiting
+    //   （wrap 处 finish）；激活中 in/out 变化（len 变化）→ 立即退出重建。
+
+    /// 激活沿/参数变化处理（update_params 每块调用）。
+    fn handle_loop_edge(&mut self) {
+        let active = self.loop_active && self.loop_out > self.loop_in;
+        if active && self.loop_exiting {
+            self.loop_exiting = false; // 收尾圈中重新激活：环继续
+        }
+        if active && self.loop_ring && !self.loop_exiting {
+            // 激活中 in/out 参数变化（len 变）→ 内容跳变：min-preroll seek
+            // 到当前显示位置折叠进新环（declick 兜底 + 环相位重建；先重算
+            // wrap blend——旧环长下预计算的 blend 对新边界已失效）。
+            let new_len = ((self.loop_out - self.loop_in) * self.sr).max(0.0) as u64;
+            if new_len > 0 && new_len != self.loop_len {
+                let li = (self.loop_in * self.sr) as u64;
+                self.build_wrap_blend(li, li + new_len, new_len);
+                let rel = (self.pos as i64 - li as i64).rem_euclid(new_len as i64) as u64;
+                self.seek_internal((li as f64 + rel as f64) / self.sr, true);
+                return;
+            }
+        }
+        if active && !self.loop_ring {
+            self.init_loop_ring();
+        } else if !active && self.loop_ring && !self.loop_exiting {
+            self.loop_exiting = true; // 关环沿：喂完当前圈退出
+        }
+    }
+
+    /// 入环初始化：d = (feed_pos − li) mod len；feed 在 [li, lo) = 连续入环
+    ///（不 reset，折返从入环相位起，退出续点 = lo）；feed ≥ lo = 偏移入环
+    ///（内容跳变：entry blend + reset 重锚到 li+d，退出续点 = P + k×len）。
+    /// feed < li = pending（保持线性喂，feed 推进后下块重试）。
+    fn init_loop_ring(&mut self) {
+        let li = (self.loop_in * self.sr) as u64;
+        let lo = (self.loop_out * self.sr) as u64;
+        if lo <= li {
+            return;
+        }
+        if self.feed_pos < li {
+            return; // pending
+        }
+        let len = lo - li;
+        self.loop_len = len;
+        self.loop_offset = (self.feed_pos - li) % len;
+        self.loop_cursor = self.loop_offset;
+        self.loop_pushed = 0;
+        self.loop_entry_at = u64::MAX;
+        self.loop_entry_len = 0;
+        self.build_wrap_blend(li, lo, len);
+        if self.feed_pos >= lo {
+            // 偏移入环：内容跳变 → entry blend + keylocker 重锚
+            self.loop_offset_engage = true;
+            self.loop_first_circle = false; // entry blend 处理 [d, d+bl)
+            self.build_entry_blend(li, len);
+            self.loop_feed_base = self.feed_pos; // 退出续点基准 P
+            // feed_pos 保持 P（每圈 +len 记账，见 loop_wrap_check wrap）
+            if let Some(kl) = self.keylocker.as_mut() {
+                kl.set_track_position(li + self.loop_offset);
+                self.loop_sp_anchor = kl.source_position();
+            }
+        } else {
+            // 连续入环：feed_pos 置 lo（退出续点）。
+            // 首圈 cursor<bl 区喂原始内容（中途入环时 wrap blend 起点
+            // 接续的是 lo−1，接不上入环相位——首圈禁用，wrap 后启用）。
+            self.loop_offset_engage = false;
+            self.loop_first_circle = true;
+            self.loop_feed_base = lo;
+            self.feed_pos = lo;
+        }
+        self.loop_ring = true;
+    }
+
+    /// 圈首 wrap blend：尾(lo−bl..lo) 淡出 × 头(li..li+bl) 淡入（等功率
+    /// cos/sin，192 帧封顶）。内容恒定 → 入环时预计算，全程复用。
+    fn build_wrap_blend(&mut self, li: u64, lo: u64, len: u64) {
+        self.loop_wrap_blend_len = 0;
+        // 钳半（旧 P22-A 语义）：blend 区 [0, bl) 与尾区 [len−bl, len) 不得
+        // 重叠（重叠 = 同一帧既作淡出又作淡入，短环取错样本）。
+        let bl = LOOP_BLEND_FRAMES.min(len as usize / 2);
+        if bl == 0 {
+            return;
+        }
+        let Some(cache) = self.cache.as_ref() else { return };
+        let mut tail = [0.0f32; LOOP_BLEND_FRAMES * 2];
+        let mut head = [0.0f32; LOOP_BLEND_FRAMES * 2];
+        let got_t = cache.copy_ready(&mut tail[..bl * 2], lo - bl as u64, bl);
+        let got_h = cache.copy_ready(&mut head[..bl * 2], li, bl);
+        if got_t == 0 || got_h == 0 {
+            return; // 未填区欠载：无 blend（seek/欠载路径已有 declick 兜底）
+        }
+        let use_len = got_t.min(got_h);
+        for i in 0..use_len {
+            let t = ((i as f32 + 0.5) / use_len as f32) * (std::f32::consts::PI / 2.0);
+            let (g_out, g_in) = (t.cos(), t.sin());
+            for ch in 0..2 {
+                self.loop_wrap_blend[i * 2 + ch] =
+                    tail[i * 2 + ch] * g_out + head[i * 2 + ch] * g_in;
+            }
+        }
+        self.loop_wrap_blend_len = use_len;
+    }
+
+    /// 偏移入环 entry blend：刚喂内容（缓存[P−bl..P)，P = 入环 feed 位置）
+    /// 淡出 × 入环位置（缓存[li+d..li+d+bl)）淡入——旧 P22-B feed_tail
+    /// 重建的缓存直读等价（feed 尾帧 = 缓存[P−bl..P)，全曲预解码免费）。
+    fn build_entry_blend(&mut self, li: u64, len: u64) {
+        self.loop_entry_len = 0;
+        self.loop_entry_at = u64::MAX;
+        let d = self.loop_offset;
+        let bl = LOOP_BLEND_FRAMES.min(len.saturating_sub(d) as usize);
+        if bl == 0 {
+            return;
+        }
+        let Some(cache) = self.cache.as_ref() else { return };
+        let p = self.loop_feed_base;
+        let fade_out_start = p.saturating_sub(bl as u64);
+        let mut tail = [0.0f32; LOOP_BLEND_FRAMES * 2];
+        let mut head = [0.0f32; LOOP_BLEND_FRAMES * 2];
+        let got_t = cache.copy_ready(&mut tail[..bl * 2], fade_out_start, bl);
+        let got_h = cache.copy_ready(&mut head[..bl * 2], li + d, bl);
+        if got_t == 0 || got_h == 0 {
+            return;
+        }
+        let use_len = got_t.min(got_h);
+        for i in 0..use_len {
+            let t = ((i as f32 + 0.5) / use_len as f32) * (std::f32::consts::PI / 2.0);
+            let (g_out, g_in) = (t.cos(), t.sin());
+            for ch in 0..2 {
+                self.loop_entry_blend[i * 2 + ch] =
+                    tail[i * 2 + ch] * g_out + head[i * 2 + ch] * g_in;
+            }
+        }
+        self.loop_entry_len = use_len;
+        self.loop_entry_at = d;
+    }
+
+    /// 环退出：pos_base 重锚 + 清环态（feed_pos 已是线性续点）。
+    /// `immediate`：激活中参数变化（内容已跳，播头锚定当前显示位置）；
+    /// false：收尾圈完成（常规 = 折返公式，偏移 = feed 记账）。
+    fn finish_loop_ring(&mut self, immediate: bool) {
+        if immediate {
+            if let Some(kl) = self.keylocker.as_ref() {
+                self.pos_base = Some(self.pos - kl.source_position());
+            }
+        } else if self.loop_offset_engage {
+            // 偏移路径：音频切回线性续点 P+k×len（feed_pos 已累计），
+            // 播头随声音跳（有符号中间量：偏移路径 Δ = k×len − pushed）
+            self.pos_base = Some(
+                (self.feed_pos as i64 - self.loop_feed_base as i64 - self.loop_pushed as i64)
+                    as f64,
+            );
+        } else if let Some(kl) = self.keylocker.as_ref() {
+            // 常规路径：音频 = 环相位连续续进（[li,lo) 接 lo 无缝），
+            // 播头 = 可闻位置（位置模反解当前标签：显示 = sp 恒等）。
+            // 不能用 (sp−anchor) 旧锚折返——引擎管线深度随喂入节奏
+            // 漂移（冷启动预填 3376 → 环中 3250），旧锚在退出时产生
+            // stale 结果；位置模 (sp−li−d) 与环显示同式，退出无缝。
+            // 收尾圈完成处 sp−li−d = len−in-flight < len（无回绕）→
+            // pos_base = 0，显示 = sp = 线性契约。
+            let sp = kl.source_position();
+            let li = (self.loop_in * self.sr) as u64;
+            let d = self.loop_offset;
+            let folded = (sp - (li + d) as f64).rem_euclid(self.loop_len as f64);
+            self.pos_base = Some((li + d) as f64 + folded - sp);
+        }
+        self.loop_ring = false;
+        self.loop_exiting = false;
+        self.loop_first_circle = false;
+        self.loop_len = 0;
+        self.loop_offset = 0;
+        self.loop_cursor = 0;
+        self.loop_pushed = 0;
+        self.loop_entry_at = u64::MAX;
+        self.loop_entry_len = 0;
+        self.loop_wrap_blend_len = 0;
     }
 
     /// 块首拍上下文（process 内调用：sync 可能在 update_params 之后改
@@ -565,6 +855,17 @@ impl Deck {
             return;
         }
         let target = (leader.grid_bpm * leader.tempo_rate / fgrid.bpm).clamp(0.5, 2.0);
+
+        // P23-B：leader 位置跳变（beatjump/seek/loop 回绕——正常推进每块
+        // <0.02 拍 @200bpm 极限，阈值 0.5 拍）→ 重新对齐。follower 自身
+        // 的微调/seek 不改变 leader 位置 → 不触发（P14「操作后不再自动
+        // 对拍」保持，只对 follower 侧成立）。
+        if let Some(last) = self.last_leader_pos
+            && (leader.position_secs - last).abs() > SYNC_LEADER_JUMP_BEATS * fgrid.period_secs()
+        {
+            self.sync_align_done = false;
+        }
+        self.last_leader_pos = Some(leader.position_secs);
 
         // P14：开启沿一次性快速对齐（相位差 wrap 到 ±0.5 拍，指数衰减
         // nudge）；收敛进死区后置位 sync_align_done，此后仅速率锁。
@@ -704,9 +1005,24 @@ impl Deck {
             out[i * 2 + 1] *= g;
         }
         // 播头 = fed 坐标 + 音轨锚点（source_position 延迟补偿、欠载冻结）；
-        // P23 Phase A：FromBuffer 折返分支已删（loop 走块首回跳）。
+        // P23 Phase B：环期间折返映射回 [loop_in, loop_out)（source_position
+        // 是累计帧，锚点不归零）；收尾圈退出后 pos_base 重锚 → 线性续进。
         let sp = kl.source_position();
-        self.pos = if let Some(base) = self.pos_base {
+        self.pos = if self.loop_ring {
+            let len = self.loop_len;
+            let li = (self.loop_in * self.sr) as u64;
+            let d = self.loop_offset;
+            if self.loop_offset_engage {
+                // 偏移路径：advance-mod（入环瞬间锚定，旧 P22-B 显示语义——
+                // engage 立即折返 li+d，长跑不出 [li+d, li+d+len)）
+                li as f64 + d as f64 + (sp - self.loop_sp_anchor).rem_euclid(len as f64)
+            } else {
+                // 连续路径：位置模 = 可闻位置相位（标签 = 内容坐标，
+                // sp−li−d ∈ [−L, len−L)，负值折叠回环；与 finish 同式
+                // 退出无缝，管线深度变化不产生 stale 折叠）
+                li as f64 + d as f64 + (sp - (li + d) as f64).rem_euclid(len as f64)
+            }
+        } else if let Some(base) = self.pos_base {
             base + sp
         } else {
             self.feed_base as f64 + sp
@@ -732,23 +1048,22 @@ impl Deck {
         let ctx = self.fx_context();
         for i in 0..frames {
             let (l, r) = if self.playing && self.loaded {
-                if n > 0 && self.pos >= n as f64 {
-                    // 播放到结尾：停；若 loop_out 钳制在曲尾则回跳续环
-                    // （引擎路径块首检查覆盖此情形，legacy 逐帧推进须特判）
-                    if self.loop_active && self.loop_out * self.sr >= n as f64 {
-                        self.seek_internal(self.loop_in, false);
-                        match self.read_stereo(self.pos) {
-                            Some((l, r)) => {
-                                self.pos += self.rate;
-                                (l, r)
-                            }
-                            None => (0.0, 0.0),
+                // P23 Phase B：legacy 环 = 逐帧回绕（fallback 无 blend，
+                // 旧实现仅曲尾钳制回跳，现统一任意环越界回绕）
+                if self.loop_active && self.pos >= self.loop_out * self.sr {
+                    self.pos = self.loop_in * self.sr;
+                    match self.read_stereo(self.pos) {
+                        Some((l, r)) => {
+                            self.pos += self.rate;
+                            (l, r)
                         }
-                    } else {
-                        self.playing = false;
-                        self.ctl.play.set(0.0);
-                        (0.0, 0.0)
+                        None => (0.0, 0.0),
                     }
+                } else if n > 0 && self.pos >= n as f64 {
+                    // 播放到结尾：停
+                    self.playing = false;
+                    self.ctl.play.set(0.0);
+                    (0.0, 0.0)
                 } else {
                     match self.read_stereo(self.pos) {
                         Some((l, r)) => {
@@ -809,6 +1124,14 @@ impl Deck {
             .unwrap()
             .demand_hint(engine_frames, MAX_ENGINE_RATE);
         while self.keylocker.as_ref().unwrap().occupied_frames() < want && !self.eof_fed {
+            // P23 Phase B：环喂入（缓存窗口循环，无捕获无 reset；EOF 不
+            // 涉及——环内容恒在缓存内，未填块 = 欠载 break）
+            if self.loop_ring {
+                if !self.feed_loop_segment() {
+                    break; // 引擎 ring 满 或 欠载
+                }
+                continue;
+            }
             // 曲尾：冲刷 resampler lookahead（finish 失败下一块重试）。
             if n > 0 && self.feed_pos >= n {
                 self.eof_fed = self.keylocker.as_mut().unwrap().finish();
@@ -843,6 +1166,92 @@ impl Deck {
             }
             self.feed_pos += accepted as u64;
         }
+    }
+
+    /// 环喂入：从缓存循环读 [li, li+len)（cursor 0..len 回绕），段界 =
+    /// entry blend 段 / 圈首 wrap blend 段 / 整圈（普通段）。返回 false =
+    /// 引擎 ring 满 或 缓存欠载（播头冻结，request_priority 跳填）。
+    /// 圈界回绕时：偏移路径 feed_pos += len（退出续点记账）；loop_exiting
+    /// 时收尾圈完成 → finish_loop_ring（退出锚点 + 切线性续喂）。
+    fn feed_loop_segment(&mut self) -> bool {
+        let li = (self.loop_in * self.sr) as u64;
+        let len = self.loop_len;
+        let cache = match &self.cache {
+            Some(c) => c,
+            None => return true,
+        };
+        // entry 段已喂完 → 失效（后续圈首走 wrap blend 段）
+        if self.loop_entry_at != u64::MAX
+            && self.loop_cursor >= self.loop_entry_at + self.loop_entry_len as u64
+        {
+            self.loop_entry_at = u64::MAX;
+        }
+        // 段界：entry 段 / 圈首 wrap blend 段 / 整圈
+        let in_entry = self.loop_entry_at != u64::MAX
+            && self.loop_cursor >= self.loop_entry_at;
+        let (src, base, seg_end): (&[f32], u64, u64) = if in_entry {
+            (
+                &self.loop_entry_blend,
+                self.loop_entry_at,
+                self.loop_entry_at + self.loop_entry_len as u64,
+            )
+        } else if !self.loop_first_circle && self.loop_cursor < self.loop_wrap_blend_len as u64 {
+            (&self.loop_wrap_blend, 0, self.loop_wrap_blend_len as u64)
+        } else {
+            // 普通段：缓存直拷（分段到 CHUNK_FRAMES；段界 = 圈界 → 不跨圈）
+            let seg_end = len;
+            let start = li + self.loop_cursor;
+            let n = (seg_end - self.loop_cursor).min(CHUNK_FRAMES as u64) as usize;
+            let got = cache.copy_ready(&mut self.feed_scratch, start, n);
+            if got == 0 {
+                cache.request_priority(start);
+                return false; // 欠载：播头冻结（等 filler）
+            }
+            let accepted = self
+                .keylocker
+                .as_mut()
+                .unwrap()
+                .push(&self.feed_scratch[..got * 2])
+                .min(got);
+            self.loop_cursor += accepted as u64;
+            self.loop_pushed += accepted as u64;
+            if accepted == 0 {
+                return false; // 引擎 ring 满
+            }
+            return self.loop_wrap_check(li, len);
+        };
+        // blend 段：喂 blend 切片（部分接受时停在段内续推）
+        let start_idx = (self.loop_cursor - base) as usize;
+        let n = (seg_end - self.loop_cursor) as usize;
+        let accepted = self
+            .keylocker
+            .as_mut()
+            .unwrap()
+            .push(&src[start_idx * 2..(start_idx + n) * 2])
+            .min(n);
+        self.loop_cursor += accepted as u64;
+        self.loop_pushed += accepted as u64;
+        if accepted == 0 {
+            return false;
+        }
+        self.loop_wrap_check(li, len)
+    }
+
+    /// 圈界回绕：cursor 回 0；偏移路径 feed_pos += len；exiting → 收尾圈
+    /// 完成退出。返回 true（喂入继续）。
+    fn loop_wrap_check(&mut self, _li: u64, len: u64) -> bool {
+        if self.loop_cursor < len {
+            return true;
+        }
+        self.loop_cursor -= len; // accepted ≤ 段长 ≤ len → 至多跨一圈
+        self.loop_first_circle = false; // 已回绕：wrap blend 区启用
+        if self.loop_offset_engage {
+            self.feed_pos += len; // 偏移路径退出续点记账（P + k×len）
+        }
+        if self.loop_exiting {
+            self.finish_loop_ring(false); // 收尾圈完成：退出锚点 + 切线性
+        }
+        true
     }
 
     /// 读取指定帧（48kHz 时间轴）的线性插值立体声采样（缓存直读）。
@@ -933,6 +1342,21 @@ impl Deck {
         self.ctl.loop_active.set(0.0);
         self.ctl.loop_in.set(0.0);
         self.ctl.loop_out.set(0.0);
+        self.loop_ring = false;
+        self.loop_exiting = false;
+        self.loop_len = 0;
+        self.loop_offset = 0;
+        self.loop_offset_engage = false;
+        self.loop_cursor = 0;
+        self.loop_feed_base = 0;
+        self.loop_pushed = 0;
+        self.loop_sp_anchor = 0.0;
+        self.loop_entry_at = u64::MAX;
+        self.loop_entry_len = 0;
+        self.loop_wrap_blend_len = 0;
+        self.loop_in_sent = None; // 新曲网格未就绪，量化边沿重新跟踪
+        self.loop_out_sent = None;
+        self.last_leader_pos = None; // 换曲：leader 位置坐标重建，跳变基准清零
     }
 
     /// 引擎操作：跳转（quantize 开启时吸附到最近拍点）。
@@ -1084,6 +1508,59 @@ impl Deck {
         } else {
             frame
         };
+        // P23 Phase B：环与 seek 交互——
+        // - 落点在环内（调用方已保 active）：重建环相位（内容从落点续喂，
+        //   seek 的 reset+declick 已防 click；统一常规语义，退出续点 = lo）；
+        // - 落点在环外（调用方 deactivate 已清 active）：清环态（seek 后
+        //   线性喂从 read_frame 起，旧环 feed 记账作废）。
+        // 判别用 loop_ring || loop_active（不能只看 active）：beatjump/
+        // seek 出环路径先 deactivate_loop_if_outside 清 active 再进这里，
+        // active 已 false 时残留 loop_ring 必须照样清除——否则显示与
+        // 喂入仍走环分支（播头钳回环内、内容回跳环头）。
+        if (self.loop_ring || self.loop_active)
+            && self.loop_out > self.loop_in
+            && self.keylocker.is_some()
+        {
+            let li = (self.loop_in * self.sr) as u64;
+            let len = ((self.loop_out - self.loop_in) * self.sr) as u64;
+            if len > 0 && read_frame >= li && read_frame < li + len {
+                self.loop_len = len;
+                self.loop_offset = read_frame - li;
+                self.loop_cursor = read_frame - li;
+                // 偏移记账（与激活即入的偏移路径同构）：退出续点 =
+                // read_frame + k×len（seek 后内容从落点续喂，退出续点
+                // 必须跟随落点——旧"常规续点 = lo"会让退出跳回 lo）。
+                self.loop_offset_engage = true;
+                self.loop_feed_base = read_frame;
+                self.feed_pos = read_frame;
+                self.loop_pushed = 0;
+                self.loop_entry_at = u64::MAX;
+                self.loop_entry_len = 0;
+                self.loop_exiting = false;
+                self.loop_ring = true;
+                // 首圈禁用 wrap blend（中途入环接不上 lo−1）；从未建过
+                // blend（激活即 pending、先 seek 后入环）时补建。
+                self.loop_first_circle = true;
+                if self.loop_wrap_blend_len == 0 {
+                    self.build_wrap_blend(li, li + len, len);
+                }
+                if let Some(kl) = self.keylocker.as_ref() {
+                    self.loop_sp_anchor = kl.source_position();
+                }
+            } else {
+                self.loop_ring = false;
+                self.loop_exiting = false;
+                self.loop_first_circle = false;
+                self.loop_len = 0;
+                self.loop_offset = 0;
+                self.loop_offset_engage = false;
+                self.loop_cursor = 0;
+                self.loop_pushed = 0;
+                self.loop_entry_at = u64::MAX;
+                self.loop_entry_len = 0;
+                self.loop_wrap_blend_len = 0;
+            }
+        }
         self.epoch = self.epoch.wrapping_add(1);
         // 未填区由 filler 按 priority 跳填（seek 落点在已填区时无害 no-op）
         if let Some(cache) = &self.cache {
@@ -3156,4 +3633,481 @@ mod tests {
         }
     }
 
+    // ---------- P23 Phase B：环状态机（缓存窗口循环喂入） ----------
+
+    /// 锯齿缓存（周期 = period 帧，值 = 相位×0.5）：圈界跳变 0.5 的
+    /// 接缝 fixture（同旧 loop_wrap_seam_blend_no_click）。本地内容
+    /// 平滑（192 帧斜率 ≈0.005）→ 无 blend 时的圈界跳变必爆 Δ 断言。
+    fn saw_cache(secs: f64, period: usize) -> Arc<TrackCache> {
+        let cache = TrackCache::test_new_empty(48_000);
+        let n = (secs * 48000.0) as u64;
+        cache.test_set_total(n);
+        let chunks = n.div_ceil(CHUNK_FRAMES as u64) as usize;
+        for k in 0..chunks {
+            let mut data = Vec::with_capacity(CHUNK_FRAMES * 2);
+            for f in 0..CHUNK_FRAMES {
+                let phase = ((k * CHUNK_FRAMES + f) % period) as f32 / period as f32;
+                let s = phase * 0.5;
+                data.push(s);
+                data.push(s);
+            }
+            cache.test_set_chunk(k, data.into_boxed_slice());
+        }
+        cache
+    }
+
+    /// 最大 2 帧步进增量（左声道）：click = 大步跳变（无 blend 的圈界
+    /// 跳变 0.5 必爆；blend 摊到 192 帧后 Δ≈0.005）。
+    fn max_delta2(rec: &[f32]) -> f32 {
+        let mut max_delta = 0.0f32;
+        for i in 2..rec.len() {
+            max_delta = max_delta.max((rec[i] - rec[i - 2]).abs());
+        }
+        max_delta
+    }
+
+    /// P23-B：bus 激活时 feed < li（pending）→ 线性续喂推进到 li 后
+    /// 连续入环——当块生效、播头折返 [li, lo)、无欠载、6s 不出环。
+    #[test]
+    fn loop_pending_then_engages_at_loop_in_no_stall() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache(&bus, 8.0, 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let _ = run_frames(&mut d, 256 * 60); // ≈0.32s：feed < li=1.0
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 1.0);
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 3.0);
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 1.0);
+        // 激活后第一块（feed 仍 < li：pending，保持线性）
+        let (peak, _head) = run_frames(&mut d, 256);
+        assert!(peak > 0.4, "pending 期间应继续出声, peak={peak}");
+        // 推进到 feed ≥ li → 连续入环（d ≈ 0..256 帧）
+        let (peak, head) = run_frames(&mut d, 256 * 130); // ≈0.69s：跨过 1.0s
+        assert!(peak > 0.4, "入环后应继续出声（激活即入，无 33ms 静音）, peak={peak}");
+        assert!(head >= 1.0, "播头应折返进 [1,3), head={head}");
+        // 6s：跨 ≥2 次圈首（wrap blend + 首圈禁用后启用）
+        let (peak, head2) = run_frames(&mut d, 48000 * 6);
+        assert!(peak > 0.4, "长环绕应持续出声, peak={peak}");
+        assert!(
+            (1.0..3.15).contains(&head2),
+            "6s 后播头应在环内（首圈偏移 < 0.01s）, head={head2}"
+        );
+        assert!(
+            d.keylocker.as_ref().unwrap().underrun_frames() == 0,
+            "环绕不得欠载（缓存全覆盖）, underrun={}",
+            d.keylocker.as_ref().unwrap().underrun_frames()
+        );
+        assert!(d.loop_ring, "应处于环绕态");
+    }
+
+    /// P23-B：feed ≥ lo 偏移入环——播头立即折返 li+d（内容跳变 +
+    /// entry blend），长跑不出 [li+d, li+d+len)（旧 P22-B 显示语义）。
+    #[test]
+    fn loop_offset_engage_folds_playhead_no_stall() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache(&bus, 8.0, 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let _ = run_frames(&mut d, 256 * 680); // ≈3.63s：feed ≥ lo=3.0
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 1.0);
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 3.0);
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 1.0);
+        let (peak, head) = run_frames(&mut d, 256);
+        assert!(peak > 0.4, "偏移入环当块应出声, peak={peak}");
+        let d_frames = (d.feed_pos - 48000) % 96000; // d = (feed−li) mod len
+        let expect = 1.0 + d_frames as f64 / 48000.0;
+        assert!(
+            (head - expect).abs() < 0.02,
+            "播头应折返到 li+d={expect:.3}, head={head}"
+        );
+        // 长跑：显示不出 [li+d, li+d+len)（旧 P22-B 折返公式语义）
+        let (peak, head2) = run_frames(&mut d, 48000 * 4);
+        assert!(peak > 0.4, "长环绕应持续出声, peak={peak}");
+        assert!(
+            head2 >= expect - 0.05 && head2 < expect + 2.05,
+            "播头应在环相位窗口内, head={head2}"
+        );
+        assert!(d.keylocker.as_ref().unwrap().underrun_frames() == 0);
+        assert!(d.loop_ring);
+    }
+
+    /// P23-B 偏移退出续点：feed 记账 P + k×len——3.52s（660 块）偏移
+    /// 入环（P = 3.515s）、2 个整圈后关环，退出线性续喂从 P+2×len。
+    /// 播头终值 = 墙钟 − 引擎延迟（内容在缓存 12s 内，P 在差中消去）。
+    #[test]
+    fn loop_offset_exit_resumes_at_advanced_feed_pos() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache(&bus, 12.0, 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let _ = run_frames(&mut d, 256 * 660); // ≈3.52s：feed ≥ lo → 偏移入环
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 1.0);
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 3.0);
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 1.0);
+        let _ = run_frames(&mut d, 256 * 470); // ≈2.507s：圈 1 + 圈 2 中途
+        assert!(d.loop_ring);
+        // 偏移会计不变量：退出公式 pos_base = d（feed 记账，见
+        // finish_loop_ring），显示 = pos_base + sp = d + sp。d 此刻捕获
+        //（feed_pos = P + 2×len，(feed_pos−li) mod len 不随圈数变化）。
+        let d_frames = (d.feed_pos - 48000) % 96000;
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 0.0);
+        // 收尾圈（折叠 0.512 → 2.0，≈1.49s）→ 退出，feed 续点 = P+2×len
+        let (peak, head) = run_frames(&mut d, (48000.0 * 4.5) as usize);
+        assert!(peak > 0.4, "退出后应继续出声, peak={peak}");
+        assert!(!d.loop_ring, "收尾圈完成后应已退出");
+        // 退出后线性：播头 = d + sp（sp = 可闻标签，标签随续点跳；
+        // 断言自洽——只验 pos_base = d 不变量，不依赖 sp 与 feed 的
+        // 具体关系，喂入节奏变化不破坏）
+        let sp = d.keylocker.as_ref().unwrap().source_position();
+        assert!(
+            (head * 48000.0 - (sp + d_frames as f64)).abs() < 960.0,
+            "偏移退出后播头应 = 续点标签 + d, head={head}, sp={sp}, d={d_frames}"
+        );
+        assert!(d.keylocker.as_ref().unwrap().underrun_frames() == 0);
+    }
+
+    /// P23-B 常规退出（连续入环）：释放后播头从释放位置线性续进无跳变
+    /// （旧 loop_exit_resumes_linear_without_gap 锚点；收尾圈 + 退出
+    /// 全程每块增量 ≈ 256/48000）。
+    #[test]
+    fn loop_exit_resumes_linear_without_gap() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache(&bus, 8.0, 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let _ = run_frames(&mut d, 256 * 60); // feed < li → pending
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 1.0);
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 3.0);
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 1.0);
+        let _ = run_frames(&mut d, 256 * 470); // ≈2.5s：入环 + 跑 >1 圈
+        assert!(d.loop_ring);
+        let head_at_release = d.ctl.playhead.get();
+        let underrun_before = d.keylocker.as_ref().unwrap().underrun_frames();
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 0.0);
+        // 收尾圈（折叠 1.824 → 2.0）+ 线性 4.0s；播头每块增量 ≈ 256/48000
+        //（显示 = 可闻位置，全程无缝；唯一异常 = 退出块音频 d-回跳
+        //（环内容 [li+d, lo+d) 回 lo 接续：−d ≈ −0.024 ± 喂入节奏抖动
+        // ≤0.006）——允许 −0.035 下界）
+        let mut out = vec![0.0; 256 * 2];
+        let mut prev = d.ctl.playhead.get();
+        for _ in 0..(4.0 * 48000.0 / 256.0) as usize {
+            d.update_params();
+            d.process(&mut out, 256);
+            assert!(out.iter().all(|v| v.is_finite()), "无 NaN");
+            let h = d.ctl.playhead.get();
+            let delta = h - prev;
+            assert!(
+                (-0.035..=256.0 / 48000.0 + 0.005).contains(&delta),
+                "退出过程播头增量应 ≈ 一块（不跳变）, Δ={delta}, head={h}"
+            );
+            prev = h;
+        }
+        let head = d.ctl.playhead.get();
+        // 终值 = 释放位置 + 4.0 − d 回跳（≈0.024）± 喂入节奏抖动（≤0.013）
+        assert!(
+            (head - (head_at_release + 4.0)).abs() < 0.05,
+            "释放后播头应从释放位置线性续进（释放={head_at_release:.3}）, head={head}"
+        );
+        assert!(!d.loop_ring, "应已退出");
+        assert_eq!(
+            d.keylocker.as_ref().unwrap().underrun_frames(),
+            underrun_before,
+            "退出续喂不应产生欠载"
+        );
+    }
+
+    /// P23-B：超旧上限（30s）的长环零欠载——31s 环（缓存 33s）跑
+    /// 32.5s：内容恒在缓存内，无需任何捕获/回填/reset。
+    #[test]
+    fn loop_arbitrary_length_no_reset_path() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache(&bus, 33.0, 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let _ = run_frames(&mut d, 256 * 100); // ≈0.53s
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 0.5);
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 31.5);
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 1.0);
+        let (peak, head) = run_frames(&mut d, 48000 * 32); // ≈32s：跨 1 个整圈
+        assert!(peak > 0.4, "31s 长环应持续出声, peak={peak}");
+        assert!(
+            (0.45..31.65).contains(&head),
+            "长环播头应折返 [0.5, 31.5)（偏移 <0.01s）, head={head}"
+        );
+        assert!(
+            d.keylocker.as_ref().unwrap().underrun_frames() == 0,
+            "长环不得欠载（旧 30s 上限已删，缓存恒覆盖）"
+        );
+        assert!(d.loop_ring);
+    }
+
+    /// P23-B：圈首 wrap blend 无 click（旧锚点改写）——锯齿周期 = 环长
+    /// 的 fixture，圈界跳变 0.5；无 blend 时逐采样 Δ2 必爆 0.1。
+    #[test]
+    fn loop_wrap_seam_blend_no_click() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache_big(&bus, saw_cache(8.0, 24000), 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        // 环 [0, 0.5)：feed=0 时激活 → 连续入环（d=0，首圈原始内容，
+        // 第 2 圈起 wrap blend）
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 0.0);
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 0.5);
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 1.0);
+        let rec = run_capture(&mut d, 1.6); // 3.2 圈：覆盖 ≥2 次 wrap 接缝
+        assert!(rec.iter().all(|v| v.is_finite()), "无 NaN");
+        let max_delta = max_delta2(&rec);
+        assert!(
+            max_delta < 0.1,
+            "圈首接缝逐采样 Δ 过大（blend 未生效）: {max_delta}"
+        );
+        assert!(d.loop_ring);
+        assert!(d.keylocker.as_ref().unwrap().underrun_frames() == 0);
+    }
+
+    /// P23-B（mixi 盲区专项）：变速下圈首接缝同样无 click——rate=0.5
+    /// 时 blend 输出时长 = 192/0.5 = 384 帧，接缝内容连续性不变。
+    #[test]
+    fn loop_wrap_seam_no_click_at_rate_half() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache_big(&bus, saw_cache(8.0, 24000), -50.0); // rate 0.5
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 0.0);
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 0.5);
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 1.0);
+        // rate 0.5：内容消费减半 → 4s 输出 = 2s 内容 = 4 圈
+        let rec = run_capture(&mut d, 4.0);
+        assert!(rec.iter().all(|v| v.is_finite()), "无 NaN");
+        let max_delta = max_delta2(&rec);
+        assert!(
+            max_delta < 0.1,
+            "rate=0.5 圈首接缝 Δ 过大（blend 未生效）: {max_delta}"
+        );
+        assert!(d.keylocker.as_ref().unwrap().underrun_frames() == 0);
+    }
+
+    /// P23-B：激活中 in/out 参数变化（len 变）→ min-preroll seek 重建
+    /// （declick + 新环相位）——播头连续（无 NaN、不出新环、无欠载）。
+    #[test]
+    fn loop_len_change_rebuilds_seamless() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache(&bus, 8.0, 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let _ = run_frames(&mut d, 256 * 60);
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 1.0);
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 3.0);
+        bus.set(&hypermixx_core::paths::deck_loop_active(0), 1.0);
+        let _ = run_frames(&mut d, 256 * 200); // 入环 + 跑 ~1s
+        assert!(d.loop_ring);
+        // Out 重按 → 3.0 → 4.0（len 2s → 3s）：立即重建（新环 [1,4)）
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 4.0);
+        // 2 块：min-preroll 重建块（可能含 warm priming/淡入）+ 收敛块
+        let (peak, head) = run_frames(&mut d, 512);
+        assert!(peak > 0.4, "重建后应出声（无静音）, peak={peak}");
+        assert!((1.0..4.1).contains(&head), "重建后播头应折返进新环, head={head}");
+        let (peak, head2) = run_frames(&mut d, 48000 * 4);
+        assert!(peak > 0.4, "新环应持续出声, peak={peak}");
+        assert!(
+            (1.0..4.1).contains(&head2),
+            "4s 后播头应仍在 [1,4) 内, head={head2}"
+        );
+        assert!(d.keylocker.as_ref().unwrap().underrun_frames() == 0);
+        assert!(d.loop_ring);
+    }
+
+    // ---------- P23-B loop 量化（起点终点全部对齐 beatgrid） ----------
+
+    /// ManualLoop 总线写入离拍 In/Out → 字段与总线都 snap 到拍线
+    ///（120BPM 拍线 = 0.5s 整数倍），幂等。
+    #[test]
+    fn manual_loop_bus_in_out_quantized_to_grid() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache(&bus, 8.0, 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let _ = run_frames(&mut d, 256);
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 1.03);
+        d.update_params();
+        assert!(
+            (d.ctl.loop_in.get() - 1.0).abs() < 1e-9,
+            "loop_in 应 snap 到 1.0, got {}",
+            d.ctl.loop_in.get()
+        );
+        assert!(
+            (bus.get(&hypermixx_core::paths::deck_loop_in(0)) - 1.0).abs() < 1e-9,
+            "总线应写回对齐值"
+        );
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 3.02);
+        d.update_params();
+        assert!(
+            (d.ctl.loop_out.get() - 3.0).abs() < 1e-9,
+            "loop_out 应 snap 到 3.0, got {}",
+            d.ctl.loop_out.get()
+        );
+        assert!((bus.get(&hypermixx_core::paths::deck_loop_out(0)) - 3.0).abs() < 1e-9);
+        // 幂等：已对齐值再跑一块不漂移
+        let _ = run_frames(&mut d, 256);
+        assert!((d.ctl.loop_in.get() - 1.0).abs() < 1e-9);
+        assert!((d.ctl.loop_out.get() - 3.0).abs() < 1e-9);
+    }
+
+    /// 终点距起点不足半拍 → 保底 1 拍（P21 语义；Out 与 In 同拍时
+    /// snap 后的距离会缩到 0——用原始 out 判断）。
+    #[test]
+    fn loop_quantize_out_half_beat_floor_one_beat() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache(&bus, 8.0, 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 1.0);
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 1.12); // 0.12s < 半拍 0.25
+        d.update_params();
+        assert!(
+            (d.ctl.loop_out.get() - 1.5).abs() < 1e-9,
+            "不足半拍应保底 1 拍 = 1.5, got {}",
+            d.ctl.loop_out.get()
+        );
+        assert!((d.ctl.loop_in.get() - 1.0).abs() < 1e-9, "起点应保持 1.0");
+    }
+
+    /// 无有效起点（未设 or 起点 ≥ 终点）→ 起点回拉 = 终点 − 4 拍
+    ///（P21 默认拍数），snap 到拍线。
+    #[test]
+    fn loop_quantize_invalid_in_pull_back_4_beats() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache(&bus, 8.0, 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 3.0); // ≥ 终点 → 无效
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 2.0);
+        d.update_params();
+        assert!(
+            (d.ctl.loop_in.get() - 0.0).abs() < 1e-9,
+            "起点应回拉 = 2.0 − 4×0.5 = 0.0, got {}",
+            d.ctl.loop_in.get()
+        );
+        assert!((d.ctl.loop_out.get() - 2.0).abs() < 1e-9, "终点应保持 2.0");
+    }
+
+    /// 无网格（bpm ≤ 0）→ 不量化，保持原始值。
+    #[test]
+    fn loop_quantize_no_grid_keeps_raw() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache(&bus, 8.0, 0.0);
+        bus.set(&hypermixx_core::paths::deck_loop_in(0), 1.03);
+        bus.set(&hypermixx_core::paths::deck_loop_out(0), 3.02);
+        d.update_params();
+        assert!(
+            (d.ctl.loop_in.get() - 1.03).abs() < 1e-12,
+            "无网格不应量化, got {}",
+            d.ctl.loop_in.get()
+        );
+        assert!((d.ctl.loop_out.get() - 3.02).abs() < 1e-12);
+    }
+
+    // ---------- P23-B sync leader 跳变重对齐 ----------
+
+    /// 对齐收敛后 leader 跳 2.5 拍（非整拍 → 相位 +0.5）→ follower
+    /// 重新对齐（脉冲相位回到 leader 新相位；无修复时相位差 0.5 拍
+    /// 永久残留）。
+    #[test]
+    fn sync_realigns_after_leader_jump() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache_big(&bus, pulse_cache(25.6, 24000), 0.0); // 120 BPM 脉冲
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        d.ctl.sync.set(1.0);
+        let mut leader = FakeLeader {
+            grid_bpm: 120.0,
+            grid_offset: 0.0,
+            tempo_rate: 1.0,
+            pos: -KEYLOCK_LATENCY_S,
+        };
+        let mut out = vec![0.0; 256 * 2];
+        let mut rec = Vec::new();
+        let blocks = (20.0 * 48000.0 / 256.0) as usize; // 20s 全程
+        let jump_at = (8.0 * 48000.0 / 256.0) as usize;
+        for (b, _) in (0..blocks).enumerate() {
+            if b == jump_at {
+                leader.pos += 1.25; // 跳 2.5 拍 @120BPM（相位 +0.5）
+            }
+            d.update_params();
+            d.apply_sync(&leader.snapshot());
+            d.process(&mut out, 256);
+            leader.advance();
+            rec.extend_from_slice(&out);
+        }
+        // 跳前窗口 [4,7] 与 跳后窗口 [15,18]（跳后 7s，收敛 + 稳定）：
+        // 脉冲相位 = (时间 mod 0.5s) 的中位残差
+        let res_pre = pulse_residuals(&rec, 4.0, 7.0);
+        let res_post = pulse_residuals(&rec, 15.0, 18.0);
+        let r_pre = median(&res_pre);
+        let r_post = median(&res_post);
+        let shift = (r_post - r_pre).rem_euclid(0.5);
+        assert!(
+            (shift - 0.25).abs() < 0.015,
+            "leader 跳 2.5 拍后 follower 相位应平移 0.25s（0.5 拍），实得 {shift:.4}s（pre={r_pre:.4} post={r_post:.4}）"
+        );
+        // 速率锁保持：间距仍 0.5s
+        let times = envelope_beat_times(&rec, 15.0, 18.0);
+        let sp = median_spacing(&times);
+        assert!(
+            (sp - 0.5).abs() < 0.003,
+            "重对齐后拍间距应仍 0.5s（120 BPM），实得 {sp:.4}s"
+        );
+    }
+
+    /// P14 语义保持：follower 自身操作（跳 0.5 拍 → 自身相位偏移）不
+    /// 触发重对齐（leader 位置无跳变）——相位偏移永久残留。
+    #[test]
+    fn sync_follower_own_jump_no_realign() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache_big(&bus, pulse_cache(25.6, 24000), 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        d.ctl.sync.set(1.0);
+        let mut leader = FakeLeader {
+            grid_bpm: 120.0,
+            grid_offset: 0.0,
+            tempo_rate: 1.0,
+            pos: -KEYLOCK_LATENCY_S,
+        };
+        let mut out = vec![0.0; 256 * 2];
+        let mut rec = Vec::new();
+        let blocks = (18.0 * 48000.0 / 256.0) as usize;
+        let jump_at = (8.0 * 48000.0 / 256.0) as usize;
+        for (b, _) in (0..blocks).enumerate() {
+            if b == jump_at {
+                d.beatjump(0.5); // follower 自跳 0.5 拍 = 0.25s（相位 +0.5）
+            }
+            d.update_params();
+            d.apply_sync(&leader.snapshot());
+            d.process(&mut out, 256);
+            leader.advance();
+            rec.extend_from_slice(&out);
+        }
+        let r_pre = median(&pulse_residuals(&rec, 4.0, 7.0));
+        let r_post = median(&pulse_residuals(&rec, 14.0, 17.0));
+        let shift = (r_post - r_pre).rem_euclid(0.5);
+        assert!(
+            (shift - 0.25).abs() < 0.015,
+            "follower 自跳后相位偏移应保留（leader 无跳变 → 不重对齐），实得 {shift:.4}s（pre={r_pre:.4} post={r_post:.4}）"
+        );
+    }
+
+    /// 脉冲时刻 mod 0.5s 的中位残差（相位测量；latency 常数在差中消去）。
+    fn pulse_residuals(rec: &[f32], from: f64, to: f64) -> Vec<f64> {
+        envelope_beat_times(rec, from, to)
+            .iter()
+            .map(|&t| t.rem_euclid(0.5))
+            .collect()
+    }
+
+    fn median(v: &[f64]) -> f64 {
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        s[s.len() / 2]
+    }
 }
