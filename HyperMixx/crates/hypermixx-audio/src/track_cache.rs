@@ -240,7 +240,10 @@ fn fill_block(
                 }
             }
         }
-        if pending.is_empty() {
+        // pending 空 ≠ EOF：升采样（44.1k→48k 等）需凑满 rubato 输入块
+        // 才有输出，首段 packet 可能不足一块 → 继续解码直到有输出或
+        // 真正 EOF（decode_next None + flush 空）。
+        if pending.is_empty() && *run_eof {
             eof = true;
             break;
         }

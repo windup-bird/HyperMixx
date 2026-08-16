@@ -2361,23 +2361,27 @@ mod tests {
         );
     }
 
-    /// 写 2s 440Hz 立体声 32-bit float WAV（真实解码路径用）。
-    fn write_sine_wav(path: &std::path::Path, secs: f64) {
+    /// 写 440Hz 立体声 32-bit float WAV（真实解码路径用），采样率可指定。
+    fn write_sine_wav_sr(path: &std::path::Path, secs: f64, sr: u32) {
         let spec = hound::WavSpec {
             channels: 2,
-            sample_rate: 48_000,
+            sample_rate: sr,
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
         };
         let mut w = hound::WavWriter::create(path, spec).unwrap();
-        let n = (secs * 48_000.0) as usize;
+        let n = (secs * sr as f64) as usize;
         for i in 0..n {
-            let t = i as f32 / 48_000.0;
+            let t = i as f32 / sr as f32;
             let s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
             w.write_sample(s).unwrap();
             w.write_sample(s).unwrap();
         }
         w.finalize().unwrap();
+    }
+
+    fn write_sine_wav(path: &std::path::Path, secs: f64) {
+        write_sine_wav_sr(path, secs, 48_000);
     }
 
     /// EOF 后 seek 回已填区直接出声（Phase A 语义：全曲缓存驻留 RAM，
@@ -2440,7 +2444,57 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 对拍临时加减速：按住期间速率 ×1.08 / ×(1/1.08)，松手恢复。
+    /// 回归：44.1kHz 源文件（非 48k）加载即出声。历史 bug：fill_block
+    /// 把升采样 pending 空无条件当 EOF → total=0、首块 0 帧、加载即无声
+    ///（beatjump 仍"可用"——seek 路径独立不受影响）。修复后首块同步
+    /// 填好、filler 续填全曲、音高保持 440Hz。
+    #[test]
+    fn loads_441k_plays_immediately() {
+        let bus = hypermixx_core::ControlBus::default();
+        let path =
+            std::env::temp_dir().join(format!("hypermixx_441k_{}.wav", std::process::id()));
+        write_sine_wav_sr(&path, 2.0, 44_100);
+
+        let mut d = Deck::new(0, 48000, &bus);
+        d.ctl.volume.set(1.0);
+        d.load(path.clone());
+
+        // 核心回归点：total=0 则此断言即失败（bug 症状）
+        let cache = d.cache.as_ref().expect("load 应建立缓存");
+        assert!(
+            cache.total_frames() > 0,
+            "44.1k 升采样 total_frames 不得为 0（fill_block EOF 误判回归）"
+        );
+        assert!(
+            cache.filled_frames() >= 2048,
+            "open 应同步填好首块，实际 {}",
+            cache.filled_frames()
+        );
+
+        // 等 filler 填满全曲（2s 曲 ≈5-20× 实时，轮询兜底并行负载）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cache.fill_done() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(cache.fill_done(), "44.1k filler 应填满 2s 曲");
+
+        // seek 过首块边界（0.043s）进入 filler 填的区，验证整曲可播
+        d.seek_seconds(0.3);
+        d.ctl.play.set(1.0);
+        let rec = run_capture(&mut d, 0.5);
+        let peak = rec.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(peak > 0.3, "44.1k 升采样应出声，peak={peak}");
+        let head = d.ctl.playhead.get();
+        assert!(head > 0.4, "播头应推进过 0.3s，实际 {head:.3}s");
+        // 频率仍是 440Hz（升采样保音高）
+        let f = zero_crossing_freq(&rec, rec.len() / 2 - 14400, rec.len() / 2 - 4800);
+        assert!(
+            cents_off(f, 440.0).abs() < 10.0,
+            "44.1k 升采样音高应保持 440Hz，实测 {f:.1}Hz"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
     /// keylock 开：音高保持 440Hz（变速不变调）；关：纯 varispeed（±8% 变调）。
     #[test]
     fn nudge_bends_rate_temporarily() {
@@ -3101,4 +3155,5 @@ mod tests {
             assert_eq!(d.pos, frozen, "EOF 后播头应冻结: {} vs {frozen}", d.pos);
         }
     }
+
 }
