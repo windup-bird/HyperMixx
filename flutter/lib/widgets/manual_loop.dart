@@ -1,12 +1,14 @@
-//! P18/P21 ManualLoop：手动 loop 两行按钮（pad 上方、预览下方）。
+//! P18/P21/P23 ManualLoop：手动 loop 两行按钮（pad 上方、预览下方）。
 //! 行1：÷2 / 显示当前 loop 拍数（点击激活/取消）/ ×2；
 //! 行2：In（loop 开始点）/ Out（loop 结束点）。
 //!
-//! P21 手动定界：In 只写 loop_in（不激活、不回填）；Out 写 loop_out 并
-//! **整倍量化**（out = in + 整拍数×拍长，长度恒为整拍、与节拍对齐）后
-//! 激活（P18 引擎总线边沿检测进捕获，零桥改动，见 deck.rs update_params）。
-//! 默认拍数 4（Out 无有效 in 回拉时用）；÷2/×2 修改本地拍数，激活中修改
-//! 立即经 beatloop 重设（同 pad 语义）。
+//! P23 手动定界：In/Out 都只写**原始播放头秒数**（不量化/不回拉），
+//! 量化（起点/终点 snap 到 beatgrid 拍线、不足 1 拍保底整拍、无起点回拉
+//! 4 拍）全部由引擎侧 snap_loop_bounds 完成（deck.rs update_params 块首
+//! 检测 loop_in/out 总线边沿）——与 beatjump/loop pad 的网格同源，杜绝
+//! P21 的 Flutter 静态 BPM 折算双源偏差（该侧量化已删）。
+//! 默认拍数 4（Out 无有效 in 时引擎回拉用）；÷2/×2 修改本地拍数，激活中
+//! 修改立即经 beatloop 重设（同 pad 语义）。
 //! 动作经 `PadActions` 出口（默认走 EngineController/桥），测试注入假实现。
 //!
 //! P22-D：_toggle/_setIn/_setOut 用 onTapDown（同 beatjump P12 先例）——
@@ -88,24 +90,12 @@ class _ManualLoopState extends State<ManualLoop> {
     widget.actions.setLoopIn(dc.deck, dc.playhead.value);
   }
 
-  /// P21 Out：loop_out = 当前位置**整倍量化**（相对 in 取整拍：
-  /// out = in + max(1, round((pos−in)/拍长))×拍长——手动定上界后长度
-  /// 恒为整拍，循环与节拍对齐）；无有效 in（未设 = 0，或 in ≥ pos）时
-  /// 无量化基准 → 保持原值并回拉 in = pos − 默认拍长。未激活 → 激活
-  /// （引擎 bus 边沿检测进捕获）。
+  /// P23 Out：loop_out = 当前位置**原始秒数**（不做任何折算）；量化与
+  /// 起点回拉由引擎 snap_loop_bounds 完成。未激活 → 激活（引擎 bus
+  /// 边沿检测进捕获）。
   void _setOut() {
     final dc = widget.deck;
-    final pos = dc.playhead.value;
-    final inValid = dc.loopIn.value > 0 && dc.loopIn.value < pos - 1e-6;
-    if (inValid) {
-      final beats = ((pos - dc.loopIn.value) / _beatSecs).round().clamp(1, 1 << 30);
-      final out = dc.loopIn.value + beats * _beatSecs;
-      widget.actions.setLoopOut(dc.deck, out);
-    } else {
-      widget.actions.setLoopOut(dc.deck, pos);
-      final inPos = pos - _beats * _beatSecs;
-      widget.actions.setLoopIn(dc.deck, inPos > 0 ? inPos : 0.0);
-    }
+    widget.actions.setLoopOut(dc.deck, dc.playhead.value);
     if (!dc.loopActive.value) widget.actions.setLoopActive(dc.deck, true);
   }
 
