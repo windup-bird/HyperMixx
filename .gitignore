@@ -14,7 +14,9 @@ flutter/linux/flutter/ephemeral/
 # 日志与临时文件
 *.log
 *~
-实现方案.md
+
+# 文档
+docs/
 
 # IDE
 .idea/
