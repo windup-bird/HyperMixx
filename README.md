@@ -39,10 +39,14 @@
 ├── scripts/
 │   ├── run_flutter.sh         # 构建 release 桥 + 设环境变量 + flutter run
 │   └── gen_bridge.sh          # 改桥接口后重新生成 FRB 绑定
+├── docs/
+│   └── ARCHITECTURE.md        # 学习指南：架构原理、数据流、关键机制逐拆
 └── 实现方案.md                # 设计决策 + P0–P23 开发日记（gitignored）
 ```
 
 数据流：`load → TrackCache 全曲预解码（filler 线程渐进填充）→ Deck 直读缓存喂 keylock 引擎 → 混音 → master`；分析线程独立解码 → `AnalysisEvent` 事件流 → 桥转发 → Flutter 画波形/网格。UI 与引擎通过**控制总线**通信（seqlock + watch），60Hz 快照驱动界面；解码永不在实时线程。
+
+想理解**整个架构**（为什么这样分层、三条数据流、ControlBus/TrackCache/loop 状态机等机制逐个拆解）：读 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
 ## 上手开发
 
