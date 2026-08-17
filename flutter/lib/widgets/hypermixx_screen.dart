@@ -36,7 +36,7 @@ class _HyperMixxScreenState extends State<HyperMixxScreen> {
           _errorBanner(),
           // master 条置顶（zoom/音量/VU/波形模式）
           _masterBar(),
-          // 两行波形（复刻 Slint main.slint）：deck1 上、deck2 下，全宽
+          // 两行波形：deck1 上、deck2 下，全宽
           SizedBox(height: 190, child: WaveStrip(deck: _engine.decks[0])),
           SizedBox(height: 190, child: WaveStrip(deck: _engine.decks[1])),
           // 下方三列：左 deck 面板 | 中心混音台 | 右 deck 面板

@@ -110,14 +110,14 @@ void main() {
         reason: '中段暂停不应有留白');
   });
 
-  testWidgets('empty deck: centered playhead (复刻 Slint 空条也画指针)', (tester) async {
+  testWidgets('empty deck: centered playhead（空条也画指针）', (tester) async {
     final dc = DeckController(0); // 无曲目：duration=0、wave 空 → 占位分支
     await pump(tester, dc);
 
     final bytes = await _capture(tester);
     final w = 800;
     expect(_nearWhite(_px(bytes, w, 400, 60)), isTrue,
-        reason: '空条应画居中播放头（x=400，与 Slint 一致）');
+        reason: '空条应画居中播放头（x=400）');
     expect(_nearTransparent(_px(bytes, w, 80, 60)), isTrue,
         reason: '无曲目：播放头外的条区应透明');
   });

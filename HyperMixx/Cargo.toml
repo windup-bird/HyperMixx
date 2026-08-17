@@ -4,9 +4,6 @@ members = [
     "crates/hypermixx-core",
     "crates/hypermixx-audio",
     "crates/hypermixx-analysis",
-    "crates/hypermixx-ui",
-    "crates/hypermixx-app",
-    "crates/hypermixx-bench",
     "crates/hypermixx-bridge",
 ]
 
@@ -19,7 +16,6 @@ license = "MIT OR Apache-2.0"
 hypermixx-core = { path = "crates/hypermixx-core" }
 hypermixx-audio = { path = "crates/hypermixx-audio" }
 hypermixx-analysis = { path = "crates/hypermixx-analysis" }
-hypermixx-ui = { path = "crates/hypermixx-ui" }
 
 # audio io / decode / dsp
 cpal = "0.18"
@@ -30,9 +26,7 @@ rubato = "5.0"
 biquad = "0.6"
 ringbuf = "0.5"
 
-# ui
-slint = "1.17"
-slint-build = "1.17"
+# 系统文件选择对话框（桥侧 XDG portal）
 rfd = "0.17"
 
 # util
@@ -42,7 +36,7 @@ env_logger = "0.11"
 libc = "0.2"
 seqlock = "0.2"
 
-# bench only
+# 测试写 WAV fixture 用（analysis 为普通依赖，audio/bridge 为 dev）
 hound = "3.5"
 # flutter 桥（两侧钉同版本，gen_bridge.sh 配套）
 flutter_rust_bridge = "=2.12.0"

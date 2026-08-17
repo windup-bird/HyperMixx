@@ -67,7 +67,7 @@ void setAnalysisPriority({required int deck, required int priority}) => RustLib
 Future<TrackMetadataWire> readMetadata({required String path}) =>
     RustLib.instance.api.crateApiReadMetadata(path: path);
 
-/// 打开系统文件选择对话框（rfd/XDG portal，复刻 Slint 加载按钮）。
+/// 打开系统文件选择对话框（rfd/XDG portal）。
 /// 阻塞 UI 线程直到选择/取消；取消返回 None。
 String? pickAudioFile() => RustLib.instance.api.crateApiPickAudioFile();
 

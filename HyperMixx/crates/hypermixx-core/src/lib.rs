@@ -7,17 +7,6 @@ pub mod control;
 pub use beatgrid::{BeatClock, BeatGrid};
 pub use control::{ControlBus, ControlHandle};
 
-use std::path::PathBuf;
-
-/// UI/MIDI → 引擎的操作命令（数值类参数走 ControlBus，命令类操作走这里）。
-#[derive(Debug)]
-pub enum EngineCommand {
-    /// 加载音轨到指定 deck（自动开始播放）。
-    Load { deck: usize, path: PathBuf },
-    /// 跳转到指定位置（秒，按 48kHz 引擎时间轴）。
-    Seek { deck: usize, seconds: f64 },
-}
-
 /// 控制点路径常量，避免 UI/引擎之间写魔法字符串。
 pub mod paths {
     pub fn deck_play(deck: usize) -> String {

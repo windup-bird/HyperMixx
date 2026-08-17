@@ -10,7 +10,7 @@
 //! **两种显示模式共享同一形状**（每像素列 √(all) 包络 + 孤立尖刺抑制），
 //! 仅染色不同（EngineController.waveMode 切换，settings 落地前经 master 条按钮）：
 //! - **rgb**：每列按 lo/mi/hi 归一化混色（全频段 → 白、单频段主导 → 纯色），
-//!   复刻 Slint waveform_texture.rs。
+//!   波形条带渲染：列聚合/RGB 方案，Flutter 原生实现。
 //! - **3-bands**：每列柱内按 low:mid:high 比例切红/绿/蓝三片（中心红、中绿、外蓝，
 //!   上下镜像），外轮廓与 rgb 完全相同。
 //!
@@ -155,7 +155,7 @@ class ScrollingWavePainter extends CustomPainter {
     final mi = List<double>.filled(W, 0);
     final hi = List<double>.filled(W, 0);
     final out = Uint8List(8);
-    // 曲头前留白（复刻 Slint lead_px）：winStart<0 时该段不画，深色背景透出
+    // 曲头前留白（lead_px 语义）：winStart<0 时该段不画，深色背景透出
     final leadPx = winStart < 0 ? (-winStart / winSecTrack * w) : 0.0;
     for (var x = 0; x < W; x++) {
       if (leadPx > 0 && x < leadPx) continue;
@@ -190,7 +190,7 @@ class ScrollingWavePainter extends CustomPainter {
     }
   }
 
-  /// RGB 染色（复刻 Slint waveform_texture.rs）：每像素列按频段归一化混色竖条
+  /// RGB 染色（mixxx 风格）：每像素列按频段归一化混色竖条
   /// （颜色 = 各带 / 主导带，全频段亮列近白、单频段纯色），共享 amp 包络。
   void _paintRgb(Canvas canvas, double w, double h, _Shape shape) {
     final W = w.toInt();

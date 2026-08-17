@@ -24,7 +24,7 @@ class EngineController {
   /// master zoom（窗口 60/zoom 秒），两 deck 共享。
   final zoom = ValueNotifier<double>(1.0);
 
-  /// 滚动波形显示模式（默认 rgb = Slint 风格；settings 落地前用 master 条按钮切换）。
+  /// 滚动波形显示模式（默认 rgb = mixxx 风格；settings 落地前用 master 条按钮切换）。
   final waveMode = ValueNotifier<WaveDisplayMode>(WaveDisplayMode.rgb);
   final masterVolume = ValueNotifier<double>(0.8);
   final masterVu = ValueNotifier<double>(0);

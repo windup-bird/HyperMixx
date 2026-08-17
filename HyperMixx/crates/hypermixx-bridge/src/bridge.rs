@@ -103,7 +103,7 @@ pub fn load_track_inner(
     }
     // 引擎语义：载入即自动开播（deck.rs）
     handle.load(deck, path.to_path_buf());
-    // 新载曲：旧网格失效（复刻 Slint UI 的 load_track 行为）
+    // 新载曲：旧网格失效（引擎不自动清，桥按载曲语义清）
     bus.set(&paths::deck_grid_bpm(deck), 0.0);
     bus.set(&paths::deck_grid_offset(deck), 0.0);
     // 新载曲：旧 loop 失效（deck.rs load 内也复位，这里双保险）

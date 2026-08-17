@@ -1,4 +1,4 @@
-// 波形显示模式测试：RGB（Slint 复刻）与三色（bands）两种渲染路径 + overview 顶部越界修复。
+// 波形显示模式测试：RGB（mixxx 风格）与三色（bands）两种渲染路径 + overview 顶部越界修复。
 // 像素级断言用 RepaintBoundary.toImage；未绘制处为全透明 (0,0,0,0)。
 
 import 'dart:typed_data';

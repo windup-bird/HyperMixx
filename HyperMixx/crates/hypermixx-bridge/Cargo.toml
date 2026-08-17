@@ -20,7 +20,7 @@ flutter_rust_bridge = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
 lofty = { workspace = true }
-# 系统文件选择对话框（复刻 Slint 加载按钮，XDG portal）
+# 系统文件选择对话框（XDG portal）
 rfd = { workspace = true }
 
 [dev-dependencies]

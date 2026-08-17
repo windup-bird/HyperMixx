@@ -1,17 +1,6 @@
-# hypermixx
+# HyperMixx Flutter UI
 
-A new Flutter project.
+Flutter 客户端（UI 层）。引擎、分析、桥接代码都在 Rust workspace（`../HyperMixx/`）。
 
-## Getting Started
-
-This project is a starting point for a Flutter application.
-
-A few resources to get you started if this is your first Flutter project:
-
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+- 项目总览、构建、测试指南：见仓库根 `../README.md`
+- 修改桥接口（`HyperMixx/crates/hypermixx-bridge/src/api.rs`）后需重生成绑定：`../scripts/gen_bridge.sh`
