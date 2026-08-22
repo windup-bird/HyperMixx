@@ -945,8 +945,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   WireColumn dco_decode_wire_column(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 8)
-      throw Exception('unexpected arr length: expect 8 but see ${arr.length}');
+    if (arr.length != 9)
+      throw Exception('unexpected arr length: expect 9 but see ${arr.length}');
     return WireColumn(
       lowP: dco_decode_u_8(arr[0]),
       lowN: dco_decode_u_8(arr[1]),
@@ -956,6 +956,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       highN: dco_decode_u_8(arr[5]),
       allP: dco_decode_u_8(arr[6]),
       allN: dco_decode_u_8(arr[7]),
+      normalizedHeight: dco_decode_u_8(arr[8]),
     );
   }
 
@@ -1312,6 +1313,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_highN = sse_decode_u_8(deserializer);
     var var_allP = sse_decode_u_8(deserializer);
     var var_allN = sse_decode_u_8(deserializer);
+    var var_normalizedHeight = sse_decode_u_8(deserializer);
     return WireColumn(
       lowP: var_lowP,
       lowN: var_lowN,
@@ -1321,6 +1323,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       highN: var_highN,
       allP: var_allP,
       allN: var_allN,
+      normalizedHeight: var_normalizedHeight,
     );
   }
 
@@ -1648,6 +1651,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_u_8(self.highN, serializer);
     sse_encode_u_8(self.allP, serializer);
     sse_encode_u_8(self.allN, serializer);
+    sse_encode_u_8(self.normalizedHeight, serializer);
   }
 
   @protected

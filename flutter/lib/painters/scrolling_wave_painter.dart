@@ -1,4 +1,4 @@
-//! 滚动波形 painter（D5，锯齿修复 + 显示模式统一）：
+//! 滚动波形 painter（D5，平滑轮廓 + 显示模式统一）：
 //! ① 连续窗口数学（f64 列坐标，不量化到 1px）
 //! ② scatter-max 分数聚合：每列投影到像素区间取最大，无 1px 步进顿挫；
 //!    colsPerPx<1 高放大时线性插值防块状
@@ -7,7 +7,7 @@
 //! ④ beatgrid 竖线 2px（下拍 3px）α0.35/0.7，间距 <4px 跳过（moiré 守卫）
 //! ⑤ loop 区域绿填充/边界、cue/hotcue 橙竖线（P11.3）
 //!
-//! **两种显示模式共享同一形状**（每像素列 √(all) 包络 + 孤立尖刺抑制），
+//! **两种显示模式共享同一形状**（每像素列平滑包络 + 孤立尖刺抑制），
 //! 仅染色不同（EngineController.waveMode 切换，settings 落地前经 master 条按钮）：
 //! - **rgb**：每列按 lo/mi/hi 归一化混色（全频段 → 白、单频段主导 → 纯色），
 //!   波形条带渲染：列聚合/RGB 方案，Flutter 原生实现。
@@ -25,6 +25,7 @@ import 'package:flutter/material.dart';
 import '../engine/deck_controller.dart';
 import '../engine/wave_display_mode.dart';
 import '../engine/wave_model.dart';
+import 'wave_shape.dart';
 
 /// 尖刺抑制：孤立单列尖刺（高于两侧较高者 _kSpikeRatio 倍，且差 > _kSpikeMinPx 像素）
 /// 压到邻居高度——去掉"极细锯齿"导致的滚动闪烁，保整体轮廓 crisp。可调。
@@ -65,8 +66,9 @@ const List<Color> _kSliceColors = [
   double gridBpm,
   double effBpm,
 ) {
-  final winSecTrack =
-      (gridBpm > 0 && effBpm > 0) ? winSec * effBpm / gridBpm : winSec;
+  final winSecTrack = (gridBpm > 0 && effBpm > 0)
+      ? winSec * effBpm / gridBpm
+      : winSec;
   final winStart = ph - winSecTrack / 2;
   return (winStart, winSecTrack);
 }
@@ -96,6 +98,9 @@ class ScrollingWavePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    if (size.width <= 0 || size.height <= 0) return;
+    canvas.save();
+    canvas.clipRect(Offset.zero & size);
     final w = size.width;
     final h = size.height;
     final wave = deck.wave;
@@ -108,6 +113,7 @@ class ScrollingWavePainter extends CustomPainter {
         Rect.fromLTWH(px - 1, 0, 2, h),
         Paint()..color = Colors.white.withValues(alpha: 0.9),
       );
+      canvas.restore();
       return;
     }
 
@@ -132,6 +138,7 @@ class ScrollingWavePainter extends CustomPainter {
 
     // 共享 overlay：beatgrid + loop/cue 标记 + 播放头
     _paintOverlay(canvas, w, h, winStart, winSecTrack, ph);
+    canvas.restore();
   }
 
   /// 共享形状计算：每像素列 scatter-max → al/lo/mi/hi，
@@ -149,12 +156,13 @@ class ScrollingWavePainter extends CustomPainter {
     final x0col = winStart * sr / fpc;
     final colsPerPx = winSecTrack * sr / fpc / w;
     final W = w.toInt();
-    final halfH = h / 2 - 3;
-    final amp = List<double>.filled(W, 0);
+    final halfH = math.max(0.0, h / 2 - 3);
+    final all = List<double>.filled(W, 0);
+    final normalized = List<double>.filled(W, 0);
     final lo = List<double>.filled(W, 0);
     final mi = List<double>.filled(W, 0);
     final hi = List<double>.filled(W, 0);
-    final out = Uint8List(8);
+    final out = Uint8List(9);
     // 曲头前留白（lead_px 语义）：winStart<0 时该段不画，深色背景透出
     final leadPx = winStart < 0 ? (-winStart / winSecTrack * w) : 0.0;
     for (var x = 0; x < W; x++) {
@@ -169,11 +177,21 @@ class ScrollingWavePainter extends CustomPainter {
       lo[x] = math.max(out[F.lowP], out[F.lowN]).toDouble();
       mi[x] = math.max(out[F.midP], out[F.midN]).toDouble();
       hi[x] = math.max(out[F.highP], out[F.highN]).toDouble();
-      if (al == 0) continue;
-      amp[x] = math.sqrt(al / 255.0) * halfH;
+      all[x] = al.toDouble();
+      normalized[x] = wave.hasNormalizedHeight
+          ? out[F.normalizedHeight].toDouble()
+          : math.sqrt(al / 255.0) * 255.0;
     }
-    _dampSpikes(amp);
-    return _Shape(amp, lo, mi, hi);
+    final shared = buildWaveShape(
+      low: lo,
+      mid: mi,
+      high: hi,
+      all: all,
+      maxHeight: halfH,
+      normalizedHeight: normalized,
+    );
+    _dampSpikes(shared.envelope);
+    return _Shape(shared.envelope, shared.low, shared.mid, shared.high);
   }
 
   /// 孤立单列尖刺抑制：把高于两侧较高者 1.5 倍且差 > 8px 的单列尖刺压平，
@@ -196,28 +214,34 @@ class ScrollingWavePainter extends CustomPainter {
     final W = w.toInt();
     final cy = h / 2;
     final paint = Paint()..isAntiAlias = false;
-    for (var x = 0; x < W; x++) {
-      final a = shape.amp[x];
-      if (a <= 0) continue;
+    for (var x = 0; x < W - 1; x++) {
+      final a0 = shape.amp[x];
+      final a1 = shape.amp[x + 1];
+      if (a0 <= 0 && a1 <= 0) continue;
       final mx = math.max(shape.lo[x], math.max(shape.mi[x], shape.hi[x]));
       if (mx <= 0) continue;
       final r = (shape.lo[x] / mx * 255).round().clamp(0, 255);
       final g = (shape.mi[x] / mx * 255).round().clamp(0, 255);
       final b = (shape.hi[x] / mx * 255).round().clamp(0, 255);
-      paint.color = Color(0xFF000000 | (r << 16) | (g << 8) | b);
-      canvas.drawRect(Rect.fromLTWH(x.toDouble(), cy - a, 1, a * 2), paint);
+      paint.color = Color.fromARGB(220, r, g, b);
+      final path = Path()
+        ..moveTo(x.toDouble(), cy - a0)
+        ..lineTo((x + 1).toDouble(), cy - a1)
+        ..lineTo((x + 1).toDouble(), cy + a1)
+        ..lineTo(x.toDouble(), cy + a0)
+        ..close();
+      canvas.drawPath(path, paint);
     }
   }
 
-  /// 3-bands 染色：每列柱 [cy-amp, cy+amp] 按 low:mid:high 比例切三段
-  /// （中心红、中绿、外蓝，上下镜像）；外轮廓 = amp，与 rgb 完全相同。
+  /// 3-bands 染色：低/中/高按原始比例切片，上下镜像到共享包络。
   void _paintBands(Canvas canvas, double w, double h, _Shape shape) {
     final W = w.toInt();
     final cy = h / 2;
     final paints = [
-      Paint()..color = _kSliceColors[0],
-      Paint()..color = _kSliceColors[1],
-      Paint()..color = _kSliceColors[2],
+      Paint()..color = _kSliceColors[0].withValues(alpha: 0.82),
+      Paint()..color = _kSliceColors[1].withValues(alpha: 0.82),
+      Paint()..color = _kSliceColors[2].withValues(alpha: 0.82),
     ];
     for (var x = 0; x < W; x++) {
       final a = shape.amp[x];
@@ -227,30 +251,23 @@ class ScrollingWavePainter extends CustomPainter {
       final hh = shape.hi[x];
       final total = l + m + hh;
       if (total <= 0) continue;
-      // 各切片高度（占比 × 柱半高）；0.5px 以下的薄片跳过绘制但仍累计偏移
-      final fr = l / total * a;
-      final fg = m / total * a;
-      final fb = hh / total * a;
-      final xd = x.toDouble();
-      // 上半 [cy, cy+a]：红(中心) → 绿 → 蓝(外沿)
+      final heights = [l / total * a, m / total * a, hh / total * a];
       var top = cy;
-      if (fr > 0.5) canvas.drawRect(Rect.fromLTWH(xd, top, 1, fr), paints[0]);
-      top += fr;
-      if (fg > 0.5) canvas.drawRect(Rect.fromLTWH(xd, top, 1, fg), paints[1]);
-      top += fg;
-      if (fb > 0.5) canvas.drawRect(Rect.fromLTWH(xd, top, 1, fb), paints[2]);
-      // 下半 [cy-a, cy]：红 → 绿 → 蓝 镜像
-      top = cy;
-      if (fr > 0.5) {
-        canvas.drawRect(Rect.fromLTWH(xd, top - fr, 1, fr), paints[0]);
-      }
-      top -= fr;
-      if (fg > 0.5) {
-        canvas.drawRect(Rect.fromLTWH(xd, top - fg, 1, fg), paints[1]);
-      }
-      top -= fg;
-      if (fb > 0.5) {
-        canvas.drawRect(Rect.fromLTWH(xd, top - fb, 1, fb), paints[2]);
+      var bottom = cy;
+      for (var b = 0; b < 3; b++) {
+        final height = heights[b];
+        if (height > 0.5) {
+          canvas.drawRect(
+            Rect.fromLTWH(x.toDouble(), bottom, 1, height),
+            paints[b],
+          );
+          canvas.drawRect(
+            Rect.fromLTWH(x.toDouble(), top - height, 1, height),
+            paints[b],
+          );
+        }
+        top -= height;
+        bottom += height;
       }
     }
   }

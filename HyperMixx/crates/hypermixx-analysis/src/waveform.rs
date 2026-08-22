@@ -33,6 +33,8 @@ pub struct Column {
     pub high_n: u8,
     pub all_p: u8,
     pub all_n: u8,
+    /// Preview height: z-score mapped as 0.5 + z/6, excluding silent columns.
+    pub normalized_height: u8,
 }
 
 pub struct WaveformData {
@@ -134,8 +136,9 @@ pub(crate) fn pop_trailing_empty(cols: &mut Vec<ColPeak>) {
 /// 每带共享标度 = max(全局正峰, 全局负半)——与旧 max|·| 归一化同值，
 /// 正半字段输出逐字节不变；负半按同标度相对显示（正负比例真实）。
 pub(crate) fn normalize_detail(cols: &[ColPeak]) -> Vec<Column> {
-    let (mut glp, mut gln, mut gmp, mut gmn, mut ghp, mut ghn, mut gap, mut gan) =
-        (1e-9f32, 1e-9f32, 1e-9f32, 1e-9f32, 1e-9f32, 1e-9f32, 1e-9f32, 1e-9f32);
+    let (mut glp, mut gln, mut gmp, mut gmn, mut ghp, mut ghn, mut gap, mut gan) = (
+        1e-9f32, 1e-9f32, 1e-9f32, 1e-9f32, 1e-9f32, 1e-9f32, 1e-9f32, 1e-9f32,
+    );
     for c in cols {
         glp = glp.max(c.low_p);
         gln = gln.max(c.low_n);
@@ -148,8 +151,10 @@ pub(crate) fn normalize_detail(cols: &[ColPeak]) -> Vec<Column> {
     }
     let (sl, sm, sh, sa) = (glp.max(gln), gmp.max(gmn), ghp.max(ghn), gap.max(gan));
     let to_u8 = |v: f32, m: f32| -> u8 { ((v / m).sqrt() * 255.0).min(255.0) as u8 };
+    let heights = normalized_heights(cols);
     cols.iter()
-        .map(|c| Column {
+        .zip(heights)
+        .map(|(c, normalized_height)| Column {
             low_p: to_u8(c.low_p, sl),
             low_n: to_u8(c.low_n, sl),
             mid_p: to_u8(c.mid_p, sm),
@@ -158,6 +163,7 @@ pub(crate) fn normalize_detail(cols: &[ColPeak]) -> Vec<Column> {
             high_n: to_u8(c.high_n, sh),
             all_p: to_u8(c.all_p, sa),
             all_n: to_u8(c.all_n, sa),
+            normalized_height,
         })
         .collect()
 }
@@ -166,8 +172,10 @@ pub(crate) fn normalize_detail(cols: &[ColPeak]) -> Vec<Column> {
 /// 全曲完成后由 normalize_detail 的全局归一化替换）。
 pub(crate) fn fixed_scale(cols: &[ColPeak]) -> Vec<Column> {
     let fx = |v: f32| -> u8 { (v.sqrt() * 255.0).min(255.0) as u8 };
+    let heights = normalized_heights(cols);
     cols.iter()
-        .map(|c| Column {
+        .zip(heights)
+        .map(|(c, normalized_height)| Column {
             low_p: fx(c.low_p),
             low_n: fx(c.low_n),
             mid_p: fx(c.mid_p),
@@ -176,6 +184,44 @@ pub(crate) fn fixed_scale(cols: &[ColPeak]) -> Vec<Column> {
             high_n: fx(c.high_n),
             all_p: fx(c.all_p),
             all_n: fx(c.all_n),
+            normalized_height,
+        })
+        .collect()
+}
+
+/// Maps whole-track loudness to a bottom-anchored preview height.
+/// Silent columns are excluded from mean/stddev and remain zero. Active
+/// columns use `0.5 + z/6`, so the mean is half height and +/-3 sigma span
+/// the complete vertical range.
+fn normalized_heights(cols: &[ColPeak]) -> Vec<u8> {
+    let peak = cols
+        .iter()
+        .map(|c| c.all_p.max(c.all_n))
+        .fold(0.0f32, f32::max);
+    let noise_floor = peak * 0.005;
+    let active: Vec<f32> = cols
+        .iter()
+        .map(|c| c.all_p.max(c.all_n))
+        .filter(|&v| v > noise_floor)
+        .collect();
+    if active.is_empty() {
+        return vec![0; cols.len()];
+    }
+    let mean = active.iter().sum::<f32>() / active.len() as f32;
+    let variance = active.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / active.len() as f32;
+    let stddev = variance.sqrt();
+    cols.iter()
+        .map(|c| {
+            let value = c.all_p.max(c.all_n);
+            if value <= noise_floor {
+                return 0;
+            }
+            let z = if stddev > 1e-9 {
+                (value - mean) / stddev
+            } else {
+                0.0
+            };
+            ((0.5 + z / 6.0).clamp(0.0, 1.0) * 255.0).round() as u8
         })
         .collect()
 }
@@ -197,6 +243,7 @@ pub(crate) fn build_overview(detail: &[Column]) -> Vec<Column> {
                 c.all_p = c.all_p.max(d.all_p);
                 c.all_n = c.all_n.max(d.all_n);
             }
+            c.normalized_height = ch.iter().map(|d| d.normalized_height).max().unwrap_or(0);
             c
         })
         .collect()
@@ -287,16 +334,69 @@ mod tests {
         // 未涉及频段保持 0（标度 floor 1e-9 防除零）
         assert_eq!(d[0].mid_p, 0);
         assert_eq!(d[0].high_n, 0);
+        assert_eq!(d[0].normalized_height, 128);
+    }
+
+    #[test]
+    fn normalized_height_ignores_silence_and_centers_mean() {
+        let cols = vec![
+            ColPeak {
+                all_p: 0.0,
+                all_n: 0.0,
+                ..Default::default()
+            },
+            ColPeak {
+                all_p: 1.0,
+                ..Default::default()
+            },
+            ColPeak {
+                all_p: 2.0,
+                ..Default::default()
+            },
+            ColPeak {
+                all_p: 3.0,
+                ..Default::default()
+            },
+        ];
+        let d = normalize_detail(&cols);
+        assert_eq!(d[0].normalized_height, 0, "静音列不参与统计且保持不可见");
+        assert!(d[1].normalized_height < 128);
+        assert_eq!(d[2].normalized_height, 128, "均值应映射到半高");
+        assert!(d[3].normalized_height > 128);
     }
 
     /// overview 聚合：正负半各自取最大（折叠幅度下"最负 = 最大 n"）。
     #[test]
     fn overview_aggregates_both_halves() {
         let detail = vec![
-            Column { low_p: 10, low_n: 200, all_p: 0, all_n: 50, ..Column::default() },
-            Column { low_p: 250, low_n: 30, all_p: 40, all_n: 0, ..Column::default() },
-            Column { low_p: 5, low_n: 20, all_p: 10, all_n: 10, ..Column::default() },
-            Column { low_p: 7, low_n: 90, all_p: 5, all_n: 60, ..Column::default() },
+            Column {
+                low_p: 10,
+                low_n: 200,
+                all_p: 0,
+                all_n: 50,
+                ..Column::default()
+            },
+            Column {
+                low_p: 250,
+                low_n: 30,
+                all_p: 40,
+                all_n: 0,
+                ..Column::default()
+            },
+            Column {
+                low_p: 5,
+                low_n: 20,
+                all_p: 10,
+                all_n: 10,
+                ..Column::default()
+            },
+            Column {
+                low_p: 7,
+                low_n: 90,
+                all_p: 5,
+                all_n: 60,
+                ..Column::default()
+            },
         ];
         let ov = build_overview(&detail);
         assert_eq!(ov.len(), 1);
