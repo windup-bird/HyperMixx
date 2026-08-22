@@ -18,7 +18,7 @@ pub const DETAIL_FRAMES_PER_COL: usize = 128;
 /// overview 每列 = 4 个 detail 列（512 帧）。
 pub const OVERVIEW_RATIO: usize = 4;
 
-const LOW_HZ: f32 = 150.0;
+const LOW_HZ: f32 = 120.0;
 const HIGH_HZ: f32 = 3000.0;
 
 /// 每列 8 值：`*_p` = 正峰、`*_n` = 负半折叠幅度（|min|），全部 ≥0。
