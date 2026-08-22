@@ -14,12 +14,12 @@ use std::thread::JoinHandle;
 use anyhow::Result;
 use timestretch::analysis::beat::detect_beats_with_options;
 use timestretch::analysis::key::detect_key;
-use timestretch::analysis::rigid_grid::refine_grid_rigid;
 use timestretch::core::preanalysis::KeyEstimate;
 use timestretch::TempoTrackingOptions;
 
 use hypermixx_audio::decode::{To48k, TrackDecoder};
 
+use crate::grid_fit::fit_fixed_grid;
 use crate::mono::{MonoAccumulator, TRACK_MONO_RATE, mixdown_48k};
 use crate::waveform::{self, BandFilters, ColPeak, Column, DETAIL_FRAMES_PER_COL, WaveformData};
 
@@ -49,8 +49,7 @@ pub enum AnalysisEvent {
         downbeats_secs: Box<[f64]>,
         confidence: f32,
         /// 分段网格初值（自研算法的参考输入）：(起点秒, bpm, 刚性 0..1)。
-        /// 取自 timestretch detect 的分段列表（refine_grid_rigid 采纳时
-        /// 会丢弃它，故在 refine 之前捕获）。
+        /// 固定网格拟合后恒为单段 [(锚点秒, bpm, 1.0)]。
         tempo_segments: Vec<(f64, f64, f32)>,
     },
     /// 全曲分析完成：与 analyze() 相同的全局归一化数据。
@@ -279,33 +278,10 @@ struct TrackAnalysisData {
 /// sync/loop 建在劣质网格上；bridge 侧另有同阈值兜底不写 grid 总线）。
 const GRID_MIN_CONFIDENCE: f32 = 0.25;
 
-/// 段刚性初值：段内相邻拍间隔的变异系数 → 1/(1+CV) ∈ (0.5, 1]。
-/// 恒定拍距 → 1.0（完全刚性）；拍距漂移越大越接近 0.5。拍不足两拍
-/// 无法估 CV，直接取 1.0。
-fn segment_rigidity(beats: &[f64], start_beat: usize, end_beat: usize) -> f32 {
-    if end_beat <= start_beat + 1 {
-        return 1.0;
-    }
-    let mut sum = 0.0;
-    let mut sumsq = 0.0;
-    let mut n = 0usize;
-    for i in start_beat..end_beat - 1 {
-        let d = beats[i + 1] - beats[i];
-        sum += d;
-        sumsq += d * d;
-        n += 1;
-    }
-    let mean = sum / n as f64;
-    if mean <= 0.0 {
-        return 1.0;
-    }
-    let var = (sumsq / n as f64 - mean * mean).max(0.0);
-    let cv = var.sqrt() / mean;
-    (1.0 / (1.0 + cv)).clamp(0.0, 1.0) as f32
-}
-
-/// 拼接各段 mono → timestretch 检测：12k 粗链定 tempo + 48k superflux
-/// 细链定拍位 + 48k rigid 拟合，key 用 12k。
+/// 拼接各段 mono → timestretch 检测：48k superflux 定拍位（EDM hint
+/// 范围 100–160），key 用 12k。动态拍列表（间隔不定、系统性滞后）再经
+/// 概率论固定网格拟合（grid_fit：恒定 BPM + 圆上 KDE 相位锚点 + 外推）
+/// 折叠为均匀网格。
 /// 各段为 None（空段）跳过；总量 <10s 直接返回 None（检测器不可信）。
 fn track_analysis(
     monos: &[Option<Box<[f32]>>],
@@ -324,69 +300,70 @@ fn track_analysis(
         mono48.extend_from_slice(m);
     }
 
-    // 0.11.0 单分辨率 48k superflux + EDM hint 范围（100–160，crates.io
-    // 版无 master 的双分辨率粗链定层级修复）；再对 48k kick 包络做 rigid
-    // 拟合（八度守卫钉在 tempogram 决定的层级上）。
     let grid = detect_beats_with_options(&mono48, 48_000, &TempoTrackingOptions {
         hint_range: Some((100.0, 160.0)),
         ..Default::default()
     });
-    // 分段初值在 refine 之前捕获：refine_grid_rigid 采纳时会把 segments
-    // 替换成单一 rigid 段（丢弃 detect 的分段列表）。空列表（如 detect
-    // 无拍）回退为单段 [0, bpm]。
+
     let sr = 48_000u32;
-    let tempo_segments: Vec<(f64, f64, f32)> = if grid.segments.is_empty() {
-        vec![(0.0, grid.bpm, 1.0)]
-    } else {
-        let mut out = Vec::with_capacity(grid.segments.len());
-        for (i, seg) in grid.segments.iter().enumerate() {
-            let end = grid
-                .segments
-                .get(i + 1)
-                .map(|n| n.start_beat)
-                .unwrap_or(grid.beats.len());
-            out.push((
-                grid.beats
-                    .get(seg.start_beat)
-                    .map(|&b| b / sr as f64)
-                    .unwrap_or(0.0),
-                seg.bpm,
-                segment_rigidity(&grid.beats, seg.start_beat, end),
-            ));
-        }
-        out
-    };
-    let (grid, adopted) = refine_grid_rigid(&mono48, 48_000, grid);
-    log::debug!(
-        "beatgrid：BPM {:.1}，rigid 细化采纳 = {adopted}，置信 {:.2}，分段 {} 个",
-        grid.bpm,
-        grid.confidence,
-        tempo_segments.len()
-    );
     let to_secs = |samples: f64| samples / sr as f64;
-    let beats_secs: Box<[f64]> = grid.beats.iter().map(|&b| to_secs(b)).collect();
-    let downbeats_secs: Box<[f64]> = grid
-        .downbeats
-        .iter()
-        .filter_map(|&i| grid.beats.get(i))
-        .map(|&b| to_secs(b))
-        .collect();
+    let duration_secs = mono48.len() as f64 / sr as f64;
+    let beats_in: Vec<f64> = grid.beats.iter().map(|&b| to_secs(b)).collect();
+
+    // 固定网格拟合：BPM 取 timestretch 的多拍基线中位数，锚点取 KDE
+    // 峰簇左缘（检测滞后 ⇒ 质量右偏 ⇒ 众数贴真值）；置信度按内点率打折，
+    // 真变速素材自动降权。退化输入（无拍/零速）原样透传动态列表。
+    let (offset_secs, beats_secs, downbeats_secs, confidence, inlier_ratio) =
+        match fit_fixed_grid(&beats_in, &grid.downbeats, grid.bpm, duration_secs) {
+            Some(fit) => (
+                fit.offset_secs,
+                fit.beats_secs,
+                fit.downbeats_secs,
+                grid.confidence * fit.inlier_ratio,
+                fit.inlier_ratio,
+            ),
+            None => {
+                let dbs: Box<[f64]> = grid
+                    .downbeats
+                    .iter()
+                    .filter_map(|&i| grid.beats.get(i))
+                    .map(|&b| to_secs(b))
+                    .collect();
+                (
+                    grid.beats.first().map(|&b| to_secs(b)).unwrap_or(0.0),
+                    beats_in.into_boxed_slice(),
+                    dbs,
+                    grid.confidence,
+                    1.0,
+                )
+            }
+        };
+
+    log::debug!(
+        "beatgrid：BPM {:.1}，固定网格 {} 点 / {} 下拍，内点率 {:.2}，置信 {:.2}",
+        grid.bpm,
+        beats_secs.len(),
+        downbeats_secs.len(),
+        inlier_ratio,
+        confidence
+    );
+
     let key = detect_key(&mono, TRACK_MONO_RATE);
     Some(TrackAnalysisData {
         // 低置信 → bpm=0（事件仍发：UI 网格线可用 beats，引擎侧无 BPM 可 sync）。
-        bpm: if grid.confidence < GRID_MIN_CONFIDENCE {
+        bpm: if confidence < GRID_MIN_CONFIDENCE {
             0.0
         } else {
             grid.bpm
         },
         key,
-        // 首拍秒：rigid 拟合把网格补齐回曲首，beats.first() 即网格锚点
-        //（可能落在首个实际拍点之前，对齐性以 beats_secs 为准）。
-        offset_secs: grid.beats.first().map(|&b| to_secs(b)).unwrap_or(0.0),
+        // 网格锚点秒：拟合后即网格首点（可能落在首个实际拍点之前，
+        // 对齐性以 beats_secs 为准）。
+        offset_secs,
         beats_secs,
         downbeats_secs,
-        confidence: grid.confidence,
-        tempo_segments,
+        confidence,
+        tempo_segments: vec![(offset_secs, grid.bpm, 1.0)],
     })
 }
 
