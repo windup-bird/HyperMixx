@@ -12,14 +12,14 @@ use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 
 use anyhow::Result;
+use timestretch::TempoTrackingOptions;
 use timestretch::analysis::beat::detect_beats_with_options;
 use timestretch::analysis::key::detect_key;
-use timestretch::analysis::rigid_grid::refine_grid_rigid;
 use timestretch::core::preanalysis::KeyEstimate;
-use timestretch::TempoTrackingOptions;
 
 use hypermixx_audio::decode::{To48k, TrackDecoder};
 
+use crate::global_grid::fit_global_grid;
 use crate::mono::{MonoAccumulator, TRACK_MONO_RATE, mixdown_48k};
 use crate::waveform::{self, BandFilters, ColPeak, Column, DETAIL_FRAMES_PER_COL, WaveformData};
 
@@ -327,13 +327,15 @@ fn track_analysis(
     // 0.11.0 单分辨率 48k superflux + EDM hint 范围（100–160，crates.io
     // 版无 master 的双分辨率粗链定层级修复）；再对 48k kick 包络做 rigid
     // 拟合（八度守卫钉在 tempogram 决定的层级上）。
-    let grid = detect_beats_with_options(&mono48, 48_000, &TempoTrackingOptions {
-        hint_range: Some((100.0, 160.0)),
-        ..Default::default()
-    });
-    // 分段初值在 refine 之前捕获：refine_grid_rigid 采纳时会把 segments
-    // 替换成单一 rigid 段（丢弃 detect 的分段列表）。空列表（如 detect
-    // 无拍）回退为单段 [0, bpm]。
+    let grid = detect_beats_with_options(
+        &mono48,
+        48_000,
+        &TempoTrackingOptions {
+            hint_range: Some((100.0, 160.0)),
+            ..Default::default()
+        },
+    );
+    // 保留动态分段仅用于诊断；最终 transport grid 始终由全曲后处理生成。
     let sr = 48_000u32;
     let tempo_segments: Vec<(f64, f64, f32)> = if grid.segments.is_empty() {
         vec![(0.0, grid.bpm, 1.0)]
@@ -356,7 +358,37 @@ fn track_analysis(
         }
         out
     };
-    let (grid, adopted) = refine_grid_rigid(&mono48, 48_000, grid);
+    let duration_secs = mono48.len() as f64 / sr as f64;
+    let global = fit_global_grid(&mono48, sr, &grid, duration_secs);
+    let (grid, adopted) = if let Some(global) = global {
+        // The final transport grid is always one full-track rigid segment.
+        // Keep timestretch's dynamic segments only as analysis evidence.
+        let beats: Vec<f64> = global.beats_secs.iter().map(|&t| t * sr as f64).collect();
+        let downbeats: Vec<usize> = global
+            .downbeat_rotation
+            .map(|rotation| {
+                (0..beats.len())
+                    .filter(|index| index % 4 == rotation)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rigid = timestretch::analysis::beat::BeatGrid {
+            beats,
+            downbeats,
+            segments: vec![timestretch::core::preanalysis::TempoSegment {
+                start_beat: 0,
+                bpm: global.bpm,
+            }],
+            bpm: global.bpm,
+            confidence: grid.confidence.max(global.phase_lock),
+            downbeat_confidence: 0.0,
+            sample_rate: sr,
+            tempo_candidates: grid.tempo_candidates.clone(),
+        };
+        (rigid, true)
+    } else {
+        (grid, false)
+    };
     log::debug!(
         "beatgrid：BPM {:.1}，rigid 细化采纳 = {adopted}，置信 {:.2}，分段 {} 个",
         grid.bpm,
