@@ -27,7 +27,7 @@
 // Section: imports
 
 use flutter_rust_bridge::for_generated::byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt};
-use flutter_rust_bridge::for_generated::{Lifetimeable, Lockable, transform_result_dco};
+use flutter_rust_bridge::for_generated::{transform_result_dco, Lifetimeable, Lockable};
 use flutter_rust_bridge::{Handler, IntoIntoDart};
 
 // Section: boilerplate
@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1314990121;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 441619590;
 
 // Section: executor
 
@@ -368,6 +368,70 @@ fn wire__crate__api__load_track_impl(
         },
     )
 }
+fn wire__crate__api__loop_in_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "loop_in",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_deck = <u32>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok({
+                    crate::api::loop_in(api_deck);
+                })?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__loop_out_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "loop_out",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_deck = <u32>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok({
+                    crate::api::loop_out(api_deck);
+                })?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
 fn wire__crate__api__master_snapshot_wire_default_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -623,6 +687,39 @@ fn wire__crate__api__set_beat_loop_impl(
         },
     )
 }
+fn wire__crate__api__set_sync_mode_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "set_sync_mode",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_deck = <u32>::sse_decode(&mut deserializer);
+            let api_on = <bool>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok({
+                    crate::api::set_sync_mode(api_deck, api_on);
+                })?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
 fn wire__crate__api__snapshot_all_impl(
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -647,6 +744,70 @@ fn wire__crate__api__snapshot_all_impl(
             deserializer.end();
             transform_result_sse::<_, ()>((move || {
                 let output_ok = Result::<_, ()>::Ok(crate::api::snapshot_all())?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__sync_align_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "sync_align",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_deck = <u32>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok({
+                    crate::api::sync_align(api_deck);
+                })?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__sync_step_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "sync_step",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_deck = <u32>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok({
+                    crate::api::sync_step(api_deck);
+                })?;
                 Ok(output_ok)
             })())
         },
@@ -850,9 +1011,13 @@ impl SseDecode for crate::api::DeckSnapshotWire {
         let mut var_gridBpm = <f64>::sse_decode(deserializer);
         let mut var_keylock = <f64>::sse_decode(deserializer);
         let mut var_sync_ = <f64>::sse_decode(deserializer);
+        let mut var_syncStage = <u32>::sse_decode(deserializer);
+        let mut var_syncMode = <u32>::sse_decode(deserializer);
+        let mut var_syncMaster = <u32>::sse_decode(deserializer);
         let mut var_loopActive = <f64>::sse_decode(deserializer);
         let mut var_loopIn = <f64>::sse_decode(deserializer);
         let mut var_loopOut = <f64>::sse_decode(deserializer);
+        let mut var_loopBeats = <f64>::sse_decode(deserializer);
         let mut var_eqLow = <f64>::sse_decode(deserializer);
         let mut var_eqMid = <f64>::sse_decode(deserializer);
         let mut var_eqHigh = <f64>::sse_decode(deserializer);
@@ -869,9 +1034,13 @@ impl SseDecode for crate::api::DeckSnapshotWire {
             grid_bpm: var_gridBpm,
             keylock: var_keylock,
             sync: var_sync_,
+            sync_stage: var_syncStage,
+            sync_mode: var_syncMode,
+            sync_master: var_syncMaster,
             loop_active: var_loopActive,
             loop_in: var_loopIn,
             loop_out: var_loopOut,
+            loop_beats: var_loopBeats,
             eq_low: var_eqLow,
             eq_mid: var_eqMid,
             eq_high: var_eqHigh,
@@ -1128,12 +1297,12 @@ fn pde_ffi_dispatcher_primary_impl(
         6 => wire__crate__api__fx_effect_wire_default_impl(port, ptr, rust_vec_len, data_len),
         8 => wire__crate__api__fx_param_wire_default_impl(port, ptr, rust_vec_len, data_len),
         10 => wire__crate__api__load_track_impl(port, ptr, rust_vec_len, data_len),
-        11 => {
+        13 => {
             wire__crate__api__master_snapshot_wire_default_impl(port, ptr, rust_vec_len, data_len)
         }
-        14 => wire__crate__api__read_metadata_impl(port, ptr, rust_vec_len, data_len),
-        20 => wire__crate__api__track_metadata_wire_default_impl(port, ptr, rust_vec_len, data_len),
-        21 => wire__crate__api__wire_column_default_impl(port, ptr, rust_vec_len, data_len),
+        16 => wire__crate__api__read_metadata_impl(port, ptr, rust_vec_len, data_len),
+        25 => wire__crate__api__track_metadata_wire_default_impl(port, ptr, rust_vec_len, data_len),
+        26 => wire__crate__api__wire_column_default_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -1151,13 +1320,18 @@ fn pde_ffi_dispatcher_sync_impl(
         4 => wire__crate__api__bus_set_impl(ptr, rust_vec_len, data_len),
         7 => wire__crate__api__fx_manifests_impl(ptr, rust_vec_len, data_len),
         9 => wire__crate__api__init_engine_impl(ptr, rust_vec_len, data_len),
-        12 => wire__crate__api__pick_audio_file_impl(ptr, rust_vec_len, data_len),
-        13 => wire__crate__api__ping_impl(ptr, rust_vec_len, data_len),
-        15 => wire__crate__api__seek_impl(ptr, rust_vec_len, data_len),
-        16 => wire__crate__api__seek_exact_impl(ptr, rust_vec_len, data_len),
-        17 => wire__crate__api__set_analysis_priority_impl(ptr, rust_vec_len, data_len),
-        18 => wire__crate__api__set_beat_loop_impl(ptr, rust_vec_len, data_len),
-        19 => wire__crate__api__snapshot_all_impl(ptr, rust_vec_len, data_len),
+        11 => wire__crate__api__loop_in_impl(ptr, rust_vec_len, data_len),
+        12 => wire__crate__api__loop_out_impl(ptr, rust_vec_len, data_len),
+        14 => wire__crate__api__pick_audio_file_impl(ptr, rust_vec_len, data_len),
+        15 => wire__crate__api__ping_impl(ptr, rust_vec_len, data_len),
+        17 => wire__crate__api__seek_impl(ptr, rust_vec_len, data_len),
+        18 => wire__crate__api__seek_exact_impl(ptr, rust_vec_len, data_len),
+        19 => wire__crate__api__set_analysis_priority_impl(ptr, rust_vec_len, data_len),
+        20 => wire__crate__api__set_beat_loop_impl(ptr, rust_vec_len, data_len),
+        21 => wire__crate__api__set_sync_mode_impl(ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__snapshot_all_impl(ptr, rust_vec_len, data_len),
+        23 => wire__crate__api__sync_align_impl(ptr, rust_vec_len, data_len),
+        24 => wire__crate__api__sync_step_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -1275,9 +1449,13 @@ impl flutter_rust_bridge::IntoDart for crate::api::DeckSnapshotWire {
             self.grid_bpm.into_into_dart().into_dart(),
             self.keylock.into_into_dart().into_dart(),
             self.sync.into_into_dart().into_dart(),
+            self.sync_stage.into_into_dart().into_dart(),
+            self.sync_mode.into_into_dart().into_dart(),
+            self.sync_master.into_into_dart().into_dart(),
             self.loop_active.into_into_dart().into_dart(),
             self.loop_in.into_into_dart().into_dart(),
             self.loop_out.into_into_dart().into_dart(),
+            self.loop_beats.into_into_dart().into_dart(),
             self.eq_low.into_into_dart().into_dart(),
             self.eq_mid.into_into_dart().into_dart(),
             self.eq_high.into_into_dart().into_dart(),
@@ -1518,9 +1696,13 @@ impl SseEncode for crate::api::DeckSnapshotWire {
         <f64>::sse_encode(self.grid_bpm, serializer);
         <f64>::sse_encode(self.keylock, serializer);
         <f64>::sse_encode(self.sync, serializer);
+        <u32>::sse_encode(self.sync_stage, serializer);
+        <u32>::sse_encode(self.sync_mode, serializer);
+        <u32>::sse_encode(self.sync_master, serializer);
         <f64>::sse_encode(self.loop_active, serializer);
         <f64>::sse_encode(self.loop_in, serializer);
         <f64>::sse_encode(self.loop_out, serializer);
+        <f64>::sse_encode(self.loop_beats, serializer);
         <f64>::sse_encode(self.eq_low, serializer);
         <f64>::sse_encode(self.eq_mid, serializer);
         <f64>::sse_encode(self.eq_high, serializer);
@@ -1722,7 +1904,7 @@ mod io {
     use flutter_rust_bridge::for_generated::byteorder::{
         NativeEndian, ReadBytesExt, WriteBytesExt,
     };
-    use flutter_rust_bridge::for_generated::{Lifetimeable, Lockable, transform_result_dco};
+    use flutter_rust_bridge::for_generated::{transform_result_dco, Lifetimeable, Lockable};
     use flutter_rust_bridge::{Handler, IntoIntoDart};
 
     // Section: boilerplate
@@ -1746,7 +1928,7 @@ mod web {
     };
     use flutter_rust_bridge::for_generated::wasm_bindgen;
     use flutter_rust_bridge::for_generated::wasm_bindgen::prelude::*;
-    use flutter_rust_bridge::for_generated::{Lifetimeable, Lockable, transform_result_dco};
+    use flutter_rust_bridge::for_generated::{transform_result_dco, Lifetimeable, Lockable};
     use flutter_rust_bridge::{Handler, IntoIntoDart};
 
     // Section: boilerplate

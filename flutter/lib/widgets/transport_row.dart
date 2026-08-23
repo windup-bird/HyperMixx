@@ -14,20 +14,7 @@
 import 'package:flutter/material.dart';
 
 import '../engine/deck_controller.dart';
-import '../engine/engine_controller.dart';
 import 'deck_pads.dart';
-
-/// P16 leader（master deck）判定——与引擎 beat sync 规则一致：
-/// 单开 = 不开 sync 的轨；双开 = deck0；都关无 leader。
-bool isSyncLeader(int deck) {
-  final decks = EngineController.instance.decks;
-  final s0 = decks[0].syncOn.value;
-  final s1 = decks[1].syncOn.value;
-  if (s0 && s1) return deck == 0;
-  if (s1) return deck == 0;
-  if (s0) return deck == 1;
-  return false;
-}
 
 /// P19 transport 行（原 play/cue/nudge 行重构）。
 class TransportRow extends StatelessWidget {
@@ -62,32 +49,36 @@ class TransportRow extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 4),
-          Expanded(child: CueButton(deck: dc, actions: actions)),
+          Expanded(
+            child: CueButton(deck: dc, actions: actions),
+          ),
           const SizedBox(width: 4),
-          // P16：leader 判定依赖两轨 sync 状态——监听双方，任一变化重绘
-          //（否则另一轨开关 sync 后本面板的 leader 指示不刷新）
+          // 单击从动轨 = 一次性对齐；长按切换锁定。master 只作状态显示。
           Expanded(
             child: ListenableBuilder(
-              listenable: Listenable.merge([
-                dc.syncOn,
-                EngineController.instance.decks[1 - dc.deck].syncOn,
-              ]),
+              listenable: Listenable.merge([dc.syncStage, dc.syncMaster]),
               builder: (context, _) {
-                final on = dc.syncOn.value;
+                final stage = dc.syncStage.value;
+                final master = dc.syncMaster.value;
                 return _TransportButton(
-                  label: 'SYNC',
-                  active: on,
+                  label: master
+                      ? 'MASTER'
+                      : stage == 2
+                      ? 'LOCK'
+                      : stage == 1
+                      ? 'SYNCED'
+                      : 'SYNC',
+                  active: stage > 0,
                   activeColor: const Color(0xFF00897B),
-                  isLeader: isSyncLeader(dc.deck),
-                  onTap: () => actions.setSync(dc.deck, !on),
+                  isLeader: master,
+                  onTap: master ? null : () => actions.syncStep(dc.deck),
+                  onDown: null,
                 );
               },
             ),
           ),
           const SizedBox(width: 4),
-          Expanded(
-            child: _TransportButton(label: 'SHIFT', dead: true),
-          ),
+          Expanded(child: _TransportButton(label: 'SHIFT', dead: true)),
           const SizedBox(width: 4),
           Expanded(
             child: _TransportButton(
@@ -167,10 +158,10 @@ class _TransportButton extends StatelessWidget {
               color: dead
                   ? Colors.white12
                   : active
-                      ? Colors.white
-                      : isLeader
-                          ? const Color(0xFFFFB300)
-                          : Colors.white70,
+                  ? Colors.white
+                  : isLeader
+                  ? const Color(0xFFFFB300)
+                  : Colors.white70,
               fontSize: 11,
               fontWeight: FontWeight.bold,
             ),

@@ -20,13 +20,10 @@ const double kTempoMin = -8.0;
 const double kTempoMax = 8.0;
 
 class TempoFader extends StatefulWidget {
-  const TempoFader({
-    super.key,
-    required this.deck,
-    this.onSetRate,
-  });
+  const TempoFader({super.key, required this.deck, this.onSetRate});
 
   final DeckController deck;
+
   /// 变速写入（%）。null = 默认 engine.setRate。
   final void Function(double v)? onSetRate;
 
@@ -48,10 +45,17 @@ class _TempoFaderState extends State<TempoFader> {
     return box?.size.height ?? 0;
   }
 
+  double _range() => widget.deck.tempoRange.value;
+
+  double _min() => -_range();
+  double _max() => _range();
+
   void _setRate(double v) {
-    final f = widget.onSetRate ??
+    if (widget.deck.syncMode.value && !widget.deck.syncMaster.value) return;
+    final f =
+        widget.onSetRate ??
         (v) => EngineController.instance.setRate(widget.deck.deck, v);
-    f(clampDouble(v, kTempoMin, kTempoMax));
+    f(clampDouble(v, _min(), _max()));
   }
 
   /// 微调按住：立即一次 + 每 100ms 重复（读侧绑快照 rate）。
@@ -70,7 +74,7 @@ class _TempoFaderState extends State<TempoFader> {
     // nudge 键或推子软接管）。P14：基准用有效速率（引擎实际值）——
     // 取消 sync 后速率保持 sync 期间值、滑杆 bus 值与实际速率不一致，
     // 读 bus 值会瞬跳。
-    if (widget.deck.syncOn.value) return;
+    if (widget.deck.syncMode.value && !widget.deck.syncMaster.value) return;
     _setRate(widget.deck.effRate.value + 0.5 * _fineDir);
   }
 
@@ -85,7 +89,7 @@ class _TempoFaderState extends State<TempoFader> {
   void _dragAt(double dy, double h) {
     if (h <= 0) return;
     final t = (dy / h).clamp(0.0, 1.0);
-    _setRate(kTempoMax - t * (kTempoMax - kTempoMin));
+    _setRate(_max() - t * (_max() - _min()));
   }
 
   @override
@@ -100,13 +104,11 @@ class _TempoFaderState extends State<TempoFader> {
     return Column(
       children: [
         Expanded(
-          child: ValueListenableBuilder<double>(
-            // P14：thumb 恒显示有效速率（引擎实际值）——同步中锁定跟随
-            // leader（拖 leader 推子实时跟随）；取消 sync 后速率保持
-            // sync 期间值（推子仅解锁），thumb 不跳回滑杆位置、与音频
-            // 一致（旧 P10.1 关 sync 回滑杆的"松手回弹"已删）。
-            valueListenable: dc.effRate,
-            builder: (_, rate, _) {
+          child: ListenableBuilder(
+            listenable: Listenable.merge([dc.effRate, dc.tempoRange]),
+            builder: (_, _) {
+              final rate = dc.effRate.value;
+              final range = dc.tempoRange.value;
               return GestureDetector(
                 key: _faderKey,
                 behavior: HitTestBehavior.opaque,
@@ -119,7 +121,9 @@ class _TempoFaderState extends State<TempoFader> {
                 // 撑满跨轴：Expanded 给的是宽松宽约束，CustomPaint 无固有
                 // 尺寸会收缩到 0 宽（拖拽/双击全部脱靶）
                 child: SizedBox.expand(
-                  child: CustomPaint(painter: _RatePainter(rate: rate)),
+                  child: CustomPaint(
+                    painter: _RatePainter(rate: rate, range: range),
+                  ),
                 ),
               );
             },
@@ -191,9 +195,10 @@ class _HoldButton extends StatelessWidget {
 
 /// 垂直速率推子自绘：track + 50% 处 0 刻度线 + 按 (rate+8)/16 定位的 thumb。
 class _RatePainter extends CustomPainter {
-  _RatePainter({required this.rate});
+  _RatePainter({required this.rate, required this.range});
 
   final double rate;
+  final double range;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -212,7 +217,7 @@ class _RatePainter extends CustomPainter {
       Paint()..color = Colors.white.withValues(alpha: 0.5),
     );
     // thumb：上快下慢
-    final t = ((rate - kTempoMin) / (kTempoMax - kTempoMin)).clamp(0.0, 1.0);
+    final t = ((rate + range) / (2 * range)).clamp(0.0, 1.0);
     final thumbH = 12.0;
     final ty = h - t * h - thumbH / 2;
     canvas.drawRRect(
@@ -225,5 +230,6 @@ class _RatePainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_RatePainter old) => old.rate != rate;
+  bool shouldRepaint(_RatePainter old) =>
+      old.rate != rate || old.range != range;
 }

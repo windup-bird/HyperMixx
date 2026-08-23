@@ -211,6 +211,40 @@ pub fn set_beat_loop(deck: u32, beats: f64) {
     }
 }
 
+pub fn loop_in(deck: u32) {
+    if (deck as usize) < DECKS
+        && let Some(handle) = with_core(|c| c.handle.clone())
+    {
+        handle.loop_in(deck as usize);
+    }
+}
+
+pub fn loop_out(deck: u32) {
+    if (deck as usize) < DECKS
+        && let Some(handle) = with_core(|c| c.handle.clone())
+    {
+        handle.loop_out(deck as usize);
+    }
+}
+
+pub fn sync_step(deck: u32) {
+    if (deck as usize) < DECKS
+        && let Some(handle) = with_core(|c| c.handle.clone())
+    {
+        handle.sync_step(deck as usize);
+    }
+}
+
+pub fn sync_align(deck: u32) {
+    sync_step(deck);
+}
+
+pub fn set_sync_mode(deck: u32, on: bool) {
+    if (deck as usize) < DECKS {
+        bus_set(&paths::deck_sync_mode(deck as usize), if on { 1.0 } else { 0.0 });
+    }
+}
+
 /// 写控制总线（未初始化时静默忽略）。
 pub fn bus_set(path: &str, value: f64) {
     if let Some(bus) = with_core(|c| c.bus.clone()) {
@@ -240,6 +274,14 @@ pub fn snapshot_from(bus: &ControlBus) -> AllSnapshotWire {
     }
 }
 
+fn loop_beats(bus: &ControlBus, deck: usize) -> f64 {
+    let bpm = bus.get(&paths::deck_grid_bpm(deck));
+    if bpm <= 0.0 {
+        return 0.0;
+    }
+    (bus.get(&paths::deck_loop_out(deck)) - bus.get(&paths::deck_loop_in(deck))) * bpm / 60.0
+}
+
 fn deck_snapshot(bus: &ControlBus, deck: usize) -> DeckSnapshotWire {
     DeckSnapshotWire {
         playhead: bus.get(&paths::deck_playhead(deck)),
@@ -253,9 +295,13 @@ fn deck_snapshot(bus: &ControlBus, deck: usize) -> DeckSnapshotWire {
         grid_bpm: bus.get(&paths::deck_grid_bpm(deck)),
         keylock: bus.get(&paths::deck_keylock(deck)),
         sync: bus.get(&paths::deck_sync(deck)),
+        sync_stage: bus.get(&paths::deck_sync_stage(deck)) as u32,
+        sync_mode: bus.get(&paths::deck_sync_mode(deck)) as u32,
+        sync_master: bus.get(&paths::deck_sync_master(deck)) as u32,
         loop_active: bus.get(&paths::deck_loop_active(deck)),
         loop_in: bus.get(&paths::deck_loop_in(deck)),
         loop_out: bus.get(&paths::deck_loop_out(deck)),
+        loop_beats: loop_beats(bus, deck),
         eq_low: bus.get(&paths::deck_eq_low(deck)),
         eq_mid: bus.get(&paths::deck_eq_mid(deck)),
         eq_high: bus.get(&paths::deck_eq_high(deck)),

@@ -35,16 +35,14 @@ class FakeActions extends PadActions {
 }
 
 Widget _wrap(Widget child) => MaterialApp(
-      home: Scaffold(
-        body: SizedBox(width: 720, height: 300, child: child),
-      ),
-    );
+  home: Scaffold(body: SizedBox(width: 720, height: 300, child: child)),
+);
 
 Finder _pad(DeckController dc, String label) =>
     find.descendant(of: find.byType(DeckPads), matching: find.text(label));
 
-Finder _tab(String label) => find.descendant(
-    of: find.byType(DeckPads), matching: find.text(label));
+Finder _tab(String label) =>
+    find.descendant(of: find.byType(DeckPads), matching: find.text(label));
 
 void main() {
   testWidgets('renders 4 mode tabs and 8 hotcue pads', (tester) async {
@@ -141,8 +139,7 @@ void main() {
 
     // 模拟引擎回执：loop 激活 + in/out 匹配 1 拍
     dc.loopActive.value = true;
-    dc.loopIn.value = 0.5;
-    dc.loopOut.value = 1.0;
+    dc.loopBeats.value = 1;
     await tester.pump();
     await tester.tap(_pad(dc, '1'));
     await tester.pump();
@@ -202,8 +199,9 @@ void main() {
     expect(_pad(dc, '9'), findsOneWidget);
     expect(_pad(dc, '16'), findsOneWidget); // 最后一页 9..16
     // 边界：下一页按钮禁用
-    final btn = tester.widget<IconButton>(find.ancestor(
-        of: down, matching: find.byType(IconButton)));
+    final btn = tester.widget<IconButton>(
+      find.ancestor(of: down, matching: find.byType(IconButton)),
+    );
     expect(btn.onPressed, isNull);
   });
 
@@ -241,7 +239,9 @@ void main() {
     // 停播位于 cue 点 → 按住试听、松开回点
     dc.playhead.value = 5.0;
     await tester.pump();
-    final g = await tester.startGesture(tester.getCenter(find.byType(CueButton)));
+    final g = await tester.startGesture(
+      tester.getCenter(find.byType(CueButton)),
+    );
     await tester.pump();
     expect(fake.plays, [(0, true)]);
     await g.up();

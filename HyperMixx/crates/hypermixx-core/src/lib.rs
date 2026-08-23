@@ -67,7 +67,19 @@ pub mod paths {
     pub fn deck_grid_offset(deck: usize) -> String {
         format!("Deck{}.grid_offset", deck + 1)
     }
-    /// beat sync 开关（0/1，P5）。
+    /// sync 三段状态（0=free，1=aligned/following，2=locked）。
+    pub fn deck_sync_stage(deck: usize) -> String {
+        format!("Deck{}.sync_stage", deck + 1)
+    }
+    /// 持久 sync 锁定模式（0/1；引擎读、UI 写）。
+    pub fn deck_sync_mode(deck: usize) -> String {
+        format!("Deck{}.sync_mode", deck + 1)
+    }
+    /// 当前自动选择的 sync master（0/1；引擎写、UI 只读）。
+    pub fn deck_sync_master(deck: usize) -> String {
+        format!("Deck{}.sync_master", deck + 1)
+    }
+    /// beat sync 旧开关（保留路径兼容旧会话；新 UI 不再写）。
     pub fn deck_sync(deck: usize) -> String {
         format!("Deck{}.sync", deck + 1)
     }

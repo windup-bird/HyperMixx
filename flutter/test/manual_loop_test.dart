@@ -14,14 +14,14 @@ import 'package:hypermixx/widgets/manual_loop.dart';
 
 /// 记录调用的假动作出口。
 class _FakeActions extends PadActions {
-  final loops = <(String, double)>[];
+  final loops = <String>[];
   final loopActive = <bool>[];
   final beatLoops = <double>[];
 
   @override
-  void setLoopIn(int deck, double seconds) => loops.add(('in', seconds));
+  void loopInAtPlayhead(int deck) => loops.add('in');
   @override
-  void setLoopOut(int deck, double seconds) => loops.add(('out', seconds));
+  void loopOutAtPlayhead(int deck) => loops.add('out');
   @override
   void setLoopActive(int deck, bool on) => loopActive.add(on);
   @override
@@ -33,7 +33,11 @@ Widget _wrap(DeckController dc, _FakeActions a) {
     home: Scaffold(
       backgroundColor: const Color(0xFF1A1E24),
       body: Center(
-        child: SizedBox(width: 200, height: 80, child: ManualLoop(deck: dc, actions: a)),
+        child: SizedBox(
+          width: 200,
+          height: 80,
+          child: ManualLoop(deck: dc, actions: a),
+        ),
       ),
     ),
   );
@@ -69,8 +73,8 @@ void main() {
 
     dc.loopActive.value = true;
     dc.loopIn.value = 0;
-    dc.loopOut.value = 2; // 120BPM 下 2s = 4 拍
-    dc.bpm.value = 120;
+    dc.loopOut.value = 2;
+    dc.loopBeats.value = 4;
     await tester.pump();
     expect(find.text('4'), findsOneWidget, reason: '激活中显示实际环拍数');
     await tester.tap(find.text('4'));
@@ -84,10 +88,9 @@ void main() {
     await tester.pumpWidget(_wrap(dc, a));
     expect(find.text('4'), findsOneWidget);
 
-    // 激活环 0.5s..1.5s @120BPM = 2 拍
+    // 引擎快照给出 2 拍。
     dc.loopActive.value = true;
-    dc.loopIn.value = 0.5;
-    dc.loopOut.value = 1.5;
+    dc.loopBeats.value = 2;
     await tester.pump();
     expect(find.text('2'), findsOneWidget);
   });
@@ -118,63 +121,18 @@ void main() {
     await tester.pumpWidget(_wrap(dc, a));
 
     await tester.tap(find.text('In'));
-    expect(a.loops, [('in', 31.5)], reason: 'P23：In 只定下界（raw 秒数）');
-    expect(a.loopActive, isEmpty, reason: 'P23：In 不激活，由 Out 定上界并激活');
+    expect(a.loops, ['in'], reason: 'In 命令由 Rust 侧捕获播放头并量化');
+    expect(a.loopActive, isEmpty, reason: 'In 不激活，由 Out 定上界并激活');
   });
 
-  testWidgets('P23 In：已有有效 out 不动；Out：只写原始播放头秒数 + 激活',
-      (tester) async {
+  testWidgets('In/Out：只下发有序的 Rust 音频线程命令', (tester) async {
     final dc = DeckController(0);
-    dc.playhead.value = 10;
-    dc.bpm.value = 120;
-    dc.loopOut.value = 15; // 已有有效环（out > in）
     final a = _FakeActions();
     await tester.pumpWidget(_wrap(dc, a));
 
     await tester.tap(find.text('In'));
-    expect(a.loops, [('in', 10.0)], reason: 'out 有效时不动 out');
-    expect(a.loopActive, isEmpty, reason: 'In 不激活');
-
-    // Out：playhead = 10 → 只写 raw 10.0（量化交给引擎 snap_loop_bounds）
-    a.loops.clear();
-    dc.playhead.value = 10;
-    dc.loopIn.value = 5; // 已有有效 in（in < out）
     await tester.tap(find.text('Out'));
-    expect(a.loops, [('out', 10.0)], reason: 'P23：out = raw 播放头秒数');
-    expect(a.loopActive, [true], reason: 'Out 确定上界后激活');
-  });
-
-  testWidgets('P23 Out：raw 秒数透传，不量化（引擎负责 snap）', (tester) async {
-    final dc = DeckController(0);
-    dc.bpm.value = 120; // 拍长 0.5s（Flutter 侧不再使用）
-    dc.loopIn.value = 10;
-    final a = _FakeActions();
-    await tester.pumpWidget(_wrap(dc, a));
-
-    // 11.8s（3.6 拍，P21 会取整到 12.0）→ P23 原样传 11.8
-    dc.playhead.value = 11.8;
-    await tester.tap(find.text('Out'));
-    expect(a.loops, [('out', 11.8)], reason: 'P23：不做整拍取整');
-    expect(a.loopActive, [true]);
-
-    // 10.14s（0.28 拍，P21 保底 1 拍 → 10.5）→ P23 原样传 10.14
-    a.loops.clear();
-    a.loopActive.clear();
-    dc.playhead.value = 10.14;
-    await tester.tap(find.text('Out'));
-    expect(a.loops, [('out', 10.14)], reason: 'P23：不做保底拍数');
-  });
-
-  testWidgets('P23 Out：无有效 in 也不回拉（起点回拉归引擎）', (tester) async {
-    final dc = DeckController(0);
-    dc.playhead.value = 20;
-    dc.bpm.value = 120;
-    final a = _FakeActions();
-    await tester.pumpWidget(_wrap(dc, a));
-
-    await tester.tap(find.text('Out'));
-    expect(a.loops, [('out', 20.0)],
-        reason: 'P23：只写 out raw 秒数，起点回拉由引擎 snap_loop_bounds 做');
-    expect(a.loopActive, [true]);
+    expect(a.loops, ['in', 'out']);
+    expect(a.loopActive, isEmpty, reason: '激活由 Rust 收到有效 Out 后完成');
   });
 }

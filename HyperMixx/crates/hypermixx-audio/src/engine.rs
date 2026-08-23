@@ -32,6 +32,11 @@ pub enum EngineOp {
     BeatJump { deck: usize, beats: f64 },
     /// 激活/调整 beat loop（量化起止）。
     SetBeatLoop { deck: usize, beats: f64 },
+    /// 在当前播放位置设定 Manual Loop In（音频线程中捕获并 snap）。
+    LoopIn { deck: usize },
+    /// 在当前播放位置设定 Manual Loop Out 并激活（需先有 In）。
+    LoopOut { deck: usize },
+    SyncStep { deck: usize },
 }
 
 /// UI/MIDI 侧持有的引擎句柄：推送操作，由音频回调在块边界消费。
@@ -74,6 +79,18 @@ impl EngineHandle {
             .lock()
             .unwrap()
             .push_back(EngineOp::SetBeatLoop { deck, beats });
+    }
+
+    pub fn loop_in(&self, deck: usize) {
+        self.ops.lock().unwrap().push_back(EngineOp::LoopIn { deck });
+    }
+
+    pub fn loop_out(&self, deck: usize) {
+        self.ops.lock().unwrap().push_back(EngineOp::LoopOut { deck });
+    }
+
+    pub fn sync_step(&self, deck: usize) {
+        self.ops.lock().unwrap().push_back(EngineOp::SyncStep { deck });
     }
 }
 
@@ -123,6 +140,7 @@ impl Engine {
             // 初始 1.0：交叉推子居中时因子恒 1.0（bitwise 恒等）
             xfa: Smoother::new(1.0, coeff as f32),
             xfb: Smoother::new(1.0, coeff as f32),
+            sync_master: None,
         };
         (state, EngineHandle { ops })
     }
@@ -138,9 +156,37 @@ pub struct EngineState {
     /// 交叉推子因子逐采样平滑（10ms，防拖动拉链声）。
     xfa: Smoother,
     xfb: Smoother,
+    /// 先开始可听播放的 deck 获得 master；只在其失效时移交。
+    sync_master: Option<usize>,
 }
 
 impl EngineState {
+    /// 解析并发布唯一 master。现任仍可用则绝不抢占；失效（停播或音量为
+    /// 零）时把角色交给另一可用 deck。升任者保留实际速率并启用推子回位。
+    fn update_sync_master(&mut self) {
+        let previous = self.sync_master;
+        if self
+            .sync_master
+            .is_some_and(|deck| !self.decks[deck].sync_master_eligible())
+        {
+            self.sync_master = None;
+        }
+        if self.sync_master.is_none() {
+            self.sync_master = self.decks.iter().position(Deck::sync_master_eligible);
+        }
+        if let Some(master) = self.sync_master
+            && previous != Some(master)
+        {
+            self.decks[master].become_sync_master();
+        }
+        for (index, deck) in self.decks.iter().enumerate() {
+            deck.ctl.sync_stage.set(deck.sync_stage() as f64);
+            deck.ctl
+                .sync_master
+                .set(if self.sync_master == Some(index) { 1.0 } else { 0.0 });
+        }
+    }
+
     pub fn process(&mut self, out: &mut [f32]) {
         // 1. 应用挂起操作（try_lock：不与 UI 线程争抢）
         if let Ok(mut q) = self.ops.try_lock() {
@@ -175,6 +221,21 @@ impl EngineState {
                             self.decks[deck].set_beat_loop(beats);
                         }
                     }
+                    EngineOp::LoopIn { deck } => {
+                        if deck < self.decks.len() {
+                            self.decks[deck].set_loop_in_at_playhead();
+                        }
+                    }
+                    EngineOp::LoopOut { deck } => {
+                        if deck < self.decks.len() {
+                            self.decks[deck].set_loop_out_at_playhead();
+                        }
+                    }
+                    EngineOp::SyncStep { deck } => {
+                        if deck < self.decks.len() && self.sync_master != Some(deck) {
+                            self.decks[deck].sync_step();
+                        }
+                    }
                 }
             }
         }
@@ -185,15 +246,14 @@ impl EngineState {
         for deck in self.decks.iter_mut() {
             deck.update_params();
         }
-        // beat sync：sync 开启的 deck 跟随另一 deck（双开时 deck1 随 deck0）
-        let (fi, li) = match (self.decks[0].sync_on(), self.decks[1].sync_on()) {
-            (true, true) | (false, true) => (1, 0),
-            (true, false) => (0, 1),
-            (false, false) => (usize::MAX, usize::MAX),
-        };
-        if fi < self.decks.len() {
-            let leader = self.decks[li].sync_leader_snapshot();
-            self.decks[fi].apply_sync(&leader);
+        self.update_sync_master();
+        if let Some(master) = self.sync_master {
+            let leader = self.decks[master].sync_leader_snapshot();
+            for follower in 0..self.decks.len() {
+                if follower != master && self.decks[follower].sync_requested() {
+                    self.decks[follower].apply_sync(&leader);
+                }
+            }
         }
         // 交叉推子：居中两边全音量，向一侧线性衰减另一侧（因子逐采样平滑）
         let (fa, fb) = crossfade_factors(self.crossfader.get() as f32);
@@ -369,43 +429,22 @@ mod tests {
         );
     }
 
-    /// P12：leader 停播后 follower 的 sync 速率保持（bpm 连续），不再
-    /// 瞬跳回滑杆值（跳变会经 effBpm 使拍轴窗口平移——"到结束时右移"）。
-    /// 后半验证无网格 fallback 下滑杆仍可调速（回归防护）。
+    /// master 停播/静音后角色移交；升任者的推子须回位后才接管。
     #[test]
-    fn sync_follower_rate_holds_after_leader_stops() {
+    fn sync_master_transfers_on_stop_and_volume_zero() {
         let (mut state, _handle, bus_a, bus_b) = dual_deck_rig();
-        bus_b.control(&paths::deck_sync(0)).set(1.0);
-        run_blocks(&mut state, 120); // 预热 + sync 收敛
-
-        // follower grid 124 追 leader 120 → rate ≈ 0.9677 → bpm ≈ 120
-        let bpm_synced = state.decks[1].ctl.bpm.get();
-        assert!(
-            (bpm_synced - 120.0).abs() < 1.0,
-            "sync 后 follower bpm 应 ≈ leader 120：{bpm_synced}"
-        );
-
-        // leader 停播 → follower apply_sync 提前返回；P12 修复后 rate 保持
-        bus_a.control(&paths::deck_play(0)).set(0.0);
         run_blocks(&mut state, 2);
-        let bpm_after = state.decks[1].ctl.bpm.get();
-        assert!(
-            (bpm_after - bpm_synced).abs() < 0.01,
-            "leader 停后 follower bpm 应连续（不跳回 124×滑杆）：{bpm_after} vs {bpm_synced}"
-        );
-        let p1a = state.decks[1].ctl.playhead.get();
-        run_blocks(&mut state, 60);
-        let p1b = state.decks[1].ctl.playhead.get();
-        assert!(p1b > p1a + 0.1, "follower 应继续播放：{p1a} → {p1b}");
+        assert_eq!(state.sync_master, Some(0), "先播放的 deck0 应为 master");
+        bus_a.control(&paths::deck_play(0)).set(0.0);
+        run_blocks(&mut state, 1);
+        assert_eq!(state.sync_master, Some(1), "deck0 停播后应移交 deck1");
+        assert_eq!(bus_b.control(&paths::deck_sync_master(0)).get(), 1.0);
 
-        // 无网格 fallback：grid 清 0 → sync 失效回滑杆，滑杆仍可调速
-        bus_b.control(&paths::deck_grid_bpm(0)).set(0.0);
-        bus_b.control(&paths::deck_rate(0)).set(4.0);
-        run_blocks(&mut state, 200);
-        let adv = state.decks[1].ctl.playhead.get() - p1b;
-        assert!(
-            (adv - 200.0 * 256.0 / 48000.0 * 1.04).abs() < 0.03,
-            "无网格 fallback 滑杆 +4% 应生效：adv={adv}"
-        );
+        bus_a.control(&paths::deck_play(0)).set(1.0);
+        run_blocks(&mut state, 1);
+        assert_eq!(state.sync_master, Some(1), "现任可用时不得抢占");
+        bus_b.control(&paths::deck_volume(0)).set(0.0);
+        run_blocks(&mut state, 1);
+        assert_eq!(state.sync_master, Some(0), "音量归零后应移交 deck0");
     }
 }

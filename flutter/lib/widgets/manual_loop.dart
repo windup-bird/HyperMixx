@@ -22,7 +22,7 @@ import 'deck_pads.dart';
 import 'panel_button.dart';
 
 /// 拍数范围（与 pad loop 列表 1/32..64 一致）。
-const double kManualLoopMinBeats = 1 / 32;
+const double kManualLoopMinBeats = 1 / 2;
 const double kManualLoopMaxBeats = 64;
 
 /// P20 拍数显示：只显示分数或整数，且只显示数字（无"拍"后缀）。
@@ -57,13 +57,6 @@ class ManualLoop extends StatefulWidget {
 class _ManualLoopState extends State<ManualLoop> {
   double _beats = 4;
 
-  /// 拍 → 秒：用静态 BPM（loop pad 同款折算）；无网格回退 120
-  /// （与引擎 set_beat_loop 同源折算，P20 显示不再出现 BPM 双源偏差）。
-  double get _beatSecs {
-    final bpm = widget.deck.bpm.value;
-    return 60.0 / (bpm > 0 ? bpm : 120.0);
-  }
-
   void _setBeats(double b) {
     setState(() {
       _beats = b.clamp(kManualLoopMinBeats, kManualLoopMaxBeats);
@@ -83,20 +76,13 @@ class _ManualLoopState extends State<ManualLoop> {
     }
   }
 
-  /// P21 In：只写 loop_in = 当前位置（手动定下界）——不再自动回填 out、
-  /// 不再自动激活；由 Out 确定上界并激活。
+  /// In/Out 由 Rust 音频线程在块首取播放头并 snap，严格 In→Out。
   void _setIn() {
-    final dc = widget.deck;
-    widget.actions.setLoopIn(dc.deck, dc.playhead.value);
+    widget.actions.loopInAtPlayhead(widget.deck.deck);
   }
 
-  /// P23 Out：loop_out = 当前位置**原始秒数**（不做任何折算）；量化与
-  /// 起点回拉由引擎 snap_loop_bounds 完成。未激活 → 激活（引擎 bus
-  /// 边沿检测进捕获）。
   void _setOut() {
-    final dc = widget.deck;
-    widget.actions.setLoopOut(dc.deck, dc.playhead.value);
-    if (!dc.loopActive.value) widget.actions.setLoopActive(dc.deck, true);
+    widget.actions.loopOutAtPlayhead(widget.deck.deck);
   }
 
   @override
@@ -116,15 +102,14 @@ class _ManualLoopState extends State<ManualLoop> {
             const SizedBox(width: 4),
             Expanded(
               flex: 2,
-              child: ValueListenableBuilder<bool>(
-                valueListenable: dc.loopActive,
-                builder: (_, active, _) {
+              child: ListenableBuilder(
+                listenable: Listenable.merge([dc.loopActive, dc.loopBeats]),
+                builder: (_, _) {
+                  final active = dc.loopActive.value;
                   // 激活中显示实际环拍数（实时快照按 _beatSecs 折算，与
                   // 引擎拍长同源）；未激活显示目标拍数。
                   // P20：fmtBeats 只显示分数/整数（去小数噪声、无"拍"）。
-                  final cur = active
-                      ? (dc.loopOut.value - dc.loopIn.value) / _beatSecs
-                      : 0.0;
+                  final cur = dc.loopBeats.value;
                   final beats = active && cur > 0 ? cur : _beats;
                   return PanelButton(
                     label: fmtBeats(beats),
@@ -147,9 +132,13 @@ class _ManualLoopState extends State<ManualLoop> {
         const SizedBox(height: 6),
         Row(
           children: [
-            Expanded(child: PanelButton(label: 'In', onTapDown: _setIn)),
+            Expanded(
+              child: PanelButton(label: 'In', onTapDown: _setIn),
+            ),
             const SizedBox(width: 4),
-            Expanded(child: PanelButton(label: 'Out', onTapDown: _setOut)),
+            Expanded(
+              child: PanelButton(label: 'Out', onTapDown: _setOut),
+            ),
           ],
         ),
       ],
