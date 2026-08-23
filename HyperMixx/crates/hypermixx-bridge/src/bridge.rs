@@ -405,6 +405,7 @@ fn to_wire_cols(cols: &[Column]) -> Vec<WireColumn> {
             high_n: c.high_n,
             all_p: c.all_p,
             all_n: c.all_n,
+            normalized_height: c.normalized_height,
         })
         .collect()
 }
@@ -666,6 +667,7 @@ mod tests {
             high_n: 6,
             all_p: 7,
             all_n: 8,
+            normalized_height: 128,
         };
         let w = to_wire(AnalysisEvent::Done {
             generation: 7,

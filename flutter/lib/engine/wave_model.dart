@@ -1,8 +1,8 @@
 //! 波形数据模型：分析事件 → 打包字节列（Dart 侧渲染用）。
 //!
-//! Rust 侧每列 8 字节（low_p/low_n/mid_p/mid_n/high_p/high_n/all_p/all_n），
+//! Rust 侧每列 9 字节（8 个 p/n 字段 + normalized_height），
 //! wire 过来是 List<WireColumn>（每列一个堆对象，整曲 12 万列 ≈ 10MB+），
-//! 这里压成 stride-8 的 Uint8List（整曲 ~1MB），painter 走字节索引。
+//! 这里压成 stride-9 的 Uint8List（整曲约 1MB），painter 走字节索引。
 
 import 'dart:typed_data';
 
@@ -11,7 +11,7 @@ import '../src/rust/api.dart';
 /// 与 Rust SEG_COLS 一致：每段 6000 列（16s @48kHz/128 帧）。
 const int kSegCols = 6000;
 
-/// 字段偏移：0=low_p 1=low_n 2=mid_p 3=mid_n 4=high_p 5=high_n 6=all_p 7=all_n。
+/// 字段偏移：0..7 为 p/n 字段，8 为 Rust 计算的预览高度。
 class F {
   static const int lowP = 0;
   static const int lowN = 1;
@@ -21,27 +21,43 @@ class F {
   static const int highN = 5;
   static const int allP = 6;
   static const int allN = 7;
+  static const int normalizedHeight = 8;
 }
 
-/// 一段打包波形列（packed.length = cols × 8）。
+/// 一段打包波形列（新数据 packed.length = cols × 9）。
 class WaveData {
-  WaveData(this.packed) : cols = packed.length ~/ 8;
+  WaveData(this.packed)
+    : stride = packed.length % 9 == 0 ? 9 : 8,
+      cols = packed.length ~/ (packed.length % 9 == 0 ? 9 : 8);
 
   final Uint8List packed;
+  final int stride;
   final int cols;
 
-  int v(int i, int f) => packed[i * 8 + f];
+  bool get hasNormalizedHeight => stride >= 9;
 
-  /// 对 [c0, c1) 列区间取 8 字段最大值累积到 out[8]（越界自动裁剪）。
+  int v(int i, int f) => f < stride ? packed[i * stride + f] : 0;
+
+  /// 对 [c0, c1) 聚合波形：p/n 峰值字段取最大，Rust 计算的预览高度取均值。
   void maxOver(int c0, int c1, Uint8List out) {
     if (c0 < 0) c0 = 0;
     if (c1 > cols) c1 = cols;
+    var heightSum = 0;
+    var heightCount = 0;
     for (var i = c0; i < c1; i++) {
-      final o = i * 8;
-      for (var f = 0; f < 8; f++) {
+      final o = i * stride;
+      for (var f = 0; f < stride; f++) {
         final v = packed[o + f];
-        if (v > out[f]) out[f] = v;
+        if (f == F.normalizedHeight) {
+          heightSum += v;
+          heightCount++;
+        } else if (v > out[f]) {
+          out[f] = v;
+        }
       }
+    }
+    if (stride > F.normalizedHeight && heightCount > 0) {
+      out[F.normalizedHeight] = (heightSum / heightCount).round();
     }
   }
 }
@@ -62,6 +78,13 @@ class WaveModel {
   int get colsTotal => full?.cols ?? segCount * kSegCols;
 
   bool get isEmpty => full == null && segs.isEmpty;
+
+  bool get hasNormalizedHeight =>
+      full?.hasNormalizedHeight ??
+      segs.values.any((segment) => segment.hasNormalizedHeight);
+
+  int get dataStride =>
+      full?.stride ?? (segs.isEmpty ? 8 : segs.values.first.stride);
 
   /// 读第 i 列的字段 f；无数据（未分析段/越界）返回 0。
   int colField(int i, int f) {
@@ -101,7 +124,7 @@ class WaveModel {
       // 每字段：列 c0、c0+1 线性插值
       final i0 = c0.floor();
       final t = c0 - i0;
-      for (var f = 0; f < 8; f++) {
+      for (var f = 0; f < dataStride; f++) {
         final a = colField(i0, f);
         final b = colField(i0 + 1, f);
         out[f] = (a + (b - a) * t).round().clamp(0, 255);
@@ -122,7 +145,7 @@ class WaveModel {
 
 /// wire 列列表 → 打包 WaveData（Segment/Done 事件用）。
 WaveData packCols(List<WireColumn> cols) {
-  final p = Uint8List(cols.length * 8);
+  final p = Uint8List(cols.length * 9);
   var o = 0;
   for (final c in cols) {
     p[o++] = c.lowP;
@@ -133,6 +156,7 @@ WaveData packCols(List<WireColumn> cols) {
     p[o++] = c.highN;
     p[o++] = c.allP;
     p[o++] = c.allN;
+    p[o++] = c.normalizedHeight;
   }
   return WaveData(p);
 }

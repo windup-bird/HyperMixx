@@ -390,6 +390,7 @@ class WireColumn {
   final int highN;
   final int allP;
   final int allN;
+  final int normalizedHeight;
 
   const WireColumn({
     required this.lowP,
@@ -400,6 +401,7 @@ class WireColumn {
     required this.highN,
     required this.allP,
     required this.allN,
+    required this.normalizedHeight,
   });
 
   static Future<WireColumn> default_() =>
@@ -414,7 +416,8 @@ class WireColumn {
       highP.hashCode ^
       highN.hashCode ^
       allP.hashCode ^
-      allN.hashCode;
+      allN.hashCode ^
+      normalizedHeight.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -428,5 +431,6 @@ class WireColumn {
           highP == other.highP &&
           highN == other.highN &&
           allP == other.allP &&
-          allN == other.allN;
+          allN == other.allN &&
+          normalizedHeight == other.normalizedHeight;
 }

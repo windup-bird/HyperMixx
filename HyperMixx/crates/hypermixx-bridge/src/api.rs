@@ -157,6 +157,7 @@ pub struct WireColumn {
     pub high_n: u8,
     pub all_p: u8,
     pub all_n: u8,
+    pub normalized_height: u8,
 }
 
 /// 渐进分析事件流（与分析 crate 的 AnalysisEvent 一一对应）。

@@ -1,8 +1,8 @@
-//! 全区波形预览 painter（D6，折叠整流半波）：
-//! 基线在底，每像素列 p 全 α、n α0.55（负半周折上、层次可见）。
+//! 全区波形预览 painter（D6，平滑频段轮廓）：
+//! 基线在底，三频段共享平滑采样和严格的内容边界。
 //! 染色跟随 waveMode（模式切换由 painter 的 repaint 合并驱动）：
 //! - rgb：单混色 (lo/mx, mi/mx, hi/mx)·255（复制 scrolling 归一化）；
-//! - bands：低/中/高 三带自底向上堆叠（红/绿/蓝）。
+//! - bands：低/中/高 按共享包络比例堆叠（红/绿/蓝）。
 //! 全曲聚合（329s@~800px ≈ 150 列/px）；播放头 60Hz 自绘。
 //! P13 已播蒙层：已播部分深色 ▓（黑 α0.38）、未播部分浅色 ░（白 α0.10），
 //! 进度一眼可见；蒙层画在标记/播放头之下，不遮它们。
@@ -15,6 +15,7 @@ import 'package:flutter/material.dart';
 import '../engine/deck_controller.dart';
 import '../engine/wave_display_mode.dart';
 import '../engine/wave_model.dart';
+import 'wave_shape.dart';
 
 class OverviewPainter extends CustomPainter {
   OverviewPainter(this.deck, this.mode)
@@ -37,6 +38,9 @@ class OverviewPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    if (size.width <= 0 || size.height <= 0) return;
+    canvas.save();
+    canvas.clipRect(Offset.zero & size);
     final w = size.width;
     final h = size.height;
     final wave = deck.wave;
@@ -53,32 +57,19 @@ class OverviewPainter extends CustomPainter {
         textDirection: TextDirection.ltr,
       )..layout();
       tp.paint(canvas, Offset((w - tp.width) / 2, (h - tp.height) / 2));
+      canvas.restore();
       return;
     }
 
     // 数据源：Done 后有 overview（4× 粗），否则用 detail/分段聚合
     final overview = wave.fullOverview ?? wave.full;
     final W = w.toInt();
-    final maxH = h - 6;
-    const bandAlpha = 0.9;
-    const foldAlpha = 0.55 * 0.9;
-    final out = Uint8List(8);
+    final maxH = math.max(0.0, h - 6);
     final rgb = mode.value == WaveDisplayMode.rgb;
-    final paints = [
-      Paint()..color = const Color(0xFFE53935).withValues(alpha: bandAlpha),
-      Paint()..color = const Color(0xFF43A047).withValues(alpha: bandAlpha),
-      Paint()..color = const Color(0xFF1E88E5).withValues(alpha: bandAlpha),
-    ];
-    final paintsFolded = [
-      Paint()..color = const Color(0xFFE53935).withValues(alpha: foldAlpha),
-      Paint()..color = const Color(0xFF43A047).withValues(alpha: foldAlpha),
-      Paint()..color = const Color(0xFF1E88E5).withValues(alpha: foldAlpha),
-    ];
-    final bandPs = [F.lowP, F.midP, F.highP];
-    final bandNs = [F.lowN, F.midN, F.highN];
-
+    final samples = List.generate(3, (_) => List<double>.filled(W, 0));
+    final normalized = List<double>.filled(W, 0);
+    final out = Uint8List(9);
     for (var x = 0; x < W; x++) {
-      out.fillRange(0, 8, 0);
       if (overview != null) {
         // 整曲数据：列区间按比例映射
         final c0 = (x / W * overview.cols).floor();
@@ -90,11 +81,27 @@ class OverviewPainter extends CustomPainter {
         final c1 = ((x + 1) / W * colsTotal);
         wave.aggregateRange(c0, c1, out);
       }
+      samples[0][x] = math.max(out[F.lowP], out[F.lowN]).toDouble();
+      samples[1][x] = math.max(out[F.midP], out[F.midN]).toDouble();
+      samples[2][x] = math.max(out[F.highP], out[F.highN]).toDouble();
+      normalized[x] = overview?.hasNormalizedHeight == true
+          ? out[F.normalizedHeight].toDouble()
+          : math.sqrt(math.max(out[F.allP], out[F.allN]) / 255.0) * 255.0;
+      out.fillRange(0, 8, 0);
+    }
+    final shape = buildWaveShape(
+      low: samples[0],
+      mid: samples[1],
+      high: samples[2],
+      maxHeight: maxH,
+      normalizedHeight: normalized,
+    );
+    for (var x = 0; x < W; x++) {
+      final values = [shape.low[x], shape.mid[x], shape.high[x]];
       if (rgb) {
-        _paintRgbCol(canvas, out, x, maxH, h);
+        _paintRgbCol(canvas, values, shape.envelope, x, h);
       } else {
-        _paintBandsCol(canvas, out, bandPs, bandNs, paints, paintsFolded,
-            x, maxH, h);
+        _paintBandsCol(canvas, values, shape.envelope[x], x, h);
       }
     }
 
@@ -157,78 +164,59 @@ class OverviewPainter extends CustomPainter {
         Paint()..color = Colors.white.withValues(alpha: 0.9),
       );
     }
+    canvas.restore();
   }
 
-  /// rgb 单混色列：lo/mi/hi 取 max(p,n) 归一化混色，p 全 α、n α0.55
-  /// 折叠堆叠（几何与 bands 一致：自底向上 p 在下、n 在上）。
-  void _paintRgbCol(Canvas canvas, Uint8List out, int x, double maxH, double h) {
-    final lo = math.max(out[F.lowP], out[F.lowN]).toDouble();
-    final mi = math.max(out[F.midP], out[F.midN]).toDouble();
-    final hi = math.max(out[F.highP], out[F.highN]).toDouble();
+  /// RGB 连续轮廓：相邻采样点连接成填充路径，避免 1px 柱状跳变。
+  void _paintRgbCol(
+    Canvas canvas,
+    List<double> values,
+    List<double> envelope,
+    int x,
+    double h,
+  ) {
+    final lo = values[0];
+    final mi = values[1];
+    final hi = values[2];
     final mx = math.max(lo, math.max(mi, hi));
     if (mx <= 0) return;
-    final pTotal = (out[F.lowP] + out[F.midP] + out[F.highP]).toDouble();
-    final nTotal = (out[F.lowN] + out[F.midN] + out[F.highN]).toDouble();
-    final total = pTotal + nTotal;
-    final k = (total > 255 ? 255.0 / total : 1.0) / 255.0;
-    final hp = pTotal * k * maxH;
-    final hn = nTotal * k * maxH;
+    final height = envelope[x];
+    final nextHeight = envelope[math.min(x + 1, envelope.length - 1)];
     final r = (lo / mx * 255).round().clamp(0, 255);
     final g = (mi / mx * 255).round().clamp(0, 255);
     final b = (hi / mx * 255).round().clamp(0, 255);
-    final paint = Paint()..color = Color(0xFF000000 | (r << 16) | (g << 8) | b);
-    if (hp > 0.5) {
-      canvas.drawRect(Rect.fromLTWH(x.toDouble(), h - hp, 1, hp), paint);
-    }
-    if (hn > 0.5) {
-      final paintN = Paint()
-        ..color = paint.color.withValues(alpha: 0.55);
-      canvas.drawRect(
-        Rect.fromLTWH(x.toDouble(), h - hp - hn, 1, hn),
-        paintN,
-      );
-    }
+    final paint = Paint()..color = Color.fromARGB(220, r, g, b);
+    if (height <= 0.5) return;
+    final path = Path()
+      ..moveTo(x.toDouble(), h - height)
+      ..lineTo((x + 1).toDouble(), h - nextHeight)
+      ..lineTo((x + 1).toDouble(), h)
+      ..lineTo(x.toDouble(), h)
+      ..close();
+    canvas.drawPath(path, paint);
   }
 
-  /// bands 三带堆叠：单列 Σ(p+n) 可达 6×255，按列总高缩放到 ≤ maxH。
+  /// bands 三带按原始频段比例堆叠到 Rust 输出的共享包络内。
   void _paintBandsCol(
     Canvas canvas,
-    Uint8List out,
-    List<int> bandPs,
-    List<int> bandNs,
-    List<Paint> paints,
-    List<Paint> paintsFolded,
+    List<double> values,
+    double envelope,
     int x,
-    double maxH,
     double h,
   ) {
-    final total =
-        out[F.lowP] +
-        out[F.lowN] +
-        out[F.midP] +
-        out[F.midN] +
-        out[F.highP] +
-        out[F.highN];
-    final k = (total > 255 ? 255.0 / total : 1.0) / 255.0;
+    const colors = [Color(0xFFE53935), Color(0xFF43A047), Color(0xFF1E88E5)];
+    final total = values[0] + values[1] + values[2];
+    if (total <= 0) return;
     var y = h;
     for (var b = 0; b < 3; b++) {
-      final p = out[bandPs[b]];
-      final n = out[bandNs[b]];
-      final hp = p * k * maxH;
-      final hn = n * k * maxH;
-      if (hp > 0.5) {
+      final height = values[b] / total * envelope;
+      if (height > 0.5) {
         canvas.drawRect(
-          Rect.fromLTWH(x.toDouble(), y - hp, 1, hp),
-          paints[b],
+          Rect.fromLTWH(x.toDouble(), y - height, 1, height),
+          Paint()..color = colors[b].withValues(alpha: 0.9),
         );
       }
-      if (hn > 0.5) {
-        canvas.drawRect(
-          Rect.fromLTWH(x.toDouble(), y - hp - hn, 1, hn),
-          paintsFolded[b],
-        );
-      }
-      y -= hp + hn;
+      y -= height;
     }
   }
 
