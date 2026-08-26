@@ -78,6 +78,59 @@ pub struct BeatClock {
     pub phase: f64,
 }
 
+/// 小节时钟：拍号（默认 4/4）+ 乐句对齐的小节/拍号/相位。
+/// 小节边界默认对齐 grid 第 0 拍；`downbeat_rotation` 来自分析产出的
+/// 乐句真起点（某拍序号相对于 grid offset 的偏移），bars 从它数起。
+#[derive(Clone, Copy, Debug)]
+pub struct BarClock {
+    pub bpm: f64,
+    /// 小节序号（0 起，起点 = 首个 downbeat；可负——外推到曲首之前）。
+    pub bar_index: i64,
+    /// 小节内拍号 0..beats_per_bar。
+    pub beat_in_bar: u32,
+    /// 拍内相位 0..1。
+    pub beat_phase: f64,
+}
+
+impl BarClock {
+    /// 默认 4/4（无拍号概念时的保守选择）。
+    pub fn from_grid_at(grid: &BeatGrid, t_secs: f64, downbeat_rotation: i64) -> Self {
+        Self::from_grid_at_bpb(grid, t_secs, downbeat_rotation, 4)
+    }
+
+    /// 从网格 + downbeat 旋转构造小节时钟。
+    ///
+    /// 数学：拍号序号 `beat = floor((t - offset)/period)`。downbeat 每隔
+    /// `beats_per_bar` 拍发生一次，第 0 个 downbeat 位于拍号 `rotation`。
+    /// 故 `beat_in_bar = (beat - rotation) mod beats_per_bar`，
+    /// `bar_index = floor((beat - rotation)/beats_per_bar)`（Euclid，兼容负）。
+    pub fn from_grid_at_bpb(
+        grid: &BeatGrid,
+        t_secs: f64,
+        downbeat_rotation: i64,
+        beats_per_bar: u32,
+    ) -> Self {
+        let bpm = grid.bpm;
+        if bpm <= 0.0 {
+            return Self {
+                bpm: 0.0,
+                bar_index: 0,
+                beat_in_bar: 0,
+                beat_phase: 0.0,
+            };
+        }
+        let bpb = beats_per_bar.max(1) as i64;
+        let beat = grid.beat_index_at(t_secs);
+        let shifted = beat - downbeat_rotation;
+        Self {
+            bpm,
+            bar_index: shifted.div_euclid(bpb),
+            beat_in_bar: shifted.rem_euclid(bpb) as u32,
+            beat_phase: grid.phase_at(t_secs),
+        }
+    }
+}
+
 impl BeatClock {
     pub fn from_grid_at(grid: &BeatGrid, t_secs: f64) -> Self {
         Self {
@@ -167,5 +220,45 @@ mod tests {
             x.abs() < 1e-9 || (x - 1.0).abs() < 1e-9,
             "0.8+0.2=1.0 → 回绕到 0（实得 {x}）"
         );
+    }
+
+    #[test]
+    fn bar_clock_four_four_from_origin() {
+        // 120bpm、offset=1.0、rotation=0（小节从 grid 第 0 拍数起）
+        let g = g120();
+        let b0 = BarClock::from_grid_at(&g, 1.0, 0);
+        assert_eq!((b0.bar_index, b0.beat_in_bar, b0.beat_phase), (0, 0, 0.0));
+        let b1 = BarClock::from_grid_at(&g, 1.5, 0);
+        assert_eq!((b1.bar_index, b1.beat_in_bar), (0, 1), "第 2 拍 → 拍号 1");
+        let b2 = BarClock::from_grid_at(&g, 2.5, 0);
+        assert_eq!((b2.bar_index, b2.beat_in_bar), (0, 3), "第 4 拍 → 拍号 3");
+        let b3 = BarClock::from_grid_at(&g, 3.0, 0);
+        assert_eq!((b3.bar_index, b3.beat_in_bar), (1, 0), "第 5 拍 → 小节 1 拍号 0");
+    }
+
+    #[test]
+    fn bar_clock_rotation_shifts_downbeat() {
+        let g = g120();
+        // rotation=2：downbeat（小节头）位于拍号 2、6、10…
+        let b0 = BarClock::from_grid_at(&g, 2.0, 2);
+        assert_eq!((b0.bar_index, b0.beat_in_bar), (0, 0), "拍号 2 → 小节 0 拍号 0");
+        let b1 = BarClock::from_grid_at(&g, 2.5, 2);
+        assert_eq!((b1.bar_index, b1.beat_in_bar), (0, 1), "拍号 3 → 小节 0 拍号 1");
+        let b2 = BarClock::from_grid_at(&g, 4.0, 2);
+        assert_eq!((b2.bar_index, b2.beat_in_bar), (1, 0), "拍号 6 是第二个 downbeat");
+        // rotation=2 时拍号 0、1 属于上一小节的末尾两拍
+        let b_neg = BarClock::from_grid_at(&g, 1.0, 2);
+        assert_eq!(b_neg.beat_in_bar, 2, "拍号 0 → 上一小节拍号 2");
+        assert_eq!(b_neg.bar_index, -1);
+    }
+
+    #[test]
+    fn bar_clock_from_beats_per_bar_and_edge() {
+        let g = g120();
+        let b = BarClock::from_grid_at_bpb(&g, 1.9, 0, 3);
+        assert_eq!((b.beat_in_bar, b.bar_index), (1, 0), "3/4：拍号 1 在小节 0");
+        let bad = BeatGrid::default();
+        let b2 = BarClock::from_grid_at(&bad, 3.7, 0);
+        assert_eq!((b2.bar_index, b2.beat_in_bar, b2.beat_phase), (0, 0, 0.0), "无网格退化");
     }
 }

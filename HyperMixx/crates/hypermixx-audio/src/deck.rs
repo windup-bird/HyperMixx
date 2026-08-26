@@ -15,7 +15,7 @@ use crate::dsp::smoother::Smoother;
 use crate::fx::{EffectId, FxContext, FxRack, manifest};
 use crate::keylocker::{Keylocker, TimestretchLocker};
 use crate::track_cache::{CHUNK_FRAMES, TrackCache};
-use hypermixx_core::{BeatClock, BeatGrid, ControlHandle};
+use hypermixx_core::{BarClock, BeatClock, BeatGrid, ControlHandle};
 
 /// 引擎块帧数（与 Engine::BLOCK_FRAMES 一致；deck 侧不依赖 engine 模块）。
 const ENGINE_BLOCK: usize = 256;
@@ -42,6 +42,20 @@ const SYNC_RATE_SLEW_PER_BLOCK: f64 = 0.2;
 /// 对齐锁定阈值（拍）：终端比例段收敛到此值即锁速率。@120BPM ≈0.25ms，
 /// 远低于可听阈；旧死区 0.01 拍（≈5ms）遗留稳态偏差由此缩小一个量级。
 const SYNC_LOCK_EPS_BEATS: f64 = 5.0e-4;
+
+// ---- P26 持续相位锁定（稳态对齐后）----
+/// 比例增益：corr = KP × err_beats。err=0.005 拍（2.5ms）→ corr=0.00025
+/// （0.025%）——作用引擎轴，缓慢无声地把漂移拉回。
+const SYNC_CONT_KP: f64 = 0.05;
+/// 修正幅值上限（0.5%）：err≥0.1 拍（50ms）时达到；此后恒定 0.5% 回正。
+/// 远低于一键对拍 nudge（±8%），不存在抢操作。
+const SYNC_CONT_MAX: f64 = 0.005;
+/// 修正死区：|err| 低于此值不修正（防 limit-cycle）。复用对齐锁阈。
+const SYNC_CONT_DEADBEAT: f64 = SYNC_LOCK_EPS_BEATS;
+/// 修正上界误差：|err| ≥ 此值时视为「用户主动偏移」（P14：seek/beatjump
+/// 后相位差应保留，不被拉回），挂起修正。零活漂移（欠载等）远小于此，
+/// 正常被修正；离散大偏移（≥0.1 拍 ≈50ms@120）不再被强拉。
+const SYNC_CONT_MAX_ERR: f64 = 0.1;
 
 // ---- P15 推子软接管（回位后推子才有效）----
 /// 回位带（速率百分点）：推子位置与当前速率差距 ≤ 此值视为"在同步速率
@@ -112,6 +126,9 @@ pub struct Deck {
     /// 对齐追相位时上一块的 wrap 误差（拍）：符号翻转 = 本块跨越零点
     /// → 立即锁定（残差 ≤ 单步修正量，@120BPM ≈0.4ms，不可闻）。
     sync_last_err: Option<f64>,
+    /// 持续相位锁定：稳态对齐后引擎轴倍率修正（× (1 + corr)）。仅作用引擎轴，
+    /// 不动 self.rate（BPM 显示 / FX 拍时钟隔离）；nudge 激活时挂起。
+    sync_phase_corr: f64,
     /// 推子尚未回到当前实际速率时保持脱开，防升任 master 后跳变。
     fader_detached: bool,
     /// 上一次滑杆位置，用于回位检测。
@@ -150,6 +167,8 @@ pub struct Deck {
     loop_in_armed: Option<f64>,
     /// P23-B sync：上一块 leader 快照位置（秒）——跳变检测重新对齐。
     last_leader_pos: Option<f64>,
+    /// downbeat 旋转缓存（ctl.grid_rotation 快照，BarClock 小节对齐用）。
+    bar_rotation: i64,
 
     // DSP
     eq: ThreeBandEq,
@@ -181,6 +200,7 @@ pub struct DeckControls {
     pub bpm: ControlHandle,
     pub grid_bpm: ControlHandle,
     pub grid_offset: ControlHandle,
+    pub grid_rotation: ControlHandle,
     /// 旧 sync 路径兼容（测试/旧客户端）；新 UI 写 sync_mode。
     pub sync: ControlHandle,
     pub sync_stage: ControlHandle,
@@ -192,6 +212,9 @@ pub struct DeckControls {
     pub vu: ControlHandle,
     pub duration: ControlHandle,
     pub loaded: ControlHandle,
+    pub bar_index: ControlHandle,
+    pub beat_in_bar: ControlHandle,
+    pub beat_phase: ControlHandle,
     pub loop_active: ControlHandle,
     pub loop_in: ControlHandle,
     pub loop_out: ControlHandle,
@@ -219,6 +242,7 @@ impl DeckControls {
             bpm: bus.control(&paths::deck_bpm(index)),
             grid_bpm: bus.control(&paths::deck_grid_bpm(index)),
             grid_offset: bus.control(&paths::deck_grid_offset(index)),
+            grid_rotation: bus.control(&paths::deck_grid_rotation(index)),
             sync: bus.control(&paths::deck_sync(index)),
             sync_stage: bus.control(&paths::deck_sync_stage(index)),
             sync_mode: bus.control(&paths::deck_sync_mode(index)),
@@ -229,6 +253,9 @@ impl DeckControls {
             vu: bus.control(&paths::deck_vu(index)),
             duration: bus.control(&paths::deck_duration(index)),
             loaded: bus.control(&paths::deck_loaded(index)),
+            bar_index: bus.control(&paths::deck_bar_index(index)),
+            beat_in_bar: bus.control(&paths::deck_beat_in_bar(index)),
+            beat_phase: bus.control(&paths::deck_beat_phase(index)),
             loop_active: bus.control(&paths::deck_loop_active(index)),
             loop_in: bus.control(&paths::deck_loop_in(index)),
             loop_out: bus.control(&paths::deck_loop_out(index)),
@@ -288,6 +315,7 @@ impl Deck {
             sync_stage: 0,
             sync_align_pending: false,
             sync_align_done: true,
+            sync_phase_corr: 0.0,
             fader_detached: false,
             last_slider_rate: None,
             loop_active: false,
@@ -309,6 +337,7 @@ impl Deck {
             loop_in_armed: None,
             last_leader_pos: None,
             sync_last_err: None,
+            bar_rotation: 0,
             eq: ThreeBandEq::new(sr as f32),
             filter: DeckFilter::new(sr as f32),
             gain: Smoother::new(1.0, coeff as f32),
@@ -324,6 +353,8 @@ impl Deck {
     /// 关 = r。P15 起 nudge 倍率叠加在引擎轴（不并入 self.rate）——
     /// sync 速率锁与显示 BPM 不含临时加减速（"暂时加减速时波形不缩放"），
     /// 且 sync 速率锁不再覆盖对拍 nudge（sync 时也能暂时加减速）。
+    /// P26 持续相位锁定同样作用引擎轴（× (1 + sync_phase_corr)），
+    /// 不并入 self.rate——BPM 显示 / FX 拍时钟保持稳定。
     fn engine_rate(&self) -> f64 {
         let shift = if self.keylock_on { self.pitch } else { 0.0 };
         let nudge = self.ctl.nudge.get();
@@ -334,7 +365,7 @@ impl Deck {
         } else {
             1.0
         };
-        self.rate / 2f64.powf(shift / 12.0) * nudge_factor
+        self.rate / 2f64.powf(shift / 12.0) * nudge_factor * (1.0 + self.sync_phase_corr)
     }
 
     /// 滑杆速率（纯推子值，不含 nudge）：P15 起 nudge 移至引擎轴——软接管
@@ -382,6 +413,7 @@ impl Deck {
         }
         self.keylock_on = self.ctl.keylock.get() > 0.5;
         self.pitch = self.ctl.pitch.get();
+        self.bar_rotation = self.ctl.grid_rotation.get().round() as i64;
         self.eq.set_low_db(self.ctl.eq_low.get() as f32);
         self.eq.set_mid_db(self.ctl.eq_mid.get() as f32);
         self.eq.set_high_db(self.ctl.eq_high.get() as f32);
@@ -923,6 +955,35 @@ impl Deck {
             target
         };
         self.rate = rate;
+        // P26：持续相位锁定（稳态精调，仅引擎轴，不动 self.rate）。
+        // 一次性对齐把 err 拉到 ≤ 死区后，锁定阶段对抗漂移（欠载等）；
+        // nudge 激活时挂起（±8% 远超 ±0.5% 上限，修正是噪声）。只对
+        // 已锁定的持久 sync_mode 生效——一次性对齐结束后自动接入。
+        if self.sync_mode && self.sync_align_done && !self.sync_align_pending {
+            let nudge = self.ctl.nudge.get();
+            let corr = if nudge.abs() > 0.5 {
+                0.0
+            } else {
+                let lc = BeatClock::from_grid_at(&lgrid, leader.position_secs);
+                let fc = BeatClock::from_grid_at(&fgrid, self.pos / self.sr);
+                let mut err = lc.phase - fc.phase;
+                if err > 0.5 {
+                    err -= 1.0;
+                } else if err < -0.5 {
+                    err += 1.0;
+                }
+                if err.abs() < SYNC_CONT_DEADBEAT || err.abs() >= SYNC_CONT_MAX_ERR {
+                    // 死区：不修正（防 limit-cycle）；≥ 上界：用户主动偏移
+                    // （P14 保留）——两类都不动，仅修正中间的小漂移带。
+                    0.0
+                } else {
+                    (SYNC_CONT_KP * err).clamp(-SYNC_CONT_MAX, SYNC_CONT_MAX)
+                }
+            };
+            self.sync_phase_corr = corr;
+        } else {
+            self.sync_phase_corr = 0.0;
+        }
         self.ctl.bpm.set(fgrid.bpm * rate);
 
         let e = self.engine_rate();
@@ -943,12 +1004,26 @@ impl Deck {
             self.process_legacy(out, frames, n);
         }
 
-        // 输出控制（playhead / VU）
+        // 输出控制（playhead / bar / VU）
         if self.loaded {
             self.ctl.playhead.set(self.pos / self.sr);
             let d = n.max(1) as f64 / self.sr;
             if self.ctl.duration.get() != d {
                 self.ctl.duration.set(d);
+            }
+            let grid = BeatGrid {
+                bpm: self.ctl.grid_bpm.get(),
+                offset_secs: self.ctl.grid_offset.get(),
+            };
+            let bar = BarClock::from_grid_at_bpb(&grid, self.pos / self.sr, self.bar_rotation, 4);
+            if self.ctl.bar_index.get() as i64 != bar.bar_index {
+                self.ctl.bar_index.set(bar.bar_index as f64);
+            }
+            if self.ctl.beat_in_bar.get() as u32 != bar.beat_in_bar {
+                self.ctl.beat_in_bar.set(bar.beat_in_bar as f64);
+            }
+            if self.ctl.beat_phase.get() != bar.beat_phase {
+                self.ctl.beat_phase.set(bar.beat_phase);
             }
             // 缓存填充进度（0..1；总长未知 → 0）
             let filled = self
@@ -1475,6 +1550,7 @@ impl Deck {
         self.pos = frame as f64;
         self.pos_base = None; // 新 fed 坐标（P11.1：收尾圈锚点随 reset 作废）
         self.ctl.playhead.set(seconds);
+        self.sync_phase_corr = 0.0; // 新时间轴：持续修正态复位
         let engine_rate = self.engine_rate();
         // keylock 路径：reset + 重新锚定 + warm_start 预卷（spike 验证零欠载零 NaN）。
         // 缓存直读从 read_frame（= target − preroll）起喂。
@@ -2174,6 +2250,106 @@ mod tests {
         assert!(
             late_err.abs() <= early_err.abs() + 0.001 && late_err.abs() < 0.05,
             "相位误差应线性收敛不回弹：早窗 {early_err:+.4}s → 晚窗 {late_err:+.4}s"
+        );
+    }
+
+    /// P26 持续相位锁定：稳态对齐后按 err（拍）做比例修正，仅作用引擎轴
+    /// （不动 self.rate），幅值钳 ±0.5%，nudge 激活或 |err| 超上界（用户
+    /// 主动偏移，P14 保留）时挂起。逻辑级直接验证 apply_sync 产出。
+    #[test]
+    fn sync_continuous_corr_proportional_bounded_nudge_gated() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache(&bus, 4.0, 0.0); // 120 BPM 脉冲
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        d.sync_mode = true;
+        d.sync_align_done = true;
+        d.sync_align_pending = false;
+        d.playing = true; // deck_with_cache 只设 ctl.play，字段默认 false
+        let base = -KEYLOCK_LATENCY_S;
+        d.pos = base * 48000.0; // pos 是帧，转换为秒对齐 leader（秒）
+        let mut leader = FakeLeader {
+            grid_bpm: 120.0,
+            grid_offset: 0.0,
+            tempo_rate: 1.0,
+            pos: base,
+        };
+
+        // 完全对齐 → 无修正
+        d.apply_sync(&leader.snapshot());
+        assert_eq!(d.sync_phase_corr, 0.0, "对齐状态下应无修正");
+
+        // leader 领先 5ms → err=+0.01 拍 → corr=0.05×0.01=5e-4（加速追赶）
+        leader.pos = base + 0.005;
+        d.apply_sync(&leader.snapshot());
+        let expect = 0.05 * (0.005 / 0.5);
+        assert!(
+            (d.sync_phase_corr - expect).abs() < 1e-9,
+            "err=0.01 拍 → corr≈{expect}，实得 {}",
+            d.sync_phase_corr
+        );
+        assert!(d.sync_phase_corr > 0.0, "leader 领先 → follower 应加速");
+        assert!(d.engine_rate() > 1.0, "修正应作用引擎轴（rate 上升）");
+        assert_eq!(d.rate, 1.0, "self.rate 不动（显示/BPM 稳定）");
+
+        // 超出修正带（0.2 拍，模拟用户 seek 偏离）→ 修正挂起（P14 保留）
+        leader.pos = base + 0.1; // 0.2 拍，≥ 上界 0.1 拍
+        d.apply_sync(&leader.snapshot());
+        assert_eq!(d.sync_phase_corr, 0.0, "≥0.1 拍 = 用户主动偏移，不拉回");
+
+        // 带内大到上限：0.08 拍 → corr=0.05×0.08=0.004（<0.005 未钳）
+        leader.pos = base + 0.04;
+        d.apply_sync(&leader.snapshot());
+        let expect2 = 0.05 * (0.04 / 0.5);
+        assert!(
+            (d.sync_phase_corr - expect2).abs() < 1e-9,
+            "0.08 拍带内 → corr≈{expect2}，实得 {}",
+            d.sync_phase_corr
+        );
+
+        // nudge 激活 → 挂起修正（±8% 远超 ±0.5% 上限，修正是噪声）
+        d.ctl.nudge.set(1.0);
+        d.apply_sync(&leader.snapshot());
+        assert_eq!(d.sync_phase_corr, 0.0, "nudge 激活应挂起");
+        d.ctl.nudge.set(0.0);
+    }
+
+    /// P26 持续修正不应发散：长跑 10s 内 err 有界（不绕圈），修正幅值
+    /// 恒在上限内，相位残差稳定（既有的 ≤10ms 断言更紧，此处聚焦稳定性）。
+    #[test]
+    fn sync_continuous_corr_stays_bounded_over_long_run() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache_big(&bus, pulse_cache(25.6, 24000), 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        d.ctl.sync.set(1.0);
+        let mut leader = FakeLeader {
+            grid_bpm: 120.0,
+            grid_offset: 0.0,
+            tempo_rate: 1.0,
+            pos: -KEYLOCK_LATENCY_S,
+        };
+        let mut corr_max = 0.0f64;
+        let mut out = vec![0.0; 256 * 2];
+        let mut rec = Vec::new();
+        let blocks = (10.0 * 48000.0 / 256.0) as usize;
+        for _ in 0..blocks {
+            d.update_params();
+            d.apply_sync(&leader.snapshot());
+            d.process(&mut out, 256);
+            leader.advance();
+            corr_max = corr_max.max(d.sync_phase_corr.abs());
+            rec.extend_from_slice(&out);
+        }
+        assert!(
+            corr_max <= 0.005 + 1e-9,
+            "修正幅值应恒 ≤ 0.5%，实得 {corr_max}"
+        );
+        let times = envelope_beat_times(&rec, 8.0, 10.0);
+        let sp = median_spacing(&times);
+        assert!(
+            (sp - 0.5).abs() < 0.004,
+            "持续修正不应漂移拍距（120BPM），实得 {sp:.4}s"
         );
     }
 

@@ -98,3 +98,34 @@
 - sync 下跳后残余时移 = 管线延迟量级（实测 ~17ms@48k）：掩蔽消静音洞
   不消时移，对 leader 有轻微 flam——待影子引擎交接里程碑消除
 - timestretch 为 crates.io 依赖，位置调度（无 reset 重锚）需 vendor 补丁
+
+# plan-26：记拍器 + 持续相位锁定（M1）
+
+**date**
+8.26
+
+**done**
+- **BarClock**（core/beatgrid.rs）：小节时钟 `bar_index / beat_in_bar
+  / beat_phase`，4/4 参数化，小节原点对齐 analysis downbeat_rotation
+  （乐句真起点）；`from_grid_at(_bpb)` 纯函数可测。
+- **downbeat_rotation 贯穿**：bridge 发布 TrackAnalysis 时由 `downbeats_secs[0]
+  - offset` 推导旋转写入 `deck_grid_rotation`（无 downbeat 退化 0）；
+  载曲清零一并复位。deck 每块快照 `bar_rotation` 用于 BarClock。
+- **持续相位锁定 P26**（deck.rs `apply_sync`）：一次性对齐后进入稳态，
+  按 `err`（拍）比例修正 `corr = clamp(0.05×err, ±0.5%)`，**仅作用引擎轴**
+  （`engine_rate() × (1+corr)`），不动 `self.rate`——BPM 显示 / FX 拍时钟
+  零抖动。三处挂起：nudge 激活（±8% 抢修正）、|err|≥0.1 拍（用户主动
+  偏移 P14 保留）、死区 <5e-4 拍（防 limit-cycle）；seek/load 复位。
+- 测试：BarClock 数学（4/4、rotation 平移、负小节、3/4 退化）、
+  `sync_continuous_corr_proportional_bounded_nudge_gated`（比例/钳幅/
+  引擎轴/self.rate 隔离/nudge 挂起，逻辑级）、
+  `sync_continuous_corr_stays_bounded_over_long_run`（10s 不发散不漂移）。
+- 全量 210 测试通过，clippy 零警告。
+
+**note**
+- 持续修正只校正「零活小漂移带」——与 P14「用户 seek/jump 相位差保留」
+  通过上界 0.1 拍调和：带内漂移被无声拉回，离散大偏移不再强拉。
+- set_rate_at（采样精确时间戳调度）尚未启用：稳态修正 ≤0.5% 经 ASAP
+  set_rate 于 32 帧重采样块平滑已不可闻；时间戳调度留作将来一次性对齐
+  线性段及更长曲线。
+

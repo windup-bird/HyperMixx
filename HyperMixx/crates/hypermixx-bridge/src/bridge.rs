@@ -106,6 +106,7 @@ pub fn load_track_inner(
     // 新载曲：旧网格失效（引擎不自动清，桥按载曲语义清）
     bus.set(&paths::deck_grid_bpm(deck), 0.0);
     bus.set(&paths::deck_grid_offset(deck), 0.0);
+    bus.set(&paths::deck_grid_rotation(deck), 0.0);
     // 新载曲：旧 loop 失效（deck.rs load 内也复位，这里双保险）
     bus.set(&paths::deck_loop_active(deck), 0.0);
     bus.set(&paths::deck_loop_in(deck), 0.0);
@@ -158,6 +159,7 @@ fn forward_events(
         if let AnalysisEvent::TrackAnalysis {
             bpm,
             offset_secs,
+            downbeats_secs,
             confidence,
             ..
         } = &ev
@@ -167,6 +169,14 @@ fn forward_events(
             if *confidence >= GRID_PUBLISH_MIN_CONFIDENCE && *bpm > 0.0 {
                 bus.set(&paths::deck_grid_bpm(deck), *bpm);
                 bus.set(&paths::deck_grid_offset(deck), *offset_secs);
+                // downbeat 旋转 = 首个 downbeat 相对网格锚点的拍号（乐句
+                // 真起点）。BarClock 用它定 bar_index 原点；无 downbeat
+                // 信息时退化 0（小节从网格第 0 拍数起）。
+                let rotation = match downbeats_secs.first() {
+                    Some(&d0) => ((d0 - offset_secs) / (60.0 / *bpm)).round() as i64,
+                    None => 0,
+                };
+                bus.set(&paths::deck_grid_rotation(deck), rotation as f64);
             }
         }
         if !sink_add(to_wire(ev)) {
