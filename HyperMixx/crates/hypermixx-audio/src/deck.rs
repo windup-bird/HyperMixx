@@ -95,6 +95,73 @@ fn read_cache_stereo(cache: &TrackCache, pos: f64) -> Option<(f32, f32)> {
     Some((p0[0] + (p1[0] - p0[0]) * frac, p0[1] + (p1[1] - p0[1]) * frac))
 }
 
+/// 分析产出的 beatgrid 数据（P26 注入 engine 的 pre_analysis 工件用）。
+/// 桥接层从 AnalysisEvent::TrackAnalysis 构造并推入 EngineOp::SetPreAnalysis；
+/// 音频层据此构造 `PreAnalysisArtifact`（构造期注入 timestretch 引擎）。
+#[derive(Clone)]
+pub struct PreAnalysisData {
+    pub bpm: f64,
+    pub offset_secs: f64,
+    /// 拍点秒坐标（48k 时间轴）。
+    pub beats_secs: Vec<f64>,
+    /// downbeat 秒坐标（48k 时间轴；beats_secs 的子集）。
+    pub downbeats_secs: Vec<f64>,
+    pub confidence: f32,
+    /// 分段网格：(起点秒, bpm, 刚性 0..1)。
+    pub tempo_segments: Vec<(f64, f64, f32)>,
+}
+
+/// 构造 timestretch pre_analysis 工件（48k 采样域绝对帧）。无拍点/bpm=0
+/// 返回 None（引擎无工件 → 通用瞬态拼接）。transient_onsets 留空：引擎
+/// 遇空退化为「无 onset 知识」，仅按拍/乐句对齐拼接（正是本项目的增益点）。
+pub fn build_pre_analysis_artifact(data: &PreAnalysisData) -> Option<Arc<timestretch::PreAnalysisArtifact>> {
+    use timestretch::{PreAnalysisArtifact, TempoSegment, PREANALYSIS_VERSION};
+    let sr = 48_000usize;
+    if data.beats_secs.is_empty() || data.bpm <= 0.0 {
+        return None;
+    }
+    let beat_positions: Vec<usize> = data
+        .beats_secs
+        .iter()
+        .map(|&s| (s * sr as f64).round() as usize)
+        .collect();
+    let beat_positions_fractional: Vec<f64> = data.beats_secs.iter().map(|&s| s * sr as f64).collect();
+    let downbeat_beat_indices: Vec<usize> = data
+        .downbeats_secs
+        .iter()
+        .filter_map(|&d| {
+            data.beats_secs
+                .iter()
+                .position(|&b| (b - d).abs() < 1e-6)
+        })
+        .collect();
+    let beat_interval = 60.0 * sr as f64 / data.bpm;
+    let downbeat_offset_samples = beat_positions_fractional
+        .first()
+        .map(|&b| b.rem_euclid(beat_interval).round() as usize)
+        .unwrap_or(0);
+    let tempo_segments: Vec<TempoSegment> = data
+        .tempo_segments
+        .iter()
+        .map(|&(start_secs, bpm, _)| TempoSegment {
+            start_beat: (start_secs / (60.0 / data.bpm)).round() as usize,
+            bpm,
+        })
+        .collect();
+    Some(Arc::new(PreAnalysisArtifact {
+        version: PREANALYSIS_VERSION,
+        sample_rate: sr as u32,
+        bpm: data.bpm,
+        downbeat_offset_samples,
+        confidence: data.confidence,
+        beat_positions,
+        beat_positions_fractional,
+        downbeat_beat_indices,
+        tempo_segments,
+        ..Default::default()
+    }))
+}
+
 
 /// 音轨总帧数（48kHz 时间轴），由读取线程在 EOF 时写入。
 pub type TrackFrames = Arc<AtomicU64>;
@@ -203,6 +270,9 @@ pub struct Deck {
     jump_cross_remaining: usize,
     /// P27 跳转前出声位置（帧）：交叉淡化旧内容从它续读（+ 块内推进）。
     jump_old_base: f64,
+    /// P26 pre_analysis 工件（构建期注入 timestretch 引擎；SOLA 拼接按拍/
+    /// downbeat 对齐）。分析完成后由 SetPreAnalysis 置位，非播放时重建引擎。
+    pre_analysis: Option<Arc<timestretch::PreAnalysisArtifact>>,
 
     // DSP
     eq: ThreeBandEq,
@@ -376,6 +446,7 @@ impl Deck {
             burst_preroll: 0,
             jump_cross_remaining: 0,
             jump_old_base: 0.0,
+            pre_analysis: None,
             eq: ThreeBandEq::new(sr as f32),
             filter: DeckFilter::new(sr as f32),
             gain: Smoother::new(1.0, coeff as f32),
@@ -769,10 +840,25 @@ impl Deck {
         }
     }
 
+    /// P26 注入 pre_analysis 工件：存储并在非播放时立即重建引擎（播放中
+    /// 不打扰——只存，profile 切换/下次 rebuild 自动带上）。
+    pub fn set_pre_analysis(&mut self, data: PreAnalysisData) {
+        if let Some(artifact) = build_pre_analysis_artifact(&data) {
+            self.pre_analysis = Some(artifact);
+            if self.ctl.play.get() < 0.5 {
+                self.rebuild_keylocker(self.engine_rate());
+            }
+        }
+    }
+
     /// 重建引擎切换 profile（key shift 跨 ±3 半音阈值）。
     fn rebuild_keylocker(&mut self, engine_rate: f64) {
         let need_wide = self.keylocker.as_ref().is_some_and(|kl| !kl.is_wide());
-        match TimestretchLocker::build(self.sr as u32, need_wide) {
+        match TimestretchLocker::build_with_analysis(
+            self.sr as u32,
+            need_wide,
+            self.pre_analysis.clone(),
+        ) {
             Ok(mut kl) => {
                 kl.set_track_position(self.feed_pos);
                 kl.set_keylock(self.keylock_on);
@@ -1428,7 +1514,11 @@ impl Deck {
         }
 
         // keylock 引擎：构建失败 → None，回退线性插值路径（trait 缝的意义）
-        let locker = match TimestretchLocker::build(self.sr as u32, false) {
+        let locker = match TimestretchLocker::build_with_analysis(
+            self.sr as u32,
+            false,
+            self.pre_analysis.clone(),
+        ) {
             Ok(kl) => Some(Box::new(kl) as Box<dyn Keylocker>),
             Err(e) => {
                 log::error!("keylock 引擎构建失败，回退线性插值路径: {e:#}");
@@ -4430,6 +4520,39 @@ mod tests {
         // 出声位置 = feed_base + source_position：跳后应与 playhead 同步
         // （audible 位置在播放推进下等于目标，无回退）。仅验证已推进。
         assert!(d.pos > before, "跳后播出位置应推进（无回退）");
+    }
+
+    /// P26 pre_analysis 工件构造：拍点/downbeat/分段映射到 48k 绝对帧。
+    /// 无拍点 → None（引擎无工件，通用拼接）；有拍 → 若工件注入引擎则
+    /// SOLA 按拍对齐（此处仅验证映射数学，不跑引擎）。
+    #[test]
+    fn build_pre_analysis_maps_beatgrid() {
+        // 120BPM（0.5s 拍），offset=1.0s：拍点 @1.0,1.5,2.0,2.5,3.0…
+        // downbeat（rotation 0）= 拍 0,4,8… 即秒 1.0,3.0,5.0
+        let data = PreAnalysisData {
+            bpm: 120.0,
+            offset_secs: 1.0,
+            beats_secs: vec![1.0, 1.5, 2.0, 2.5, 3.0, 3.5],
+            downbeats_secs: vec![1.0, 3.0],
+            confidence: 0.9,
+            tempo_segments: vec![(1.0, 120.0, 1.0)],
+        };
+        let artifact = build_pre_analysis_artifact(&data).expect("有拍应构造工件");
+        assert_eq!(artifact.sample_rate, 48_000);
+        assert_eq!(artifact.bpm, 120.0);
+        assert_eq!(artifact.beat_positions, vec![48000, 72000, 96000, 120000, 144000, 168000]);
+        assert_eq!(artifact.downbeat_beat_indices, vec![0, 4]);
+        assert_eq!(artifact.beat_positions_fractional.len(), 6);
+        // downbeat_offset_samples = beats[0] mod 拍距(24000帧) = 48000 mod 24000 = 0
+        assert_eq!(artifact.downbeat_offset_samples, 0);
+        assert_eq!(artifact.tempo_segments.len(), 1);
+
+        // 无拍点 → None
+        let empty = PreAnalysisData {
+            bpm: 0.0,
+            ..data
+        };
+        assert!(build_pre_analysis_artifact(&empty).is_none());
     }
 
     fn median(v: &[f64]) -> f64 {

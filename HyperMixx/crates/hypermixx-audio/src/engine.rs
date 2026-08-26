@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 
 use crate::backend::{AudioBackend, AudioStream};
-use crate::deck::Deck;
+use crate::deck::{Deck, PreAnalysisData};
 use crate::dsp::smoother::Smoother;
 use hypermixx_core::{ControlBus, ControlHandle};
 
@@ -37,6 +37,9 @@ pub enum EngineOp {
     /// 在当前播放位置设定 Manual Loop Out 并激活（需先有 In）。
     LoopOut { deck: usize },
     SyncStep { deck: usize },
+    /// 注入分析产出的 beatgrid 工件（pre_analysis；非播放时重建引擎带上，
+    /// 播放中仅存储）。
+    SetPreAnalysis { deck: usize, data: PreAnalysisData },
 }
 
 /// UI/MIDI 侧持有的引擎句柄：推送操作，由音频回调在块边界消费。
@@ -91,6 +94,13 @@ impl EngineHandle {
 
     pub fn sync_step(&self, deck: usize) {
         self.ops.lock().unwrap().push_back(EngineOp::SyncStep { deck });
+    }
+
+    pub fn set_pre_analysis(&self, deck: usize, data: PreAnalysisData) {
+        self.ops
+            .lock()
+            .unwrap()
+            .push_back(EngineOp::SetPreAnalysis { deck, data });
     }
 }
 
@@ -234,6 +244,11 @@ impl EngineState {
                     EngineOp::SyncStep { deck } => {
                         if deck < self.decks.len() && self.sync_master != Some(deck) {
                             self.decks[deck].sync_step();
+                        }
+                    }
+                    EngineOp::SetPreAnalysis { deck, data } => {
+                        if deck < self.decks.len() {
+                            self.decks[deck].set_pre_analysis(data);
                         }
                     }
                 }

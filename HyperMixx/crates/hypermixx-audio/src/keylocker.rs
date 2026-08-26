@@ -17,6 +17,8 @@
 //! - 速率 clamp 到 [0.25, 4.0]（MIN/MAX_TEMPO_RATE）。
 
 use anyhow::Result;
+use std::sync::Arc;
+use timestretch::PreAnalysisArtifact;
 use timestretch::engine::{Engine, EngineConfig, EngineHandles, EngineProfile};
 
 /// 变速不变调引擎（Deck 视角的实时接口）。所有方法 infallible、零分配。
@@ -74,6 +76,19 @@ impl TimestretchLocker {
     /// 512 帧（10.7ms）环形源容量 32768 帧 ≈ 682ms（对齐官方 desktop
     /// 参考实现：大占用环支撑 seek 预热与最快速率下的调度余量）。
     pub fn build(sr: u32, wide: bool) -> Result<Self> {
+        Self::build_with_analysis(sr, wide, None)
+    }
+
+    /// 构建引擎，可选携带 `pre_analysis`（beatgrid/downbeat 工件）。
+    ///
+    /// 工件在构建期注入 engine（timestretch 无运行时注入 API）；SOLA 拼接
+    /// 按拍/downbeat 对齐，质量优于无工件（仅吃通用瞬态检测）。经
+    /// `TimestretchLocker` 封装，deck 侧无感知。
+    pub fn build_with_analysis(
+        sr: u32,
+        wide: bool,
+        pre_analysis: Option<Arc<PreAnalysisArtifact>>,
+    ) -> Result<Self> {
         let config = EngineConfig {
             sample_rate: sr,
             channels: 2,
@@ -85,7 +100,7 @@ impl TimestretchLocker {
             initial_tempo_rate: 1.0,
             max_block_frames: 256,
             source_capacity_frames: 32_768,
-            pre_analysis: None,
+            pre_analysis,
         };
         let EngineHandles {
             controller,

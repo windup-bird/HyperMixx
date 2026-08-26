@@ -165,3 +165,34 @@
 - Wide profile（preroll 4096 > 预算硬顶 2048）爆发下限 2 块：仍有 ≤1 块
   静音窗（10.6ms），远小于旧 30ms，接受。
 
+# plan-26：pre_analysis 工件接入（M3）
+
+**date**
+8.26
+
+**done**
+- **引擎构建期注入工件**（keylocker.rs）：`build_with_analysis(sr, wide,
+  Option<Arc<PreAnalysisArtifact>>)`，`EngineConfig.pre_analysis` 由它接管
+  （timestretch 无运行时注入 API，只能构建期带）。`build` 委派 None。
+- **工件构造**（deck.rs）：`PreAnalysisData`（bpm/offset/beats_secs/
+  downbeats_secs/confidence/tempo_segments，桥接层向引擎薄传）+ 
+  `build_pre_analysis_artifact` → `PreAnalysisArtifact`（48k 绝对帧
+  beat_positions、downbeat_beat_indices、TempoSegment；transient_onsets 留空
+  → 引擎退化为「按拍/downbeat 对齐拼接，无 onset 知识」，恰是本增产力点）。
+- **异步-构建期时序调和**（用户选「分析完成后安全重建」）：桥接层
+  `forward_events` 接到高置信 TrackAnalysis → `EngineHandle::set_pre_analysis`
+  推 op；引擎回调 `SetPreAnalysis` → `deck.set_pre_analysis`：存储工件，
+  **非播放时立即重建引擎**（播放中不打扰，只存；profile 切换/下次 rebuild
+  自动带上）。deck `load`/`rebuild_keylocker` 均用 `pre_analysis.clone()` 构建。
+- 测试：`build_pre_analysis_maps_beatgrid`（拍点/downbeat/分段映射到 48k
+  帧、downbeat_offset_samples、无拍 None）；桥接 forwarder 测试适配新签名。
+- 全量 212 测试通过，clippy 零警告。
+
+**note**
+- 工件仅提升 keylock 拼接质量（SOLA 避开拍/乐句边界），非正确性；初次
+  build 常无工件（分析异步）——播放中载入曲目的首段 keylock 走通用拼接，
+  分析完成且暂停后重建才带。可接受（用户决策）。
+- 版本耦合：`PREANALYSIS_VERSION`(=13) 随 timestretch 升级需核对
+  MIN_COMPATIBLE；锚在 `build_pre_analysis_artifact`。
+- 播放中不自动重建避免了 mid-mix 可闻 blip（~45ms 管线填充），换覆盖率。
+

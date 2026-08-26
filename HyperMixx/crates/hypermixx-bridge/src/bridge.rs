@@ -130,9 +130,10 @@ pub fn load_track_inner(
         tx,
     );
     let bus = bus.clone();
+    let handle = handle.clone();
     std::thread::Builder::new()
         .name(format!("bridge-forward-{deck}"))
-        .spawn(move || forward_events(rx, &bus, deck, generation, sink_add))
+        .spawn(move || forward_events(rx, &bus, &handle, deck, generation, sink_add))
         .map_err(|e| anyhow!("spawn forwarder: {e}"))?;
     Ok(generation)
 }
@@ -142,6 +143,7 @@ pub fn load_track_inner(
 fn forward_events(
     rx: Receiver<AnalysisEvent>,
     bus: &ControlBus,
+    handle: &EngineHandle,
     deck: usize,
     generation: u64,
     mut sink_add: impl FnMut(AnalysisEventWire) -> bool,
@@ -159,8 +161,10 @@ fn forward_events(
         if let AnalysisEvent::TrackAnalysis {
             bpm,
             offset_secs,
+            beats_secs,
             downbeats_secs,
             confidence,
+            tempo_segments,
             ..
         } = &ev
         {
@@ -177,6 +181,19 @@ fn forward_events(
                     None => 0,
                 };
                 bus.set(&paths::deck_grid_rotation(deck), rotation as f64);
+                // P26：分析结果注入引擎 pre_analysis 工件（SOLA 拼接按拍/
+                // downbeat 对齐）。非播放时引擎重建带上；播放中仅存。
+                handle.set_pre_analysis(
+                    deck,
+                    hypermixx_audio::deck::PreAnalysisData {
+                        bpm: *bpm,
+                        offset_secs: *offset_secs,
+                        beats_secs: beats_secs.to_vec(),
+                        downbeats_secs: downbeats_secs.to_vec(),
+                        confidence: *confidence,
+                        tempo_segments: tempo_segments.clone(),
+                    },
+                );
             }
         }
         if !sink_add(to_wire(ev)) {
@@ -471,6 +488,12 @@ mod tests {
     use super::*;
     use hypermixx_analysis::{KeyEstimate, KeyMode, SEG_COLS};
     use std::path::PathBuf;
+
+    /// 无音频设备的 headless EngineHandle（forward_events 推 op 用）。
+    fn test_handle(bus: &ControlBus) -> EngineHandle {
+        let (_state, handle) = Engine::core(bus);
+        handle
+    }
     use std::time::Duration;
 
     /// 合成 24s 48kHz 立体声 WAV：120 BPM 咔嗒（瞬态能量集中），
@@ -626,8 +649,9 @@ mod tests {
         let cc = collected.clone();
         let g = 3u64;
         let tbus = bus.clone(); // 克隆进线程，主线程保留总线做断言
+        let thandle = test_handle(&bus);
         let t = std::thread::spawn(move || {
-            forward_events(rx, &tbus, 0, g, |w| {
+            forward_events(rx, &tbus, &thandle, 0, g, |w| {
                 cc.lock().unwrap().push(w);
                 true
             })
@@ -695,8 +719,9 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let cc = count.clone();
+        let thandle = test_handle(&bus);
         let t = std::thread::spawn(move || {
-            forward_events(rx, &bus, 0, 1, |_| {
+            forward_events(rx, &bus, &thandle, 0, 1, |_| {
                 cc.fetch_add(1, Ordering::Relaxed);
                 false // 模拟 Dart 侧取消订阅：sink.add 返回 Err
             })
