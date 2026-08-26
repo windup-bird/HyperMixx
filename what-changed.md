@@ -196,3 +196,25 @@
   MIN_COMPATIBLE；锚在 `build_pre_analysis_artifact`。
 - 播放中不自动重建避免了 mid-mix 可闻 blip（~45ms 管线填充），换覆盖率。
 
+# plan-26：bar 级跳拍 + 收尾（M4）
+
+**date**
+8.26
+
+**done**
+- **bar 级跳拍**（engine.rs）：`beatjump_bars(deck, bars)` → `BeatJumpBars`
+  → `beatjump(bars×4)`（4/4，源拍域）。整数拍跳距保相位，sync 下两轨小节
+  边界对齐——直接消费 M1 BarClock 的小节原点。为 MIDI/UI 提供按小节跳演的
+  干净入口。
+- **WCET 确定性**：爆发调用次数 = `ceil(preprall / clamp(2×engine_frames,
+  256, 2048))` 全链路确定性公式，版本锚定测试保护（compat 风险随
+  `PRIME_BUDGET_*` 变化显性化）；极端情况（Wide、cache 欠载）回退官方协议。
+- 全量 212 测试通过，clippy 零警告。
+
+**fuck / 后续里程碑（不在本轮）**
+- 搓碟 ScrubVoice 移植（MIDI platter 直读旁路 + 落地并行预热）——用户
+  硬需求「延迟低 + 位移精确」的主战场，官方 desktop 参考实现在手
+- 记拍机制：乐句对齐 + 循环槽位（BarClock 已铺路）
+- WideKeylock 全局化 bench（RK3399 CPU 预算是否允许全局 0ms 头）
+
+

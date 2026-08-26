@@ -30,6 +30,9 @@ pub enum EngineOp {
     SeekExact { deck: usize, seconds: f64 },
     /// 按拍跳跃（拍长匹配当前速度，不量化）。
     BeatJump { deck: usize, beats: f64 },
+    /// 按小节跳跃（4/4：bars×4 拍落地；sync 下源拍单位随速率，保持两轨
+    /// 小节对齐——M1 BarClock 定小节原点）。
+    BeatJumpBars { deck: usize, bars: f64 },
     /// 激活/调整 beat loop（量化起止）。
     SetBeatLoop { deck: usize, beats: f64 },
     /// 在当前播放位置设定 Manual Loop In（音频线程中捕获并 snap）。
@@ -82,6 +85,13 @@ impl EngineHandle {
             .lock()
             .unwrap()
             .push_back(EngineOp::SetBeatLoop { deck, beats });
+    }
+
+    pub fn beatjump_bars(&self, deck: usize, bars: f64) {
+        self.ops
+            .lock()
+            .unwrap()
+            .push_back(EngineOp::BeatJumpBars { deck, bars });
     }
 
     pub fn loop_in(&self, deck: usize) {
@@ -224,6 +234,13 @@ impl EngineState {
                             // sync 后两轨一起跳不符合预期）。简单跳拍：
                             // 各自独立落 grid 拍；sync 速率锁保持 BPM 一致。
                             self.decks[deck].beatjump(beats);
+                        }
+                    }
+                    EngineOp::BeatJumpBars { deck, bars } => {
+                        if deck < self.decks.len() {
+                            // 4/4：bars×4 拍（源拍域；整数拍跳距保相位，sync
+                            // 下两轨小节边界对齐——M1 BarClock 原点）。
+                            self.decks[deck].beatjump(bars * 4.0);
                         }
                     }
                     EngineOp::SetBeatLoop { deck, beats } => {
