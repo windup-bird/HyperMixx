@@ -388,6 +388,9 @@ pub struct SyncLeader {
     pub tempo_rate: f64,
     /// 延迟补偿的当前出声位置（秒）。
     pub position_secs: f64,
+    /// P28：leader 侧 nudge 值（跟随方 target 需折入 leader 实际速率，
+    /// 否则 leader 微调时 target 仍基于 slider → 跟随方滞后）。
+    pub nudge: f64,
 }
 
 impl Deck {
@@ -1013,6 +1016,7 @@ impl Deck {
             grid_offset: self.ctl.grid_offset.get(),
             tempo_rate: self.rate,
             position_secs: self.pos / self.sr,
+            nudge: self.ctl.nudge.get(),
         }
     }
 
@@ -1068,7 +1072,16 @@ impl Deck {
             }
             return;
         }
-        let target = (leader.grid_bpm * leader.tempo_rate / fgrid.bpm).clamp(0.5, 2.0);
+        // target 折入 leader 实际速率：leader.nudge 已作用于 leader 引擎，
+        // 跟随方需匹配该速率（否则 leader 微调时 target 仍基于 slider → 滞后）。
+        let leader_nudge = if leader.nudge > 0.5 {
+            NUDGE_UP
+        } else if leader.nudge < -0.5 {
+            NUDGE_DOWN
+        } else {
+            1.0
+        };
+        let target = (leader.grid_bpm * leader.tempo_rate * leader_nudge / fgrid.bpm).clamp(0.5, 2.0);
 
         // P23-B：leader 位置跳变（beatjump/seek/loop 回绕——正常推进每块
         // <0.02 拍 @200bpm 极限，阈值 0.5 拍）→ 重新对齐。follower 自身
@@ -2368,6 +2381,7 @@ mod tests {
         grid_offset: f64,
         tempo_rate: f64,
         pos: f64,
+        nudge: f64,
     }
 
     impl FakeLeader {
@@ -2379,6 +2393,7 @@ mod tests {
                 grid_offset: self.grid_offset,
                 tempo_rate: self.tempo_rate,
                 position_secs: self.pos,
+                nudge: self.nudge,
             }
         }
         fn advance(&mut self) {
@@ -2417,6 +2432,7 @@ mod tests {
             grid_bpm: 128.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let rec = run_sync(&mut d, &mut leader, 20.0);
@@ -2461,6 +2477,7 @@ mod tests {
             grid_bpm: 120.0,
             grid_offset: 0.125, // 0.25 拍领先
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let rec = run_sync(&mut d, &mut leader, 10.0);
@@ -2504,6 +2521,7 @@ mod tests {
             grid_bpm: 120.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: base,
         };
 
@@ -2559,6 +2577,7 @@ mod tests {
             grid_bpm: 120.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let mut corr_max = 0.0f64;
@@ -2599,6 +2618,7 @@ mod tests {
             grid_bpm: 120.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let mut out = vec![0.0; 256 * 2];
@@ -2654,6 +2674,7 @@ mod tests {
             grid_bpm: 120.06, // 0.05% 失配
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let rec = run_sync(&mut d, &mut leader, 30.0);
@@ -2700,6 +2721,7 @@ mod tests {
             grid_bpm: 120.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let mut out = vec![0.0; 256 * 2];
@@ -2735,6 +2757,7 @@ mod tests {
             grid_bpm: 120.0,
             grid_offset: 0.625, // 1.25 拍领先（整拍 + 0.25）
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let rec = run_sync(&mut d, &mut leader, 10.0);
@@ -2771,6 +2794,7 @@ mod tests {
             grid_bpm: 120.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let mut out = vec![0.0; 256 * 2];
@@ -2810,6 +2834,7 @@ mod tests {
             grid_bpm: 120.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let mut out = vec![0.0; 256 * 2];
@@ -2861,6 +2886,7 @@ mod tests {
             grid_bpm: 120.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let mut out = vec![0.0; 256 * 2];
@@ -2932,6 +2958,7 @@ mod tests {
             grid_bpm: 120.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let mut out = vec![0.0; 256 * 2];
@@ -2964,6 +2991,7 @@ mod tests {
             grid_bpm: 120.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let grid = BeatGrid {
@@ -3055,6 +3083,7 @@ mod tests {
             grid_bpm: 120.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let grid = BeatGrid {
@@ -3136,6 +3165,7 @@ mod tests {
             grid_bpm: 120.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let rec = run_sync(&mut d, &mut leader, 8.0);
@@ -4343,6 +4373,7 @@ mod tests {
             grid_bpm: 120.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let mut out = vec![0.0; 256 * 2];
@@ -4392,6 +4423,7 @@ mod tests {
             grid_bpm: 120.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let mut out = vec![0.0; 256 * 2];
@@ -4627,6 +4659,7 @@ mod tests {
             grid_bpm: 128.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         // 首块 apply_sync：target = 128/120 ≈ 1.0667
@@ -4673,6 +4706,7 @@ mod tests {
             grid_bpm: 128.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let target = 128.0 / 120.0;
@@ -4772,6 +4806,7 @@ mod tests {
             grid_bpm: 128.0,
             grid_offset: 0.0,
             tempo_rate: 1.0,
+                nudge: 0.0,
             pos: -KEYLOCK_LATENCY_S,
         };
         let target = 128.0 / 120.0;

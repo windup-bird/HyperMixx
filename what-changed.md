@@ -237,7 +237,11 @@
     `fader_detached`（双位置模型：实际速率位置 vs MIDI 推子位置）。
   - `become_sync_master` / `sync_step` stage0 / `update_params` sync-off
     边沿统一走 `exit_sync()`，消除三相问题 #2（解除后速率 ≠ 解除前）。
-- **移除 SYNC_RATE_SLEW_PER_BLOCK**：P28 对齐不再爬坡 self.rate，该常量
+- **target 折入 leader nudge**（deck.rs / SyncLeader）：`SyncLeader.nudge`
+  新增字段；target = `leader.bpm × tempo_rate × leader_nudge / follower.bpm`。
+  旧 target 基于 slider（不含 nudge）→ leader 微调时 follower 滞后（target
+  与 leader 实际速率不匹配）。
+- 移除 SYNC_RATE_SLEW_PER_BLOCK：P28 对齐不再爬坡 self.rate，该常量
   废弃。清理一处 unused warning。
 - **测试新增/修复**（4 项，总计 216）：
   - `sync_rate_instant_lock`：开启 sync 后 rate 瞬锁 target（不线性爬坡），
