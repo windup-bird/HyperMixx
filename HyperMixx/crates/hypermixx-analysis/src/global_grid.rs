@@ -179,6 +179,7 @@ mod tests {
             downbeat_confidence: 0.8,
             sample_rate: 48_000,
             tempo_candidates: Vec::new(),
+            phase_untrusted: false,
         };
         let fit = fit_global_grid(&[], 48_000, &detected, 12.0).expect("fallback fit");
         assert_eq!(fit.downbeat_rotation, Some(0));

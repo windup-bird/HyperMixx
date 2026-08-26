@@ -1728,8 +1728,9 @@ mod tests {
     use super::*;
     use super::test_deck_with_cache as deck_with_cache;
 
-    /// Keylock profile 引擎延迟（560 帧，spike 实测）折算秒。
-    const KEYLOCK_LATENCY_S: f64 = 560.0 / 48000.0;
+    /// Keylock profile 引擎延迟折算秒。⚠️ 随上游版本漂移：0.11=560 帧、
+    /// 0.14=610 帧（低频校正器）——升级 timestretch 后必须核对。
+    const KEYLOCK_LATENCY_S: f64 = 610.0 / 48000.0;
 
     /// P23-C：cache_filled 总线 = 已填/总长；未加载 deck 恒 0。
     #[test]
@@ -3214,7 +3215,9 @@ mod tests {
         for i in 2..rec.len() {
             max_delta = max_delta.max((rec[i] - rec[i - 2]).abs());
         }
-        assert!(max_delta < 0.1, "换型逐采样 Δ 过大: {max_delta}");
+        // 0.14 低频校正器改变回声尾/混响湿声的能量分布，实测 Δ≈0.108
+        //（0.11 时 ≈0.09）；阈值放宽到 0.12，仍远小于可闻 click。
+        assert!(max_delta < 0.12, "换型逐采样 Δ 过大: {max_delta}");
     }
 
     #[test]
@@ -4141,7 +4144,7 @@ mod tests {
         // 填充缓冲容量公式锚定（@latency=560 → snap=1024×2、掩蔽窗=560）：
         // 跨平台回归基线——引擎延迟变化时此断言随之更新。
         assert_eq!(d.beatjump_snap.len(), 2048, "填充容量应 = next_pow2(latency)×2");
-        assert_eq!(d.beatjump_mask_len, 560, "掩蔽长度应 = 管线延迟");
+        assert_eq!(d.beatjump_mask_len, 610, "掩蔽长度应 = 管线延迟");
         let mut out = vec![0.0; 256 * 2];
         let mut rec = Vec::new();
         let blocks = (16.0 * 48000.0 / 256.0) as usize;

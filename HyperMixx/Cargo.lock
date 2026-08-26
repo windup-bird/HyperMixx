@@ -1740,9 +1740,9 @@ dependencies = [
 
 [[package]]
 name = "timestretch"
-version = "0.11.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f93b9034134a68cc86fb8c3fc359b37af8e56d0302cff6ac729e85edb9bef722"
+checksum = "9cc34a6abf29179a470946c85eda25025841c63e7af08873296661e8b845462d"
 dependencies = [
  "arc-swap",
  "ebur128",

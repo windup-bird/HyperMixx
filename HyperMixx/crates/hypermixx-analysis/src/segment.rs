@@ -384,6 +384,9 @@ fn track_analysis(
             downbeat_confidence: 0.0,
             sample_rate: sr,
             tempo_candidates: grid.tempo_candidates.clone(),
+            // 合成刚性网格：相位已经 rigid fitter 重锚定，不继承
+            // 检测器分歧标记（phase_untrusted 语义见 0.14 beat.rs）。
+            phase_untrusted: false,
         };
         (rigid, true)
     } else {
