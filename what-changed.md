@@ -28,3 +28,51 @@
 - sync对不准
 - beatjump偏移
 - beatjump后变速
+
+# hyper-sync 重构：sync 曲线重设计 + beatjump 接缝修复
+
+**date**
+8.26
+
+**done**
+- **sync 曲线重写**（deck.rs `apply_sync`）：tempo 开启沿瞬锁目标速率；
+  相位线性平移——远区恒定 ±8% 追相位，**误差过零即锁**（残差 ≤ 单步
+  ≈0.4ms@120BPM）。旧 smoothstep+0.01 拍死区随机停住遗留 ≤10ms 永久
+  稳态偏差，已消除。两个陷阱记录：单块精确闭合被引擎 set_rate 平滑
+  打破（振荡不收敛）；窄锁定窗会被整步飞越错过（绕圈）——过零判定
+  对任意相对运动确定性终止。
+- **stage-2 盲取消 bug**：快速连点 sync（1→2）曾无条件置
+  `sync_align_done=true` 中止对齐且永不重试；现保留 pending 至收敛。
+- **beatjump 与 sync 完全解耦**：删除 sync 下跳拍的重新对齐触发
+  （旧路径置 pending → 相位修正弯折速率 =「jump 改变播放速率」根因，
+  最高 ±100%×eased 持续约秒级）。整数拍按 grid 坐标推进天然保相。
+- **beatjump 接缝填充**（借鉴 Mixxx readToCrossfadeBuffer 思想）：
+  - 引擎侧根因：timestretch 前瞻管线 reset 后需重填充（~560 帧），
+    该声学空洞在数学上不可消除（前瞻链需要 L 帧未来上下文）
+  - 方案 = 加性填充：从出声位置直读缓存原始采样续读（旧音频的真正
+    延续），包络 smoothstep 渐入渐出；前 ~64 帧由引擎自带 release
+    ramp 承载（与已听内容波形连续）。两轮失败教训：回放历史窗口
+    （时间倒退阶跃）、直接拼接原始采样（keylock 颗粒重组改变波形，
+    引擎输出≠原始采样）
+  - 配套：min_preroll 1帧→pipeline_latency_frames()，stage 链在真实
+    内容上收敛，消除重填充边界新内容单样本硬进入（Δ 0.37→0.04）
+- **跨平台自适应**：所有尺寸构建期查询 keylocker，零硬编码帧数——
+  填充容量 next_pow2(latency)、掩蔽长度 = latency、测试容差动态推导。
+- 测试：`beatjump_seam_no_silence_gap`（±30ms 无静音洞）、
+  `beatjump_seam_blend_no_click`（逐采样 Δ<0.05）、
+  `beatjump_integer_phase_lag_diagnostic`（时移量化基线）、
+  `sync_follower_own_jump_no_realign` 容差随 mask_len 动态化。
+- 全量 cargo test --workspace 通过（165+20），clippy 零警告。
+
+**调研**
+- Mixxx 参考结论（~/Git/mixxx）：同步拉取渲染 vs 本项目推喂管线——
+  Mixxx 无引擎内延迟、seek 同回调交叉淡化零空洞；loop 在读路径内联
+  换向；sync 用连续 P 控制器吸收一切瞬态。本项目 P14 刻意删连续修正
+  （用户微调不被拉回），故每个转换须自身精确。
+- 预热预算论证：timestretch prime budget ≤512 帧/回调 ≈ 2×实时，
+  提预热帧数不缩短静音窗（与管线填充同速），仅换质量。
+
+**fuck**
+- sync 下跳后残余时移 = 管线延迟量级（实测 ~17ms@48k）：掩蔽消静音洞
+  不消时移，对 leader 有轻微 flam——待影子引擎交接里程碑消除
+- timestretch 为 crates.io 依赖，位置调度（无 reset 重锚）需 vendor 补丁
