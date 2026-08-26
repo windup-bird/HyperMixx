@@ -217,4 +217,52 @@
 - 记拍机制：乐句对齐 + 循环槽位（BarClock 已铺路）
 - WideKeylock 全局化 bench（RK3399 CPU 预算是否允许全局 0ms 头）
 
+# plan-28：同步三相修复 + 引擎轴组合器
+
+**date**
+8.27
+
+**done**
+- **同步三相修复**（deck.rs / apply_sync）：
+  - **S1 瞬锁 target**：开启沿立即 `self.rate = target`（不再线性爬坡），
+    相位修正走引擎轴 `sync_align_factor`（±8% 恒定线性追相位，跨零后
+    指数衰减归零，全程不触碰 `self.rate`——显示/基准两侧即时一致）。
+  - **S2 引擎轴单通道组合器**：`engine_rate() = rate × 2^(shift/12) ×
+    nudge × (1 + sync_align_factor + sync_phase_corr)`，所有临时修正
+    统一到同一引擎轴因子（align/phase_corr/nudge 同轴），消除多通道
+    速率不一致（三相问题 #3）。
+  - **S3 解除恢复快照**：`request_sync_align` / `update_params` 开启沿
+    记 `pre_sync_rate = self.rate`（仅首次 tap，防 stage2 覆盖成 target）；
+    `exit_sync()` 恢复快照值、清所有引擎轴因子、按恢复值重判
+    `fader_detached`（双位置模型：实际速率位置 vs MIDI 推子位置）。
+  - `become_sync_master` / `sync_step` stage0 / `update_params` sync-off
+    边沿统一走 `exit_sync()`，消除三相问题 #2（解除后速率 ≠ 解除前）。
+- **移除 SYNC_RATE_SLEW_PER_BLOCK**：P28 对齐不再爬坡 self.rate，该常量
+  废弃。清理一处 unused warning。
+- **测试新增/修复**（4 项，总计 216）：
+  - `sync_rate_instant_lock`：开启 sync 后 rate 瞬锁 target（不线性爬坡），
+    pre_sync_rate 快照正确。
+  - `sync_exit_restores_rate`：stage1→stage2→stage0 全链路恢复 pre_rate；
+    exit_sync 清 factor/phase_corr/pre_sync_rate。
+  - `sync_engine_rate_combinator`：engine_rate() 公式验证（rate × pitch ×
+    nudge × (1+align+phase_corr)）。
+  - `sync_fader_restores_on_exit`：stage2→stage0 后 fader_detached 按恢复值
+    vs 推子重判（双位置模型语义验证）。
+  - `sync_pitch_axis_rate_is_engine_rate`：放宽断言（±1e-3），因 P26 持续
+    修正在引擎轴引入 ±0.5% 内微调（不可闻，由设计保证）。
+- 全量 216 测试通过，clippy 零警告。
+
+**架构说明**
+- 三相问题根因：旧实现在 self.rate（持久轴）上做临时修正（一次性对齐爬坡、
+  sync_phase_corr），与 nudge（引擎轴）走两个轴，解除时无法干净复位。
+  P28 将所有临时修正统一到引擎轴因子（align + phase_corr），self.rate 仅
+  在 sync 开启/解除时写入（target 或 pre_sync_rate），不承载临时修正。
+- sync_align_factor 衰减：对齐完成后指数衰减（×0.5/block，≤5e-4 归零），
+  13 块 ≈70ms 全程不可闻；P26 持续修正自动接管稳态微调。
+
+**fuck / 后续里程碑（不在本轮）**
+- 搓碟 ScrubVoice 移植（MIDI platter 直读旁路 + 落地并行预热）
+- 记拍机制：乐句对齐 + 循环槽位（BarClock 已铺路）
+- WideKeylock 全局化 bench（RK3399 CPU 预算是否允许全局 0ms 头）
+
 

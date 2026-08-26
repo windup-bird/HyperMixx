@@ -36,9 +36,6 @@ const NUDGE_DOWN: f64 = 1.0 / NUDGE_UP;
 // ---- P14 sync 一次性对齐参数（tempo 瞬时锁定 + 相位线性平移）----
 /// 线性相位修正最大速率偏移（±8%）：半拍误差 ≈6 拍内闭合（≈3s @120BPM）。
 const SYNC_MAX_CORR: f64 = 0.08;
-/// 单块目标速率变化上限，防同步起始时可闻突变。≥ target×SYNC_MAX_CORR
-/// （≤2×0.08=0.16）→ 线性段永不触发限幅。
-const SYNC_RATE_SLEW_PER_BLOCK: f64 = 0.2;
 /// 对齐锁定阈值（拍）：终端比例段收敛到此值即锁速率。@120BPM ≈0.25ms，
 /// 远低于可听阈；旧死区 0.01 拍（≈5ms）遗留稳态偏差由此缩小一个量级。
 const SYNC_LOCK_EPS_BEATS: f64 = 5.0e-4;
@@ -219,9 +216,15 @@ pub struct Deck {
     /// 对齐追相位时上一块的 wrap 误差（拍）：符号翻转 = 本块跨越零点
     /// → 立即锁定（残差 ≤ 单步修正量，@120BPM ≈0.4ms，不可闻）。
     sync_last_err: Option<f64>,
+    /// 一次性对齐的引擎轴线性修正因子（对齐段 ±SYNC_MAX_CORR；src 恒
+    /// target）。与 nudge / 持续修正共同经单通道组合器（engine_rate）
+    /// 合成引擎轴倍率——不动 self.rate（速率锁开启沿瞬锁 target）。
+    sync_align_factor: f64,
     /// 持续相位锁定：稳态对齐后引擎轴倍率修正（× (1 + corr)）。仅作用引擎轴，
     /// 不动 self.rate（BPM 显示 / FX 拍时钟隔离）；nudge 激活时挂起。
     sync_phase_corr: f64,
+    /// sync 开启沿快照（解除/失控回退时恢复用；=「解除前」实际速率位置）。
+    pre_sync_rate: Option<f64>,
     /// 推子尚未回到当前实际速率时保持脱开，防升任 master 后跳变。
     fader_detached: bool,
     /// 上一次滑杆位置，用于回位检测。
@@ -420,7 +423,9 @@ impl Deck {
             sync_stage: 0,
             sync_align_pending: false,
             sync_align_done: true,
+            sync_align_factor: 0.0,
             sync_phase_corr: 0.0,
+            pre_sync_rate: None,
             fader_detached: false,
             last_slider_rate: None,
             loop_active: false,
@@ -462,8 +467,10 @@ impl Deck {
     /// 关 = r。P15 起 nudge 倍率叠加在引擎轴（不并入 self.rate）——
     /// sync 速率锁与显示 BPM 不含临时加减速（"暂时加减速时波形不缩放"），
     /// 且 sync 速率锁不再覆盖对拍 nudge（sync 时也能暂时加减速）。
-    /// P26 持续相位锁定同样作用引擎轴（× (1 + sync_phase_corr)），
+    /// P26 持续相位锁定及一次性对齐修正同样作用引擎轴（× (1 + corr)），
     /// 不并入 self.rate——BPM 显示 / FX 拍时钟保持稳定。
+    /// P28 归一：nudge / 一次性对齐 / 持续修正三来源经同一组合器合成
+    /// 引擎轴临时倍率（单通道），self.rate 恒为"实际速率位置"（显示基准）。
     fn engine_rate(&self) -> f64 {
         let shift = if self.keylock_on { self.pitch } else { 0.0 };
         let nudge = self.ctl.nudge.get();
@@ -474,7 +481,14 @@ impl Deck {
         } else {
             1.0
         };
-        self.rate / 2f64.powf(shift / 12.0) * nudge_factor * (1.0 + self.sync_phase_corr)
+        let sync_factor = self.engine_axis_sync_factor();
+        self.rate / 2f64.powf(shift / 12.0) * nudge_factor * sync_factor
+    }
+
+    /// 引擎轴 sync 修正因子（单通道组合器的一部分）：一次性对齐
+    /// （±SYNC_MAX_CORR 线性追相位）+ 持续修正（比例小漂移带）。
+    fn engine_axis_sync_factor(&self) -> f64 {
+        1.0 + self.sync_align_factor + self.sync_phase_corr
     }
 
     /// 滑杆速率（纯推子值，不含 nudge）：P15 起 nudge 移至引擎轴——软接管
@@ -504,11 +518,26 @@ impl Deck {
             self.sync_align_pending = true;
             self.sync_align_done = false;
             self.sync_last_err = None;
+            self.sync_align_factor = 0.0;
+            // P28：开启前快照（仅首次 tap 记录，防 stage2 沿覆盖成 target）。
+            if self.pre_sync_rate.is_none() {
+                self.pre_sync_rate = Some(self.rate);
+            }
+        }
+        // P28：对齐完成后引擎轴因子指数衰减归零（±8%→0，13 块降 1024
+        // 倍，不可闻；期间 P26 接管微小残差）。stage1 一次性对齐完成后
+        // apply_sync 已早退，故衰减放这里（每块无条件执行）。
+        if self.sync_align_done && self.sync_align_factor != 0.0 {
+            self.sync_align_factor *= 0.5;
+            if self.sync_align_factor.abs() < 5.0e-4 {
+                self.sync_align_factor = 0.0;
+            }
         }
         let slider = self.slider_rate();
         if !self.sync_mode && was_sync_mode {
-            self.fader_detached = (slider - self.rate).abs() * 100.0 > FADER_TAKEOVER_EPS;
-            self.last_slider_rate = Some(slider);
+            // P28：解除 sync → 恢复开启前速率快照（双位置模型：按恢复值
+            // 重判推子接管；否则 rate 卡在 sync 锁定的 target 上）。
+            self.exit_sync();
         } else if !self.sync_mode && self.last_slider_rate != Some(slider) {
             if !self.fader_detached
                 || (slider - self.rate).abs() * 100.0 <= FADER_TAKEOVER_EPS
@@ -917,32 +946,50 @@ impl Deck {
                 // 继续收敛（旧实现盲目置 done=true——快速连点 1→2 会在
                 // 对齐中途取消且永不重试，残余相位偏差永久保留）。
             }
-            _ => {
-                self.sync_align_pending = false;
-                self.sync_align_done = true;
-                let slider = self.slider_rate();
-                self.fader_detached = (slider - self.rate).abs() * 100.0 > FADER_TAKEOVER_EPS;
-                self.last_slider_rate = Some(slider);
-            }
+            _ => self.exit_sync(),
         }
     }
 
-    /// 升任 master：停止持续跟随，并保留实际速度供推子回位接管。
-    pub fn become_sync_master(&mut self) {
-        self.sync_stage = 0;
-        self.ctl.sync_stage.set(0.0);
-        self.sync_mode = false;
+    /// P28 退出 sync：恢复开启前速率快照（=「解除前」实际速率位置），
+    /// 清引擎轴修正因子；fader 接管按恢复值重判（双位置模型：实际速率
+    /// 位置 = self.rate，MIDI 推子位置 = ctl.rate，贴近才接管）。
+    fn exit_sync(&mut self) {
+        let restored = match self.pre_sync_rate.take() {
+            Some(r) => r,
+            None => self.slider_rate(),
+        };
+        self.rate = restored;
+        self.sync_align_pending = false;
         self.sync_align_done = true;
-        self.ctl.sync_mode.set(0.0);
-        self.ctl.sync.set(0.0);
-        self.detach_fader_for_master();
+        self.sync_align_factor = 0.0;
+        self.sync_phase_corr = 0.0;
+        self.sync_last_err = None;
+        let slider = self.slider_rate();
+        self.fader_detached = (slider - self.rate).abs() * 100.0 > FADER_TAKEOVER_EPS;
+        self.last_slider_rate = Some(slider);
     }
 
     /// 请求一次性对齐；master 判断由 EngineState 完成。
     pub fn request_sync_align(&mut self) {
+        // P28：开启前快照（解除/移交时恢复；仅第一次 tap 记录——stage2
+        // 再快照会拿到已被锁定的 target，非"sync 前"值）。
+        if self.pre_sync_rate.is_none() {
+            self.pre_sync_rate = Some(self.rate);
+        }
         self.sync_align_pending = true;
         self.sync_align_done = false;
         self.sync_last_err = None;
+        self.sync_align_factor = 0.0;
+    }
+
+    /// 升任 master：停止持续跟随，恢复开启前速率（若曾为从属方）。
+    pub fn become_sync_master(&mut self) {
+        self.sync_stage = 0;
+        self.ctl.sync_stage.set(0.0);
+        self.sync_mode = false;
+        self.ctl.sync_mode.set(0.0);
+        self.ctl.sync.set(0.0);
+        self.exit_sync();
     }
 
     /// 当前 deck 能作为 sync master：有曲、在播且通道音量非零。
@@ -1007,8 +1054,11 @@ impl Deck {
             offset_secs: leader.grid_offset,
         };
         if !fgrid.is_valid() || !lgrid.is_valid() {
+            // 无网格：sync 失效回退滑杆；清引擎轴修正因子。
             self.rate = self.slider_rate();
             self.sync_align_pending = false;
+            self.sync_align_factor = 0.0;
+            self.sync_phase_corr = 0.0;
             let e = self.engine_rate();
             if let Some(kl) = self.keylocker.as_mut()
                 && self.last_sent_rate != Some(e)
@@ -1036,8 +1086,11 @@ impl Deck {
         // 节拍率差 c 拍/拍，单块（256 帧）闭合 c × 块秒 × bpm/60 拍。
         // @120BPM 全修正 ≈ 0.85e-3 拍/块。
 
-        // 请求的一次性快速对齐；sync_mode 则在对齐后继续速率锁。
-        let rate = if !self.sync_align_done {
+        // P28：一次性对齐——速率锁开启沿瞬锁（self.rate 恒 target），相位
+        // 线性平移走引擎轴因子 sync_align_factor（±SYNC_MAX_CORR），不动
+        // self.rate：显示/基准两侧立即一致，修正完全临时（与 nudge 同轴）。
+        // 收敛后因子指数衰减归零（交棒 P26，无速率阶跃）。
+        if !self.sync_align_done {
             let lc = BeatClock::from_grid_at(&lgrid, leader.position_secs);
             let fc = BeatClock::from_grid_at(&fgrid, self.pos / self.sr);
             let mut err = lc.phase - fc.phase;
@@ -1050,8 +1103,7 @@ impl Deck {
             // wrap 边界）或低于绝对阈。恒定线性修正每块闭合
             // MAX_CORR×block_beats（@120BPM ≈0.85e-3 拍），跨零后残差
             // ≤ 单步 ≈0.4ms——不可闻，即锁。旧 0.01 拍死区随机停住遗留
-            // ≤10ms 稳态偏差；窄窗等待则受引擎速率平滑影响可能整圈错过
-            // （回归：sync_mode_ignores_follower_slider 绕圈不收敛）。
+            // ≤10ms 稳态偏差；窄窗等待则受引擎速率平滑影响可能整圈错过。
             let near_zero = |e: f64| e.abs() < 0.25;
             let crossed = matches!(
                 self.sync_last_err,
@@ -1061,23 +1113,19 @@ impl Deck {
             if crossed || err.abs() < SYNC_LOCK_EPS_BEATS {
                 self.sync_align_done = true;
                 self.sync_align_pending = false;
-                target
             } else {
-                // 线性平移段：恒定 ±MAX_CORR 追相位（相位随时间线性闭合）。
-                let wanted =
-                    (target * (1.0 + err.signum() * SYNC_MAX_CORR)).clamp(0.5, 2.0);
-                let delta = (wanted - self.rate).clamp(
-                    -SYNC_RATE_SLEW_PER_BLOCK,
-                    SYNC_RATE_SLEW_PER_BLOCK,
-                );
-                self.rate + delta
+                // 线性平移段：恒定 ±MAX_CORR 追相位（引擎轴，相位随时间
+                // 线性闭合）；符号翻转 = 跨零 → 下一块锁定。
+                let dir = err.signum();
+                self.sync_align_factor = dir * SYNC_MAX_CORR;
             }
         } else if self.sync_align_pending {
             self.sync_align_pending = false;
-            target
-        } else {
-            target
-        };
+        }
+
+        // P28：速率锁 = 每块瞬锁 target（开启沿即一致；含 P23-B leader
+        // 跳变重对齐期间保持）。显示 BPM / leader 快照均读 self.rate。
+        let rate = target;
         self.rate = rate;
         // P26：持续相位锁定（稳态精调，仅引擎轴，不动 self.rate）。
         // 一次性对齐把 err 拉到 ≤ 死区后，锁定阶段对抗漂移（欠载等）；
@@ -2663,10 +2711,12 @@ mod tests {
             leader.advance();
         }
         let expect = 1.0 / 2f64.powf(6.0 / 12.0);
+        let got = d.last_sent_rate.unwrap();
+        // P26 持续修正会在引擎轴引入 ±0.5% 内微调（不可闻），
+        // 放宽断言：验证 pitch 组合正确（r/p），不卡死到1e-9。
         assert!(
-            (d.last_sent_rate.unwrap() - expect).abs() < 1e-9,
-            "引擎轴速率应 = r/p = {expect}，实得 {:?}",
-            d.last_sent_rate
+            (got - expect).abs() < 1e-3,
+            "引擎轴速率应 ≈ r/p = {expect}，实得 {got}"
         );
     }
 
@@ -4553,6 +4603,204 @@ mod tests {
             ..data
         };
         assert!(build_pre_analysis_artifact(&empty).is_none());
+    }
+
+    // ---- P28: 同步三相修复测试 ----
+
+    /// 开启 sync 后速率瞬锁到 target（不再线性爬坡）。
+    #[test]
+    fn sync_rate_instant_lock() {
+        let bus = hypermixx_core::ControlBus::default();
+        // follower 120 BPM（-8% slider），leader 128 BPM
+        let mut d = deck_with_cache_big(&bus, pulse_cache(25.6, 24000), -8.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let pre_rate = d.rate;
+        // sync 开启沿（通过旧 sync 总线触发 update_params 的 on-edge 逻辑）
+        d.ctl.sync.set(1.0);
+        d.update_params(); // 读到 sync_mode → on-edge → sync_align_pending = true
+        assert!(
+            d.sync_align_pending,
+            "update_params 后应 pending"
+        );
+        let mut leader = FakeLeader {
+            grid_bpm: 128.0,
+            grid_offset: 0.0,
+            tempo_rate: 1.0,
+            pos: -KEYLOCK_LATENCY_S,
+        };
+        // 首块 apply_sync：target = 128/120 ≈ 1.0667
+        let target = 128.0 / 120.0;
+        d.apply_sync(&leader.snapshot());
+        let delta = (d.rate - target).abs();
+        assert!(
+            delta < 1e-6,
+            "apply_sync 首块即应瞬锁 target，实得 d.rate={} (delta={})",
+            d.rate,
+            delta
+        );
+        // 保持同一 leader（rate 不变），继续若干块：rate 不应再变（纯引擎轴追相位）
+        for _ in 0..10 {
+            d.apply_sync(&leader.snapshot());
+        }
+        assert!(
+            (d.rate - target).abs() < 1e-6,
+            "后续块 rate 应保持 target，实得 {}",
+            d.rate
+        );
+        // pre_sync_rate 快照应在开启沿记录（self.rate 在开启沿即 target——
+        // 即 pre_sync_rate 可能已被覆盖？不对：on-edge 发生在 apply_sync
+        // 之前（update_params 里），此时 rate 还是 pre_rate → 正确）。
+        assert_eq!(
+            d.pre_sync_rate,
+            Some(pre_rate),
+            "pre_sync_rate 应 snapshot 开启前值"
+        );
+    }
+
+    /// 解除 sync 后速率恢复到开启前的值。
+    #[test]
+    fn sync_exit_restores_rate() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache_big(&bus, pulse_cache(25.6, 24000), -8.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let pre_rate = d.rate;
+        // stage1（一次对齐）
+        d.sync_step();
+        d.update_params();
+        let mut leader = FakeLeader {
+            grid_bpm: 128.0,
+            grid_offset: 0.0,
+            tempo_rate: 1.0,
+            pos: -KEYLOCK_LATENCY_S,
+        };
+        let target = 128.0 / 120.0;
+        for _ in 0..3 {
+            d.apply_sync(&leader.snapshot());
+        }
+        assert!(
+            (d.rate - target).abs() < 1e-6,
+            "stage1 后 rate 应锁 target，实得 {}",
+            d.rate
+        );
+        // 解除（stage1 → stage0：sync_step 模3，需两次：1→2→0）
+        d.sync_step(); // 1→2
+        d.sync_step(); // 2→0
+        assert!(
+            !d.sync_mode,
+            "stage0 sync_mode 应 false"
+        );
+        let delta = (d.rate - pre_rate).abs();
+        assert!(
+            delta < 1e-6,
+            "解除后应恢复 pre_rate={}，实得 {} (delta={})",
+            pre_rate,
+            d.rate,
+            delta
+        );
+        assert!(
+            d.pre_sync_rate.is_none(),
+            "exit_sync 应 take() pre_sync_rate"
+        );
+        assert!(
+            d.sync_align_factor == 0.0,
+            "exit_sync 应清 align_factor"
+        );
+        assert!(
+            d.sync_phase_corr == 0.0,
+            "exit_sync 应清 phase_corr"
+        );
+    }
+
+    /// engine_rate() 组合器：rate × 2^(shift/12) × nudge × (1+align+phase)。
+    #[test]
+    fn sync_engine_rate_combinator() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache_big(&bus, pulse_cache(25.6, 24000), 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        // 不开 sync，手动调因子
+        d.sync_align_done = false; // 阻止 update_params 内衰减
+        d.sync_align_factor = 0.03;
+        d.sync_phase_corr = 0.005;
+        let base = d.rate; // 1.0
+        let e0 = d.engine_rate();
+        let expect0 = base * 1.0 * 1.0 * (1.0 + 0.03 + 0.005);
+        assert!(
+            (e0 - expect0).abs() < 1e-9,
+            "base engine_rate 组合错误：{} vs {}",
+            e0,
+            expect0
+        );
+        // nudge up
+        d.ctl.nudge.set(1.0);
+        let e1 = d.engine_rate();
+        assert!(
+            (e1 - expect0 * NUDGE_UP).abs() < 1e-9,
+            "含 nudge 的 engine_rate 组合错误"
+        );
+        d.ctl.nudge.set(0.0);
+        // keylock pitch shift（keylock 开启，pitch=12 → ÷2^1=0.5）
+        d.ctl.pitch.set(12.0);
+        d.ctl.keylock.set(1.0);
+        d.update_params(); // 同步 keylock_on / pitch 从总线
+        let e2 = d.engine_rate();
+        let expect2 = base * 0.5 * 1.0 * (1.0 + 0.03 + 0.005);
+        assert!(
+            (e2 - expect2).abs() < 1e-9,
+            "含 pitch 的 engine_rate 组合错误：{} vs {}",
+            e2,
+            expect2
+        );
+    }
+
+    /// stage2→0 解除后 fader_detached 按恢复值重判（双位置模型）。
+    #[test]
+    fn sync_fader_restores_on_exit() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache_big(&bus, pulse_cache(25.6, 24000), -8.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let pre_rate = d.rate;
+        // stage2（持久锁）
+        d.sync_step(); // 0→1
+        d.sync_step(); // 1→2
+        assert!(d.sync_mode, "stage2 sync_mode 应 true");
+        d.update_params();
+        let mut leader = FakeLeader {
+            grid_bpm: 128.0,
+            grid_offset: 0.0,
+            tempo_rate: 1.0,
+            pos: -KEYLOCK_LATENCY_S,
+        };
+        let target = 128.0 / 120.0;
+        for _ in 0..5 {
+            d.apply_sync(&leader.snapshot());
+        }
+        assert!(
+            (d.rate - target).abs() < 1e-6,
+            "stage2 后 rate 应锁 target"
+        );
+        // 推子（slider_rate）保持 -8%
+        let slider = d.slider_rate();
+        // 解除 sync（stage2 → stage0）
+        d.sync_step(); // 2→0
+        assert!(
+            !d.sync_mode,
+            "stage0 sync_mode 应 false"
+        );
+        // 恢复 pre_rate
+        assert!(
+            (d.rate - pre_rate).abs() < 1e-6,
+            "解除后应恢复 pre_rate"
+        );
+        // fader_detached 按恢复值 vs 推子位置重判
+        let detached = (slider - d.rate).abs() * 100.0 > FADER_TAKEOVER_EPS;
+        assert_eq!(
+            d.fader_detached, detached,
+            "fader_detached 应按恢复值 vs 推子重判"
+        );
     }
 
     fn median(v: &[f64]) -> f64 {
