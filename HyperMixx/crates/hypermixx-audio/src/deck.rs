@@ -72,6 +72,29 @@ const LOOP_BLEND_FRAMES: usize = 64;
 /// follower 重新对齐（P14「操作后不再自动对拍」仅限 follower 自身操作）。
 const SYNC_LEADER_JUMP_BEATS: f64 = 0.5;
 
+// ---- P27 无缝跳转（beatjump/seek 同回调爆发 + 旧尾交叉淡化）----
+/// 切换点交叉淡化长度（帧）：≈2.7ms@48k。旧内容（缓存直读续播）× cos
+/// 淡出 × 新内容（引擎已就绪）× sin 淡入；整数拍跳距新旧相位恒等 →
+/// 混合拍对齐，无 click。
+const JUMP_CROSSFADE_FRAMES: usize = 128;
+
+/// 线性插值读缓存单帧立体声（P27 旧尾交叉淡化用；独立于 Deck 的
+/// read_stereo——后者借 &mut self，交叉淡化在 process_engine 内需与
+/// self.engine_scratch 的可变借用并存，故走自由函数 + 共享借 cache）。
+fn read_cache_stereo(cache: &TrackCache, pos: f64) -> Option<(f32, f32)> {
+    let i0 = pos.floor() as usize;
+    let frac = (pos - i0 as f64) as f32;
+    let mut p0 = [0.0f32; 2];
+    let mut p1 = [0.0f32; 2];
+    if cache.copy_ready(&mut p0, i0 as u64, 1) != 1 {
+        return None;
+    }
+    if cache.copy_ready(&mut p1, (i0 + 1) as u64, 1) != 1 {
+        return None;
+    }
+    Some((p0[0] + (p1[0] - p0[0]) * frac, p0[1] + (p1[1] - p0[1]) * frac))
+}
+
 
 /// 音轨总帧数（48kHz 时间轴），由读取线程在 EOF 时写入。
 pub type TrackFrames = Arc<AtomicU64>;
@@ -99,6 +122,9 @@ pub struct Deck {
     /// 引擎渲染暂存：升调（p>1）时每块渲染 256×p 帧（上限 513），
     /// load 时预分配，运行时零分配。
     engine_scratch: Vec<f32>,
+    /// P27 爆发排干暂存：同回调烧 warm_start priming 的 dummy process 目标
+    /// （引擎忽略其输出）。尺寸同 engine_scratch 上限，预分配零分配。
+    prime_scratch: Vec<f32>,
     /// 引擎渲染帧数的分数余量：256×p 非整数时用累加器均摊，
     /// 长期供给恰好等于 pitch 级消费，carry 不漂移。
     shifter_frac: f64,
@@ -169,6 +195,14 @@ pub struct Deck {
     last_leader_pos: Option<f64>,
     /// downbeat 旋转缓存（ctl.grid_rotation 快照，BarClock 小节对齐用）。
     bar_rotation: i64,
+    /// P27 无缝跳转：warm_start 预卷帧数（>0 = 本块同回调爆发排干），
+    /// seek 时若缓存可喂满全预卷才置位，否则 0（回退官方协议静音窗）。
+    burst_preroll: u32,
+    /// P27 旧尾交叉淡化剩余帧数（0 = 无淡）。仅在爆发成功时置
+    /// JUMP_CROSSFADE_FRAMES，回退路径 0。
+    jump_cross_remaining: usize,
+    /// P27 跳转前出声位置（帧）：交叉淡化旧内容从它续读（+ 块内推进）。
+    jump_old_base: f64,
 
     // DSP
     eq: ThreeBandEq,
@@ -300,6 +334,7 @@ impl Deck {
             keylocker: None,
             pitch_shifter: PitchShifter::new(),
             engine_scratch: vec![0.0; (ENGINE_BLOCK * 2 + 2) * 2],
+            prime_scratch: vec![0.0; (ENGINE_BLOCK * 2 + 2) * 2],
             shifter_frac: 0.0,
             feed_pos: 0,
             feed_base: 0,
@@ -338,6 +373,9 @@ impl Deck {
             last_leader_pos: None,
             sync_last_err: None,
             bar_rotation: 0,
+            burst_preroll: 0,
+            jump_cross_remaining: 0,
+            jump_old_base: 0.0,
             eq: ThreeBandEq::new(sr as f32),
             filter: DeckFilter::new(sr as f32),
             gain: Smoother::new(1.0, coeff as f32),
@@ -1067,10 +1105,48 @@ impl Deck {
             ENGINE_BLOCK
         };
         self.feed_keylocker(engine_frames);
+        // P27 无缝跳转：刚 seek 且缓存喂满全预卷 → 本回调同帧烧完 warm_start
+        // priming（dummy process 丢弃输出），随后真实 process 直接产出目标
+        // 内容——无静音窗（官方协议改为跨回调预热 + 静音）。调用次数 =
+        // ceil(preroll / 单块预算)，预算 = clamp(2×engine_frames, 256, 2048)
+        // （与引擎 PRIME_BUDGET_* 一致；版本锚定测试保护）。
+        if self.burst_preroll > 0 {
+            let budget = ((engine_frames as u64) * 2).clamp(256, 2048);
+            let calls = (self.burst_preroll as u64).div_ceil(budget);
+            for _ in 0..calls.saturating_sub(1) {
+                self.keylocker
+                    .as_mut()
+                    .unwrap()
+                    .process(&mut self.prime_scratch[..engine_frames * 2]);
+            }
+            self.burst_preroll = 0;
+        }
         self.keylocker
             .as_mut()
             .unwrap()
             .process(&mut self.engine_scratch[..engine_frames * 2]);
+        // P27 旧尾交叉淡化：跳转块前 JUMP_CROSSFADE_FRAMES 帧混合旧内容
+        //（缓存直读续播）× cos 淡出 + 引擎新内容 × sin 淡入——整数拍跳
+        // 新旧相位恒等，混合拍对齐无 click。之后 pitch 级统一处理。
+        if self.jump_cross_remaining > 0 {
+            let n = self.jump_cross_remaining.min(engine_frames);
+            let rate = self.engine_rate();
+            let base = self.jump_old_base;
+            if let Some(cache) = self.cache.as_ref() {
+                for j in 0..n {
+                    let t = ((j as f32 + 0.5) / JUMP_CROSSFADE_FRAMES as f32)
+                        * (std::f32::consts::PI / 2.0);
+                    let (g_out, g_in) = (t.cos(), t.sin());
+                    let (ol, r) =
+                        read_cache_stereo(cache, base + j as f64 * rate).unwrap_or((0.0, 0.0));
+                    self.engine_scratch[j * 2] =
+                        self.engine_scratch[j * 2] * g_in + ol * g_out;
+                    self.engine_scratch[j * 2 + 1] =
+                        self.engine_scratch[j * 2 + 1] * g_in + r * g_out;
+                }
+            }
+            self.jump_cross_remaining = self.jump_cross_remaining.saturating_sub(n);
+        }
         // pitch 级：旁路直通 / 256×p 消费；EQ 在 pitch 之后
         //（引擎瞬态检测应吃原始音频，处理链不能前置）
         self.pitch_shifter
@@ -1370,6 +1446,8 @@ impl Deck {
         self.last_sent_rate = None; // 首块强制 set_rate
         self.keylock_sent = None; // 首块强制 set_keylock
         self.rebuild_pending = false;
+        self.burst_preroll = 0;
+        self.jump_cross_remaining = 0;
         self.pitch = 0.0;
         self.keylock_on = true;
         self.sync_align_pending = self.sync_mode; // 锁定模式换曲后需重新对齐
@@ -1547,10 +1625,15 @@ impl Deck {
     /// 的短暂延迟换取时间轴严格。未填区由 filler 按 priority 跳填。
     fn seek_internal(&mut self, seconds: f64) {
         let frame = (seconds * self.sr) as u64;
+        // P27：跳转前出声位置 → 交叉淡化旧内容续读起点（音频线程旧音持续）。
+        let old_pos = self.pos;
         self.pos = frame as f64;
         self.pos_base = None; // 新 fed 坐标（P11.1：收尾圈锚点随 reset 作废）
         self.ctl.playhead.set(seconds);
         self.sync_phase_corr = 0.0; // 新时间轴：持续修正态复位
+        self.burst_preroll = 0;
+        self.jump_cross_remaining = 0;
+        self.jump_old_base = old_pos;
         let engine_rate = self.engine_rate();
         // keylock 路径：reset + 重新锚定 + warm_start 预卷（spike 验证零欠载零 NaN）。
         // 缓存直读从 read_frame（= target − preroll）起喂。
@@ -1589,6 +1672,12 @@ impl Deck {
                     fed += accepted as u64;
                 }
                 self.feed_pos = read_frame + fed;
+                // P27：全预卷喂满 → 本回调可爆发排干 priming + 旧尾交叉淡化；
+                // 欠载（fed < preroll）回退官方协议（静音窗）。
+                if fed == preroll {
+                    self.burst_preroll = preroll as u32;
+                    self.jump_cross_remaining = JUMP_CROSSFADE_FRAMES;
+                }
             }
             read_frame
         } else {
@@ -1609,10 +1698,15 @@ impl Deck {
         {
             let li = (self.loop_in * self.sr) as u64;
             let len = ((self.loop_out - self.loop_in) * self.sr) as u64;
-            if len > 0 && read_frame >= li && read_frame < li + len {
+            // 用 feed_pos（续喂位置）判别环内。原条件 read_frame >= li 在
+            // target 距环头 < preroll 时（read_frame 回落到环外）误清环——
+            // 但 target 仍在环内，应重建环相位留在环内。feed_pos 在环内
+            // 即续喂点落在环内 → 重建；
+            if len > 0 && self.feed_pos >= li && self.feed_pos < li + len {
+                let off = self.feed_pos - li;
                 self.loop_len = len;
-                self.loop_offset = read_frame - li;
-                self.loop_cursor = read_frame - li;
+                self.loop_offset = off;
+                self.loop_cursor = off;
                 self.loop_ring = true;
                 self.loop_first_circle = true;
                 self.loop_entry_at = u64::MAX;
@@ -4279,10 +4373,23 @@ mod tests {
         let resume_at = resume_at.expect("跳转后应恢复出声");
         let gap_ms = (resume_at - seam) as f64 / sr * 1000.0;
         assert!(
-            gap_ms < 50.0,
-            "接缝静音窗应有界（<50ms），实测 {gap_ms:.1}ms"
+            gap_ms < 6.0,
+            "接缝静音窗应 <6ms（P27 爆发），实测 {gap_ms:.2}ms"
         );
-        println!("beatjump 接缝静音窗 {gap_ms:.1}ms");
+        println!("beatjump 接缝静音窗 {gap_ms:.2}ms");
+        // 接缝无 click：saw 内容在整曲中本身每 24000 帧回绕（Δ0.5），故只在
+        // 紧贴接缝 ±16 帧测最大增量——爆发+交叉应摊平该窗（旧尾×cos +
+        // 新内容×sin），否则接缝处必有 >0.05 阶跃（无交叉时 0.48）。
+        let lo = seam.saturating_sub(16);
+        let hi = (seam + 16).min(rec.len() / 2);
+        let mut max_delta = 0.0f32;
+        for i in lo + 2..hi {
+            max_delta = max_delta.max((rec[i * 2] - rec[(i - 2) * 2]).abs());
+        }
+        assert!(
+            max_delta < 0.05,
+            "接缝窗口应无 click（交叉摊平），最大增量 {max_delta}"
+        );
         // 恢复后持续出声（非一次性闪现）
         let win = 0.05 * sr;
         let lo = resume_at;
@@ -4291,6 +4398,38 @@ mod tests {
             .iter()
             .fold(0.0f32, |m, v| m.max(v.abs()));
         assert!(peak > 0.3, "恢复后应持续出声, peak={peak}");
+    }
+
+    /// P27 爆发排干：全填缓存 → seek 后 burst_preroll>0、cross 置 128；
+    /// 同块 process 内爆发消耗完毕。落点相位：跳后 pos 差值 = 源拍域
+    /// 精确步长（此处 4 拍 = +2s 源拍，速率 1 下可闻位置同步推进）。
+    #[test]
+    fn beatjump_burst_engages_crossfade_and_lands_exact() {
+        let bus = hypermixx_core::ControlBus::default();
+        let mut d = deck_with_cache_big(&bus, pulse_cache(8.0, 24000), 0.0);
+        d.ctl.grid_bpm.set(120.0);
+        d.ctl.grid_offset.set(0.0);
+        let _ = run_frames(&mut d, 256 * 10);
+        let before = d.ctl.playhead.get();
+        d.beatjump(4.0);
+        assert!(d.burst_preroll > 0, "全填缓存应启用爆发，实得 {}", d.burst_preroll);
+        assert_eq!(
+            d.jump_cross_remaining,
+            JUMP_CROSSFADE_FRAMES,
+            "爆发路径应置交叉淡化"
+        );
+        // 跳后阶段目标 = 旧位置 + 4 拍（2s 源拍域）——显示 playhead 立即到位
+        assert!(
+            (d.ctl.playhead.get() - before - 2.0).abs() < 1e-6,
+            "跳距应 4 拍 = 2s：{:.6}",
+            d.ctl.playhead.get() - before
+        );
+        d.process(&mut [0.0; 512], 256);
+        assert_eq!(d.burst_preroll, 0, "爆发应本块消耗");
+        assert_eq!(d.jump_cross_remaining, 0, "交叉应本块消耗");
+        // 出声位置 = feed_base + source_position：跳后应与 playhead 同步
+        // （audible 位置在播放推进下等于目标，无回退）。仅验证已推进。
+        assert!(d.pos > before, "跳后播出位置应推进（无回退）");
     }
 
     fn median(v: &[f64]) -> f64 {

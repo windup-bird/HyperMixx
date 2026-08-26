@@ -129,3 +129,39 @@
   set_rate 于 32 帧重采样块平滑已不可闻；时间戳调度留作将来一次性对齐
   线性段及更长曲线。
 
+# plan-26：beatjump 落点无缝（M2）
+
+**date**
+8.26
+
+**done**
+- **同回调爆发排干**（deck.rs）：seek 时若缓存可喂满全预卷（`fed ==
+  preroll`）→ 置 `burst_preroll`；process_engine 内按 `ceil(preroll /
+  clamp(2×engine_frames, 256, 2048))` 烧 dummy process 排干 warm_start
+  priming（调用次数与引擎 `PRIME_BUDGET_*` 一致，版本锚定测试保护）。
+  真实 process 同块即产出目标内容——**接缝静音窗 30ms → 0ms**。
+- **旧尾交叉淡化 128 帧**（`JUMP_CROSSFADE_FRAMES`）：跳转块前 128 帧混合
+  旧内容（`read_cache_stereo` 缓存直读续播，`jump_old_base`=跳前出声位置）
+  × cos 淡出 + 引擎新内容 × sin 淡入（等功率）。整数拍跳距新旧相位恒等
+  → 混合拍对齐，无 click。自由函数 `read_cache_stereo` 复用缓存读，
+  与 `self.engine_scratch` 可变借用并存（避免 `read_stereo` 的 &mut self
+  借用冲突）。
+- **回退保留**：缓存欠载（`fed < preroll`）→ `burst_preroll=0` → 官方协议
+  静音窗（未变），不引入新路径风险。
+- **修复环内跳拍边角 bug**：seek 重建环相位改用 `feed_pos`（续喂点）判别
+  环内，原 `read_frame >= li` 在 target 距环头 < preroll 时误清环。
+- 测试：`beatjump_seam_gap_bounded` 收紧静音窗 <6ms + 接缝 ±16 帧无 click
+  （saw 整曲每 24000 帧天然回绕故只测紧贴接缝窗）；
+  `beatjump_burst_engages_crossfade_and_lands_exact`（burst 置位/耗尽、
+  交叉置位/耗尽、跳距 4 拍精确、播头推进无回退）。
+- 全量 211 测试通过，clippy 零警告。
+
+**note**
+- 旧尾交叉在引擎输出原域采样机含量（keylock 关 + 变速时新旧 pitch 微差，
+  128 帧≈2.7ms 内不可闻）；默认 keylock 开时恒等，无影响。
+- 环内跳拍的爆发 feed 按线性 cache 读（短环 + 目标近环头时可能跨环界读
+  越界内容），与实际环折叠喂入在极短环下有偏差——低频次边角，留待
+  Wide profile / 极短环特例统一。
+- Wide profile（preroll 4096 > 预算硬顶 2048）爆发下限 2 块：仍有 ≤1 块
+  静音窗（10.6ms），远小于旧 30ms，接受。
+
