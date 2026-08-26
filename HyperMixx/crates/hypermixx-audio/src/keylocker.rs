@@ -71,7 +71,8 @@ impl TimestretchLocker {
     /// `wide` 选 profile：key shift 生效时引擎速率 = r/p 可达 0.46–2.16，
     /// 超出 Keylock profile ±20.5% 的全 keylock 带 → WideKeylock（0.25–2.0，
     /// CPU 约为窄频 3.3×）；无 shift 用 Keylock（RK3399 预算内）。
-    /// 512 帧（10.7ms）环形源容量 8192 帧 ≈ 171ms。
+    /// 512 帧（10.7ms）环形源容量 32768 帧 ≈ 682ms（对齐官方 desktop
+    /// 参考实现：大占用环支撑 seek 预热与最快速率下的调度余量）。
     pub fn build(sr: u32, wide: bool) -> Result<Self> {
         let config = EngineConfig {
             sample_rate: sr,
@@ -83,7 +84,7 @@ impl TimestretchLocker {
             },
             initial_tempo_rate: 1.0,
             max_block_frames: 256,
-            source_capacity_frames: 8192,
+            source_capacity_frames: 32_768,
             pre_analysis: None,
         };
         let EngineHandles {

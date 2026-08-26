@@ -29,6 +29,28 @@
 - beatjump偏移
 - beatjump后变速
 
+# hypermixx-ts014
+
+**date**
+8.26
+
+**done**
+- timestretch 0.11 → 0.14：低频段音高校正、downbeat 低频能量选举
+  （修 snare 落重拍）、DnB 度量表；KEYLOCK 延迟 560→610 帧
+- seek/cue/beatjump 统一官方 desktop 参考协议：`reset → set_track_position(target−preroll)
+  → warm_start(preroll) → 立即补推预热区`，全质量预热，接受 ~30ms
+  操作到输出延迟换时间轴严格（用户取舍：可接受延迟，不可接受轨间相位误差）
+- 删除接缝填充/掩蔽机制全套（capture_jump_filler/apply_beatjump_blend/
+  beatjump_snap/mask）——被官方协议取代
+- 环容量 8192→32768 帧（对齐官方参考，支撑大占用调度余量）
+- analysis clippy 存量告警清零（as_chunks）
+- 测试重构：seam 有界静音窗断言、时移诊断（实测 ~29ms=预热跑图期，
+  上界 0.04 防异常）、sync follower 容差随 KEYLOCK_LATENCY 动态化
+
+**fuck**
+- beatjump 后对 leader 相位仍滞后 ≈ 预热跑图期（~30ms）——官方协议
+  固有；后续可选「同回调爆发排干」归零（设计已验证可行）
+
 # hyper-sync 重构：sync 曲线重设计 + beatjump 接缝修复
 
 **date**

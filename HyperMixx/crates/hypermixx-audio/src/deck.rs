@@ -150,20 +150,6 @@ pub struct Deck {
     loop_in_armed: Option<f64>,
     /// P23-B sync：上一块 leader 快照位置（秒）——跳变检测重新对齐。
     last_leader_pos: Option<f64>,
-    /// Beatjump 后输出交叉淡化尾巴（不改变跳距/调度）。
-    /// Beatjump 接缝填充源：跳转瞬间从出声位置起直读缓存的原始采样
-    /// （旧音频的真实延续，非历史回放——回放会产生时间倒退阶跃）。
-    /// 容量按管线延迟 next_pow2 预留（构建期查询，跨平台自适应）；
-    /// 处理链着色（EQ/滤波）以末端增益近似，详见 capture_jump_filler。
-    beatjump_snap: Vec<f32>,
-    /// 掩蔽目标长度（帧）＝ keylocker 管线延迟（重填充窗宽度的模型值）。
-    beatjump_mask_len: usize,
-    /// 末端增益估计（每块 gain×gain_db 的最后步进值）：填充采样乘它
-    /// 以贴近实际听感电平。
-    jump_gain_est: f32,
-    beatjump_blend_len: usize,
-    beatjump_blend_pos: usize,
-    beatjump_blend_pending: bool,
 
     // DSP
     eq: ThreeBandEq,
@@ -323,12 +309,6 @@ impl Deck {
             loop_in_armed: None,
             last_leader_pos: None,
             sync_last_err: None,
-            beatjump_snap: Vec::new(),
-            beatjump_mask_len: 0,
-            jump_gain_est: 1.0,
-            beatjump_blend_len: 0,
-            beatjump_blend_pos: 0,
-            beatjump_blend_pending: false,
             eq: ThreeBandEq::new(sr as f32),
             filter: DeckFilter::new(sr as f32),
             gain: Smoother::new(1.0, coeff as f32),
@@ -731,7 +711,6 @@ impl Deck {
                 self.keylocker = Some(Box::new(kl));
                 self.feed_base = self.feed_pos; // 新引擎 fed 坐标从 0 重新计
                 self.pos_base = None; // P11.1：收尾圈锚点随引擎重建作废
-                self.retune_jump_tail();
                 self.last_sent_rate = Some(engine_rate);
                 self.keylock_sent = Some(self.keylock_on);
                 self.rebuild_pending = false;
@@ -996,84 +975,7 @@ impl Deck {
         self.ctl.vu.set(peak as f64);
     }
 
-    /// 按 keylocker 管线延迟重设跳变填充缓冲（构建/换引擎时调用，音频
-    /// 线程外——含 Vec 分配）。同长度不重分配；变更清空回放态。
-    fn retune_jump_tail(&mut self) {
-        let latency = self
-            .keylocker
-            .as_ref()
-            .map(|k| k.pipeline_latency_frames())
-            .unwrap_or(0);
-        let cap = latency.next_power_of_two().clamp(512, 8192);
-        if cap * 2 == self.beatjump_snap.len() {
-            return;
-        }
-        self.beatjump_mask_len = latency;
-        self.beatjump_snap = vec![0.0; cap * 2];
-        self.beatjump_blend_len = 0;
-        self.beatjump_blend_pos = 0;
-        self.beatjump_blend_pending = false;
-    }
-
-    /// 跳转接缝填充：从当前出声位置起续读原始缓存——旧音频的真实延续
-    /// （Mixxx readToCrossfadeBuffer 思想的直读近似：引擎前瞻管线无法
-    /// 预渲染未来输出，而原始缓存续读在常态链路下与出声内容连续）。
-    /// 处理链着色（EQ/滤波/gain 平滑）以末端增益估计近似；环激活按环
-    /// 坐标折返（掩蔽窗 <25ms，简单折返足够）；EOF 截断补零。
-    fn capture_jump_filler(&mut self, frames: usize) {
-        let g = self.jump_gain_est;
-        let sr = self.sr;
-        let li = self.loop_in * sr;
-        let llo = self.loop_out * sr;
-        let ring = self.loop_ring && llo > li;
-        let mut pf = (self.pos / sr).max(0.0) * sr; // 帧
-        for i in 0..frames {
-            if ring {
-                pf = li + (pf - li).rem_euclid(llo - li);
-            }
-            let (l, r) = match self.read_stereo(pf) {
-                Some((l, r)) => (l * g, r * g),
-                None => (0.0, 0.0),
-            };
-            self.beatjump_snap[i * 2] = l;
-            self.beatjump_snap[i * 2 + 1] = r;
-            pf += 1.0;
-        }
-    }
-
-    /// 接缝填充混入：加性叠加（不改写引擎输出）。引擎 reset 自带
-    /// release ramp——前 ~64 帧输出的是上一块末帧的衰减延续（与已听
-    /// 内容波形连续），填充包络在其下方渐入接管；尾部对称渐出与到达
-    /// 的重填充内容交棒。keylock 引擎输出 ≠ 原始采样（颗粒重组），
-    /// 因此填充不能从第 0 帧全幅拼接——必须由引擎续音过渡。
-    fn apply_beatjump_blend(&mut self, out: &mut [f32], frames: usize) {
-        if !self.beatjump_blend_pending || self.beatjump_blend_pos >= self.beatjump_blend_len {
-            return;
-        }
-        let len = self.beatjump_blend_len;
-        // 渐变沿：上升沿对齐引擎 release ramp（DECLICK 量级）；不足
-        // 2R 的短窗按 R=len/3 收缩。
-        let ramp = (len / 3).clamp(8, 96) as f32;
-        let available = (len - self.beatjump_blend_pos).min(frames);
-        for i in 0..available {
-            let n = self.beatjump_blend_pos + i;
-            let rise = (((n + 1) as f32) / ramp).clamp(0.0, 1.0);
-            let rise = rise * rise * (3.0 - 2.0 * rise);
-            let fall_t = ((len - n) as f32 / ramp).clamp(0.0, 1.0);
-            let fall = fall_t * fall_t * (3.0 - 2.0 * fall_t);
-            let env = rise * fall;
-            for ch in 0..2 {
-                let idx = i * 2 + ch;
-                out[idx] += self.beatjump_snap[n * 2 + ch] * env;
-            }
-        }
-        self.beatjump_blend_pos += available;
-        if self.beatjump_blend_pos == self.beatjump_blend_len {
-            self.beatjump_blend_pending = false;
-        }
-    }
-
-    /// keylock 引擎路径：喂入 → 引擎渲染（256×p 帧）→ pitch → EQ → FX → gain。
+/// keylock 引擎路径：喂入 → 引擎渲染（256×p 帧）→ pitch → EQ → FX → gain。
     fn process_engine(&mut self, out: &mut [f32], frames: usize) {
         // 块首拍上下文（pos 在块尾才更新，此刻 = 上一块播头）
         let ctx = self.fx_context();
@@ -1107,18 +1009,11 @@ impl Deck {
         self.filter.process(out, frames);
         // FX rack：滤波之后、gain 之前（链序：变速/keylock → EQ → 滤波 → FX → 音量）
         self.rack.process(out, frames, &ctx);
-        let mut g_last = 1.0f32;
         for i in 0..frames {
             let g = self.gain.step() * self.gain_db.step();
             out[i * 2] *= g;
             out[i * 2 + 1] *= g;
-            g_last = g;
         }
-        self.jump_gain_est = g_last;
-        // Beatjump 过渡：等功率混合跳转前旧音频的缓存延续（capture 在
-        // beatjump() 内直读），填补引擎重填充窗口；长度 = 管线延迟
-        //（构建期查询），不改 seek 调度。
-        self.apply_beatjump_blend(out, frames);
         let sp = self
             .keylocker
             .as_ref()
@@ -1390,7 +1285,6 @@ impl Deck {
             }
         };
         self.keylocker = locker;
-        self.retune_jump_tail();
         self.pitch_shifter.set_semitones(0.0);
         self.feed_pos = 0;
         self.feed_base = 0;
@@ -1474,7 +1368,7 @@ impl Deck {
             }
         }
         self.deactivate_loop_if_outside(seconds);
-        self.seek_internal(seconds, false);
+        self.seek_internal(seconds);
     }
 
     /// 引擎操作：精确跳转（不量化；cue/hotcue 召回用——量化会把
@@ -1485,7 +1379,7 @@ impl Deck {
         }
         let seconds = seconds.max(0.0);
         self.deactivate_loop_if_outside(seconds);
-        self.seek_internal(seconds, false);
+        self.seek_internal(seconds);
     }
 
     /// 用户跳转落在 [loop_in, loop_out) 之外时取消 loop（环内回跳
@@ -1564,31 +1458,19 @@ impl Deck {
         // 与起跳相位恒等（浮点误差可忽略）——旧实现置 sync_align_pending
         // 触发相位修正 = 每次跳拍后可闻加减速弯折（"jump 改变播放速率"
         // 的根因）。速率锁本身不受影响继续生效。
-        // 接缝填充：从出声位置直读原始缓存作为淡化源（旧音频的真正延
-        // 续）——填补引擎重填充窗口。timestretch 前瞻管线的跳转空洞在
-        // 声学上不可消除（P22-C 延迟观测）；掩蔽长度 = 管线延迟，构建
-        // 期查询自适应。sync 场景残余时移待影子引擎里程碑消除。
-        let mask = self
-            .beatjump_mask_len
-            .min(self.beatjump_snap.len() / 2);
-        if mask > 0 && self.keylocker.is_some() {
-            self.capture_jump_filler(mask);
-        }
-        self.beatjump_blend_len = mask;
-        self.beatjump_blend_pos = 0;
-        self.beatjump_blend_pending = mask > 0;
-        self.seek_internal(target, true); // P24：管线延迟量预热，接缝无硬进入
+        self.seek_internal(target);
     }
 
     /// 跳转本体（量化/清环决策由调用方负责；seek 内部不动 playing）。
-    /// `min_preroll`：beatjump 专用——1 帧预卷，priming 立即收尾出声
-    ///（全预卷 1584 帧 priming 丢弃输出 ≈33ms 静音，是跳拍卡顿根因；
-    /// P14）。seek/cue 保持全预卷（质量优先）。
     ///
-    /// P23：数据源 = 缓存直读，无排水/命令/respawn——只剩 reset 重锚 +
-    /// request_priority（未填区由 filler 按 priority 跳填，音频线程零
-    /// 阻塞 store）。捕获状态机已删（Phase B 重做）。
-    fn seek_internal(&mut self, seconds: f64, min_preroll: bool) {
+    /// P24 对齐 timestretch 官方 desktop 参考实现的 seek 协议：
+    /// `reset()` → `set_track_position(target − preroll)` →
+    /// `warm_start(preroll)` → 立即从缓存补推预热区。预热取
+    /// `warm_start_preroll_frames()`（管线延迟 + 收敛余量，全质量），
+    /// 曲头不足时用实际可用帧数。预热期输出为引擎发布的静音
+    /// （~管线延迟量级），随后目标内容精确落地——接受这一操作到输出
+    /// 的短暂延迟换取时间轴严格。未填区由 filler 按 priority 跳填。
+    fn seek_internal(&mut self, seconds: f64) {
         let frame = (seconds * self.sr) as u64;
         self.pos = frame as f64;
         self.pos_base = None; // 新 fed 坐标（P11.1：收尾圈锚点随 reset 作废）
@@ -1597,26 +1479,14 @@ impl Deck {
         // keylock 路径：reset + 重新锚定 + warm_start 预卷（spike 验证零欠载零 NaN）。
         // 缓存直读从 read_frame（= target − preroll）起喂。
         let read_frame = if let Some(kl) = self.keylocker.as_mut() {
-            let preroll = if min_preroll {
-                // P14 beatjump 最小预卷 → P24 修正：预热到管线延迟量。
-                // 1 帧预热时 stage 链欠收敛，重填充边界处新内容单样本硬
-                // 进入（实测接缝 Δ≈0.37，引擎侧欠载淡化在该路径未生效）；
-                // 预热 = pipeline_latency 让链在真实内容上收敛、首块即
-                // 输出目标内容。代价 = 预热期静音回调（≤512 帧/回调预算，
-                // ~2 块）——由 beatjump 填充（capture_jump_filler）加性
-                // 覆盖，听感为旧音频延续。曲头不足时用实际可用帧数。
-                let lat = kl.pipeline_latency_frames() as u64;
-                frame.min(lat).max(1)
-            } else {
-                kl.warm_start_preroll_frames() as u64
-            };
-            let read_frame = frame.saturating_sub(preroll);
+            let preroll = kl.warm_start_preroll_frames() as u64;
+            let preroll = preroll.min(frame);
+            let read_frame = frame - preroll;
             kl.reset();
             kl.set_rate(engine_rate);
             kl.set_keylock(self.keylock_on);
             kl.set_track_position(read_frame);
-            // 曲头 preroll 不足时传实际可用帧数（0 = 无预卷，release ramp 兜底）
-            kl.warm_start((frame - read_frame) as u32);
+            kl.warm_start(preroll as u32);
             self.last_sent_rate = Some(engine_rate);
             self.keylock_sent = Some(self.keylock_on);
             self.feed_base = read_frame;
@@ -1624,6 +1494,26 @@ impl Deck {
             self.eof_fed = false;
             self.eof_stall = 0;
             self.last_sp = 0.0;
+            // 立即补推预热区（缓存直读；未填区交由常规 feed/filler 兜底）：
+            // 引擎 reset 排空了环，priming 需要这些源帧才能收敛出声。
+            if preroll > 0 && let Some(cache) = &self.cache {
+                let mut fed: u64 = 0;
+                while fed < preroll {
+                    let start = read_frame + fed;
+                    let n = (preroll - fed).min(CHUNK_FRAMES as u64) as usize;
+                    let got = cache.copy_ready(&mut self.feed_scratch, start, n);
+                    if got == 0 {
+                        break; // 未填区：priority fill 已请求，常规路径续推
+                    }
+                    let accepted =
+                        self.keylocker.as_mut().unwrap().push(&self.feed_scratch[..got * 2]);
+                    if accepted == 0 {
+                        break; // ring 满
+                    }
+                    fed += accepted as u64;
+                }
+                self.feed_pos = read_frame + fed;
+            }
             read_frame
         } else {
             frame
@@ -1719,7 +1609,6 @@ pub(crate) fn test_deck_with_cache(
     d.keylocker = TimestretchLocker::build(48_000, false)
         .ok()
         .map(|k| Box::new(k) as Box<dyn Keylocker>);
-    d.retune_jump_tail();
     d
 }
 
@@ -2102,8 +1991,7 @@ mod tests {
         d.keylocker = TimestretchLocker::build(48_000, false)
             .ok()
             .map(|k| Box::new(k) as Box<dyn Keylocker>);
-        d.retune_jump_tail();
-        d
+            d
     }
 
     /// 输出包络的拍脉冲时刻（秒）：64 帧 RMS 窗口（32 帧步进）→ 局部极大值
@@ -4113,10 +4001,9 @@ mod tests {
         let r_pre = median(&pulse_residuals(&rec, 4.0, 7.0));
         let r_post = median(&pulse_residuals(&rec, 14.0, 17.0));
         let shift = (r_post - r_pre).rem_euclid(0.5);
-        // 容差含设计内时移：跳转重填充时移 = 管线延迟（掩蔽只消静音洞
-        // 不消时移，sync 场景残余 flam 待影子引擎里程碑消除——见
-        // beatjump_integer_phase_lag_diagnostic）。
-        let tol = 0.015 + d.beatjump_mask_len as f64 / 48000.0;
+        // 容差含设计内时移：官方 seek 协议的预热静音窗 ≈ 管线延迟
+        //（KEYLOCK_LATENCY_S），内容落地后时间轴严格。
+        let tol = 0.015 + KEYLOCK_LATENCY_S * 2.0;
         assert!(
             (shift - 0.25).abs() < tol,
             "follower 自跳后相位偏移应保留（leader 无跳变 → 不重对齐），实得 {shift:.4}s（pre={r_pre:.4} post={r_post:.4}，tol={tol:.4}）"
@@ -4141,10 +4028,6 @@ mod tests {
         let mut d = deck_with_cache_big(&bus, pulse_cache(38.4, 24000), 0.0);
         d.ctl.grid_bpm.set(120.0);
         d.ctl.grid_offset.set(0.0);
-        // 填充缓冲容量公式锚定（@latency=560 → snap=1024×2、掩蔽窗=560）：
-        // 跨平台回归基线——引擎延迟变化时此断言随之更新。
-        assert_eq!(d.beatjump_snap.len(), 2048, "填充容量应 = next_pow2(latency)×2");
-        assert_eq!(d.beatjump_mask_len, 610, "掩蔽长度应 = 管线延迟");
         let mut out = vec![0.0; 256 * 2];
         let mut rec = Vec::new();
         let blocks = (16.0 * 48000.0 / 256.0) as usize;
@@ -4164,9 +4047,9 @@ mod tests {
             (sp_pre - 0.5).abs() < 0.003 && (sp_post - 0.5).abs() < 0.003,
             "beatjump 不得改变播放速率：pre={sp_pre:.4}s post={sp_post:.4}s"
         );
-        // 相位滞后量化：重填充时移 = 管线延迟量级，旧音频掩蔽只消静音
-        // 洞不消时移——sync 场景残余 flam 待影子引擎里程碑消除（已留档）。
-        // 此处宽松上界防回归恶化，实测值打印供跨平台对比。
+        // 时移量化（P24 官方 seek 协议的接受设计）：预热静音窗 =
+        // warm_start_preroll 全量跑图期，内容落地后时间轴严格。
+        // 打印实测值供回归对比；上界防异常恶化。
         let r_pre = median(&pulse_residuals(&rec, 2.0, 6.0));
         let r_post = median(&pulse_residuals(&rec, 10.0, 15.0));
         let lag = (r_post - r_pre).rem_euclid(0.5);
@@ -4175,16 +4058,19 @@ mod tests {
             "beatjump 时移（管线延迟量级）：pre 残差 {r_pre:+.4}s → post 残差 {r_post:+.4}s，偏移 {lag_signed:+.4}s（{:.1}ms）",
             lag_signed * 1000.0
         );
+        // 全量预热（warm_start_preroll ≈ 延迟+收敛余量）→ 时移 ≈ 预卷
+        // 跑图期（~30ms@48k），属官方协议的接受设计；上界防异常恶化。
         assert!(
-            lag_signed.abs() < 0.02,
-            "整数拍跳后时移应稳定在管线延迟量级，实得 {lag_signed:+.4}s"
+            lag_signed.abs() < 0.04,
+            "整数拍跳后时移应稳定在预热跑图期量级，实得 {lag_signed:+.4}s"
         );
     }
 
-    /// 接缝静音洞守卫：beatjump 重填充窗口必须被旧音频回放覆盖——跳缝
-    /// ±30ms 内任意 4ms 窗的峰值不得接近零（连续锯齿源，静音即裸露）。
+    /// 接缝语义（P24 官方 seek 协议）：跳转后存在预热静音窗
+    /// （≈ warm_start_preroll 全量跑图期，接受的操作到输出延迟），
+    /// 窗长必须有界，且之后目标内容立即恢复满电平。
     #[test]
-    fn beatjump_seam_no_silence_gap() {
+    fn beatjump_seam_gap_bounded() {
         let bus = hypermixx_core::ControlBus::default();
         let mut d = deck_with_cache_big(&bus, saw_cache(8.0, 24000), 0.0);
         d.ctl.grid_bpm.set(120.0);
@@ -4192,7 +4078,7 @@ mod tests {
         let mut out = vec![0.0; 256 * 2];
         let mut rec = Vec::new();
         let bps = 48000.0 / 256.0;
-        let total = (4.0 * bps) as usize;
+        let total = (5.0 * bps) as usize;
         let jump_at = (2.0 * bps) as usize;
         for b in 0..total {
             d.update_params();
@@ -4203,56 +4089,32 @@ mod tests {
             rec.extend_from_slice(&out);
         }
         assert!(rec.iter().all(|v| v.is_finite()), "无 NaN");
+        // 跳点后首个恢复样本（|v|>0.05）：窗长 < 50ms（预热跑图上界）
         let sr = 48000.0f64;
-        let t0 = jump_at as f64 * 256.0 / sr;
-        let win = (0.004 * sr) as usize;
-        let lo = ((t0 - 0.03).max(0.0) * sr) as usize;
-        let hi = (((t0 + 0.03) * sr) as usize).min(rec.len() / 2 - win);
-        assert!(hi > lo, "接缝窗口为空");
-        for s in (lo..hi).step_by(win / 2) {
-            let peak = rec[s * 2..(s + win) * 2]
-                .iter()
-                .fold(0.0f32, |m, v| m.max(v.abs()));
-            assert!(
-                peak > 0.05,
-                "跳缝附近出现静音洞（掩蔽失效）：t={:.4}s peak={peak}",
-                s as f64 / sr
-            );
-        }
-    }
-
-    /// 接缝 click 守卫：等功率淡化下逐采样 Δ 有界。源用连续正弦
-    ///（440Hz 全填缓存）——锯齿/脉冲信号自带周期性阶跃会污染检查；
-    /// 新旧内容同为正弦仅相位差，交叉淡化全程平滑，任何 >0.05 的
-    /// 单步即为真实缺陷。
-    #[test]
-    fn beatjump_seam_blend_no_click() {
-        let bus = hypermixx_core::ControlBus::default();
-        let mut d = test_deck_with_cache(&bus, 4.0, 0.0);
-        d.ctl.grid_bpm.set(120.0);
-        d.ctl.grid_offset.set(0.0);
-        let mut out = vec![0.0; 256 * 2];
-        let mut rec = Vec::new();
-        let bps = 48000.0 / 256.0;
-        let total = (3.0 * bps) as usize;
-        let jump_at = (1.6 * bps) as usize;
-        for b in 0..total {
-            d.update_params();
-            if b == jump_at {
-                d.beatjump(2.0);
+        let seam = jump_at * 256;
+        let search_end = ((seam as f64 + 0.15) * sr) as usize;
+        let mut resume_at = None;
+        for f in seam..search_end.min(rec.len() / 2) {
+            if rec[f * 2].abs() > 0.05 {
+                resume_at = Some(f);
+                break;
             }
-            d.process(&mut out, 256);
-            rec.extend_from_slice(&out);
         }
-        let lo = (jump_at - 8) * 256;
-        let hi = ((jump_at + 24) * 256).min(rec.len() / 2);
-        let seam = &rec[lo * 2..hi * 2];
-        assert!(d.keylocker.is_some());
-        let max_delta = max_delta2(seam);
+        let resume_at = resume_at.expect("跳转后应恢复出声");
+        let gap_ms = (resume_at - seam) as f64 / sr * 1000.0;
         assert!(
-            max_delta < 0.05,
-            "接缝逐采样 Δ 过大（blend 未生效）: {max_delta}"
+            gap_ms < 50.0,
+            "接缝静音窗应有界（<50ms），实测 {gap_ms:.1}ms"
         );
+        println!("beatjump 接缝静音窗 {gap_ms:.1}ms");
+        // 恢复后持续出声（非一次性闪现）
+        let win = 0.05 * sr;
+        let lo = resume_at;
+        let hi = (lo + win as usize).min(rec.len() / 2 - 64);
+        let peak = rec[lo * 2..hi * 2]
+            .iter()
+            .fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(peak > 0.3, "恢复后应持续出声, peak={peak}");
     }
 
     fn median(v: &[f64]) -> f64 {
