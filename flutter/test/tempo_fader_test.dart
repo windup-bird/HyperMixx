@@ -8,10 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:hypermixx/engine/deck_controller.dart';
 import 'package:hypermixx/widgets/tempo_fader.dart';
 
-Widget _wrap(
-  DeckController dc, {
-  void Function(double v)? onSetRate,
-}) {
+Widget _wrap(DeckController dc, {void Function(double v)? onSetRate}) {
   return MaterialApp(
     home: Scaffold(
       backgroundColor: const Color(0xFF1A1E24),
@@ -61,27 +58,28 @@ void main() {
     await tester.pump(const Duration(milliseconds: 700));
   });
 
-  testWidgets('同步期间拖拽写 bus（引擎软接管判定）、微调 gate、thumb 恒显示有效速率（P15）',
-      (tester) async {
+  testWidgets('同步期间拖拽写 bus（引擎软接管判定）、微调 gate、thumb 恒显示有效速率（P15）', (
+    tester,
+  ) async {
     final dc = DeckController(0);
     final calls = <double>[];
-    dc.syncOn.value = true;
+    dc.syncMode.value = true;
     dc.rate.value = 3.0; // 滑杆位置 +3%
     dc.effRate.value = 1.5; // 引擎实际 +1.5%（sync 覆写）
     await tester.pumpWidget(_wrap(dc, onSetRate: calls.add));
 
     CustomPaint faderPaint() => tester.widget<CustomPaint>(
-          find
-              .descendant(
-                  of: find.byType(TempoFader),
-                  matching: find.byType(CustomPaint))
-              .first,
-        );
+      find
+          .descendant(
+            of: find.byType(TempoFader),
+            matching: find.byType(CustomPaint),
+          )
+          .first,
+    );
 
     final center = tester.getCenter(find.byType(TempoFader));
     await tester.dragFrom(center, const Offset(0, -70));
-    expect(calls, isNotEmpty,
-        reason: 'P15：sync 期间拖拽照常写 bus，生效与否由引擎软接管判定');
+    expect(calls, isEmpty, reason: '锁定模式禁用推子');
 
     // 微调 gate：sync 期间微调不写（防瞬移推子位置；暂时加减速用 nudge）
     final fineBefore = calls.length;
@@ -107,13 +105,35 @@ void main() {
 
     // 关 sync（P14：推子仅解锁）：微调恢复；thumb 仍显实际速率
     //（不跳回滑杆位置——与引擎"解锁不改播放状态"一致）
-    dc.syncOn.value = false;
+    dc.syncMode.value = false;
     await tester.pump();
     final g2 = await tester.startGesture(tester.getCenter(find.text('−')));
     await tester.pump();
     await g2.up();
     await tester.pump();
     expect(calls.length, fineBefore + 1, reason: '关 sync 后微调恢复');
+    await tester.pump(const Duration(milliseconds: 700));
+  });
+
+  testWidgets('范围按 8/16/30/50 循环，推子端点跟随当前范围', (tester) async {
+    final dc = DeckController(0);
+    final calls = <double>[];
+    await tester.pumpWidget(_wrap(dc, onSetRate: calls.add));
+    expect(dc.tempoRange.value, 8);
+    dc.cycleTempoRange();
+    expect(dc.tempoRange.value, 16);
+    dc.cycleTempoRange();
+    expect(dc.tempoRange.value, 30);
+    dc.cycleTempoRange();
+    expect(dc.tempoRange.value, 50);
+    dc.cycleTempoRange();
+    expect(dc.tempoRange.value, 8);
+
+    dc.tempoRange.value = 30;
+    await tester.pump();
+    final center = tester.getCenter(find.byType(TempoFader));
+    await tester.dragFrom(center, const Offset(0, -100));
+    expect(calls.last, closeTo(30, 1), reason: '范围 30 时推到顶 = +30%');
     await tester.pump(const Duration(milliseconds: 700));
   });
 
@@ -130,8 +150,7 @@ void main() {
     expect(calls, [0.0]);
   });
 
-  testWidgets('默认回调路径渲染（P18 推子列仅 −/+ 与推子；nudge 已移走）',
-      (tester) async {
+  testWidgets('默认回调路径渲染（P18 推子列仅 −/+ 与推子；nudge 已移走）', (tester) async {
     final dc = DeckController(0);
     await tester.pumpWidget(_wrap(dc));
     for (final t in ['−', '+']) {

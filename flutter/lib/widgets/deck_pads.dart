@@ -29,10 +29,10 @@ class PadActions {
       engine().seekExactTo(deck, seconds);
   void setPlaying(int deck, bool on) => engine().setPlaying(deck, on);
   void setLoopActive(int deck, bool on) => engine().setLoopActive(deck, on);
-  /// P18 ManualLoop：loop 边界（秒，原始位置不经量化；引擎边沿检测进捕获）。
-  void setLoopIn(int deck, double seconds) => engine().setLoopIn(deck, seconds);
-  void setLoopOut(int deck, double seconds) =>
-      engine().setLoopOut(deck, seconds);
+
+  /// Manual LoopIn/Out 由 Rust 音频线程取当前播放位置。
+  void loopInAtPlayhead(int deck) => engine().loopInAtPlayhead(deck);
+  void loopOutAtPlayhead(int deck) => engine().loopOutAtPlayhead(deck);
   void activateBeatLoop(int deck, double beats) =>
       engine().activateBeatLoop(deck, beats);
   void beatJump(int deck, double beats) => engine().beatJump(deck, beats);
@@ -44,8 +44,10 @@ class PadActions {
       engine().setFxDrywet(deck, slot, v);
   void setFxParam(int deck, int slot, int paramIdx, double v) =>
       engine().setFxParam(deck, slot, paramIdx, v);
-  /// P19 transport 行：sync 切换（点击开/关）。
-  void setSync(int deck, bool on) => engine().setSync(deck, on);
+
+  /// Rust 侧递进：对齐 → 锁定 → 取消。
+  void syncStep(int deck) => engine().syncStepCommand(deck);
+
   /// P19 transport 行：nudge 按住值（松开写 0，引擎侧保持）。
   void setNudge(int deck, int v) => engine().setNudge(deck, v);
 }
@@ -116,7 +118,8 @@ class _CueButtonState extends State<CueButton> {
       builder: (_, _) {
         final cue = dc.cuePoint.value;
         // 停播且指针位于 cue 点 = "armed"（按下即试听）
-        final armed = !dc.playing.value &&
+        final armed =
+            !dc.playing.value &&
             cue != null &&
             (dc.playhead.value - cue).abs() <= kCueEpsilonSecs;
         return GestureDetector(
@@ -154,7 +157,11 @@ class _CueButtonState extends State<CueButton> {
 
 /// 2×4 打击垫区（deckinfo 下方）。
 class DeckPads extends StatefulWidget {
-  const DeckPads({super.key, required this.deck, this.actions = const PadActions()});
+  const DeckPads({
+    super.key,
+    required this.deck,
+    this.actions = const PadActions(),
+  });
 
   final DeckController deck;
   final PadActions actions;
@@ -168,15 +175,9 @@ class _DeckPadsState extends State<DeckPads> {
   static const _windowSize = 8;
   static const _step = 4;
 
-  /// loop 拍数长列表（1/32..64，12 项，窗口 8 步长 4 → 2 页）。
-  static const _loopBeats = [
-    1 / 32, 1 / 16, 1 / 8, 1 / 4, 1 / 2, 1.0, 2.0, 4.0, //
-    8.0, 16.0, 32.0, 64.0,
-  ];
-  static const _loopLabels = [
-    '1/32', '1/16', '1/8', '1/4', '1/2', '1', '2', '4', //
-    '8', '16', '32', '64',
-  ];
+  /// loop 档位（1/2..64，2 的幂）。
+  static const _loopBeats = [1 / 2, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
+  static const _loopLabels = ['1/2', '1', '2', '4', '8', '16', '32', '64'];
 
   /// P21 beatjump 线性列表（成对横排：◀1 ▶1 ◀2 ▶2 ...——左跳右跳相邻，
   /// 不是旧的上排全左跳/下排全右跳），窗口 8 步长 4 → 页0 = 左右 1/2/4/8、
@@ -188,17 +189,19 @@ class _DeckPadsState extends State<DeckPads> {
 
   int _mode = 0;
   final List<int> _page = [0, 0, 0, 0];
+
   /// 当前按住的网格位（0..7，按压高亮）。
   int? _pressed;
+
   /// hotcue 试听中待执行的松开动作。
   CuePressResult? _pendingCue;
 
   int get _itemCount => switch (_mode) {
-        0 => 16, // hotcue 1..16
-        1 => _loopBeats.length,
-        2 => _beatjumpBeats.length, // P21：成对横排列表（12 项）
-        _ => 8, // fx 槽
-      };
+    0 => 16, // hotcue 1..16
+    1 => _loopBeats.length,
+    2 => _beatjumpBeats.length, // P21：成对横排列表（12 项）
+    _ => 8, // fx 槽
+  };
 
   int get _pageCount {
     // P21 beatjump 同走窗口/步长（12 项窗口 8 步长 4 → 2 页，滚动间隔 4）。
@@ -273,7 +276,11 @@ class _DeckPadsState extends State<DeckPads> {
                     right: 2,
                     child: GestureDetector(
                       onTap: () => dc.hotcues[slot].value = null,
-                      child: const Icon(Icons.close, size: 10, color: Colors.white70),
+                      child: const Icon(
+                        Icons.close,
+                        size: 10,
+                        color: Colors.white70,
+                      ),
                     ),
                   )
                 : null,
@@ -286,13 +293,12 @@ class _DeckPadsState extends State<DeckPads> {
   // ---- loop ----
   Widget _loopPad(double beats, String label) {
     final dc = widget.deck;
-    return ValueListenableBuilder<bool>(
-      valueListenable: dc.loopActive,
-      builder: (_, active, _) {
-        // 匹配当前激活环的拍数（loopOut−loopIn 按有效 BPM 折算）
-        final cur = active
-            ? (dc.loopOut.value - dc.loopIn.value) * dc.bpm.value / 60.0
-            : 0.0;
+    return ListenableBuilder(
+      listenable: Listenable.merge([dc.loopActive, dc.loopBeats]),
+      builder: (_, _) {
+        final active = dc.loopActive.value;
+        // 引擎快照给出唯一的 loop 拍数口径。
+        final cur = active ? dc.loopBeats.value : 0.0;
         final isActive = active && (cur - beats).abs() < 0.05;
         return GestureDetector(
           behavior: HitTestBehavior.opaque,
@@ -324,7 +330,12 @@ class _DeckPadsState extends State<DeckPads> {
   Widget _beatjumpPad(double? beats) {
     final dc = widget.deck;
     if (beats == null) {
-      return _padBox(label: '', lit: false, litColor: Colors.transparent, dead: true);
+      return _padBox(
+        label: '',
+        lit: false,
+        litColor: Colors.transparent,
+        dead: true,
+      );
     }
     final b = beats.abs();
     final label = beats < 0 ? '◀${_beatLabel(b)}' : '▶${_beatLabel(b)}';
@@ -333,7 +344,11 @@ class _DeckPadsState extends State<DeckPads> {
       // onTapDown 按下即跳（P12）：beatjump 对时序敏感，onTap 要等手势
       // 仲裁（抬指 + 竞争判定 ~数十毫秒）才触发——跳晚了相位就丢了。
       onTapDown: (_) => widget.actions.beatJump(dc.deck, beats),
-      child: _padBox(label: label, lit: false, litColor: const Color(0xFF283593)),
+      child: _padBox(
+        label: label,
+        lit: false,
+        litColor: const Color(0xFF283593),
+      ),
     );
   }
 
@@ -400,7 +415,9 @@ class _DeckPadsState extends State<DeckPads> {
               child: Text(
                 label,
                 style: TextStyle(
-                  color: dead ? Colors.white12 : (lit || pressed ? Colors.white : Colors.white60),
+                  color: dead
+                      ? Colors.white12
+                      : (lit || pressed ? Colors.white : Colors.white60),
                   fontSize: 11,
                   fontWeight: FontWeight.w600,
                 ),
@@ -423,7 +440,9 @@ class _DeckPadsState extends State<DeckPads> {
           padding: EdgeInsets.zero,
           minimumSize: const Size(0, 22),
           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-          backgroundColor: selected ? const Color(0xFF3949AB) : const Color(0xFF2E353D),
+          backgroundColor: selected
+              ? const Color(0xFF3949AB)
+              : const Color(0xFF2E353D),
           foregroundColor: selected ? Colors.white : Colors.white38,
         ),
         child: Text(
@@ -491,7 +510,9 @@ class _DeckPadsState extends State<DeckPads> {
                 iconSize: 16,
                 padding: EdgeInsets.zero,
                 color: Colors.white54,
-                onPressed: _page[_mode] < _pageCount - 1 ? () => _setPage(1) : null,
+                onPressed: _page[_mode] < _pageCount - 1
+                    ? () => _setPage(1)
+                    : null,
                 icon: const Icon(Icons.keyboard_arrow_down),
               ),
             ),

@@ -57,7 +57,7 @@ impl MonoAccumulator {
 
     /// 处理交织立体声帧（48k），把抽取出的 12k 单声道样本追加到 out。
     pub fn process(&mut self, samples: &[f32], out: &mut Vec<f32>) {
-        for s in samples.chunks_exact(2) {
+        for s in samples.as_chunks::<2>().0 {
             let x = (s[0] + s[1]) * 0.5;
             self.hist[self.pos] = x;
             self.pos += 1;
@@ -89,7 +89,7 @@ impl Default for MonoAccumulator {
 /// 与 12k 抽取路径并存：细拍位检测（superflux @48k）需要全速率信号，
 /// 12k 信号只用于 key 与粗 tempo。奇数尾帧丢弃（半帧无意义）。
 pub fn mixdown_48k(samples: &[f32], out: &mut Vec<f32>) {
-    for s in samples.chunks_exact(2) {
+    for s in samples.as_chunks::<2>().0 {
         out.push((s[0] + s[1]) * 0.5);
     }
 }

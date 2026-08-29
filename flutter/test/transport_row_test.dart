@@ -11,12 +11,13 @@ import 'package:hypermixx/widgets/deck_pads.dart';
 import 'package:hypermixx/widgets/transport_row.dart';
 
 class _FakeActions extends PadActions {
-  final syncs = <bool>[];
+  final aligns = <int>[];
+  final syncModes = <bool>[];
   final plays = <bool>[];
   final nudges = <int>[];
 
   @override
-  void setSync(int deck, bool on) => syncs.add(on);
+  void syncStep(int deck) => syncModes.add(true);
   @override
   void setPlaying(int deck, bool on) => plays.add(on);
   @override
@@ -28,7 +29,11 @@ Widget _wrap(DeckController dc, PadActions a) {
     home: Scaffold(
       backgroundColor: const Color(0xFF1A1E24),
       body: Center(
-        child: SizedBox(width: 353, height: 30, child: TransportRow(deck: dc, actions: a)),
+        child: SizedBox(
+          width: 353,
+          height: 30,
+          child: TransportRow(deck: dc, actions: a),
+        ),
       ),
     ),
   );
@@ -66,27 +71,41 @@ void main() {
 
     await tester.tap(find.text('SHIFT'));
     await tester.pump();
-    expect(fake.syncs, isEmpty);
+    expect(fake.aligns, isEmpty);
+    expect(fake.syncModes, isEmpty);
     expect(fake.plays, isEmpty);
     expect(fake.nudges, isEmpty);
   });
 
-  testWidgets('SYNC：点击切换 setSync（关→开→关）', (tester) async {
+  testWidgets('SYNC：单击请求一次性对齐', (tester) async {
     final dc = EngineController.instance.decks[0];
-    addTearDown(() => dc.syncOn.value = false);
+    dc.syncMaster.value = false;
     final fake = _FakeActions();
     await tester.pumpWidget(_wrap(dc, fake));
 
     await tester.tap(find.text('SYNC'));
-    await tester.pump();
-    expect(fake.syncs, [true], reason: '点击开启 sync');
-    dc.syncOn.value = true;
-    await tester.pump();
-    await tester.tap(find.text('SYNC'));
-    await tester.pump();
-    expect(fake.syncs, [true, false], reason: '再点关闭 sync');
+    await tester.pump(const Duration(milliseconds: 350));
+    expect(fake.syncModes, [true]);
   });
 
+  testWidgets('SYNC：连续三次点击依次对齐、锁定、取消', (tester) async {
+    final dc = EngineController.instance.decks[0];
+    dc.syncMaster.value = false;
+    dc.syncStage.value = 0;
+    final fake = _FakeActions();
+    await tester.pumpWidget(_wrap(dc, fake));
+
+    await tester.tap(find.text('SYNC'));
+    expect(fake.syncModes, [true]);
+    dc.syncStage.value = 1;
+    await tester.pump();
+    await tester.tap(find.text('SYNCED'));
+    expect(fake.syncModes, [true, true]);
+    dc.syncStage.value = 2;
+    await tester.pump();
+    await tester.tap(find.text('LOCK'));
+    expect(fake.syncModes, [true, true, true]);
+  });
   testWidgets('PLAY：点击 setPlaying 切换 + 符号 ▶/‖（P22.4 橙底符号）', (tester) async {
     final dc = EngineController.instance.decks[0];
     addTearDown(() => dc.playing.value = false);
@@ -130,17 +149,19 @@ void main() {
 
   testWidgets('窄窗（160px）6 按钮不溢出', (tester) async {
     final dc = EngineController.instance.decks[0];
-    await tester.pumpWidget(MaterialApp(
-      home: Scaffold(
-        body: Center(
-          child: SizedBox(
-            width: 160,
-            height: 30,
-            child: TransportRow(deck: dc),
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Center(
+            child: SizedBox(
+              width: 160,
+              height: 30,
+              child: TransportRow(deck: dc),
+            ),
           ),
         ),
       ),
-    ));
+    );
     await tester.pump();
     expect(tester.takeException(), isNull);
   });

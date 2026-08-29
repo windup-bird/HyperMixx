@@ -4,7 +4,7 @@
 pub mod beatgrid;
 pub mod control;
 
-pub use beatgrid::{BeatClock, BeatGrid};
+pub use beatgrid::{BarClock, BeatClock, BeatGrid};
 pub use control::{ControlBus, ControlHandle};
 
 /// 控制点路径常量，避免 UI/引擎之间写魔法字符串。
@@ -47,6 +47,18 @@ pub mod paths {
     pub fn deck_loaded(deck: usize) -> String {
         format!("Deck{}.loaded", deck + 1)
     }
+    /// 小节序号（引擎写 UI 读；BarClock 产出，UI 节拍显示/FX 乐句同步用）。
+    pub fn deck_bar_index(deck: usize) -> String {
+        format!("Deck{}.bar_index", deck + 1)
+    }
+    /// 小节内拍号 0..3（引擎写 UI 读）。
+    pub fn deck_beat_in_bar(deck: usize) -> String {
+        format!("Deck{}.beat_in_bar", deck + 1)
+    }
+    /// 拍内相位 0..1（引擎写 UI 读，节拍显示高精度用）。
+    pub fn deck_beat_phase(deck: usize) -> String {
+        format!("Deck{}.beat_phase", deck + 1)
+    }
     /// Key shift 半音（-12..12，仅 keylock 开启时生效）。
     pub fn deck_pitch(deck: usize) -> String {
         format!("Deck{}.pitch", deck + 1)
@@ -67,7 +79,24 @@ pub mod paths {
     pub fn deck_grid_offset(deck: usize) -> String {
         format!("Deck{}.grid_offset", deck + 1)
     }
-    /// beat sync 开关（0/1，P5）。
+    /// beatgrid downbeat 旋转（某拍序号 = 乐句真起点；0 = 小节从 grid 第 0 拍起）。
+    /// 分析结果写入引擎读；BarClock 用它确定 music 小节边界。
+    pub fn deck_grid_rotation(deck: usize) -> String {
+        format!("Deck{}.grid_rotation", deck + 1)
+    }
+    /// sync 三段状态（0=free，1=aligned/following，2=locked）。
+    pub fn deck_sync_stage(deck: usize) -> String {
+        format!("Deck{}.sync_stage", deck + 1)
+    }
+    /// 持久 sync 锁定模式（0/1；引擎读、UI 写）。
+    pub fn deck_sync_mode(deck: usize) -> String {
+        format!("Deck{}.sync_mode", deck + 1)
+    }
+    /// 当前自动选择的 sync master（0/1；引擎写、UI 只读）。
+    pub fn deck_sync_master(deck: usize) -> String {
+        format!("Deck{}.sync_master", deck + 1)
+    }
+    /// beat sync 旧开关（保留路径兼容旧会话；新 UI 不再写）。
     pub fn deck_sync(deck: usize) -> String {
         format!("Deck{}.sync", deck + 1)
     }

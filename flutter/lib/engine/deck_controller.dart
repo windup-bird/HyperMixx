@@ -23,13 +23,19 @@ class DeckController extends ChangeNotifier {
   final tempoText = ValueNotifier<String>('范围 ±8%\n当前 ±0.00%');
   final playing = ValueNotifier<bool>(false);
   final syncOn = ValueNotifier<bool>(false);
+  final syncMode = ValueNotifier<bool>(false);
+  final syncStage = ValueNotifier<int>(0);
+  final syncMaster = ValueNotifier<bool>(false);
   final keylockOn = ValueNotifier<bool>(false);
   final rate = ValueNotifier<double>(0);
+  final tempoRange = ValueNotifier<double>(8);
+
   /// 有效速率 %（P10.1）：gridBpm>0 时 = (bpm/gridBpm − 1)×100——同步中
   /// 显示的是引擎实际速率而非滑杆位置；无网格回退滑杆 rate。
   final effRate = ValueNotifier<double>(0);
   final volume = ValueNotifier<double>(1.0);
   final vu = ValueNotifier<double>(0);
+
   /// EQ 三带增益（dB，-40..+6，0 = 直通）。
   final eqLow = ValueNotifier<double>(0);
   final eqMid = ValueNotifier<double>(0);
@@ -37,33 +43,48 @@ class DeckController extends ChangeNotifier {
   final loaded = ValueNotifier<bool>(false);
   final playhead = ValueNotifier<double>(0);
   final duration = ValueNotifier<double>(0);
+
   /// P13 显示播放头外推状态：最近 tick 采样（引擎真值）+ 采样时刻。
   double _phSample = 0;
   DateTime? _phSampleAt;
+
   /// 外推速率（音轨秒/秒）：推进中 = grid 有效速率（无网格 1.0）；
   /// 停播/欠载（playhead 采样连续不变）冻结为 0。
   double _phExtrapRate = 0;
+
   /// 每 tick 递增：滚动波形 repaint。
   final waveTick = ValueNotifier<int>(0);
+
   /// 分析数据变化时递增：overview 重绘 + 波形数据刷新。
   final waveRev = ValueNotifier<int>(0);
+
   /// 元数据（封面/title）变化。
   final metaRev = ValueNotifier<int>(0);
 
   // ---- P8：cue / hotcue / loop ----
   /// 主 cue 点（秒；null = 未设）。载曲时回到曲首 0。
   final cuePoint = ValueNotifier<double?>(null);
+
   /// 16 个 hotcue（null = 空槽）。pad 每槽监听自己的 notifier。
-  final hotcues =
-      List<ValueNotifier<double?>>.generate(16, (_) => ValueNotifier<double?>(null));
+  final hotcues = List<ValueNotifier<double?>>.generate(
+    16,
+    (_) => ValueNotifier<double?>(null),
+  );
+
   /// beat loop 状态（60Hz 快照；in/out 秒，未激活时为 0）。
   final loopActive = ValueNotifier<bool>(false);
   final loopIn = ValueNotifier<double>(0);
   final loopOut = ValueNotifier<double>(0);
+
+  /// 引擎计算的环长度（拍），避免 UI 二次反推。
+  final loopBeats = ValueNotifier<double>(0);
+
   /// 有效 BPM（grid 优先，无 grid 用分析值；loop pad 匹配拍数用）。
   final bpm = ValueNotifier<double>(0);
+
   /// 分析网格 BPM 快照（60Hz，无网格 0；滚动波形拍轴用）。
   final gridBpm = ValueNotifier<double>(0);
+
   /// 变速后的实际 BPM = grid × rate（deckinfo 显示用；引擎每块写
   /// s.bpm，无网格/未播放时回退静态 bpm）。
   final effBpm = ValueNotifier<double>(0);
@@ -116,6 +137,21 @@ class DeckController extends ChangeNotifier {
     }
   }
 
+  static const tempoRanges = [8.0, 16.0, 30.0, 50.0];
+
+  void cycleTempoRange() {
+    final i = tempoRanges.indexOf(tempoRange.value);
+    tempoRange.value = tempoRanges[(i + 1) % tempoRanges.length];
+    _updateTempoText();
+  }
+
+  void _updateTempoText() {
+    final r = effRate.value;
+    final range = tempoRange.value.toStringAsFixed(0);
+    tempoText.value =
+        '范围 ±$range%\n当前 ${r >= 0 ? '+' : ''}${r.toStringAsFixed(2)}%';
+  }
+
   /// 60Hz tick：分发快照到各 notifier。
   void updateFromWire(DeckSnapshotWire s) {
     duration.value = s.duration;
@@ -126,7 +162,10 @@ class DeckController extends ChangeNotifier {
     vu.value = s.vu;
     rate.value = s.rate;
     volume.value = s.volume;
-    syncOn.value = s.sync_ != 0;
+    syncOn.value = s.syncMode != 0;
+    syncMode.value = s.syncMode != 0;
+    syncStage.value = s.syncStage;
+    syncMaster.value = s.syncMaster != 0;
     keylockOn.value = s.keylock != 0;
     eqLow.value = s.eqLow;
     eqMid.value = s.eqMid;
@@ -134,6 +173,7 @@ class DeckController extends ChangeNotifier {
     loopActive.value = s.loopActive != 0;
     loopIn.value = s.loopIn;
     loopOut.value = s.loopOut;
+    loopBeats.value = s.loopBeats;
 
     timeText.value = '${_fmtTime(s.playhead)} / ${_fmtTime(s.duration)}';
     // 静态 BPM（loop pad 拍数匹配用）保持 grid 优先语义；
@@ -142,12 +182,13 @@ class DeckController extends ChangeNotifier {
     final staticBpm = s.gridBpm > 0 ? s.gridBpm : trackBpm;
     bpm.value = staticBpm;
     effBpm.value = s.bpm > 0 ? s.bpm : staticBpm;
-    bpmKeyText.value =
-        effBpm.value > 0 ? '${effBpm.value.toStringAsFixed(1)} $keyCamelot' : keyCamelot;
+    bpmKeyText.value = effBpm.value > 0
+        ? '${effBpm.value.toStringAsFixed(1)} $keyCamelot'
+        : keyCamelot;
     // 有效速率：同步/推子锁定期间引擎速率 ≠ 滑杆位置（P10.1）
     final r = s.gridBpm > 0 ? (s.bpm / s.gridBpm - 1.0) * 100.0 : s.rate;
     effRate.value = r;
-    tempoText.value = '范围 ±8%\n当前 ${r >= 0 ? '+' : ''}${r.toStringAsFixed(2)}%';
+    _updateTempoText();
 
     // 播放头所在分析段（变化时告知分析线程排序）
     final seg = (s.playhead / kSegSecs).floor();
@@ -206,8 +247,12 @@ class DeckController extends ChangeNotifier {
     tempoText.dispose();
     playing.dispose();
     syncOn.dispose();
+    syncMode.dispose();
+    syncStage.dispose();
+    syncMaster.dispose();
     keylockOn.dispose();
     rate.dispose();
+    tempoRange.dispose();
     effRate.dispose();
     volume.dispose();
     vu.dispose();
@@ -227,6 +272,7 @@ class DeckController extends ChangeNotifier {
     loopActive.dispose();
     loopIn.dispose();
     loopOut.dispose();
+    loopBeats.dispose();
     bpm.dispose();
     gridBpm.dispose();
     effBpm.dispose();

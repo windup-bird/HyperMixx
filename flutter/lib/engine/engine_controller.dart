@@ -115,6 +115,11 @@ class EngineController {
     setBeatLoop(deck: deck, beats: beats);
   }
 
+  /// Manual Loop In/Out 由音频线程在块首捕获播放位置并量化。
+  void loopInAtPlayhead(int deck) => loopIn(deck: deck);
+
+  void loopOutAtPlayhead(int deck) => loopOut(deck: deck);
+
   void setLoopActive(int deck, bool on) {
     busSet(path: 'Deck${deck + 1}.loop_active', value: on ? 1 : 0);
   }
@@ -173,8 +178,10 @@ class EngineController {
   }
 
   void setSync(int deck, bool on) {
-    busSet(path: 'Deck${deck + 1}.sync', value: on ? 1 : 0);
+    setSyncMode(deck: deck, on_: on);
   }
+
+  void syncStepCommand(int deck) => syncStep(deck: deck);
 
   void setKeylock(int deck, bool on) {
     busSet(path: 'Deck${deck + 1}.keylock', value: on ? 1 : 0);

@@ -58,6 +58,31 @@ pub fn set_beat_loop(deck: u32, beats: f64) {
     bridge::set_beat_loop(deck, beats);
 }
 
+#[frb(sync)]
+pub fn loop_in(deck: u32) {
+    bridge::loop_in(deck);
+}
+
+#[frb(sync)]
+pub fn loop_out(deck: u32) {
+    bridge::loop_out(deck);
+}
+
+#[frb(sync)]
+pub fn sync_step(deck: u32) {
+    bridge::sync_step(deck);
+}
+
+#[frb(sync)]
+pub fn sync_align(deck: u32) {
+    bridge::sync_align(deck);
+}
+
+#[frb(sync)]
+pub fn set_sync_mode(deck: u32, on: bool) {
+    bridge::set_sync_mode(deck, on);
+}
+
 /// 写控制总线（音量 / rate / sync / keylock / zoom 等任意 paths）。
 #[frb(sync)]
 pub fn bus_set(path: String, value: f64) {
@@ -120,10 +145,16 @@ pub struct DeckSnapshotWire {
     pub grid_bpm: f64,
     pub keylock: f64,
     pub sync: f64,
+    /// 持久 sync 锁定模式与引擎解析的 master（0/1）。
+    pub sync_stage: u32,
+    pub sync_mode: u32,
+    pub sync_master: u32,
     /// beat loop 状态（active 0/1；in/out 秒，未激活时为 0）。
     pub loop_active: f64,
     pub loop_in: f64,
     pub loop_out: f64,
+    /// 引擎按 grid 计算的 loop 长度；无有效 grid 时为 0。
+    pub loop_beats: f64,
     /// EQ 三带增益（dB，-40..+6，0 = 直通）。
     pub eq_low: f64,
     pub eq_mid: f64,

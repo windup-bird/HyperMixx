@@ -42,6 +42,7 @@ const double kLoopJumpPanelHeight = 66;
 const double kDeckFxHeight = kPadsRowHeight;
 const double kPadsRowHeight = 26 + 4 + 40 + 6 + 40;
 const double kTransportRowHeight = 30;
+
 /// TempoFader 高度 = loop/jump + pad 行 + transport + 间距。
 const double kTempoFaderHeight =
     kLoopJumpPanelHeight + 6 + kPadsRowHeight + 6 + kTransportRowHeight;
@@ -271,32 +272,61 @@ class _DeckPanelState extends State<DeckPanel> {
               valueListenable: dc.bpmKeyText,
               builder: (_, v, _) => Text(
                 v,
-                style: const TextStyle(
-                  color: Color(0xFF9CCC65),
-                  fontSize: 13,
+                style: const TextStyle(color: Color(0xFF9CCC65), fontSize: 13),
+              ),
+            ),
+            const SizedBox(width: 6),
+            GestureDetector(
+              onTap: dc.cycleTempoRange,
+              child: ValueListenableBuilder<String>(
+                valueListenable: dc.tempoText,
+                builder: (_, v, _) => Text(
+                  v,
+                  textAlign: TextAlign.right,
+                  style: const TextStyle(
+                    color: Colors.orangeAccent,
+                    fontSize: 11,
+                    height: 1.2,
+                  ),
                 ),
               ),
             ),
             const SizedBox(width: 6),
-            ValueListenableBuilder<String>(
-              valueListenable: dc.tempoText,
-              builder: (_, v, _) => Text(
-                v,
-                textAlign: TextAlign.right,
-                style: const TextStyle(
-                  color: Colors.orangeAccent,
-                  fontSize: 11,
-                  height: 1.2,
+            ValueListenableBuilder<bool>(
+              valueListenable: dc.syncMaster,
+              builder: (_, master, _) => ValueListenableBuilder<int>(
+                valueListenable: dc.syncStage,
+                builder: (_, stage, _) => TextButton(
+                  onPressed: master
+                      ? null
+                      : () => engine.syncStepCommand(dc.deck),
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    minimumSize: const Size(48, 28),
+                    backgroundColor: stage > 0
+                        ? const Color(0xFF00897B)
+                        : Colors.transparent,
+                    foregroundColor: master
+                        ? const Color(0xFFFFB300)
+                        : stage > 0
+                        ? Colors.white
+                        : Colors.white38,
+                  ),
+                  child: Text(
+                    master
+                        ? 'MASTER'
+                        : stage == 2
+                        ? 'LOCK'
+                        : stage == 1
+                        ? 'SYNCED'
+                        : 'SYNC',
+                    style: const TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(width: 6),
-            _toggle(
-              dc: dc,
-              notifier: dc.syncOn,
-              label: 'SYNC',
-              activeColor: const Color(0xFF00897B),
-              onChanged: (v) => engine.setSync(dc.deck, v),
             ),
             const SizedBox(width: 6),
             _toggle(

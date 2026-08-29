@@ -109,7 +109,7 @@ pub(crate) fn accumulate_upto(
     max_frames: usize,
 ) -> usize {
     let n = (samples.len() / 2).min(max_frames);
-    for s in samples[..n * 2].chunks_exact(2) {
+    for s in samples[..n * 2].as_chunks::<2>().0 {
         let x = (s[0] + s[1]) * 0.5;
         let (low, mid, high) = f.process(x);
         let col = cols.last_mut().expect("cols 非空");

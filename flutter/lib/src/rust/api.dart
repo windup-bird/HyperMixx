@@ -42,6 +42,21 @@ void beatjump({required int deck, required double beats}) =>
 void setBeatLoop({required int deck, required double beats}) =>
     RustLib.instance.api.crateApiSetBeatLoop(deck: deck, beats: beats);
 
+void loopIn({required int deck}) =>
+    RustLib.instance.api.crateApiLoopIn(deck: deck);
+
+void loopOut({required int deck}) =>
+    RustLib.instance.api.crateApiLoopOut(deck: deck);
+
+void syncStep({required int deck}) =>
+    RustLib.instance.api.crateApiSyncStep(deck: deck);
+
+void syncAlign({required int deck}) =>
+    RustLib.instance.api.crateApiSyncAlign(deck: deck);
+
+void setSyncMode({required int deck, required bool on_}) =>
+    RustLib.instance.api.crateApiSetSyncMode(deck: deck, on_: on_);
+
 /// 写控制总线（音量 / rate / sync / keylock / zoom 等任意 paths）。
 void busSet({required String path, required double value}) =>
     RustLib.instance.api.crateApiBusSet(path: path, value: value);
@@ -156,10 +171,18 @@ class DeckSnapshotWire {
   final double keylock;
   final double sync_;
 
+  /// 持久 sync 锁定模式与引擎解析的 master（0/1）。
+  final int syncStage;
+  final int syncMode;
+  final int syncMaster;
+
   /// beat loop 状态（active 0/1；in/out 秒，未激活时为 0）。
   final double loopActive;
   final double loopIn;
   final double loopOut;
+
+  /// 引擎按 grid 计算的 loop 长度；无有效 grid 时为 0。
+  final double loopBeats;
 
   /// EQ 三带增益（dB，-40..+6，0 = 直通）。
   final double eqLow;
@@ -181,9 +204,13 @@ class DeckSnapshotWire {
     required this.gridBpm,
     required this.keylock,
     required this.sync_,
+    required this.syncStage,
+    required this.syncMode,
+    required this.syncMaster,
     required this.loopActive,
     required this.loopIn,
     required this.loopOut,
+    required this.loopBeats,
     required this.eqLow,
     required this.eqMid,
     required this.eqHigh,
@@ -206,9 +233,13 @@ class DeckSnapshotWire {
       gridBpm.hashCode ^
       keylock.hashCode ^
       sync_.hashCode ^
+      syncStage.hashCode ^
+      syncMode.hashCode ^
+      syncMaster.hashCode ^
       loopActive.hashCode ^
       loopIn.hashCode ^
       loopOut.hashCode ^
+      loopBeats.hashCode ^
       eqLow.hashCode ^
       eqMid.hashCode ^
       eqHigh.hashCode ^
@@ -230,9 +261,13 @@ class DeckSnapshotWire {
           gridBpm == other.gridBpm &&
           keylock == other.keylock &&
           sync_ == other.sync_ &&
+          syncStage == other.syncStage &&
+          syncMode == other.syncMode &&
+          syncMaster == other.syncMaster &&
           loopActive == other.loopActive &&
           loopIn == other.loopIn &&
           loopOut == other.loopOut &&
+          loopBeats == other.loopBeats &&
           eqLow == other.eqLow &&
           eqMid == other.eqMid &&
           eqHigh == other.eqHigh &&

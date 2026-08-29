@@ -11,11 +11,11 @@ import 'package:hypermixx/engine/engine_controller.dart';
 import 'package:hypermixx/widgets/deck_panel.dart';
 import 'package:hypermixx/widgets/transport_row.dart';
 
-/// transport 行内的 SYNC 文本（deckinfo 列 P22.4 也有同名按钮，须限定）。
+/// transport 行内的 sync 文本（master 状态显示为 MASTER）。
 Finder _trSync(Finder panel) => find.descendant(
-      of: find.descendant(of: panel, matching: find.byType(TransportRow)),
-      matching: find.text('SYNC'),
-    );
+  of: find.descendant(of: panel, matching: find.byType(TransportRow)),
+  matching: find.textContaining(RegExp(r'^(SYNC|MASTER)$')),
+);
 
 /// 泵入双面板（deck1 在左、deck0 在右），返回按面板序的 transport 行
 /// SYNC 按钮容器。
@@ -66,11 +66,13 @@ void main() {
   final engine = EngineController.instance;
 
   tearDown(() {
-    engine.decks[0].syncOn.value = false;
-    engine.decks[1].syncOn.value = false;
+    engine.decks[0].syncMaster.value = false;
+    engine.decks[1].syncMaster.value = false;
   });
 
-  testWidgets('SYNC 在 transport 行 + P22.4 info 列加回；KEY 在 info 列', (tester) async {
+  testWidgets('SYNC 在 transport 行 + P22.4 info 列加回；KEY 在 info 列', (
+    tester,
+  ) async {
     final dc = engine.decks[0];
     await tester.pumpWidget(
       MaterialApp(
@@ -83,59 +85,57 @@ void main() {
 
     // P22.4：每面板两个 SYNC——info 列（与 KEY 同排）+ transport 行（KEY 下方）
     final syncs = find.text('SYNC');
-    expect(syncs, findsNWidgets(2), reason: 'P22.4：SYNC 加回 info 列（transport 行仍有）');
+    expect(
+      syncs,
+      findsNWidgets(2),
+      reason: 'P22.4：SYNC 加回 info 列（transport 行仍有）',
+    );
     final keyRect = tester.getRect(find.text('KEY'));
-    final syncTops = syncs
-        .evaluate()
-        .map((e) => tester.getTopLeft(find.byWidget(e.widget as Text)).dy)
-        .toList()
-      ..sort();
-    expect(syncTops.first, closeTo(keyRect.top, 2),
-        reason: 'info 列 SYNC 与 KEY 同排');
-    expect(syncTops.last, greaterThan(keyRect.bottom),
-        reason: 'transport 行 SYNC 在 KEY 下方');
-    expect(tester.getSize(find.text('SYNC').at(1)).width,
-        greaterThan(keyRect.width),
-        reason: 'transport 按钮等分宽 > info 列小按钮');
+    final syncTops =
+        syncs
+            .evaluate()
+            .map((e) => tester.getTopLeft(find.byWidget(e.widget as Text)).dy)
+            .toList()
+          ..sort();
+    expect(
+      syncTops.first,
+      closeTo(keyRect.top, 2),
+      reason: 'info 列 SYNC 与 KEY 同排',
+    );
+    expect(
+      syncTops.last,
+      greaterThan(keyRect.bottom),
+      reason: 'transport 行 SYNC 在 KEY 下方',
+    );
+    expect(
+      tester.getSize(find.text('SYNC').at(1)).width,
+      greaterThan(keyRect.width),
+      reason: 'transport 按钮等分宽 > info 列小按钮',
+    );
   });
 
-  testWidgets('单开 sync：未开 sync 轨 = leader（amber 边框），开 sync 轨无', (tester) async {
-    engine.decks[0].syncOn.value = true; // deck0 跟随 → deck1 是 leader
-    engine.decks[1].syncOn.value = false;
-    final [leaderBtn, followerBtn] = await _pumpBoth(tester);
+  testWidgets('引擎 snapshot 标出的 master 显示 amber 边框', (tester) async {
+    engine.decks[0].syncMaster.value = false;
+    engine.decks[1].syncMaster.value = true;
+    final [masterBtn, followerBtn] = await _pumpBoth(tester);
 
-    expect(sideOf(leaderBtn), isNotNull, reason: 'leader 轨 SYNC 应有 amber 边框');
-    expect(sideOf(leaderBtn)?.color, const Color(0xFFFFB300));
-    expect(sideOf(followerBtn), isNull, reason: 'follower 轨 SYNC 无边框');
+    expect(sideOf(masterBtn), isNotNull, reason: 'master 轨 SYNC 应有 amber 边框');
+    expect(sideOf(masterBtn)?.color, const Color(0xFFFFB300));
+    expect(sideOf(followerBtn), isNull);
   });
 
-  testWidgets('双开 sync：deck0 = leader；都关：无 leader', (tester) async {
-    engine.decks[0].syncOn.value = true;
-    engine.decks[1].syncOn.value = true;
+  testWidgets('master 转移时边框随引擎 snapshot 转移', (tester) async {
+    engine.decks[0].syncMaster.value = true;
+    engine.decks[1].syncMaster.value = false;
     final [deck1Btn, deck0Btn] = await _pumpBoth(tester);
-    expect(sideOf(deck0Btn), isNotNull, reason: '双开时 deck0 是 leader');
-    expect(sideOf(deck1Btn), isNull, reason: 'deck1 是 follower');
+    expect(sideOf(deck0Btn), isNotNull);
+    expect(sideOf(deck1Btn), isNull);
 
-    engine.decks[0].syncOn.value = false;
-    engine.decks[1].syncOn.value = false;
+    engine.decks[0].syncMaster.value = false;
+    engine.decks[1].syncMaster.value = true;
     await tester.pump();
     final [d1, d0] = await _pumpBoth(tester);
-    expect(sideOf(d0), isNull, reason: '都关 sync：无 leader 指示');
-    expect(sideOf(d1), isNull);
-  });
-
-  testWidgets('leader 轨开启 sync 后指示消失（现在另一轨是 leader）', (tester) async {
-    engine.decks[0].syncOn.value = true;
-    engine.decks[1].syncOn.value = false;
-    final [leaderBtn, _] = await _pumpBoth(tester);
-    expect(sideOf(leaderBtn), isNotNull);
-
-    // 模拟引擎回调：deck1（原 leader）开 sync → 双开 → deck0 成为 leader
-    engine.decks[0].syncOn.value = true;
-    engine.decks[1].syncOn.value = true;
-    await tester.pump();
-    final [d1, d0] = await _pumpBoth(tester);
-    expect(sideOf(d1), isNull, reason: '双开后 deck1 不再是 leader');
-    expect(sideOf(d0), isNotNull, reason: '双开后 deck0 是 leader');
+    expect(sideOf(d1), isNotNull);
+    expect(sideOf(d0), isNull);
   });
 }

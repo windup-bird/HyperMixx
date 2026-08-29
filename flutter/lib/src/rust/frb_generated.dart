@@ -64,7 +64,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => 1314990121;
+  int get rustContentHash => 441619590;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -99,6 +99,10 @@ abstract class RustLibApi extends BaseApi {
     required String path,
   });
 
+  void crateApiLoopIn({required int deck});
+
+  void crateApiLoopOut({required int deck});
+
   Future<MasterSnapshotWire> crateApiMasterSnapshotWireDefault();
 
   String? crateApiPickAudioFile();
@@ -115,7 +119,13 @@ abstract class RustLibApi extends BaseApi {
 
   void crateApiSetBeatLoop({required int deck, required double beats});
 
+  void crateApiSetSyncMode({required int deck, required bool on_});
+
   AllSnapshotWire crateApiSnapshotAll();
+
+  void crateApiSyncAlign({required int deck});
+
+  void crateApiSyncStep({required int deck});
 
   Future<TrackMetadataWire> crateApiTrackMetadataWireDefault();
 
@@ -396,6 +406,52 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   );
 
   @override
+  void crateApiLoopIn({required int deck}) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_u_32(deck, serializer);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 11)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiLoopInConstMeta,
+        argValues: [deck],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiLoopInConstMeta =>
+      const TaskConstMeta(debugName: "loop_in", argNames: ["deck"]);
+
+  @override
+  void crateApiLoopOut({required int deck}) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_u_32(deck, serializer);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 12)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiLoopOutConstMeta,
+        argValues: [deck],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiLoopOutConstMeta =>
+      const TaskConstMeta(debugName: "loop_out", argNames: ["deck"]);
+
+  @override
   Future<MasterSnapshotWire> crateApiMasterSnapshotWireDefault() {
     return handler.executeNormal(
       NormalTask(
@@ -404,7 +460,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 11,
+            funcId: 13,
             port: port_,
           );
         },
@@ -431,7 +487,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       SyncTask(
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 12)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 14)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_opt_String,
@@ -453,7 +509,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       SyncTask(
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 13)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 15)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_u_64,
@@ -479,7 +535,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 14,
+            funcId: 16,
             port: port_,
           );
         },
@@ -505,7 +561,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_u_32(deck, serializer);
           sse_encode_f_64(seconds, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 15)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 17)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -529,7 +585,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_u_32(deck, serializer);
           sse_encode_f_64(seconds, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 16)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 18)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -555,7 +611,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_u_32(deck, serializer);
           sse_encode_u_32(priority, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 17)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 19)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -582,7 +638,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_u_32(deck, serializer);
           sse_encode_f_64(beats, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 18)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 20)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -601,12 +657,38 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   );
 
   @override
+  void crateApiSetSyncMode({required int deck, required bool on_}) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_u_32(deck, serializer);
+          sse_encode_bool(on_, serializer);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 21)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiSetSyncModeConstMeta,
+        argValues: [deck, on_],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSetSyncModeConstMeta => const TaskConstMeta(
+    debugName: "set_sync_mode",
+    argNames: ["deck", "on_"],
+  );
+
+  @override
   AllSnapshotWire crateApiSnapshotAll() {
     return handler.executeSync(
       SyncTask(
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 19)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 22)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_all_snapshot_wire,
@@ -623,6 +705,52 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "snapshot_all", argNames: []);
 
   @override
+  void crateApiSyncAlign({required int deck}) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_u_32(deck, serializer);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 23)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiSyncAlignConstMeta,
+        argValues: [deck],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSyncAlignConstMeta =>
+      const TaskConstMeta(debugName: "sync_align", argNames: ["deck"]);
+
+  @override
+  void crateApiSyncStep({required int deck}) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_u_32(deck, serializer);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 24)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiSyncStepConstMeta,
+        argValues: [deck],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSyncStepConstMeta =>
+      const TaskConstMeta(debugName: "sync_step", argNames: ["deck"]);
+
+  @override
   Future<TrackMetadataWire> crateApiTrackMetadataWireDefault() {
     return handler.executeNormal(
       NormalTask(
@@ -631,7 +759,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 20,
+            funcId: 25,
             port: port_,
           );
         },
@@ -661,7 +789,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 21,
+            funcId: 26,
             port: port_,
           );
         },
@@ -763,8 +891,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   DeckSnapshotWire dco_decode_deck_snapshot_wire(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 18)
-      throw Exception('unexpected arr length: expect 18 but see ${arr.length}');
+    if (arr.length != 22)
+      throw Exception('unexpected arr length: expect 22 but see ${arr.length}');
     return DeckSnapshotWire(
       playhead: dco_decode_f_64(arr[0]),
       duration: dco_decode_f_64(arr[1]),
@@ -777,13 +905,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       gridBpm: dco_decode_f_64(arr[8]),
       keylock: dco_decode_f_64(arr[9]),
       sync_: dco_decode_f_64(arr[10]),
-      loopActive: dco_decode_f_64(arr[11]),
-      loopIn: dco_decode_f_64(arr[12]),
-      loopOut: dco_decode_f_64(arr[13]),
-      eqLow: dco_decode_f_64(arr[14]),
-      eqMid: dco_decode_f_64(arr[15]),
-      eqHigh: dco_decode_f_64(arr[16]),
-      cacheFilled: dco_decode_f_64(arr[17]),
+      syncStage: dco_decode_u_32(arr[11]),
+      syncMode: dco_decode_u_32(arr[12]),
+      syncMaster: dco_decode_u_32(arr[13]),
+      loopActive: dco_decode_f_64(arr[14]),
+      loopIn: dco_decode_f_64(arr[15]),
+      loopOut: dco_decode_f_64(arr[16]),
+      loopBeats: dco_decode_f_64(arr[17]),
+      eqLow: dco_decode_f_64(arr[18]),
+      eqMid: dco_decode_f_64(arr[19]),
+      eqHigh: dco_decode_f_64(arr[20]),
+      cacheFilled: dco_decode_f_64(arr[21]),
     );
   }
 
@@ -1083,9 +1215,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_gridBpm = sse_decode_f_64(deserializer);
     var var_keylock = sse_decode_f_64(deserializer);
     var var_sync_ = sse_decode_f_64(deserializer);
+    var var_syncStage = sse_decode_u_32(deserializer);
+    var var_syncMode = sse_decode_u_32(deserializer);
+    var var_syncMaster = sse_decode_u_32(deserializer);
     var var_loopActive = sse_decode_f_64(deserializer);
     var var_loopIn = sse_decode_f_64(deserializer);
     var var_loopOut = sse_decode_f_64(deserializer);
+    var var_loopBeats = sse_decode_f_64(deserializer);
     var var_eqLow = sse_decode_f_64(deserializer);
     var var_eqMid = sse_decode_f_64(deserializer);
     var var_eqHigh = sse_decode_f_64(deserializer);
@@ -1102,9 +1238,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       gridBpm: var_gridBpm,
       keylock: var_keylock,
       sync_: var_sync_,
+      syncStage: var_syncStage,
+      syncMode: var_syncMode,
+      syncMaster: var_syncMaster,
       loopActive: var_loopActive,
       loopIn: var_loopIn,
       loopOut: var_loopOut,
+      loopBeats: var_loopBeats,
       eqLow: var_eqLow,
       eqMid: var_eqMid,
       eqHigh: var_eqHigh,
@@ -1463,9 +1603,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_f_64(self.gridBpm, serializer);
     sse_encode_f_64(self.keylock, serializer);
     sse_encode_f_64(self.sync_, serializer);
+    sse_encode_u_32(self.syncStage, serializer);
+    sse_encode_u_32(self.syncMode, serializer);
+    sse_encode_u_32(self.syncMaster, serializer);
     sse_encode_f_64(self.loopActive, serializer);
     sse_encode_f_64(self.loopIn, serializer);
     sse_encode_f_64(self.loopOut, serializer);
+    sse_encode_f_64(self.loopBeats, serializer);
     sse_encode_f_64(self.eqLow, serializer);
     sse_encode_f_64(self.eqMid, serializer);
     sse_encode_f_64(self.eqHigh, serializer);
