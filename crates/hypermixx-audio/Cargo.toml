@@ -1,0 +1,12 @@
+[package]
+name = "hypermixx-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hypermixx audio engine: decode -> deck -> ring buffer -> cpal output"
+
+[dependencies]
+cpal = { workspace = true }
+rtrb = { workspace = true }
+symphonia = { workspace = true }
+crossbeam-channel = { workspace = true }
