@@ -12,7 +12,7 @@ pub mod ringbuf;
 pub mod source;
 
 pub use beatgrid::{BeatGrid, TrackAnalysis};
-pub use command::{Command, CommandResponse};
+pub use command::{Command, CommandResponse, DeckState};
 pub use deck::Deck;
 pub use flow::Flow;
 pub use pipeline::AudioPipeline;

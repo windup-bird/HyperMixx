@@ -10,8 +10,9 @@ mod common;
 use std::fs;
 use std::time::Duration;
 
-use common::{ack, ask, load_both, session, state};
-use hypermixx_audio::{BeatGrid, Command, SAMPLE_RATE};
+use common::{ack, ask, load_both, session, state, states};
+use crossbeam_channel::{Receiver, Sender};
+use hypermixx_audio::{BeatGrid, Command, CommandResponse, SAMPLE_RATE};
 
 const BPM: f32 = 122.0;
 const BEATS: i64 = 4;
@@ -20,15 +21,10 @@ const ROUNDS: usize = 3;
 const BEAT_FRAMES: f64 = 48_000.0 * 60.0 / 122.0;
 /// The distance one 4-beat jump must add.
 const STEP_DELTA: i64 = (4.0 * BEAT_FRAMES).round() as i64;
-/// Slack for block quantization (256 frames) plus warm-up latency, per round.
-const TOLERANCE: i64 = 2_500;
-/// How far apart the two decks may sit inside a beat, in beats.
-///
-/// KNOWN ISSUE: every beatjump drags the jumping deck by ~1 block (256 frames = 5.3ms). The
-/// target is computed at command time but applied one or two blocks later, while the old flow
-/// keeps playing — so the new flow starts from a stale position. Measured 0.011 beats after one
-/// jump, 0.022 after two. Tighten this together with the latency compensation in `Deck::switch_to`.
-const PHASE_TOLERANCE: f32 = 0.05;
+/// Slack for the grid's per-beat frame rounding (±1) plus one block of switch quantization.
+const TOLERANCE: i64 = 512;
+/// How far apart the two decks may sit inside a beat, in beats (0.01 beat ≈ 4.9ms at 122 BPM).
+const PHASE_TOLERANCE: f32 = 0.01;
 
 fn beat_sleep(beats: i64) -> Duration {
     Duration::from_nanos((beats as f64 * BEAT_FRAMES * 1e9 / SAMPLE_RATE as f64) as u64)
@@ -40,19 +36,28 @@ fn phase_gap(grid: &BeatGrid, deck0: u64, deck1: u64) -> f32 {
     gap.min(1.0 - gap)
 }
 
+/// Both decks' positions, sampled inside the same production block.
+fn pair(tx: &Sender<Command>, rx: &Receiver<CommandResponse>) -> (u64, u64) {
+    let both = states(tx, rx);
+    assert_eq!(both.len(), 2, "GetAllStates must answer for both decks");
+    (both[0].current_frame, both[1].current_frame)
+}
+
 #[test]
 fn repeated_beatjumps_add_exactly_four_beats_each_time() {
     let (path, tx, rx, _pipeline) = session("beatlock.wav", 14);
     let total_frames = load_both(&tx, &rx, &path, BPM)[0].1;
     let grid = BeatGrid::from_constant_bpm(BPM, 0, total_frames, SAMPLE_RATE);
 
+    // Both play commands are queued before reading any answer, so the producer handles them inside
+    // one drain pass and the decks start on the same block. Asked and answered one at a time, deck
+    // 1 would begin a block late and carry that 256-frame offset forever.
     ask(&tx, Command::Play { deck_id: 0 });
-    ack(&rx);
     ask(&tx, Command::Play { deck_id: 1 });
     ack(&rx);
+    ack(&rx);
 
-    let start0 = state(&tx, &rx, 0).current_frame;
-    let start1 = state(&tx, &rx, 1).current_frame;
+    let (start0, start1) = pair(&tx, &rx);
     let baseline = start1 as i64 - start0 as i64;
     assert!(
         phase_gap(&grid, start0, start1) < PHASE_TOLERANCE,
@@ -72,8 +77,7 @@ fn repeated_beatjumps_add_exactly_four_beats_each_time() {
         ack(&rx);
         std::thread::sleep(Duration::from_millis(300)); // warm-up thread + block switch
 
-        let deck0 = state(&tx, &rx, 0).current_frame;
-        let deck1 = state(&tx, &rx, 1).current_frame;
+        let (deck0, deck1) = pair(&tx, &rx);
         let delta = deck1 as i64 - deck0 as i64;
         let err = delta - (baseline + round as i64 * STEP_DELTA);
         let gap = phase_gap(&grid, deck0, deck1);

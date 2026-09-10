@@ -16,7 +16,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use rtrb::{Consumer, Producer};
 
 use crate::beatgrid::{BeatGrid, TrackAnalysis};
-use crate::command::{Command, CommandResponse};
+use crate::command::{Command, CommandResponse, DeckState};
 use crate::deck::Deck;
 use crate::ringbuf::{fill_with_silence_on_underrun, pop_samples, push_samples, AudioRingBuffer};
 use crate::source::{decode_file, PcmPool, Source};
@@ -231,14 +231,17 @@ impl AudioPipeline {
                 let Some(deck) = decks.get(deck_id) else {
                     return unknown_deck(response_tx, deck_id, decks.len());
                 };
-                let deck = lock(deck);
-                let _ = response_tx.send(CommandResponse::State {
-                    deck_id,
-                    current_frame: deck.current_frame(),
-                    playing: deck.is_playing(),
-                    total_frames: deck.total_frames(),
-                    bpm: deck.bpm(),
-                });
+                let _ = response_tx.send(CommandResponse::State(state_of(deck_id, deck)));
+            }
+            Command::GetAllStates => {
+                // One pass over every deck: all frames in the answer come from the same block, so
+                // differences between decks are free of sampling skew.
+                let states = decks
+                    .iter()
+                    .enumerate()
+                    .map(|(deck_id, deck)| state_of(deck_id, deck))
+                    .collect();
+                let _ = response_tx.send(CommandResponse::States(states));
             }
             Command::Quit => {
                 // The producer loop intercepts `Quit` before calling this function; stopping the
@@ -389,6 +392,18 @@ fn fill_ring_with_silence(producer: &mut Producer<f32>, frames: usize) {
             break; // ring is full; the prefill target is already met
         }
         remaining -= written;
+    }
+}
+
+/// Reads one deck's transport. Called from the producer thread only.
+fn state_of(deck_id: usize, deck: &Arc<Mutex<Deck>>) -> DeckState {
+    let deck = lock(deck);
+    DeckState {
+        deck_id,
+        current_frame: deck.current_frame(),
+        playing: deck.is_playing(),
+        total_frames: deck.total_frames(),
+        bpm: deck.bpm(),
     }
 }
 

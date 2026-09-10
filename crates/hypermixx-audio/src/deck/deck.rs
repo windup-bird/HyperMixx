@@ -22,6 +22,9 @@ pub struct Deck {
     active_index: usize,
     timeshift: TimeShift,
     next_flow_id: u64,
+    /// Deck position when the pending jump was submitted, used to shift its landing point by the
+    /// audio the deck played while the new flow warmed up.
+    cued_from: u64,
     playing: AtomicBool,
     /// Analysis can arrive from the decode thread while the producer thread is sampling the deck,
     /// so it swaps in lock-free instead of riding on the deck mutex.
@@ -41,6 +44,7 @@ impl Deck {
             active_index: 0,
             timeshift,
             next_flow_id: 1,
+            cued_from: 0,
             playing: AtomicBool::new(false),
             analysis: ArcSwapOption::empty(),
         }
@@ -70,6 +74,7 @@ impl Deck {
         let target = target_frame.min(self.pool.total_frames());
         let id = self.next_flow_id;
         self.next_flow_id = id.wrapping_add(1);
+        self.cued_from = self.current_frame();
         let flow = Flow::new(
             id,
             Arc::clone(&self.pool),
@@ -161,6 +166,14 @@ impl Deck {
         let Some(mut flow) = self.timeshift.take_ready_flow(flow_id) else {
             return;
         };
+        // The target was computed when the command arrived; this deck kept playing while the flow
+        // warmed up, so move the landing point forward by exactly that much. Otherwise every jump
+        // loses a block of gap against a running sibling deck — and with a real time-stretch engine,
+        // whose warm-up costs several blocks, the loss would grow with it.
+        let played = self.current_frame().saturating_sub(self.cued_from);
+        if played > 0 {
+            flow.reset_to(flow.current_frame() + played);
+        }
         for other in &mut self.flows {
             if other.id != flow_id {
                 other.retire();
@@ -306,9 +319,11 @@ mod tests {
         deck.jump(3000);
         settle_at(&mut deck, &mut out, 3000);
         assert!(deck.current_frame() >= 3000);
+        // The landing point is `3000 + the frames this deck played while the flow warmed up`, so
+        // allow a generous warm-up window; a leaked stale jump would sit below 3000 instead.
         assert!(
-            deck.current_frame() < 3000 + 2 * 256,
-            "stale jump leaked: {}",
+            deck.current_frame() <= 3000 + 8 * 256,
+            "overshot the newest jump target: {}",
             deck.current_frame()
         );
     }

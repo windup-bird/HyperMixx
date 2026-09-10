@@ -51,7 +51,7 @@ pub fn temp_path(name: &str) -> String {
 use std::time::Duration;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use hypermixx_audio::{AudioPipeline, Command, CommandResponse, SAMPLE_RATE};
+use hypermixx_audio::{AudioPipeline, Command, CommandResponse, DeckState, SAMPLE_RATE};
 
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -96,32 +96,21 @@ pub fn ack(rx: &Receiver<CommandResponse>) {
     }
 }
 
-#[derive(Debug)]
-pub struct Snapshot {
-    pub deck_id: usize,
-    pub current_frame: u64,
-    pub playing: bool,
-    pub total_frames: u64,
-    pub bpm: f32,
-}
-
-pub fn state(tx: &Sender<Command>, rx: &Receiver<CommandResponse>, deck_id: usize) -> Snapshot {
+pub fn state(tx: &Sender<Command>, rx: &Receiver<CommandResponse>, deck_id: usize) -> DeckState {
     ask(tx, Command::GetState { deck_id });
     match answer(rx) {
-        CommandResponse::State {
-            deck_id,
-            current_frame,
-            playing,
-            total_frames,
-            bpm,
-        } => Snapshot {
-            deck_id,
-            current_frame,
-            playing,
-            total_frames,
-            bpm,
-        },
+        CommandResponse::State(state) => state,
         other => panic!("expected State, got {other:?}"),
+    }
+}
+
+/// Every deck at once, sampled inside the same production block. Use this when comparing decks:
+/// two `GetState` commands are answered a block apart and so differ by ~256 frames on their own.
+pub fn states(tx: &Sender<Command>, rx: &Receiver<CommandResponse>) -> Vec<DeckState> {
+    ask(tx, Command::GetAllStates);
+    match answer(rx) {
+        CommandResponse::States(states) => states,
+        other => panic!("expected States, got {other:?}"),
     }
 }
 

@@ -53,6 +53,12 @@ impl Flow {
         self.pitchshift.prepare_jump(self.start_frame);
     }
 
+    /// Repositions the playhead without warming up again — the light path used by loops and by the
+    /// deck's jump-latency compensation.
+    pub fn reset_to(&mut self, target_frame: u64) {
+        self.pitchshift.reset_to(target_frame);
+    }
+
     /// Fills `output` with the next block. Returns the number of frames written (zero-filled at
     /// the tail when the flow is inactive or has run out of audio).
     pub fn process_block(&mut self, output: &mut [f32]) -> usize {

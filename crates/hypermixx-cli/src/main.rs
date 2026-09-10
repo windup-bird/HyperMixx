@@ -4,7 +4,9 @@ use std::io::{self, BufRead, Write};
 use std::time::Duration;
 
 use crossbeam_channel::{unbounded, Receiver};
-use hypermixx_audio::{AudioPipeline, Command, CommandResponse, DECK_COUNT, SAMPLE_RATE};
+use hypermixx_audio::{
+    AudioPipeline, Command, CommandResponse, DeckState, DECK_COUNT, SAMPLE_RATE,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Decoding runs in the engine, so `load` may take a while on long files.
@@ -89,7 +91,7 @@ fn read_line(stdin: &mut impl BufRead) -> Option<String> {
     }
 }
 
-/// Turns one input line into the commands to send. `state` fans out to every deck.
+/// Turns one input line into the commands to send.
 fn parse(line: &str) -> Result<Vec<Command>, String> {
     let mut words = line.split_whitespace();
     let commands = match words.next().unwrap_or_default() {
@@ -131,9 +133,7 @@ fn parse(line: &str) -> Result<Vec<Command>, String> {
                     .map_err(|_| "beats must be a whole number")?,
             }]
         }
-        "state" => (0..DECK_COUNT)
-            .map(|deck_id| Command::GetState { deck_id })
-            .collect(),
+        "state" => vec![Command::GetAllStates],
         "quit" | "exit" | "q" => vec![Command::Quit],
         "help" | "h" | "?" => {
             print_help();
@@ -182,34 +182,12 @@ fn report(response_rx: &Receiver<CommandResponse>, timeout: Duration) {
             "deck{deck_id} loaded: {total_frames} frames ({}) @ {bpm:.1} BPM",
             format_time(total_frames)
         ),
-        Ok(CommandResponse::State {
-            deck_id,
-            current_frame,
-            playing,
-            total_frames,
-            bpm,
-        }) => {
-            let transport = if total_frames == 0 {
-                "empty"
-            } else if playing {
-                "playing"
-            } else {
-                "paused"
-            };
-            let duration = if total_frames == 0 {
-                "-".to_owned()
-            } else {
-                format_time(total_frames)
-            };
-            let tempo = if bpm > 0.0 {
-                format!("{bpm:.1} BPM")
-            } else {
-                "no grid".into()
-            };
-            println!(
-                "deck{deck_id}  {transport:<7} {} / {duration}  [{current_frame}/{total_frames}]  {tempo}",
-                format_time(current_frame)
-            );
+        Ok(CommandResponse::State(state)) => print_state(&state),
+        // One answer holding every deck: all rows come from the same production block.
+        Ok(CommandResponse::States(states)) => {
+            for state in states {
+                print_state(&state);
+            }
         }
         Ok(CommandResponse::Ok) => {}
         Ok(CommandResponse::Error(message)) => eprintln!("error: {message}"),
@@ -220,6 +198,37 @@ fn report(response_rx: &Receiver<CommandResponse>, timeout: Duration) {
             eprintln!("error: the audio engine shut down")
         }
     }
+}
+
+fn print_state(state: &DeckState) {
+    let DeckState {
+        deck_id,
+        current_frame,
+        playing,
+        total_frames,
+        bpm,
+    } = *state;
+    let transport = if total_frames == 0 {
+        "empty"
+    } else if playing {
+        "playing"
+    } else {
+        "paused"
+    };
+    let duration = if total_frames == 0 {
+        "-".to_owned()
+    } else {
+        format_time(total_frames)
+    };
+    let tempo = if bpm > 0.0 {
+        format!("{bpm:.1} BPM")
+    } else {
+        "no grid".into()
+    };
+    println!(
+        "deck{deck_id}  {transport:<7} {} / {duration}  [{current_frame}/{total_frames}]  {tempo}",
+        format_time(current_frame)
+    );
 }
 
 /// Frames -> `m:ss.mmm` at the engine rate.

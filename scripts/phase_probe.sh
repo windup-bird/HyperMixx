@@ -18,6 +18,9 @@ ROUNDS=${5:-6}
 
 [[ -x "$BIN" ]] || { echo "找不到可执行文件 $BIN，先 cargo build --release" >&2; exit 2; }
 [[ -f "$FILE" ]] || { echo "找不到音频文件 $FILE" >&2; exit 2; }
+# 本脚本只测正向步进：负拍会在曲首夹在拍 0 上（正确行为），且反向节奏需要预置起点。
+# 抵消性由 cargo test -p hypermixx-audio --test beatlock 的 undoing_a_beatjump_* 覆盖。
+(( BEATS > 0 )) || { echo "beats 必须是正整数（本脚本只测正向步进）" >&2; exit 2; }
 
 INTERVAL=$(awk -v b="$BEATS" -v bpm="$BPM" 'BEGIN { printf "%.3f", b * 60 / bpm }')
 
@@ -26,6 +29,8 @@ INTERVAL=$(awk -v b="$BEATS" -v bpm="$BPM" 'BEGIN { printf "%.3f", b * 60 / bpm 
   printf 'load 0 %s %s\n' "$FILE" "$BPM"
   printf 'load 1 %s %s\n' "$FILE" "$BPM"
   printf 'play 0\nplay 1\n'
+  sleep 0.3
+  printf 'state\n'
   for _ in $(seq 1 "$ROUNDS"); do
     sleep "$INTERVAL"
     printf 'beatjump 1 %s\n' "$BEATS"
@@ -44,18 +49,26 @@ INTERVAL=$(awk -v b="$BEATS" -v bpm="$BPM" 'BEGIN { printf "%.3f", b * 60 / bpm 
     head = substr($0, RSTART, RLENGTH)
     frame = substr(head, index(head, "[") + 1) + 0
     if ($0 ~ /deck0/) { f0 = frame; next }
-    round++
     delta = frame - f0
-    # inc = 本轮相对上轮的相位差增量，这才是"每次跳 4 拍"的直接判据（首轮以 delta 为准）
-    inc = round == 1 ? delta : delta - prev
+    # 第一对是起跳前的基线：两条 play 各等一次回答，deck1 会晚一块起步，扣掉它才看得清跳转精度
+    if (!seen++) {
+      base = delta
+      prev = delta
+      printf "%5s %12d %12d %10d %29s 基线（两 deck 起跑差）\n", "-", f0, frame, delta, ""
+      next
+    }
+    round++
+    # inc = 本轮相对上轮的相位差增量，这才是"每次跳 N 拍"的直接判据
+    inc = delta - prev
     prev = delta
-    err = delta - round * step
+    err = delta - (base + round * step)
     printf "%5d %12d %12d %10d %10d %8d %+8d %7.3f %6.1f  %s\n", round, f0, frame, delta, \
-           round * step, inc, err, delta * bpm / (48000.0 * 60.0), err / 48.0, \
-           (inc != step && (inc - step > step / 2 || step - inc > step / 2) ? "FAIL" : "ok")
+           base + round * step, inc, err, (delta - base) * bpm / (48000.0 * 60.0), err / 48.0, \
+           (inc > step + step / 2 || step - inc > step / 2 ? "FAIL" : "ok")
   }
   END {
     if (!round) { print "没解析到成对的 state 行：检查 CLI 是否正常启动、素材能否加载" ; exit 3 }
-    printf "\n共 %d 轮；最后一轮误差 %+d 帧（1 帧 ≈ 0.02ms，step = %d 帧 / %d 拍）\n", round, err, step, beats
+    printf "\n共 %d 轮，step = %d 帧 / %d 拍；基线 %+d 帧；最后一轮误差 %+d 帧（1 帧 ≈ 0.02ms）\n", \
+           round, step, beats, base, err
   }
 '
