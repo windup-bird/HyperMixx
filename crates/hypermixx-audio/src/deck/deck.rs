@@ -3,7 +3,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
+
 use super::TimeShift;
+use crate::beatgrid::TrackAnalysis;
 use crate::flow::{Flow, FlowState};
 use crate::source::Source;
 use crate::CHANNELS;
@@ -20,6 +23,9 @@ pub struct Deck {
     timeshift: TimeShift,
     next_flow_id: u64,
     playing: AtomicBool,
+    /// Analysis can arrive from the decode thread while the producer thread is sampling the deck,
+    /// so it swaps in lock-free instead of riding on the deck mutex.
+    analysis: ArcSwapOption<TrackAnalysis>,
 }
 
 impl Deck {
@@ -36,6 +42,7 @@ impl Deck {
             timeshift,
             next_flow_id: 1,
             playing: AtomicBool::new(false),
+            analysis: ArcSwapOption::empty(),
         }
     }
 
@@ -71,6 +78,42 @@ impl Deck {
             self.timeshift.ready_sender(),
         );
         self.timeshift.submit_prepare(flow);
+    }
+
+    /// Publishes track analysis (beat grid). Safe to call while the deck is playing.
+    pub fn set_analysis(&self, analysis: TrackAnalysis) {
+        self.analysis.store(Some(Arc::new(analysis)));
+    }
+
+    /// The current analysis, if the loaded track has one.
+    pub fn analysis(&self) -> Option<Arc<TrackAnalysis>> {
+        self.analysis.load_full()
+    }
+
+    /// Grid tempo, or 0.0 when the deck has no analysis.
+    pub fn bpm(&self) -> f32 {
+        self.analysis()
+            .map(|a| a.beatgrid.average_bpm())
+            .unwrap_or(0.0)
+    }
+
+    /// Where [`beatjump`](Self::beatjump) would land from the current position, without jumping.
+    pub fn beat_target_frame(&self, beats: i64) -> Option<u64> {
+        let analysis = self.analysis()?;
+        Some(
+            analysis
+                .beatgrid
+                .beatjump_target(self.current_frame(), beats),
+        )
+    }
+
+    /// Non-blocking jump of whole beats, keeping the phase inside the current beat.
+    ///
+    /// Does nothing when the deck has no beat grid yet — a wrong grid is worse than no grid.
+    pub fn beatjump(&mut self, beats: i64) {
+        if let Some(target) = self.beat_target_frame(beats) {
+            self.jump(target);
+        }
     }
 
     /// Processes one block, applying any completed jump first.
@@ -161,6 +204,21 @@ mod tests {
         }
         panic!(
             "deck never reached frame {target}, stopped at {}",
+            deck.current_frame()
+        );
+    }
+
+    /// Drives blocks until the playhead falls behind `above`, i.e. until a backward jump lands.
+    fn settle_below(deck: &mut Deck, out: &mut [f32], above: u64) {
+        for _ in 0..500 {
+            deck.process_block(out);
+            if deck.current_frame() < above {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!(
+            "deck never moved back below {above}, stuck at {}",
             deck.current_frame()
         );
     }
@@ -263,5 +321,89 @@ mod tests {
         assert_eq!(deck.process_block(&mut out), 0);
         assert!(out.iter().all(|s| *s == 0.0));
         assert!(deck.is_at_end());
+    }
+
+    fn grid_122bpm(total_frames: u64) -> TrackAnalysis {
+        TrackAnalysis {
+            beatgrid: crate::beatgrid::BeatGrid::from_constant_bpm(
+                122.0,
+                0,
+                total_frames,
+                crate::SAMPLE_RATE,
+            ),
+        }
+    }
+
+    #[test]
+    fn deck_without_analysis_reports_no_tempo_and_ignores_beatjump() {
+        let mut deck = Deck::new(pool(10_000));
+        assert_eq!(deck.bpm(), 0.0);
+        assert!(deck.analysis().is_none());
+        assert_eq!(deck.beat_target_frame(4), None);
+        deck.play();
+        let mut out = vec![0.0f32; 256 * CHANNELS];
+        deck.beatjump(4);
+        deck.process_block(&mut out);
+        assert_eq!(
+            deck.current_frame(),
+            256,
+            "beatjump must not move without a grid"
+        );
+    }
+
+    #[test]
+    fn analysis_swaps_in_while_playing() {
+        let mut deck = Deck::new(pool(10_000));
+        deck.play();
+        let mut out = vec![0.0f32; 256 * CHANNELS];
+        deck.process_block(&mut out);
+        deck.set_analysis(grid_122bpm(10_000)); // no deck lock involved
+        assert!((deck.bpm() - 122.0).abs() < 0.5, "bpm {}", deck.bpm());
+        assert!(deck.analysis().is_some());
+    }
+
+    #[test]
+    fn beatjump_preview_matches_the_grid_formula() {
+        let deck = Deck::new(pool(10_000));
+        deck.set_analysis(grid_122bpm(10_000));
+        let frames_per_beat: f64 = 48_000.0 * 60.0 / 122.0;
+        assert_eq!(
+            deck.beat_target_frame(1),
+            Some(frames_per_beat.round() as u64)
+        );
+        assert_eq!(
+            deck.beat_target_frame(-1),
+            Some(0),
+            "clamped at the first beat"
+        );
+    }
+
+    #[test]
+    fn beatjump_moves_by_beats_and_keeps_phase() {
+        let mut deck = Deck::new(pool(48_000 * 20));
+        deck.set_analysis(grid_122bpm(48_000 * 20));
+        deck.play();
+        let mut out = vec![0.0f32; 256 * CHANNELS];
+
+        // Cue somewhere inside beat 0, off the grid, then step four beats ahead.
+        deck.jump(5_000);
+        settle_at(&mut deck, &mut out, 5_000);
+        let before = deck.current_frame();
+        deck.beatjump(4);
+        settle_at(&mut deck, &mut out, before + 4 * 23_000);
+        let forward = deck.current_frame();
+        assert!(
+            (forward as i64 - (before as i64 + 4 * 23_607)).abs() <= 2 * 256,
+            "four beats ahead should be ~94428 frames on: {before} -> {forward}"
+        );
+
+        deck.beatjump(-4);
+        let back = deck.beat_target_frame(-4).expect("grid");
+        settle_below(&mut deck, &mut out, forward);
+        assert!(
+            (deck.current_frame() as i64 - back as i64).abs() <= 2 * 256,
+            "back to the original phase: expected ~{back}, got {}",
+            deck.current_frame()
+        );
     }
 }

@@ -1,8 +1,9 @@
-//! Hypermixx audio engine — v1: single deck, passthrough pitchshift, no mixer.
+//! Hypermixx audio engine: two decks, beat grid, passthrough pitchshift, no mixer yet.
 
 // `flow/flow.rs` and `deck/deck.rs` are named by the project spec, not by us.
 #![allow(clippy::module_inception)]
 
+pub mod beatgrid;
 pub mod command;
 pub mod deck;
 pub mod flow;
@@ -10,6 +11,7 @@ pub mod pipeline;
 pub mod ringbuf;
 pub mod source;
 
+pub use beatgrid::{BeatGrid, TrackAnalysis};
 pub use command::{Command, CommandResponse};
 pub use deck::Deck;
 pub use flow::Flow;
@@ -27,6 +29,12 @@ pub const BLOCK_SIZE: usize = 256;
 pub const OUTPUT_RING_CAPACITY: usize = 4096;
 /// Frames pre-filled into the output ring before the audio stream starts.
 pub const PREFILL_FRAMES: usize = 2048;
+/// Number of decks the pipeline owns: 0 and 1.
+pub const DECK_COUNT: usize = 2;
+/// Per-deck gain when summing decks; keeps a two-deck mix at unity.
+pub const DECK_MIX_GAIN: f32 = 0.5;
+/// Tempo assumed when a track is loaded without an explicit BPM (the `test.mp3` fixture).
+pub const DEFAULT_BPM: f32 = 122.0;
 
 /// Samples (f32) per processing block.
 pub const BLOCK_SAMPLES: usize = BLOCK_SIZE * CHANNELS;
