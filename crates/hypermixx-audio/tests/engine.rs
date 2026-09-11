@@ -5,8 +5,8 @@ mod common;
 use std::fs;
 use std::time::Duration;
 
-use common::{ack, answer, ask, load_both, session, state};
-use hypermixx_audio::{Command, CommandResponse, DEFAULT_BPM, SAMPLE_RATE};
+use common::{ack, answer, ask, load_both, seed_grids, session, state};
+use hypermixx_audio::{Command, CommandResponse, SAMPLE_RATE};
 
 /// Frames in one beat at 122 BPM.
 const FRAMES_PER_BEAT: u64 = (48_000.0f64 * 60.0 / 122.0).round() as u64;
@@ -20,22 +20,20 @@ fn load_play_beatjump_and_pause_on_one_deck() {
         Command::Load {
             deck_id: 0,
             path: path.clone(),
-            bpm: None,
         },
     );
     match answer(&rx) {
         CommandResponse::Loaded {
             deck_id,
             total_frames,
-            bpm,
         } => {
             assert_eq!(deck_id, 0);
             assert_eq!(total_frames, 6 * SAMPLE_RATE as u64);
-            assert!((bpm - DEFAULT_BPM).abs() < 0.001, "reported bpm {bpm}");
         }
         CommandResponse::Error(err) => panic!("load failed: {err}"),
         other => panic!("expected Loaded, got {other:?}"),
     }
+    seed_grids(&tx, &rx, 122.0, 6 * SAMPLE_RATE as u64);
 
     let cued = state(&tx, &rx, 0);
     assert_eq!(
@@ -47,7 +45,6 @@ fn load_play_beatjump_and_pause_on_one_deck() {
         6 * SAMPLE_RATE as u64,
         "state must report the deck length"
     );
-    assert!((cued.bpm - 122.0).abs() < 0.5, "state bpm {}", cued.bpm);
 
     // play -> the playhead advances roughly in real time.
     ask(&tx, Command::Play { deck_id: 0 });
@@ -107,11 +104,12 @@ fn load_play_beatjump_and_pause_on_one_deck() {
 #[test]
 fn two_decks_run_independently() {
     let (path, tx, rx, _pipeline) = session("dual0.wav", 6);
-    let loaded = load_both(&tx, &rx, &path, 122.0);
+    let loaded = load_both(&tx, &rx, &path);
     assert_eq!(
         loaded,
         vec![(0, 6 * SAMPLE_RATE as u64), (1, 6 * SAMPLE_RATE as u64)]
     );
+    seed_grids(&tx, &rx, 122.0, 6 * SAMPLE_RATE as u64);
 
     ask(&tx, Command::Play { deck_id: 0 });
     ack(&rx);
@@ -196,7 +194,6 @@ fn bad_deck_ids_and_missing_files_answer_with_errors() {
         Command::Load {
             deck_id: 0,
             path: "/nope/nothing.wav".into(),
-            bpm: None,
         },
     );
     match answer(&rx) {

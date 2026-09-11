@@ -11,7 +11,7 @@ pub mod pipeline;
 pub mod ringbuf;
 pub mod source;
 
-pub use beatgrid::{BeatGrid, TrackAnalysis};
+pub use beatgrid::{BeatGrid, KeyMode, KeyReport, TrackAnalysis};
 pub use command::{Command, CommandResponse, DeckState};
 pub use deck::Deck;
 pub use flow::Flow;
@@ -33,8 +33,6 @@ pub const PREFILL_FRAMES: usize = 2048;
 pub const DECK_COUNT: usize = 2;
 /// Per-deck gain when summing decks; keeps a two-deck mix at unity.
 pub const DECK_MIX_GAIN: f32 = 0.5;
-/// Tempo assumed when a track is loaded without an explicit BPM (the `test.mp3` fixture).
-pub const DEFAULT_BPM: f32 = 122.0;
 
 /// Samples (f32) per processing block.
 pub const BLOCK_SAMPLES: usize = BLOCK_SIZE * CHANNELS;

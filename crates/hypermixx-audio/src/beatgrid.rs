@@ -6,9 +6,43 @@
 
 use crate::SAMPLE_RATE;
 
-/// Everything the deck knows about a track's musical grid.
+/// Everything the deck knows about a track's musical analysis.
+#[derive(Debug, Clone)]
 pub struct TrackAnalysis {
     pub beatgrid: BeatGrid,
+    pub key: Option<KeyReport>,
+    pub bpm: Option<f32>,
+}
+
+/// Detected musical key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyMode {
+    Major,
+    Minor,
+}
+
+/// A key detection result: pitch class + mode + confidence.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyReport {
+    /// 0 = C, 1 = C#, ..., 11 = B.
+    pub pc: u8,
+    pub mode: KeyMode,
+    /// 0.0–1.0, from the analyser.
+    pub confidence: f32,
+}
+
+impl KeyReport {
+    /// Standard name: `"C"`, `"Am"`, `"F#"`.
+    pub fn name(&self) -> String {
+        const PITCH_NAMES: [&str; 12] = [
+            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+        ];
+        let root = PITCH_NAMES[self.pc as usize % 12];
+        match self.mode {
+            KeyMode::Major => root.to_owned(),
+            KeyMode::Minor => format!("{root}m"),
+        }
+    }
 }
 
 /// Strictly increasing absolute beat positions, in frames.
@@ -20,6 +54,18 @@ pub struct BeatGrid {
 }
 
 impl BeatGrid {
+    /// Builds a grid from beat times in seconds (e.g. from an external analyser).
+    pub fn from_seconds(beats_sec: &[f32], sample_rate: u32) -> Self {
+        let beat_frames = beats_sec
+            .iter()
+            .map(|t| (*t * sample_rate as f32).round().max(0.0) as u64)
+            .collect();
+        Self {
+            beat_frames,
+            sample_rate,
+        }
+    }
+
     /// Builds a grid of evenly spaced beats starting at `first_beat_frame`.
     ///
     /// Positions come from rounding `i * frames_per_beat` rather than accumulating an interval, so

@@ -119,7 +119,6 @@ pub fn load_both(
     tx: &Sender<Command>,
     rx: &Receiver<CommandResponse>,
     path: &str,
-    bpm: f32,
 ) -> Vec<(usize, u64)> {
     for deck_id in 0..2 {
         ask(
@@ -127,7 +126,6 @@ pub fn load_both(
             Command::Load {
                 deck_id,
                 path: path.to_owned(),
-                bpm: Some(bpm),
             },
         );
     }
@@ -145,4 +143,27 @@ pub fn load_both(
     }
     loaded.sort_unstable();
     loaded
+}
+
+/// Sends a constant-BPM grid to both decks so beatjump has something to work with.
+pub fn seed_grids(
+    tx: &Sender<Command>,
+    rx: &Receiver<CommandResponse>,
+    bpm: f32,
+    total_frames: u64,
+) {
+    for deck_id in 0..2 {
+        let analysis = hypermixx_audio::TrackAnalysis {
+            beatgrid: hypermixx_audio::BeatGrid::from_constant_bpm(
+                bpm,
+                0,
+                total_frames,
+                hypermixx_audio::SAMPLE_RATE,
+            ),
+            key: None,
+            bpm: Some(bpm),
+        };
+        ask(tx, Command::SetAnalysis { deck_id, analysis });
+        ack(rx);
+    }
 }

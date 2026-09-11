@@ -15,14 +15,13 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use rtrb::{Consumer, Producer};
 
-use crate::beatgrid::{BeatGrid, TrackAnalysis};
 use crate::command::{Command, CommandResponse, DeckState};
 use crate::deck::Deck;
 use crate::ringbuf::{fill_with_silence_on_underrun, pop_samples, push_samples, AudioRingBuffer};
 use crate::source::{decode_file, PcmPool, Source};
 use crate::{
-    BLOCK_SAMPLES, BLOCK_SIZE, CHANNELS, DECK_COUNT, DECK_MIX_GAIN, DEFAULT_BPM,
-    OUTPUT_RING_CAPACITY, OUTPUT_RING_SAMPLES, PREFILL_FRAMES, SAMPLE_RATE,
+    BLOCK_SAMPLES, BLOCK_SIZE, CHANNELS, DECK_COUNT, DECK_MIX_GAIN, OUTPUT_RING_CAPACITY,
+    OUTPUT_RING_SAMPLES, PREFILL_FRAMES, SAMPLE_RATE,
 };
 
 /// Sleep between produced blocks: deliberately shorter than the block's audio duration (90% of
@@ -161,11 +160,10 @@ impl AudioPipeline {
         response_tx: &Sender<CommandResponse>,
     ) {
         match command {
-            Command::Load { deck_id, path, bpm } => {
+            Command::Load { deck_id, path } => {
                 let Some(target) = decks.get(deck_id).cloned() else {
                     return unknown_deck(response_tx, deck_id, decks.len());
                 };
-                let bpm = bpm.unwrap_or(DEFAULT_BPM);
                 // Decoding is slow, so it gets its own thread; audio keeps running meanwhile.
                 let worker_tx = response_tx.clone();
                 let spawned = std::thread::Builder::new()
@@ -174,17 +172,13 @@ impl AudioPipeline {
                         Ok(decoded) => {
                             let total_frames = decoded.total_frames;
                             let pool: Arc<dyn Source> = Arc::new(PcmPool::from_decoded(decoded));
-                            let beatgrid =
-                                BeatGrid::from_constant_bpm(bpm, 0, total_frames, SAMPLE_RATE);
                             let deck = Deck::new(pool);
-                            deck.set_analysis(TrackAnalysis { beatgrid });
                             // Replacing the deck resets its transport and joins the old warm-up
                             // thread on drop; the other deck keeps playing untouched.
                             *lock(&target) = deck;
                             let _ = worker_tx.send(CommandResponse::Loaded {
                                 deck_id,
                                 total_frames,
-                                bpm,
                             });
                         }
                         Err(err) => {
@@ -226,6 +220,13 @@ impl AudioPipeline {
                     deck.beatjump(beats);
                     CommandResponse::Ok
                 });
+            }
+            Command::SetAnalysis { deck_id, analysis } => {
+                let Some(deck) = decks.get(deck_id) else {
+                    return unknown_deck(response_tx, deck_id, decks.len());
+                };
+                lock(deck).set_analysis(analysis);
+                let _ = response_tx.send(CommandResponse::Ok);
             }
             Command::GetState { deck_id } => {
                 let Some(deck) = decks.get(deck_id) else {
@@ -404,6 +405,7 @@ fn state_of(deck_id: usize, deck: &Arc<Mutex<Deck>>) -> DeckState {
         playing: deck.is_playing(),
         total_frames: deck.total_frames(),
         bpm: deck.bpm(),
+        key: deck.key().map(|k| k.name()),
     }
 }
 

@@ -10,7 +10,7 @@ mod common;
 use std::fs;
 use std::time::Duration;
 
-use common::{ack, ask, load_both, session, state, states};
+use common::{ack, ask, load_both, seed_grids, session, state, states};
 use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::{BeatGrid, Command, CommandResponse, SAMPLE_RATE};
 
@@ -46,7 +46,8 @@ fn pair(tx: &Sender<Command>, rx: &Receiver<CommandResponse>) -> (u64, u64) {
 #[test]
 fn repeated_beatjumps_add_exactly_four_beats_each_time() {
     let (path, tx, rx, _pipeline) = session("beatlock.wav", 14);
-    let total_frames = load_both(&tx, &rx, &path, BPM)[0].1;
+    let total_frames = load_both(&tx, &rx, &path)[0].1;
+    seed_grids(&tx, &rx, BPM, total_frames);
     let grid = BeatGrid::from_constant_bpm(BPM, 0, total_frames, SAMPLE_RATE);
 
     // Both play commands are queued before reading any answer, so the producer handles them inside
@@ -113,7 +114,9 @@ fn repeated_beatjumps_add_exactly_four_beats_each_time() {
 #[test]
 fn undoing_a_beatjump_returns_to_the_same_frame() {
     let (path, tx, rx, _pipeline) = session("beatundo.wav", 6);
-    load_both(&tx, &rx, &path, BPM);
+    let loaded = load_both(&tx, &rx, &path);
+    let total_frames = loaded[0].1;
+    seed_grids(&tx, &rx, BPM, total_frames);
     ask(&tx, Command::Play { deck_id: 1 });
     ack(&rx);
     std::thread::sleep(Duration::from_millis(400));

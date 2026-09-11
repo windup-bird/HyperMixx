@@ -11,4 +11,5 @@ path = "src/main.rs"
 
 [dependencies]
 hypermixx-audio = { path = "../hypermixx-audio" }
+hypermixx-analysis = { path = "../hypermixx-analysis" }
 crossbeam-channel = { workspace = true }

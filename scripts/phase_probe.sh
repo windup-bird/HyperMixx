@@ -15,6 +15,8 @@ FILE=${2:-test.mp3}
 BPM=${3:-122}
 BEATS=${4:-4}
 ROUNDS=${5:-6}
+# Analysis runs asynchronously after load; the grid must be ready before beatjumping.
+WAIT_SECS=${6:-30}
 
 [[ -x "$BIN" ]] || { echo "找不到可执行文件 $BIN，先 cargo build --release" >&2; exit 2; }
 [[ -f "$FILE" ]] || { echo "找不到音频文件 $FILE" >&2; exit 2; }
@@ -30,6 +32,10 @@ INTERVAL=$(awk -v b="$BEATS" -v bpm="$BPM" 'BEGIN { printf "%.3f", b * 60 / bpm 
   printf 'load 1 %s %s\n' "$FILE" "$BPM"
   printf 'play 0\nplay 1\n'
   sleep 0.3
+  printf 'state\n'
+  # Wait for the async analysis to publish its grid (bpm > 0 in the state output).
+  echo "waiting ${WAIT_SECS}s for analysis..."
+  sleep "$WAIT_SECS"
   printf 'state\n'
   for _ in $(seq 1 "$ROUNDS"); do
     sleep "$INTERVAL"

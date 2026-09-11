@@ -1,13 +1,14 @@
 //! Command / response protocol between the CLI and the audio pipeline.
 
+use crate::beatgrid::TrackAnalysis;
+
 /// A command sent to the pipeline's producer thread.
 #[derive(Debug)]
 pub enum Command {
-    /// Decodes `path` into `deck_id`. `bpm` overrides the tempo used to build the beat grid.
+    /// Decodes `path` into `deck_id`.
     Load {
         deck_id: usize,
         path: String,
-        bpm: Option<f32>,
     },
     Play {
         deck_id: usize,
@@ -24,6 +25,11 @@ pub enum Command {
     BeatJump {
         deck_id: usize,
         beats: i64,
+    },
+    /// Publishes analysis (beat grid + key + bpm) to a deck.
+    SetAnalysis {
+        deck_id: usize,
+        analysis: TrackAnalysis,
     },
     /// One deck's state. Use [`Command::GetAllStates`] when comparing decks: two separate
     /// `GetState` commands are answered one production block apart.
@@ -45,16 +51,14 @@ pub struct DeckState {
     pub total_frames: u64,
     /// 0.0 while the deck has no beat grid.
     pub bpm: f32,
+    /// Detected key name (e.g. `"Am"`), or `None` without analysis.
+    pub key: Option<String>,
 }
 
 /// The reply to a [`Command`].
 #[derive(Debug, PartialEq)]
 pub enum CommandResponse {
-    Loaded {
-        deck_id: usize,
-        total_frames: u64,
-        bpm: f32,
-    },
+    Loaded { deck_id: usize, total_frames: u64 },
     State(DeckState),
     States(Vec<DeckState>),
     Ok,

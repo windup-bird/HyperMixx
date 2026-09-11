@@ -64,7 +64,9 @@ fn main() {
             break;
         }
         for _ in 0..expected {
-            report(&response_rx, timeout);
+            if let Some(deck_id) = report(&response_rx, timeout) {
+                spawn_analysis(deck_id, &pipeline);
+            }
         }
     }
 
@@ -97,16 +99,10 @@ fn parse(line: &str) -> Result<Vec<Command>, String> {
     let commands = match words.next().unwrap_or_default() {
         "load" => {
             let deck_id = deck_id(words.next())?;
-            let path = words.next().ok_or("usage: load <deck_id> <path> [bpm]")?;
-            let bpm = words
-                .next()
-                .map(str::parse::<f32>)
-                .transpose()
-                .map_err(|_| "bpm must be a number")?;
+            let path = words.next().ok_or("usage: load <deck_id> <path>")?;
             vec![Command::Load {
                 deck_id,
                 path: path.to_owned(),
-                bpm,
             }]
         }
         "play" => vec![Command::Play {
@@ -172,63 +168,108 @@ fn print_help() {
     );
 }
 
-fn report(response_rx: &Receiver<CommandResponse>, timeout: Duration) {
+fn report(response_rx: &Receiver<CommandResponse>, timeout: Duration) -> Option<usize> {
     match response_rx.recv_timeout(timeout) {
         Ok(CommandResponse::Loaded {
             deck_id,
             total_frames,
-            bpm,
-        }) => println!(
-            "deck{deck_id} loaded: {total_frames} frames ({}) @ {bpm:.1} BPM",
-            format_time(total_frames)
-        ),
-        Ok(CommandResponse::State(state)) => print_state(&state),
+        }) => {
+            println!(
+                "deck{deck_id} loaded: {total_frames} frames ({})",
+                format_time(total_frames)
+            );
+            Some(deck_id)
+        }
+        Ok(CommandResponse::State(state)) => {
+            print_state(&state);
+            None
+        }
         // One answer holding every deck: all rows come from the same production block.
         Ok(CommandResponse::States(states)) => {
             for state in states {
                 print_state(&state);
             }
+            None
         }
-        Ok(CommandResponse::Ok) => {}
-        Ok(CommandResponse::Error(message)) => eprintln!("error: {message}"),
+        Ok(CommandResponse::Ok) => None,
+        Ok(CommandResponse::Error(message)) => {
+            eprintln!("error: {message}");
+            None
+        }
         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-            eprintln!("error: the engine did not answer in time")
+            eprintln!("error: the engine did not answer in time");
+            None
         }
         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-            eprintln!("error: the audio engine shut down")
+            eprintln!("error: the audio engine shut down");
+            None
         }
     }
 }
 
 fn print_state(state: &DeckState) {
-    let DeckState {
-        deck_id,
-        current_frame,
-        playing,
-        total_frames,
-        bpm,
-    } = *state;
-    let transport = if total_frames == 0 {
+    let transport = if state.total_frames == 0 {
         "empty"
-    } else if playing {
+    } else if state.playing {
         "playing"
     } else {
         "paused"
     };
-    let duration = if total_frames == 0 {
+    let duration = if state.total_frames == 0 {
         "-".to_owned()
     } else {
-        format_time(total_frames)
+        format_time(state.total_frames)
     };
-    let tempo = if bpm > 0.0 {
-        format!("{bpm:.1} BPM")
+    let tempo = if state.bpm > 0.0 {
+        format!("{:.1} BPM", state.bpm)
     } else {
         "no grid".into()
     };
+    let key_label = state.key.as_deref().unwrap_or("--");
     println!(
-        "deck{deck_id}  {transport:<7} {} / {duration}  [{current_frame}/{total_frames}]  {tempo}",
-        format_time(current_frame)
+        "deck{}  {transport:<7} {} / {duration}  [{}/{}]  {tempo}  {key_label}",
+        state.deck_id,
+        format_time(state.current_frame),
+        state.current_frame,
+        state.total_frames,
     );
+}
+
+/// Spawns a background thread that reads PCM from the deck, runs beat/key analysis, and publishes
+/// the result via `Deck::set_analysis` (ArcSwap, lock-free). The next `state` query shows it.
+fn spawn_analysis(deck_id: usize, pipeline: &AudioPipeline) {
+    let Some(deck) = pipeline.deck(deck_id).cloned() else {
+        return;
+    };
+    let spawned = std::thread::Builder::new()
+        .name(format!("hypermixx-analysis-{deck_id}"))
+        .spawn(move || {
+            let (source, total_frames) = {
+                let guard = deck.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                (guard.source(), guard.total_frames())
+            };
+            if total_frames == 0 {
+                return;
+            }
+            eprintln!("[analysis] deck{deck_id}: analyzing {total_frames} frames...");
+            let mono = hypermixx_analysis::downmix_to_mono(source.as_ref(), total_frames, 2);
+            match hypermixx_analysis::analyze(&mono, hypermixx_audio::SAMPLE_RATE) {
+                Ok(analysis) => {
+                    let bpm = analysis.bpm.unwrap_or(0.0);
+                    let key = analysis.key.as_ref().map(|k| k.name()).unwrap_or_default();
+                    deck.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .set_analysis(analysis);
+                    eprintln!("[analysis] deck{deck_id}: {bpm:.1} BPM, {key}");
+                }
+                Err(err) => {
+                    eprintln!("[analysis] deck{deck_id}: {err}");
+                }
+            }
+        });
+    if let Err(err) = spawned {
+        eprintln!("[analysis] could not start thread: {err}");
+    }
 }
 
 /// Frames -> `m:ss.mmm` at the engine rate.

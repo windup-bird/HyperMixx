@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwapOption;
 
 use super::TimeShift;
-use crate::beatgrid::TrackAnalysis;
+use crate::beatgrid::{KeyReport, TrackAnalysis};
 use crate::flow::{Flow, FlowState};
 use crate::source::Source;
 use crate::CHANNELS;
@@ -67,6 +67,11 @@ impl Deck {
         self.pool.total_frames()
     }
 
+    /// The underlying PCM source, for out-of-band readers (e.g. the analysis layer).
+    pub fn source(&self) -> Arc<dyn Source> {
+        Arc::clone(&self.pool)
+    }
+
     /// Non-blocking jump: spawns a flow at `target_frame` and hands it to the warm-up thread.
     /// The switch happens on the next [`process_block`](Self::process_block), so the audible
     /// position may lag by at most the current block plus the warm-up time.
@@ -95,11 +100,17 @@ impl Deck {
         self.analysis.load_full()
     }
 
-    /// Grid tempo, or 0.0 when the deck has no analysis.
+    /// Detected musical key, or `None` when the deck has no analysis.
+    pub fn key(&self) -> Option<KeyReport> {
+        self.analysis().and_then(|a| a.key)
+    }
+
+    /// Reported BPM (from analysis), or grid-derived average. 0.0 without analysis.
     pub fn bpm(&self) -> f32 {
-        self.analysis()
-            .map(|a| a.beatgrid.average_bpm())
-            .unwrap_or(0.0)
+        match self.analysis() {
+            Some(a) => a.bpm.unwrap_or_else(|| a.beatgrid.average_bpm()),
+            None => 0.0,
+        }
     }
 
     /// Where [`beatjump`](Self::beatjump) would land from the current position, without jumping.
@@ -346,6 +357,8 @@ mod tests {
                 total_frames,
                 crate::SAMPLE_RATE,
             ),
+            key: None,
+            bpm: Some(122.0),
         }
     }
 
