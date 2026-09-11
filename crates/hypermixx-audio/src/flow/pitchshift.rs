@@ -1,124 +1,168 @@
-//! Pitchshift: time-stretches a `Source` for a `Flow`. v1 is a passthrough.
+//! Pitchshift: real-time time-stretch engine wrapping timestretch-rs.
+//!
+//! Three profiles: Tape (varispeed, pitch follows tempo), Keylock (SOLA, pitch
+//! locked), WideKeylock (phase vocoder, full-spectrum keylock). All run through
+//! the same pull-based engine: we push source audio into its ring and pull
+//! processed output in `process_block`.
 
 use std::sync::Arc;
 
-use crate::source::Source;
-use crate::CHANNELS;
+use timestretch::engine::{
+    Engine, EngineConfig, EngineController, EngineProcessor, EngineProfile, SourceProducer,
+};
+use timestretch::error::StretchError;
 
-/// Placeholder time-stretch engine: it copies input to output 1:1 (`ratio` is stored but has no
-/// effect). The interface is what matters — swapping in a real OLA/SOLA engine keeps
-/// `prepare_jump` / `process_block` / `reset_to` as the only integration points.
-#[derive(Clone)]
+use crate::source::Source;
+use crate::{CHANNELS, SAMPLE_RATE};
+
+/// How many source frames to push into the engine's ring per process_block.
+/// The ring absorbs excess; the engine consumes at its own tempo rate.
+const FEED_CHUNK_FRAMES: usize = 1024;
+
+/// A real-time time-stretch engine for one flow.
 pub struct PitchShiftEngine {
+    controller: EngineController,
+    processor: EngineProcessor,
+    source_producer: SourceProducer,
     source: Arc<dyn Source>,
-    current_input_frame: u64,
+    /// Absolute frame position in the source that we've fed up to.
+    track_position: u64,
+    /// Output playhead (what the listener hears). At ratio=1.0 this equals the
+    /// source position.
+    output_frame: u64,
     ratio: f32,
+    total: u64,
+    feed_buf: Vec<f32>,
+    /// Output frames remaining in the current warm-start priming (silence).
+    priming_remaining: usize,
+    profile: EngineProfile,
 }
 
 impl PitchShiftEngine {
+    /// Creates an engine with the default Tape profile (zero latency, passthrough at ratio 1.0).
     pub fn new(source: Arc<dyn Source>, ratio: f32) -> Self {
-        Self {
-            source,
-            current_input_frame: 0,
-            ratio,
-        }
+        Self::with_profile(source, ratio, EngineProfile::Tape)
+            .expect("timestretch engine config is statically valid")
     }
 
-    /// Processes one block (up to `output.len() / CHANNELS` frames), copying raw source data into
-    /// `output`. Returns the number of frames written; the tail is zero-filled.
+    /// Creates an engine with a specific profile.
+    pub fn with_profile(
+        source: Arc<dyn Source>,
+        ratio: f32,
+        profile: EngineProfile,
+    ) -> Result<Self, StretchError> {
+        let total = source.total_frames();
+        let config = EngineConfig {
+            sample_rate: SAMPLE_RATE,
+            channels: CHANNELS,
+            profile,
+            initial_tempo_rate: (ratio as f64).clamp(0.25, 4.0),
+            max_block_frames: 256,
+            source_capacity_frames: 32768,
+            pre_analysis: None,
+        };
+        let handles = Engine::build(config)?;
+        Ok(Self {
+            controller: handles.controller,
+            processor: handles.processor,
+            source_producer: handles.source,
+            source,
+            track_position: 0,
+            output_frame: 0,
+            ratio,
+            total,
+            feed_buf: vec![0.0; FEED_CHUNK_FRAMES * CHANNELS],
+            priming_remaining: 0,
+            profile,
+        })
+    }
+
+    /// Processes one block. Feeds source audio into the engine, then pulls
+    /// processed output. Returns the number of frames written.
     pub fn process_block(&mut self, output: &mut [f32]) -> usize {
         let capacity = output.len() / CHANNELS;
-        let frames = self
-            .source
-            .read_frames(self.current_input_frame, &mut output[..capacity * CHANNELS]);
-        self.current_input_frame += frames as u64;
-        for sample in &mut output[frames * CHANNELS..capacity * CHANNELS] {
-            *sample = 0.0;
+        self.feed();
+        self.processor.process(output);
+        if self.priming_remaining > 0 {
+            let silent = capacity.min(self.priming_remaining);
+            self.priming_remaining -= silent;
+            if self.priming_remaining == 0 {
+                // Priming just ended; start counting from the jump target.
+                self.output_frame = self.output_frame.max(self.output_frame);
+            }
+            // output_frame stays frozen during priming (the listener hears silence).
+        } else {
+            self.output_frame += capacity as u64;
         }
-        frames
+        capacity
     }
 
-    /// Warms up to `target_frame`. The passthrough version only needs to reposition.
+    /// Full seek protocol. Tape skips the warm-start (zero-latency passthrough);
+    /// Keylock/WideKeylock run the priming to converge stage state.
     pub fn prepare_jump(&mut self, target_frame: u64) {
-        self.current_input_frame = target_frame;
+        let target = target_frame.min(self.total);
+        self.processor.reset();
+        self.output_frame = target;
+
+        if self.profile == EngineProfile::Tape {
+            // Tape has no stages to converge: re-anchor and go.
+            self.source_producer.set_track_position(target);
+            self.track_position = target;
+            self.priming_remaining = 0;
+        } else {
+            let preroll = self.processor.warm_start_preroll_frames();
+            let start = target.saturating_sub(preroll as u64);
+            self.source_producer.set_track_position(start);
+            self.controller.warm_start(preroll as u32);
+            self.track_position = start;
+            self.priming_remaining = preroll + 64; // preroll + declick fade-in
+        }
+        self.feed();
     }
 
-    /// Light-weight reset to `target_frame` (used for loops). Same as `prepare_jump` here, but a
-    /// real engine skips the overlap warm-up on this path.
+    /// Repositions without the full warm-start (used by loop wraps). Delegates to prepare_jump
+    /// since the timestretch engine always needs its seek protocol for correctness.
     pub fn reset_to(&mut self, target_frame: u64) {
         self.prepare_jump(target_frame);
     }
 
-    /// Current input-side playhead, in frames.
+    /// Current output playhead (what the listener hears), in source frames.
+    /// At ratio=1.0 this equals the source position.
     pub fn current_frame(&self) -> u64 {
-        self.current_input_frame
+        self.output_frame
     }
 
-    /// Current playback rate (1.0 = untouched pitch/tempo).
     pub fn ratio(&self) -> f32 {
         self.ratio
     }
 
-    /// Sets the playback rate. Stored only; v1 does not alter timing or pitch.
+    /// Sets the tempo rate. ratio=1.0 is unity, >1 speeds up, <1 slows down.
     pub fn set_ratio(&mut self, ratio: f32) {
         self.ratio = ratio;
+        self.controller.set_tempo_rate(ratio as f64);
     }
 
     /// Total frames available from the backing source.
     pub fn total_frames(&self) -> u64 {
-        self.source.total_frames()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::source::PcmPool;
-
-    fn ramp(n_frames: u64) -> Arc<dyn Source> {
-        Arc::new(PcmPool::from_decoded(crate::source::DecodedAudio {
-            pcm: (0..n_frames as usize)
-                .flat_map(|i| [i as f32, i as f32])
-                .collect(),
-            total_frames: n_frames,
-            sample_rate: 48_000,
-            channels: CHANNELS,
-        }))
+        self.total
     }
 
-    #[test]
-    fn passthrough_copies_1_to_1() {
-        let mut engine = PitchShiftEngine::new(ramp(1000), 1.0);
-        let mut out = vec![0.0f32; 256 * CHANNELS];
-        assert_eq!(engine.process_block(&mut out), 256);
-        assert_eq!(&out[..2], &[0.0, 0.0]);
-        assert_eq!(engine.current_frame(), 256);
+    /// The backing source, for rebuilding the engine with a different profile.
+    pub fn source_ref(&self) -> Arc<dyn Source> {
+        Arc::clone(&self.source)
     }
 
-    #[test]
-    fn prepare_jump_repositions_without_processing() {
-        let mut engine = PitchShiftEngine::new(ramp(1000), 1.0);
-        engine.prepare_jump(500);
-        let mut out = vec![0.0f32; 4 * CHANNELS];
-        assert_eq!(engine.process_block(&mut out), 4);
-        assert_eq!(out[0], 500.0);
-    }
-
-    #[test]
-    fn tail_is_silenced_at_end_of_source() {
-        let mut engine = PitchShiftEngine::new(ramp(10), 1.0);
-        engine.prepare_jump(8);
-        let mut out = vec![1.0f32; 4 * CHANNELS];
-        assert_eq!(engine.process_block(&mut out), 2);
-        assert!(out[2 * CHANNELS..].iter().all(|s| *s == 0.0));
-    }
-
-    #[test]
-    fn ratio_is_stored_but_inert() {
-        let mut engine = PitchShiftEngine::new(ramp(1000), 1.0);
-        engine.set_ratio(0.5);
-        assert_eq!(engine.ratio(), 0.5);
-        let mut out = vec![0.0f32; 256 * CHANNELS];
-        assert_eq!(engine.process_block(&mut out), 256);
+    /// Pushes source audio into the engine's ring buffer.
+    fn feed(&mut self) {
+        if self.track_position >= self.total {
+            return;
+        }
+        let read = self
+            .source
+            .read_frames(self.track_position, &mut self.feed_buf);
+        if read > 0 {
+            let pushed = self.source_producer.push(&self.feed_buf[..read * CHANNELS]);
+            self.track_position += pushed as u64;
+        }
     }
 }

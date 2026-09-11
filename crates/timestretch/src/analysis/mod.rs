@@ -1,0 +1,24 @@
+//! Audio analysis: transient detection, beat tracking, frequency analysis, and HPSS.
+
+pub mod beat;
+pub mod comparison;
+pub mod frequency;
+pub mod hpss;
+pub mod key;
+pub mod loudness;
+pub mod preanalysis;
+pub mod rigid_grid;
+pub mod tempogram;
+pub mod transient;
+pub mod waveform;
+
+pub use beat::*;
+pub use comparison::*;
+pub use frequency::*;
+pub use key::*;
+pub use loudness::*;
+pub use preanalysis::*;
+pub use rigid_grid::*;
+pub use tempogram::*;
+pub use transient::*;
+pub use waveform::*;

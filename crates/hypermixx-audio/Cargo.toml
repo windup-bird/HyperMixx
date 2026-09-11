@@ -10,4 +10,5 @@ cpal = { workspace = true }
 rtrb = { workspace = true }
 symphonia = { workspace = true }
 crossbeam-channel = { workspace = true }
+timestretch = { path = "../timestretch" }
 arc-swap = "1"

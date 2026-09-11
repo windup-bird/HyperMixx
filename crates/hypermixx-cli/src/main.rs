@@ -130,6 +130,24 @@ fn parse(line: &str) -> Result<Vec<Command>, String> {
             }]
         }
         "state" => vec![Command::GetAllStates],
+        "rate" => {
+            let deck_id = deck_id(words.next())?;
+            let rate = words.next().ok_or("usage: rate <deck_id> <ratio>")?;
+            vec![Command::SetRate {
+                deck_id,
+                rate: rate.parse::<f32>().map_err(|_| "rate must be a number")?,
+            }]
+        }
+        "profile" => {
+            let deck_id = deck_id(words.next())?;
+            let profile = words
+                .next()
+                .ok_or("usage: profile <deck_id> <tape|keylock|wide>")?;
+            vec![Command::SetProfile {
+                deck_id,
+                profile: profile.to_owned(),
+            }]
+        }
         "quit" | "exit" | "q" => vec![Command::Quit],
         "help" | "h" | "?" => {
             print_help();
@@ -156,11 +174,13 @@ fn deck_id(word: Option<&str>) -> Result<usize, String> {
 fn print_help() {
     println!(
         "commands ({} decks, ids 0..{}):
-  load <deck> <path> [bpm]   decode mp3/wav/flac into that deck (bpm defaults to the engine's)
+  load <deck> <path>         decode mp3/wav/flac into that deck
   play <deck>                start that deck
   pause <deck>               stop it, keeping the position
   jump <deck> <frame>        seek to a frame (1 second = {SAMPLE_RATE} frames)
-  beatjump <deck> <beats>    seek by whole beats, keeping the phase; negative goes back
+  beatjump <deck> <beats>    seek by whole beats, keeping the phase
+  rate <deck> <ratio>        set tempo rate (1.0 = unity, 0.5 = half speed)
+  profile <deck> <name>      tape / keylock / wide (default: tape)
   state                      show every deck
   quit                       exit",
         DECK_COUNT,

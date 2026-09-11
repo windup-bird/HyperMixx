@@ -18,7 +18,6 @@ pub enum FlowState {
 }
 
 /// A bounded (or open-ended) playback of a [`Source`].
-#[derive(Clone)]
 pub struct Flow {
     pub id: u64,
     pub state: FlowState,
@@ -59,13 +58,29 @@ impl Flow {
         self.pitchshift.reset_to(target_frame);
     }
 
-    /// Fills `output` with the next block. Returns the number of frames written (zero-filled at
-    /// the tail when the flow is inactive or has run out of audio).
+    /// Sets the tempo rate on the underlying engine.
+    pub fn set_ratio(&mut self, ratio: f32) {
+        self.pitchshift.set_ratio(ratio);
+    }
+
+    /// Rebuilds the engine with a different profile, preserving position and ratio.
+    pub fn set_profile(&mut self, profile: timestretch::engine::EngineProfile) {
+        let source = self.pitchshift.source_ref();
+        let ratio = self.pitchshift.ratio();
+        let position = self.pitchshift.current_frame();
+        self.pitchshift = PitchShiftEngine::with_profile(source.clone(), ratio, profile)
+            .unwrap_or_else(|_| PitchShiftEngine::new(source, ratio));
+        self.pitchshift.prepare_jump(position);
+    }
+
+    /// Fills `output` with the next block from the time-stretch engine.
+    /// Always fills the entire buffer (silence when inactive or past the end).
+    /// Returns the number of frames written (= `output.len() / CHANNELS`).
     pub fn process_block(&mut self, output: &mut [f32]) -> usize {
         let capacity = output.len() / CHANNELS;
         if self.state != FlowState::Active {
             output[..capacity * CHANNELS].fill(0.0);
-            return 0;
+            return capacity;
         }
         let budget = match self.end_frame {
             Some(end) => capacity.min(end.saturating_sub(self.current_frame()) as usize),
@@ -73,13 +88,12 @@ impl Flow {
         };
         if budget == 0 {
             output[..capacity * CHANNELS].fill(0.0);
-            return 0;
+            return capacity;
         }
-        let frames = self
-            .pitchshift
+        self.pitchshift
             .process_block(&mut output[..budget * CHANNELS]);
-        output[frames * CHANNELS..capacity * CHANNELS].fill(0.0);
-        frames
+        output[budget * CHANNELS..capacity * CHANNELS].fill(0.0);
+        capacity
     }
 
     /// Current playhead position, in frames.
@@ -100,19 +114,6 @@ impl Flow {
         self.state = FlowState::Ready;
         if let Some(tx) = self.ready_tx.take() {
             let _ = tx.send(self.id);
-        }
-    }
-
-    /// A `Ready` copy for the warm-up thread to park before announcing its id, so the deck can
-    /// never poll an id whose flow is not retrievable yet. The copy keeps no announcement channel.
-    pub fn ready_copy(&self) -> Flow {
-        Flow {
-            id: self.id,
-            state: FlowState::Ready,
-            start_frame: self.start_frame,
-            end_frame: self.end_frame,
-            pitchshift: self.pitchshift.clone(),
-            ready_tx: None,
         }
     }
 
@@ -148,7 +149,7 @@ mod tests {
     fn inactive_flow_outputs_silence() {
         let (mut f, _) = flow(1000, 0, None);
         let mut out = vec![1.0f32; 4 * CHANNELS];
-        assert_eq!(f.process_block(&mut out), 0);
+        assert_eq!(f.process_block(&mut out), 4);
         assert!(out.iter().all(|s| *s == 0.0));
     }
 
@@ -171,9 +172,11 @@ mod tests {
         f.prepare();
         f.activate();
         let mut out = vec![0.0f32; 8 * CHANNELS];
-        assert_eq!(f.process_block(&mut out), 6);
+        assert_eq!(f.process_block(&mut out), 8);
         assert!(f.reached_end());
-        assert_eq!(f.process_block(&mut out), 0);
+        // After end, output is silence but process_block still fills the buffer.
+        assert_eq!(f.process_block(&mut out), 8);
+        assert!(out.iter().all(|s| *s == 0.0));
     }
 
     #[test]

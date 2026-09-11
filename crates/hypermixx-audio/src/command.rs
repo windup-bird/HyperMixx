@@ -26,6 +26,16 @@ pub enum Command {
         deck_id: usize,
         beats: i64,
     },
+    /// Sets the tempo rate (0.25 = quarter speed, 1.0 = unity, 4.0 = quadruple).
+    SetRate {
+        deck_id: usize,
+        rate: f32,
+    },
+    /// Switches the time-stretch profile ("tape", "keylock", "wide").
+    SetProfile {
+        deck_id: usize,
+        profile: String,
+    },
     /// Publishes analysis (beat grid + key + bpm) to a deck.
     SetAnalysis {
         deck_id: usize,

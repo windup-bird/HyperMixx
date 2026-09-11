@@ -5,6 +5,7 @@ members = [
     "crates/hypermixx-analysis",
     "crates/hypermixx-cli",
     "crates/stratum-dsp",
+    "crates/timestretch",
 ]
 
 [workspace.package]

@@ -50,12 +50,13 @@ impl TimeShift {
                                 // A newer jump made this warm-up irrelevant; drop it silently.
                                 continue;
                             }
-                            // Park before announcing, so `poll_ready()` never hands out an id whose
-                            // flow cannot be taken yet.
+                            // Move (not clone) the prepared flow into the warm map, then announce.
+                            // The timestretch engine handles are not Clone, so the deck receives
+                            // the exact engine instance that was warmed up.
                             if let Ok(mut guard) = thread_warm.lock() {
-                                guard.insert(flow.id, flow.ready_copy());
+                                flow.mark_ready();
+                                guard.insert(flow.id, flow);
                             }
-                            flow.mark_ready();
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -139,7 +140,7 @@ mod tests {
     /// A flow wired to its own ready channel, so tests can watch the announcement directly.
     fn dummy_flow(id: u64, start: u64) -> (Flow, Receiver<u64>) {
         let (tx, rx) = unbounded();
-        (Flow::new(id, source(1000), start, None, tx), rx)
+        (Flow::new(id, source(10_000), start, None, tx), rx)
     }
 
     /// Polls `probe` until it yields a value; the warm-up thread ticks every 2ms.

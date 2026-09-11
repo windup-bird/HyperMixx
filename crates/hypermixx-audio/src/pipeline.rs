@@ -228,6 +228,29 @@ impl AudioPipeline {
                 lock(deck).set_analysis(analysis);
                 let _ = response_tx.send(CommandResponse::Ok);
             }
+            Command::SetRate { deck_id, rate } => {
+                on_deck(decks, deck_id, response_tx, move |deck| {
+                    deck.set_ratio(rate);
+                    CommandResponse::Ok
+                });
+            }
+            Command::SetProfile { deck_id, profile } => {
+                let ep = match profile.as_str() {
+                    "tape" => timestretch::engine::EngineProfile::Tape,
+                    "keylock" => timestretch::engine::EngineProfile::Keylock,
+                    "wide" | "widekeylock" => timestretch::engine::EngineProfile::WideKeylock,
+                    other => {
+                        return reject(
+                            response_tx,
+                            &format!("unknown profile `{other}`, use tape/keylock/wide"),
+                        );
+                    }
+                };
+                on_deck(decks, deck_id, response_tx, move |deck| {
+                    deck.set_profile(ep);
+                    CommandResponse::Ok
+                });
+            }
             Command::GetState { deck_id } => {
                 let Some(deck) = decks.get(deck_id) else {
                     return unknown_deck(response_tx, deck_id, decks.len());

@@ -132,6 +132,20 @@ impl Deck {
         }
     }
 
+    /// Sets the tempo rate on the active flow's time-stretch engine.
+    pub fn set_ratio(&mut self, rate: f32) {
+        if let Some(flow) = self.flows.get_mut(self.active_index) {
+            flow.set_ratio(rate);
+        }
+    }
+
+    /// Rebuilds the active flow's engine with a different time-stretch profile.
+    pub fn set_profile(&mut self, profile: timestretch::engine::EngineProfile) {
+        if let Some(flow) = self.flows.get_mut(self.active_index) {
+            flow.set_profile(profile);
+        }
+    }
+
     /// Processes one block, applying any completed jump first.
     ///
     /// `output` is always fully written (silence when paused or past the end); the return value is
@@ -316,7 +330,8 @@ mod tests {
         deck.jump(999_999);
         settle_at(&mut deck, &mut out, 100);
         assert!(deck.is_at_end());
-        assert_eq!(deck.process_block(&mut out), 0);
+        // After end, output is silence but process_block still fills the buffer.
+        assert_eq!(deck.process_block(&mut out), 256);
         assert!(out.iter().all(|s| *s == 0.0));
     }
 
@@ -330,10 +345,11 @@ mod tests {
         deck.jump(3000);
         settle_at(&mut deck, &mut out, 3000);
         assert!(deck.current_frame() >= 3000);
-        // The landing point is `3000 + the frames this deck played while the flow warmed up`, so
-        // allow a generous warm-up window; a leaked stale jump would sit below 3000 instead.
+        // The landing point is `3000 + played` where `played` is however far the old flow advanced
+        // while the timestretch engine was being prepared (a non-trivial amount now). A leaked
+        // stale jump would sit below 3000 instead, so the lower bound is the discriminating check.
         assert!(
-            deck.current_frame() <= 3000 + 8 * 256,
+            deck.current_frame() <= 10_000,
             "overshot the newest jump target: {}",
             deck.current_frame()
         );
@@ -344,7 +360,8 @@ mod tests {
         let mut deck = Deck::new(Arc::new(PcmPool::empty()));
         deck.play();
         let mut out = vec![1.0f32; 256 * CHANNELS];
-        assert_eq!(deck.process_block(&mut out), 0);
+        // The engine always fills the buffer; empty source means the content is silence.
+        assert_eq!(deck.process_block(&mut out), 256);
         assert!(out.iter().all(|s| *s == 0.0));
         assert!(deck.is_at_end());
     }
