@@ -64,8 +64,12 @@ fn main() {
             break;
         }
         for _ in 0..expected {
-            if let Some(deck_id) = report(&response_rx, timeout) {
-                spawn_analysis(deck_id, &pipeline);
+            // report yields (deck_id, needs_analysis) on a load: skip analysis when the deck
+            // already carries a constant-bpm grid.
+            if let Some((deck_id, needs_analysis)) = report(&response_rx, timeout) {
+                if needs_analysis {
+                    spawn_analysis(deck_id, &pipeline);
+                }
             }
         }
     }
@@ -99,10 +103,17 @@ fn parse(line: &str) -> Result<Vec<Command>, String> {
     let commands = match words.next().unwrap_or_default() {
         "load" => {
             let deck_id = deck_id(words.next())?;
-            let path = words.next().ok_or("usage: load <deck_id> <path>")?;
+            let path = words.next().ok_or("usage: load <deck_id> <path> [bpm]")?;
+            // An explicit BPM builds a deterministic constant-tempo grid in the engine and skips
+            // async analysis; omitting it runs the analyser.
+            let bpm = match words.next() {
+                Some(raw) => Some(raw.parse::<f32>().map_err(|_| "bpm must be a number")?),
+                None => None,
+            };
             vec![Command::Load {
                 deck_id,
                 path: path.to_owned(),
+                bpm,
             }]
         }
         "play" => vec![Command::Play {
@@ -174,7 +185,7 @@ fn deck_id(word: Option<&str>) -> Result<usize, String> {
 fn print_help() {
     println!(
         "commands ({} decks, ids 0..{}):
-  load <deck> <path>         decode mp3/wav/flac into that deck
+  load <deck> <path> [bpm]   decode mp3/wav/flac; a given bpm builds a fixed grid and skips analysis
   play <deck>                start that deck
   pause <deck>               stop it, keeping the position
   jump <deck> <frame>        seek to a frame (1 second = {SAMPLE_RATE} frames)
@@ -188,17 +199,18 @@ fn print_help() {
     );
 }
 
-fn report(response_rx: &Receiver<CommandResponse>, timeout: Duration) -> Option<usize> {
+fn report(response_rx: &Receiver<CommandResponse>, timeout: Duration) -> Option<(usize, bool)> {
     match response_rx.recv_timeout(timeout) {
         Ok(CommandResponse::Loaded {
             deck_id,
             total_frames,
+            analyzed,
         }) => {
             println!(
                 "deck{deck_id} loaded: {total_frames} frames ({})",
                 format_time(total_frames)
             );
-            Some(deck_id)
+            Some((deck_id, !analyzed))
         }
         Ok(CommandResponse::State(state)) => {
             print_state(&state);

@@ -5,10 +5,13 @@ use crate::beatgrid::TrackAnalysis;
 /// A command sent to the pipeline's producer thread.
 #[derive(Debug)]
 pub enum Command {
-    /// Decodes `path` into `deck_id`.
+    /// Decodes `path` into `deck_id`. When `bpm` is `Some`, a constant-tempo grid is built
+    /// immediately and analysis is skipped (a deterministic grid for testing/beat-matching);
+    /// when `None`, an async analysis job is expected to fill the grid via [`Command::SetAnalysis`].
     Load {
         deck_id: usize,
         path: String,
+        bpm: Option<f32>,
     },
     Play {
         deck_id: usize,
@@ -68,7 +71,13 @@ pub struct DeckState {
 /// The reply to a [`Command`].
 #[derive(Debug, PartialEq)]
 pub enum CommandResponse {
-    Loaded { deck_id: usize, total_frames: u64 },
+    /// `analyzed` is true when the deck already carries a grid (constant-bpm load), so the caller
+    /// should not launch an async analysis that would overwrite it.
+    Loaded {
+        deck_id: usize,
+        total_frames: u64,
+        analyzed: bool,
+    },
     State(DeckState),
     States(Vec<DeckState>),
     Ok,

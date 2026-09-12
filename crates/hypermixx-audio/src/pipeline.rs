@@ -15,6 +15,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use rtrb::{Consumer, Producer};
 
+use crate::beatgrid::{BeatGrid, TrackAnalysis};
 use crate::command::{Command, CommandResponse, DeckState};
 use crate::deck::Deck;
 use crate::ringbuf::{fill_with_silence_on_underrun, pop_samples, push_samples, AudioRingBuffer};
@@ -160,7 +161,7 @@ impl AudioPipeline {
         response_tx: &Sender<CommandResponse>,
     ) {
         match command {
-            Command::Load { deck_id, path } => {
+            Command::Load { deck_id, path, bpm } => {
                 let Some(target) = decks.get(deck_id).cloned() else {
                     return unknown_deck(response_tx, deck_id, decks.len());
                 };
@@ -173,12 +174,30 @@ impl AudioPipeline {
                             let total_frames = decoded.total_frames;
                             let pool: Arc<dyn Source> = Arc::new(PcmPool::from_decoded(decoded));
                             let deck = Deck::new(pool);
+                            // A caller-supplied BPM builds a deterministic constant-tempo grid
+                            // now, so no async analysis is expected to overwrite it.
+                            let mut analyzed = false;
+                            if let Some(bpm) = bpm.filter(|b| *b > 0.0) {
+                                let beatgrid = BeatGrid::from_constant_bpm(
+                                    bpm,
+                                    0,
+                                    total_frames,
+                                    SAMPLE_RATE,
+                                );
+                                deck.set_analysis(TrackAnalysis {
+                                    beatgrid,
+                                    key: None,
+                                    bpm: Some(bpm),
+                                });
+                                analyzed = true;
+                            }
                             // Replacing the deck resets its transport and joins the old warm-up
                             // thread on drop; the other deck keeps playing untouched.
                             *lock(&target) = deck;
                             let _ = worker_tx.send(CommandResponse::Loaded {
                                 deck_id,
                                 total_frames,
+                                analyzed,
                             });
                         }
                         Err(err) => {
