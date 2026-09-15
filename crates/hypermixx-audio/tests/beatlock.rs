@@ -7,10 +7,9 @@
 
 mod common;
 
-use std::fs;
 use std::time::Duration;
 
-use common::{ack, ask, load_both, seed_grids, session, state, states};
+use common::{ack, ask, decode_wav, load_both, seed_grids, session, state, states};
 use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::{BeatGrid, Command, CommandResponse, SAMPLE_RATE};
 
@@ -45,8 +44,8 @@ fn pair(tx: &Sender<Command>, rx: &Receiver<CommandResponse>) -> (u64, u64) {
 
 #[test]
 fn repeated_beatjumps_add_exactly_four_beats_each_time() {
-    let (path, tx, rx, _pipeline) = session("beatlock.wav", 14);
-    let total_frames = load_both(&tx, &rx, &path)[0].1;
+    let (tx, rx, _pipeline) = session();
+    let total_frames = load_both(&tx, &rx, decode_wav("beatlock.wav", 14))[0].1;
     seed_grids(&tx, &rx, BPM, total_frames);
     let grid = BeatGrid::from_constant_bpm(BPM, 0, total_frames, SAMPLE_RATE);
 
@@ -108,14 +107,12 @@ fn repeated_beatjumps_add_exactly_four_beats_each_time() {
 
     ask(&tx, Command::Quit);
     ack(&rx);
-    let _ = fs::remove_file(path);
 }
 
 #[test]
 fn undoing_a_beatjump_returns_to_the_same_frame() {
-    let (path, tx, rx, _pipeline) = session("beatundo.wav", 6);
-    let loaded = load_both(&tx, &rx, &path);
-    let total_frames = loaded[0].1;
+    let (tx, rx, _pipeline) = session();
+    let total_frames = load_both(&tx, &rx, decode_wav("beatundo.wav", 6))[0].1;
     seed_grids(&tx, &rx, BPM, total_frames);
     ask(&tx, Command::Play { deck_id: 1 });
     ack(&rx);
@@ -157,5 +154,4 @@ fn undoing_a_beatjump_returns_to_the_same_frame() {
 
     ask(&tx, Command::Quit);
     ack(&rx);
-    let _ = fs::remove_file(path);
 }

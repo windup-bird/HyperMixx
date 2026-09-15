@@ -1,9 +1,10 @@
-//! PCM memory pool: the in-memory `Source` the deck reads from.
+//! PCM memory pool: the in-memory `Source` the deck and analyser read from.
 
 use std::sync::Arc;
 
-use super::{DecodedAudio, Source};
-use crate::CHANNELS;
+use crate::decoder::DecodedAudio;
+use crate::Source;
+use hypermixx_core::CHANNELS;
 
 /// Immutable, shareable decoded track. Cloning a pool is an `Arc` bump, so every `Flow` of a deck
 /// can hold one without duplicating audio data.

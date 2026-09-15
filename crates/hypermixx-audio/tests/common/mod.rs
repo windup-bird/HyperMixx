@@ -48,34 +48,38 @@ pub fn temp_path(name: &str) -> String {
 
 // Command-channel harness, shared by the engine-level tests.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use hypermixx_audio::{AudioPipeline, Command, CommandResponse, DeckState, SAMPLE_RATE};
+use hypermixx_audio::{
+    AudioPipeline, BeatGrid, Command, CommandResponse, DeckId, DeckState, TrackAnalysis,
+};
+use hypermixx_core::Shared;
+use hypermixx_media::{decode_file, PcmPool};
 
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Starts an engine over a generated wav and hands back a command line plus its answers.
-pub fn session(
-    name: &str,
-    seconds: u64,
-) -> (
-    String,
-    Sender<Command>,
-    Receiver<CommandResponse>,
-    AudioPipeline,
-) {
+/// Writes a generated wav, decodes it (as the CLI would), and returns the ready source.
+pub fn decode_wav(name: &str, seconds: u64) -> Shared {
     let path = temp_path(name);
     write_wav(
         &path,
-        SAMPLE_RATE,
+        hypermixx_audio::SAMPLE_RATE,
         2,
-        (seconds as u32 * SAMPLE_RATE) as usize,
+        (seconds as u32 * hypermixx_audio::SAMPLE_RATE) as usize,
     );
+    let decoded = decode_file(&path).expect("generated wav should decode");
+    let _ = std::fs::remove_file(&path);
+    Arc::new(PcmPool::from_decoded(decoded))
+}
+
+/// Starts an engine and hands back a command line plus its answers.
+pub fn session() -> (Sender<Command>, Receiver<CommandResponse>, AudioPipeline) {
     let (command_tx, command_rx) = unbounded();
     let (response_tx, response_rx) = unbounded();
     let pipeline = AudioPipeline::start(command_rx, response_tx);
-    (path, command_tx, response_rx, pipeline)
+    (command_tx, response_rx, pipeline)
 }
 
 pub fn ask(tx: &Sender<Command>, command: Command) {
@@ -96,7 +100,7 @@ pub fn ack(rx: &Receiver<CommandResponse>) {
     }
 }
 
-pub fn state(tx: &Sender<Command>, rx: &Receiver<CommandResponse>, deck_id: usize) -> DeckState {
+pub fn state(tx: &Sender<Command>, rx: &Receiver<CommandResponse>, deck_id: DeckId) -> DeckState {
     ask(tx, Command::GetState { deck_id });
     match answer(rx) {
         CommandResponse::State(state) => state,
@@ -114,28 +118,56 @@ pub fn states(tx: &Sender<Command>, rx: &Receiver<CommandResponse>) -> Vec<DeckS
     }
 }
 
-/// Loads the same file into both decks and waits for both decode threads to answer.
+/// Loads the same decoded source into a deck and returns its length from the `Loaded` reply.
+pub fn load(
+    tx: &Sender<Command>,
+    rx: &Receiver<CommandResponse>,
+    deck_id: DeckId,
+    source: Shared,
+) -> u64 {
+    ask(
+        tx,
+        Command::Load {
+            deck_id,
+            source,
+            analysis: None,
+        },
+    );
+    match answer(rx) {
+        CommandResponse::Loaded {
+            deck_id: d,
+            total_frames,
+        } => {
+            assert_eq!(d, deck_id);
+            total_frames
+        }
+        CommandResponse::Error(err) => panic!("load failed: {err}"),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+}
+
+/// Loads the same source into both decks, returning `(deck_id, total_frames)` for each.
 pub fn load_both(
     tx: &Sender<Command>,
     rx: &Receiver<CommandResponse>,
-    path: &str,
-) -> Vec<(usize, u64)> {
+    source: Shared,
+) -> Vec<(DeckId, u64)> {
+    let mut loaded = Vec::new();
     for deck_id in 0..2 {
         ask(
             tx,
             Command::Load {
                 deck_id,
-                path: path.to_owned(),
+                source: Arc::clone(&source),
+                analysis: None,
             },
         );
     }
-    let mut loaded = Vec::new();
     for _ in 0..2 {
         match answer(rx) {
             CommandResponse::Loaded {
                 deck_id,
                 total_frames,
-                ..
             } => loaded.push((deck_id, total_frames)),
             CommandResponse::Error(err) => panic!("load failed: {err}"),
             other => panic!("expected Loaded, got {other:?}"),
@@ -143,6 +175,15 @@ pub fn load_both(
     }
     loaded.sort_unstable();
     loaded
+}
+
+/// A deterministic constant-BPM analysis the caller can install alongside a load.
+pub fn constant_grid(bpm: f32, total_frames: u64) -> TrackAnalysis {
+    TrackAnalysis {
+        beatgrid: BeatGrid::from_constant_bpm(bpm, 0, total_frames, hypermixx_audio::SAMPLE_RATE),
+        key: None,
+        bpm: Some(bpm),
+    }
 }
 
 /// Sends a constant-BPM grid to both decks so beatjump has something to work with.
@@ -153,17 +194,13 @@ pub fn seed_grids(
     total_frames: u64,
 ) {
     for deck_id in 0..2 {
-        let analysis = hypermixx_audio::TrackAnalysis {
-            beatgrid: hypermixx_audio::BeatGrid::from_constant_bpm(
-                bpm,
-                0,
-                total_frames,
-                hypermixx_audio::SAMPLE_RATE,
-            ),
-            key: None,
-            bpm: Some(bpm),
-        };
-        ask(tx, Command::SetAnalysis { deck_id, analysis });
+        ask(
+            tx,
+            Command::SetAnalysis {
+                deck_id,
+                analysis: constant_grid(bpm, total_frames),
+            },
+        );
         ack(rx);
     }
 }

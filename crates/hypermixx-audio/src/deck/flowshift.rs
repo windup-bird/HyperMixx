@@ -1,7 +1,9 @@
-//! TimeShift: offloads flow warm-up to a background thread so jumps never block the caller.
+//! FlowShift: offloads flow warm-up to a background thread so jumps never block the caller.
+//!
+//! Renamed from `TimeShift` — "time" collided with time-stretch; this shifts *flows*, not time.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -15,7 +17,7 @@ use crate::flow::Flow;
 /// `submit_prepare` moves a `Flow` to the worker, which warms it up and parks it in `warm` before
 /// announcing its id on the ready channel. Announcing after parking means `poll_ready() -> Some(id)`
 /// always guarantees `take_ready_flow(id)` succeeds.
-pub struct TimeShift {
+pub struct FlowShift {
     prepare_tx: Sender<Flow>,
     ready_rx: Receiver<u64>,
     ready_tx: Sender<u64>,
@@ -23,16 +25,16 @@ pub struct TimeShift {
     /// Only the newest submitted flow is announced; a newer jump supersedes an in-flight warm-up.
     latest: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: Arc<AtomicBool>,
 }
 
-impl TimeShift {
+impl FlowShift {
     pub fn new() -> Self {
         let (prepare_tx, prepare_rx) = unbounded::<Flow>();
         let (ready_tx, ready_rx) = unbounded::<u64>();
         let warm: Arc<Mutex<HashMap<u64, Flow>>> = Arc::new(Mutex::new(HashMap::new()));
         let latest = Arc::new(AtomicU64::new(0));
-        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         let thread_warm = Arc::clone(&warm);
         let thread_latest = Arc::clone(&latest);
@@ -103,13 +105,13 @@ impl TimeShift {
     }
 }
 
-impl Default for TimeShift {
+impl Default for FlowShift {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Drop for TimeShift {
+impl Drop for FlowShift {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
@@ -122,11 +124,11 @@ impl Drop for TimeShift {
 mod tests {
     use super::*;
     use crate::flow::FlowState;
-    use crate::source::{DecodedAudio, PcmPool};
-    use crate::CHANNELS;
+    use hypermixx_core::CHANNELS;
+    use hypermixx_media::{DecodedAudio, PcmPool};
     use std::sync::Arc;
 
-    fn source(n_frames: u64) -> Arc<dyn crate::source::Source> {
+    fn source(n_frames: u64) -> Arc<dyn hypermixx_core::Source> {
         Arc::new(PcmPool::from_decoded(DecodedAudio {
             pcm: (0..n_frames as usize)
                 .flat_map(|i| [i as f32, i as f32])
@@ -156,7 +158,7 @@ mod tests {
 
     #[test]
     fn warms_flow_up_and_parks_it() {
-        let ts = TimeShift::new();
+        let ts = FlowShift::new();
         let (flow, ready_rx) = dummy_flow(1, 123);
         ts.submit_prepare(flow);
 
@@ -172,7 +174,7 @@ mod tests {
 
     #[test]
     fn announces_on_the_channel_it_was_given() {
-        let ts = TimeShift::new();
+        let ts = FlowShift::new();
         let flow = Flow::new(3, source(1000), 200, None, ts.ready_sender());
         ts.submit_prepare(flow);
         assert_eq!(wait_for("deck announcement", || ts.poll_ready()), 3);
@@ -184,7 +186,7 @@ mod tests {
 
     #[test]
     fn the_newest_jump_always_ends_up_warm() {
-        let ts = TimeShift::new();
+        let ts = FlowShift::new();
         for id in 10..14 {
             let (flow, _) = dummy_flow(id, id * 100);
             ts.submit_prepare(flow);
@@ -195,7 +197,7 @@ mod tests {
 
     #[test]
     fn poll_is_non_blocking_when_idle() {
-        let ts = TimeShift::new();
+        let ts = FlowShift::new();
         assert_eq!(ts.poll_ready(), None);
         assert!(ts.take_ready_flow(1).is_none());
         assert_eq!(ts.pending(), 0);

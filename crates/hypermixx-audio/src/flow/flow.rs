@@ -4,8 +4,8 @@ use crossbeam_channel::Sender;
 use std::sync::Arc;
 
 use super::PitchShiftEngine;
-use crate::source::Source;
 use crate::CHANNELS;
+use hypermixx_core::Source;
 
 /// Lifecycle of a flow. A deck always keeps exactly one `Active` flow; jumps spawn a
 /// `Preparing` flow that becomes `Ready` on the warm-up thread and `Active` on the next block.
@@ -129,8 +129,8 @@ impl Flow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{DecodedAudio, PcmPool};
     use crossbeam_channel::{unbounded, Receiver};
+    use hypermixx_media::{DecodedAudio, PcmPool};
 
     fn flow(n_frames: u64, start: u64, end: Option<u64>) -> (Flow, Receiver<u64>) {
         let source = Arc::new(PcmPool::from_decoded(DecodedAudio {

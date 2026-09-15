@@ -1,245 +1,287 @@
 //! Command line front-end for the Hypermixx audio engine.
+//!
+//! The CLI owns file IO and analysis: `load` decodes on a worker thread and hands the pipeline a
+//! ready source; `analyse` runs the library analyser and publishes a compiled grid. The pipeline
+//! only ever receives executable commands. A dedicated printer thread renders responses as they
+//! arrive, so nothing here blocks on the engine.
 
 use std::io::{self, BufRead, Write};
-use std::time::Duration;
+use std::sync::Arc;
 
-use crossbeam_channel::{unbounded, Receiver};
-use hypermixx_audio::{
-    AudioPipeline, Command, CommandResponse, DeckState, DECK_COUNT, SAMPLE_RATE,
-};
+use crossbeam_channel::{unbounded, Sender};
+use hypermixx_audio::{AudioPipeline, Command, CommandResponse, DECK_COUNT, SAMPLE_RATE};
+use hypermixx_core::Backend;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// Decoding runs in the engine, so `load` may take a while on long files.
-const LOAD_TIMEOUT: Duration = Duration::from_secs(300);
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() {
+    let backend = parse_backend();
     let (command_tx, command_rx) = unbounded();
     let (response_tx, response_rx) = unbounded();
     let pipeline = AudioPipeline::start(command_rx, response_tx);
 
     println!(
-        "hypermixx {VERSION} — {DECK_COUNT} decks, 48kHz stereo. `help` for commands, `quit` to exit."
+        "hypermixx {VERSION} — {DECK_COUNT} decks, 48kHz stereo, backend {backend:?}. \
+         `help` for commands, `quit` to exit."
     );
-    let mut stdin = io::stdin().lock();
 
-    // `read_line` returns None on EOF or Ctrl-D, which ends the session.
+    // Printer thread: render every engine response as it lands, then end when the channel closes.
+    let printer = std::thread::spawn(move || {
+        while let Ok(response) = response_rx.recv() {
+            print_response(&response);
+        }
+    });
+
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
+    // `read_line` returns None on EOF / Ctrl-D, which ends the session.
     while let Some(line) = read_line(&mut stdin) {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let commands = match parse(line) {
-            Ok(commands) => commands,
-            Err(message) => {
-                eprintln!("error: {message}");
-                continue;
-            }
-        };
-        if commands.is_empty() {
-            continue; // help, or a line that needs no engine round-trip
-        }
-        let quitting = commands
-            .iter()
-            .any(|command| matches!(command, Command::Quit));
-        let loading = commands
-            .iter()
-            .any(|command| matches!(command, Command::Load { .. }));
-        let timeout = if loading {
-            LOAD_TIMEOUT
-        } else {
-            COMMAND_TIMEOUT
-        };
-
-        // Every command answers exactly once, so send them all and then collect the same number
-        // of replies, in order.
-        let expected = commands.len();
-        for command in commands {
-            if command_tx.send(command).is_err() {
-                eprintln!("error: the audio engine is gone");
-                return;
-            }
-        }
-        if quitting {
-            break;
-        }
-        for _ in 0..expected {
-            // report yields (deck_id, needs_analysis) on a load: skip analysis when the deck
-            // already carries a constant-bpm grid.
-            if let Some((deck_id, needs_analysis)) = report(&response_rx, timeout) {
-                if needs_analysis {
-                    spawn_analysis(deck_id, &pipeline);
-                }
-            }
+        match dispatch(line, &command_tx, &pipeline, backend) {
+            Action::Continue => {}
+            Action::Quit => break,
+            Action::Bad(message) => eprintln!("error: {message}"),
         }
     }
 
-    // Ask nicely, then let the pipeline's Drop join its threads.
     let _ = command_tx.send(Command::Quit);
+    drop(command_tx);
     drop(pipeline);
+    let _ = printer.join();
 }
 
-/// Reads one line, printing the prompt. `None` means end of input.
-fn read_line(stdin: &mut impl BufRead) -> Option<String> {
-    print!("hypermixx> ");
-    let _ = io::stdout().flush();
-    let mut line = String::new();
-    match stdin.read_line(&mut line) {
-        Ok(0) => {
-            println!();
-            None
-        }
-        Ok(_) => Some(line),
-        Err(err) => {
-            eprintln!("error: stdin ({err})");
-            None
-        }
-    }
+/// Result of interpreting one input line.
+enum Action {
+    Continue,
+    Quit,
+    Bad(String),
 }
 
-/// Turns one input line into the commands to send.
-fn parse(line: &str) -> Result<Vec<Command>, String> {
+/// Turns a line into engine effects: an immediate command, or a background decode/analyse task.
+fn dispatch(
+    line: &str,
+    command_tx: &Sender<Command>,
+    pipeline: &AudioPipeline,
+    backend: Backend,
+) -> Action {
     let mut words = line.split_whitespace();
-    let commands = match words.next().unwrap_or_default() {
+    let head = words.next().unwrap_or_default();
+    let mut deck = || deck_id(words.next());
+
+    match head {
         "load" => {
-            let deck_id = deck_id(words.next())?;
-            let path = words.next().ok_or("usage: load <deck_id> <path> [bpm]")?;
-            // An explicit BPM builds a deterministic constant-tempo grid in the engine and skips
-            // async analysis; omitting it runs the analyser.
+            let deck_id = match deck() {
+                Ok(id) => id,
+                Err(e) => return Action::Bad(e),
+            };
+            let Some(path) = words.next() else {
+                return Action::Bad("usage: load <deck> <path> [bpm]".into());
+            };
             let bpm = match words.next() {
-                Some(raw) => Some(raw.parse::<f32>().map_err(|_| "bpm must be a number")?),
+                Some(raw) => match raw.parse::<f32>() {
+                    Ok(v) => Some(v),
+                    Err(_) => return Action::Bad("bpm must be a number".into()),
+                },
                 None => None,
             };
-            vec![Command::Load {
-                deck_id,
-                path: path.to_owned(),
-                bpm,
-            }]
+            spawn_load(deck_id, path.to_owned(), bpm, command_tx.clone());
+            Action::Continue
         }
-        "play" => vec![Command::Play {
-            deck_id: deck_id(words.next())?,
-        }],
-        "pause" => vec![Command::Pause {
-            deck_id: deck_id(words.next())?,
-        }],
+        "analyse" | "analyze" => {
+            let deck_id = match deck() {
+                Ok(id) => id,
+                Err(e) => return Action::Bad(e),
+            };
+            let Some(source) = deck_source(pipeline, deck_id) else {
+                return Action::Bad(format!("deck {deck_id} holds no track to analyse"));
+            };
+            spawn_analyse(deck_id, source, backend, command_tx.clone());
+            Action::Continue
+        }
+        "play" => forward(deck().map(|d| Command::Play { deck_id: d }), command_tx),
+        "pause" => forward(deck().map(|d| Command::Pause { deck_id: d }), command_tx),
         "jump" => {
-            let deck_id = deck_id(words.next())?;
-            let frame = words.next().ok_or("usage: jump <deck_id> <frame>")?;
-            vec![Command::Jump {
-                deck_id,
-                target_frame: frame.parse::<u64>().map_err(|_| "frame must be a number")?,
-            }]
+            let deck_id = match deck() {
+                Ok(id) => id,
+                Err(e) => return Action::Bad(e),
+            };
+            match words.next().map(str::parse::<u64>) {
+                Some(Ok(target_frame)) => send(
+                    command_tx,
+                    Command::Jump {
+                        deck_id,
+                        target_frame,
+                    },
+                ),
+                _ => Action::Bad("usage: jump <deck> <frame>".into()),
+            }
         }
         "beatjump" => {
-            let deck_id = deck_id(words.next())?;
-            let beats = words.next().ok_or("usage: beatjump <deck_id> <beats>")?;
-            vec![Command::BeatJump {
-                deck_id,
-                beats: beats
-                    .parse::<i64>()
-                    .map_err(|_| "beats must be a whole number")?,
-            }]
+            let deck_id = match deck() {
+                Ok(id) => id,
+                Err(e) => return Action::Bad(e),
+            };
+            match words.next().map(str::parse::<i64>) {
+                Some(Ok(beats)) => send(command_tx, Command::BeatJump { deck_id, beats }),
+                _ => Action::Bad("usage: beatjump <deck> <beats>".into()),
+            }
         }
-        "state" => vec![Command::GetAllStates],
         "rate" => {
-            let deck_id = deck_id(words.next())?;
-            let rate = words.next().ok_or("usage: rate <deck_id> <ratio>")?;
-            vec![Command::SetRate {
-                deck_id,
-                rate: rate.parse::<f32>().map_err(|_| "rate must be a number")?,
-            }]
+            let deck_id = match deck() {
+                Ok(id) => id,
+                Err(e) => return Action::Bad(e),
+            };
+            match words.next().map(str::parse::<f32>) {
+                Some(Ok(rate)) => send(command_tx, Command::SetRate { deck_id, rate }),
+                _ => Action::Bad("usage: rate <deck> <ratio>".into()),
+            }
         }
         "profile" => {
-            let deck_id = deck_id(words.next())?;
-            let profile = words
-                .next()
-                .ok_or("usage: profile <deck_id> <tape|keylock|wide>")?;
-            vec![Command::SetProfile {
-                deck_id,
-                profile: profile.to_owned(),
-            }]
+            let deck_id = match deck() {
+                Ok(id) => id,
+                Err(e) => return Action::Bad(e),
+            };
+            match words.next() {
+                Some(profile) => send(
+                    command_tx,
+                    Command::SetProfile {
+                        deck_id,
+                        profile: profile.to_owned(),
+                    },
+                ),
+                None => Action::Bad("usage: profile <deck> <tape|keylock|wide>".into()),
+            }
         }
-        "quit" | "exit" | "q" => vec![Command::Quit],
+        "state" => send(command_tx, Command::GetAllStates),
         "help" | "h" | "?" => {
             print_help();
-            Vec::new()
+            Action::Continue
         }
-        other => return Err(format!("unknown command `{other}` — `help` lists them")),
-    };
-    Ok(commands)
+        "quit" | "exit" | "q" => Action::Quit,
+        other => Action::Bad(format!("unknown command `{other}` — `help` lists them")),
+    }
 }
 
-fn deck_id(word: Option<&str>) -> Result<usize, String> {
-    let last = DECK_COUNT - 1;
-    let raw = word.ok_or(format!("missing deck id, expected 0..{last}"))?;
-    let id = raw
-        .parse::<usize>()
-        .map_err(|_| format!("deck id must be a number, got `{raw}`"))?;
-    if id < DECK_COUNT {
+fn forward(built: Result<Command, String>, command_tx: &Sender<Command>) -> Action {
+    match built {
+        Ok(command) => send(command_tx, command),
+        Err(message) => Action::Bad(message),
+    }
+}
+
+fn send(command_tx: &Sender<Command>, command: Command) -> Action {
+    if command_tx.send(command).is_err() {
+        Action::Bad("the audio engine is gone".into())
+    } else {
+        Action::Continue
+    }
+}
+
+fn deck_id(word: Option<&str>) -> Result<u8, String> {
+    let last = (DECK_COUNT - 1) as u8;
+    let raw = word.ok_or_else(|| format!("missing deck id, expected 0..{last}"))?;
+    let id: u8 = raw
+        .parse()
+        .map_err(|_| format!("deck id must be a number in 0..{last}, got `{raw}`"))?;
+    if (id as usize) < DECK_COUNT {
         Ok(id)
     } else {
-        Err(format!("unknown deck {id}, valid ids are 0..{last}"))
+        Err(format!("unknown deck {id}, valid ids are 0..={last}"))
     }
 }
 
-fn print_help() {
-    println!(
-        "commands ({} decks, ids 0..{}):
-  load <deck> <path> [bpm]   decode mp3/wav/flac; a given bpm builds a fixed grid and skips analysis
-  play <deck>                start that deck
-  pause <deck>               stop it, keeping the position
-  jump <deck> <frame>        seek to a frame (1 second = {SAMPLE_RATE} frames)
-  beatjump <deck> <beats>    seek by whole beats, keeping the phase
-  rate <deck> <ratio>        set tempo rate (1.0 = unity, 0.5 = half speed)
-  profile <deck> <name>      tape / keylock / wide (default: tape)
-  state                      show every deck
-  quit                       exit",
-        DECK_COUNT,
-        DECK_COUNT - 1
-    );
+/// Clones the deck's current PCM source out from behind its mutex.
+fn deck_source(pipeline: &AudioPipeline, deck_id: u8) -> Option<Arc<dyn hypermixx_core::Source>> {
+    let deck = pipeline.deck(deck_id)?;
+    let guard = deck.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.total_frames() == 0 {
+        return None;
+    }
+    Some(guard.source())
 }
 
-fn report(response_rx: &Receiver<CommandResponse>, timeout: Duration) -> Option<(usize, bool)> {
-    match response_rx.recv_timeout(timeout) {
-        Ok(CommandResponse::Loaded {
+/// Decodes on a worker thread, then hands the pipeline a ready source (+ optional constant grid).
+fn spawn_load(deck_id: u8, path: String, bpm: Option<f32>, command_tx: Sender<Command>) {
+    std::thread::Builder::new()
+        .name(format!("hypermixx-load-{deck_id}"))
+        .spawn(move || match hypermixx_media::decode_file(&path) {
+            Ok(decoded) => {
+                let total_frames = decoded.total_frames;
+                let analysis = bpm.filter(|b| *b > 0.0).map(|bpm| {
+                    hypermixx_core::TrackAnalysis::from_grid(
+                        hypermixx_core::BeatGrid::from_constant_bpm(
+                            bpm,
+                            0,
+                            total_frames,
+                            SAMPLE_RATE,
+                        ),
+                        bpm,
+                    )
+                });
+                let source: hypermixx_core::Shared =
+                    Arc::new(hypermixx_media::PcmPool::from_decoded(decoded));
+                let _ = command_tx.send(Command::Load {
+                    deck_id,
+                    source,
+                    analysis,
+                });
+            }
+            Err(err) => eprintln!("error: deck {deck_id}, {path}: {err}"),
+        })
+        .ok();
+}
+
+/// Runs the library analyser on a worker thread, then publishes a compiled grid.
+fn spawn_analyse(
+    deck_id: u8,
+    source: Arc<dyn hypermixx_core::Source>,
+    backend: Backend,
+    command_tx: Sender<Command>,
+) {
+    std::thread::Builder::new()
+        .name(format!("hypermixx-analyse-{deck_id}"))
+        .spawn(move || {
+            eprintln!("[analyse] deck{deck_id}: running {backend:?}...");
+            match hypermixx_library::analyser::analyze(source, SAMPLE_RATE, backend) {
+                Ok(analysis) => {
+                    let bpm = analysis.bpm();
+                    let key = analysis
+                        .key
+                        .map(|k| k.traditional())
+                        .unwrap_or_else(|| "--".into());
+                    eprintln!("[analyse] deck{deck_id}: {bpm:.1} BPM, {key}");
+                    let _ = command_tx.send(Command::SetAnalysis { deck_id, analysis });
+                }
+                Err(err) => eprintln!("[analyse] deck{deck_id}: {err}"),
+            }
+        })
+        .ok();
+}
+
+fn print_response(response: &CommandResponse) {
+    match response {
+        CommandResponse::Loaded {
             deck_id,
             total_frames,
-            analyzed,
-        }) => {
-            println!(
-                "deck{deck_id} loaded: {total_frames} frames ({})",
-                format_time(total_frames)
-            );
-            Some((deck_id, !analyzed))
-        }
-        Ok(CommandResponse::State(state)) => {
-            print_state(&state);
-            None
-        }
-        // One answer holding every deck: all rows come from the same production block.
-        Ok(CommandResponse::States(states)) => {
+        } => println!(
+            "deck{deck_id} loaded: {total_frames} frames ({})",
+            format_time(*total_frames)
+        ),
+        CommandResponse::State(state) => print_state(state),
+        CommandResponse::States(states) => {
             for state in states {
-                print_state(&state);
+                print_state(state);
             }
-            None
         }
-        Ok(CommandResponse::Ok) => None,
-        Ok(CommandResponse::Error(message)) => {
-            eprintln!("error: {message}");
-            None
-        }
-        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-            eprintln!("error: the engine did not answer in time");
-            None
-        }
-        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-            eprintln!("error: the audio engine shut down");
-            None
-        }
+        CommandResponse::Ok => {}
+        CommandResponse::Error(message) => eprintln!("error: {message}"),
     }
 }
 
-fn print_state(state: &DeckState) {
+fn print_state(state: &hypermixx_core::DeckState) {
     let transport = if state.total_frames == 0 {
         "empty"
     } else if state.playing {
@@ -257,9 +299,9 @@ fn print_state(state: &DeckState) {
     } else {
         "no grid".into()
     };
-    let key_label = state.key.as_deref().unwrap_or("--");
+    let key = state.key.as_deref().unwrap_or("--");
     println!(
-        "deck{}  {transport:<7} {} / {duration}  [{}/{}]  {tempo}  {key_label}",
+        "deck{}  {transport:<7} {} / {duration}  [{}/{}]  {tempo}  {key}",
         state.deck_id,
         format_time(state.current_frame),
         state.current_frame,
@@ -267,41 +309,54 @@ fn print_state(state: &DeckState) {
     );
 }
 
-/// Spawns a background thread that reads PCM from the deck, runs beat/key analysis, and publishes
-/// the result via `Deck::set_analysis` (ArcSwap, lock-free). The next `state` query shows it.
-fn spawn_analysis(deck_id: usize, pipeline: &AudioPipeline) {
-    let Some(deck) = pipeline.deck(deck_id).cloned() else {
-        return;
-    };
-    let spawned = std::thread::Builder::new()
-        .name(format!("hypermixx-analysis-{deck_id}"))
-        .spawn(move || {
-            let (source, total_frames) = {
-                let guard = deck.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                (guard.source(), guard.total_frames())
-            };
-            if total_frames == 0 {
-                return;
-            }
-            eprintln!("[analysis] deck{deck_id}: analyzing {total_frames} frames...");
-            let mono = hypermixx_analysis::downmix_to_mono(source.as_ref(), total_frames, 2);
-            match hypermixx_analysis::analyze(&mono, hypermixx_audio::SAMPLE_RATE) {
-                Ok(analysis) => {
-                    let bpm = analysis.bpm.unwrap_or(0.0);
-                    let key = analysis.key.as_ref().map(|k| k.name()).unwrap_or_default();
-                    deck.lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .set_analysis(analysis);
-                    eprintln!("[analysis] deck{deck_id}: {bpm:.1} BPM, {key}");
-                }
-                Err(err) => {
-                    eprintln!("[analysis] deck{deck_id}: {err}");
-                }
-            }
-        });
-    if let Err(err) = spawned {
-        eprintln!("[analysis] could not start thread: {err}");
+fn read_line(stdin: &mut impl BufRead) -> Option<String> {
+    print!("hypermixx> ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    match stdin.read_line(&mut line) {
+        Ok(0) => {
+            println!();
+            None
+        }
+        Ok(_) => Some(line),
+        Err(err) => {
+            eprintln!("error: stdin ({err})");
+            None
+        }
     }
+}
+
+/// Reads `--backend auto|stratum|timestretch` (default `auto`).
+fn parse_backend() -> Backend {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--backend" {
+            return match args.next().as_deref() {
+                Some("stratum") => Backend::Stratum,
+                Some("timestretch") => Backend::Timestretch,
+                _ => Backend::Auto,
+            };
+        }
+    }
+    Backend::Auto
+}
+
+fn print_help() {
+    println!(
+        "commands ({} decks, ids 0..{}):
+  load <deck> <path> [bpm]   decode a file; a given bpm builds a fixed grid, skipping analysis
+  analyse <deck>             run the analyser on the deck's track and publish its grid
+  play <deck>                start that deck
+  pause <deck>               stop it, keeping the position
+  jump <deck> <frame>        seek to a frame (1 second = {SAMPLE_RATE} frames)
+  beatjump <deck> <beats>    seek by whole beats, keeping the phase
+  rate <deck> <ratio>        set tempo rate (1.0 = unity, 0.5 = half speed)
+  profile <deck> <name>      tape / keylock / wide (default: tape)
+  state                      show every deck
+  quit                       exit",
+        DECK_COUNT,
+        DECK_COUNT - 1
+    );
 }
 
 /// Frames -> `m:ss.mmm` at the engine rate.

@@ -12,8 +12,8 @@ use timestretch::engine::{
 };
 use timestretch::error::StretchError;
 
-use crate::source::Source;
 use crate::{CHANNELS, SAMPLE_RATE};
+use hypermixx_core::Source;
 
 /// How many source frames to push into the engine's ring per process_block.
 /// The ring absorbs excess; the engine consumes at its own tempo rate.

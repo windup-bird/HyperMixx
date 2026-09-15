@@ -3,12 +3,13 @@ name = "hypermixx-audio"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Hypermixx audio engine: decode -> deck -> ring buffer -> cpal output"
+description = "Real-time playback engine: decks, flows, time-stretch, mixing, cpal output"
 
 [dependencies]
+hypermixx-core = { path = "../hypermixx-core" }
+hypermixx-media = { path = "../hypermixx-media" }
 cpal = { workspace = true }
 rtrb = { workspace = true }
-symphonia = { workspace = true }
 crossbeam-channel = { workspace = true }
 timestretch = { path = "../timestretch" }
 arc-swap = "1"

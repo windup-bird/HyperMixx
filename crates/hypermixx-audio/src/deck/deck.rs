@@ -4,11 +4,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
+use hypermixx_core::{Key, Source, TrackAnalysis};
 
-use super::TimeShift;
-use crate::beatgrid::{KeyReport, TrackAnalysis};
+use super::jump::{resolve, Seek};
+use super::FlowShift;
 use crate::flow::{Flow, FlowState};
-use crate::source::Source;
 use crate::CHANNELS;
 
 /// A single playback deck.
@@ -20,7 +20,7 @@ pub struct Deck {
     pool: Arc<dyn Source>,
     flows: Vec<Flow>,
     active_index: usize,
-    timeshift: TimeShift,
+    flowshift: FlowShift,
     next_flow_id: u64,
     /// Deck position when the pending jump was submitted, used to shift its landing point by the
     /// audio the deck played while the new flow warmed up.
@@ -34,15 +34,15 @@ pub struct Deck {
 impl Deck {
     /// Creates a deck over `pool`, cued at frame 0 and paused.
     pub fn new(pool: Arc<dyn Source>) -> Self {
-        let timeshift = TimeShift::new();
-        let mut first = Flow::new(0, Arc::clone(&pool), 0, None, timeshift.ready_sender());
+        let flowshift = FlowShift::new();
+        let mut first = Flow::new(0, Arc::clone(&pool), 0, None, flowshift.ready_sender());
         first.prepare();
         first.activate();
         Self {
             pool,
             flows: vec![first],
             active_index: 0,
-            timeshift,
+            flowshift,
             next_flow_id: 1,
             cued_from: 0,
             playing: AtomicBool::new(false),
@@ -85,9 +85,9 @@ impl Deck {
             Arc::clone(&self.pool),
             target,
             None,
-            self.timeshift.ready_sender(),
+            self.flowshift.ready_sender(),
         );
-        self.timeshift.submit_prepare(flow);
+        self.flowshift.submit_prepare(flow);
     }
 
     /// Publishes track analysis (beat grid). Safe to call while the deck is playing.
@@ -101,33 +101,42 @@ impl Deck {
     }
 
     /// Detected musical key, or `None` when the deck has no analysis.
-    pub fn key(&self) -> Option<KeyReport> {
+    pub fn key(&self) -> Option<Key> {
         self.analysis().and_then(|a| a.key)
     }
 
     /// Reported BPM (from analysis), or grid-derived average. 0.0 without analysis.
     pub fn bpm(&self) -> f32 {
-        match self.analysis() {
-            Some(a) => a.bpm.unwrap_or_else(|| a.beatgrid.average_bpm()),
-            None => 0.0,
+        self.analysis().map(|a| a.bpm()).unwrap_or(0.0)
+    }
+
+    /// Where a [`Seek`] would land from the current position, without jumping. `None` without a
+    /// grid (except [`Seek::Frames`], which needs none).
+    pub fn seek_target_frame(&self, seek: Seek) -> Option<u64> {
+        match seek {
+            Seek::Frames(frame) => Some(frame),
+            other => {
+                let analysis = self.analysis()?;
+                resolve(&other, &analysis.beatgrid, self.current_frame())
+            }
         }
     }
 
     /// Where [`beatjump`](Self::beatjump) would land from the current position, without jumping.
     pub fn beat_target_frame(&self, beats: i64) -> Option<u64> {
-        let analysis = self.analysis()?;
-        Some(
-            analysis
-                .beatgrid
-                .beatjump_target(self.current_frame(), beats),
-        )
+        self.seek_target_frame(Seek::Beats(beats))
     }
 
     /// Non-blocking jump of whole beats, keeping the phase inside the current beat.
     ///
     /// Does nothing when the deck has no beat grid yet — a wrong grid is worse than no grid.
     pub fn beatjump(&mut self, beats: i64) {
-        if let Some(target) = self.beat_target_frame(beats) {
+        self.seek(Seek::Beats(beats));
+    }
+
+    /// Non-blocking seek from a musical [`Seek`]; no-op if it can't be resolved (empty grid).
+    pub fn seek(&mut self, seek: Seek) {
+        if let Some(target) = self.seek_target_frame(seek) {
             self.jump(target);
         }
     }
@@ -182,13 +191,13 @@ impl Deck {
     }
 
     fn poll_ready_flows(&mut self) {
-        while let Some(id) = self.timeshift.poll_ready() {
+        while let Some(id) = self.flowshift.poll_ready() {
             self.switch_to(id);
         }
     }
 
     fn switch_to(&mut self, flow_id: u64) {
-        let Some(mut flow) = self.timeshift.take_ready_flow(flow_id) else {
+        let Some(mut flow) = self.flowshift.take_ready_flow(flow_id) else {
             return;
         };
         // The target was computed when the command arrived; this deck kept playing while the flow
@@ -218,7 +227,8 @@ impl Deck {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{DecodedAudio, PcmPool};
+    use hypermixx_core::BeatGrid;
+    use hypermixx_media::{DecodedAudio, PcmPool};
 
     fn pool(n_frames: u64) -> Arc<dyn Source> {
         Arc::new(PcmPool::from_decoded(DecodedAudio {
@@ -368,12 +378,7 @@ mod tests {
 
     fn grid_122bpm(total_frames: u64) -> TrackAnalysis {
         TrackAnalysis {
-            beatgrid: crate::beatgrid::BeatGrid::from_constant_bpm(
-                122.0,
-                0,
-                total_frames,
-                crate::SAMPLE_RATE,
-            ),
+            beatgrid: BeatGrid::from_constant_bpm(122.0, 0, total_frames, crate::SAMPLE_RATE),
             key: None,
             bpm: Some(122.0),
         }

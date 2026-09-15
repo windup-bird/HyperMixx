@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fs::File;
 use std::path::Path;
 
+use hypermixx_core::{CHANNELS, SAMPLE_RATE};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymError;
@@ -12,9 +13,7 @@ use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-use crate::{CHANNELS, SAMPLE_RATE};
-
-/// Fully decoded audio, ready to be turned into a [`PcmPool`](crate::source::PcmPool).
+/// Fully decoded audio, ready to be turned into a [`PcmPool`](crate::PcmPool).
 pub struct DecodedAudio {
     /// Interleaved stereo PCM at `sample_rate`.
     pub pcm: Vec<f32>,
@@ -128,9 +127,9 @@ fn into_stereo(pcm: Vec<f32>, channels: usize) -> Vec<f32> {
 
 /// Naive linear-interpolation resampler, interleaved in / out.
 ///
-/// v1 deliberately trades quality for simplicity (spec allows "简单处理"): no anti-alias filter,
-/// so upsampling is slightly bright and downsampling can alias. Replace with a proper
-/// (polyphase / windowed-sinc) stage before shipping time-stretch quality work.
+/// v1 deliberately trades quality for simplicity: no anti-alias filter, so upsampling is slightly
+/// bright and downsampling can alias. Replace with a proper (polyphase / windowed-sinc) stage
+/// before shipping time-stretch quality work.
 fn resample(pcm: Vec<f32>, from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == 0 || from_rate == to_rate {
         return pcm;

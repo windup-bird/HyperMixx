@@ -1,0 +1,9 @@
+[package]
+name = "hypermixx-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared protocol types: beat grid, key, deck state, commands, source interface"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

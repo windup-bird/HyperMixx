@@ -1,28 +1,29 @@
-//! Hypermixx audio engine: two decks, beat grid, passthrough pitchshift, no mixer yet.
+//! Hypermixx audio engine: dual-deck transport, time-stretch, mixing, cpal output.
+//!
+//! Depends on `core` (types) and `media` (PCM). Knows nothing about files or analysis — the CLI
+//! decodes and analyses elsewhere, then hands results in via [`Command`](hypermixx_core::Command).
 
-// `flow/flow.rs` and `deck/deck.rs` are named by the project spec, not by us.
+// `deck/deck.rs` and `flow/flow.rs` keep their names from the project spec.
 #![allow(clippy::module_inception)]
 
-pub mod beatgrid;
-pub mod command;
 pub mod deck;
 pub mod flow;
 pub mod pipeline;
 pub mod ringbuf;
-pub mod source;
 
-pub use beatgrid::{BeatGrid, KeyMode, KeyReport, TrackAnalysis};
-pub use command::{Command, CommandResponse, DeckState};
-pub use deck::Deck;
-pub use flow::Flow;
+// The engine's public surface: re-export the core types it trades in plus its own runtime types.
+pub use deck::{Deck, FlowShift, LoopState, Seek};
+pub use flow::{Flow, FlowState, PitchShiftEngine};
 pub use pipeline::AudioPipeline;
 pub use ringbuf::AudioRingBuffer;
-pub use source::{PcmPool, Source};
 
-/// Engine-wide sample rate. Everything downstream of the decoder is 48kHz.
-pub const SAMPLE_RATE: u32 = 48_000;
-/// Interleaved stereo.
-pub const CHANNELS: usize = 2;
+pub use {hypermixx_core as core, hypermixx_media as media};
+
+pub use hypermixx_core::{
+    Backend, BeatGrid, Command, CommandResponse, DeckId, DeckState, Key, KeyFormat, KeyMode,
+    TrackAnalysis, CHANNELS, SAMPLE_RATE,
+};
+
 /// Frames per processing block (one deck tick).
 pub const BLOCK_SIZE: usize = 256;
 /// Output ring buffer capacity, in frames.

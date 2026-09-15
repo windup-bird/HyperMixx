@@ -1,0 +1,12 @@
+[package]
+name = "hypermixx-library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Track metadata, editable beat specs, the grid compiler, and the beat/key analyser"
+
+[dependencies]
+hypermixx-core = { path = "../hypermixx-core" }
+hypermixx-media = { path = "../hypermixx-media" }
+stratum-dsp = { path = "../stratum-dsp" }
+serde = { version = "1", features = ["derive"] }

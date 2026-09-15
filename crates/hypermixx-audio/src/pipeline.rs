@@ -4,7 +4,8 @@
 //!   CLI --Command--> [producer thread: deck0 + deck1 -> mix] --f32--> ring --f32--> [cpal callback]
 //!
 //! The two ends of the ring are split to their threads at construction, so the audio callback only
-//! touches the ring buffer: no locks, no allocation, no decoding.
+//! touches the ring buffer: no locks, no allocation, no decoding. Commands carry already-decoded
+//! sources and already-compiled analysis — this thread never opens a file or runs an analyser.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -13,13 +14,12 @@ use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use hypermixx_core::{Command, CommandResponse, DeckId, DeckState};
+use hypermixx_media::PcmPool;
 use rtrb::{Consumer, Producer};
 
-use crate::beatgrid::{BeatGrid, TrackAnalysis};
-use crate::command::{Command, CommandResponse, DeckState};
 use crate::deck::Deck;
 use crate::ringbuf::{fill_with_silence_on_underrun, pop_samples, push_samples, AudioRingBuffer};
-use crate::source::{decode_file, PcmPool, Source};
 use crate::{
     BLOCK_SAMPLES, BLOCK_SIZE, CHANNELS, DECK_COUNT, DECK_MIX_GAIN, OUTPUT_RING_CAPACITY,
     OUTPUT_RING_SAMPLES, PREFILL_FRAMES, SAMPLE_RATE,
@@ -86,8 +86,8 @@ impl AudioPipeline {
 
     /// The deck behind `deck_id`, for consumers that inspect a transport directly (a future UI or
     /// mixer) instead of going through the command channel.
-    pub fn deck(&self, deck_id: usize) -> Option<&Arc<Mutex<Deck>>> {
-        self.decks.get(deck_id)
+    pub fn deck(&self, deck_id: DeckId) -> Option<&Arc<Mutex<Deck>>> {
+        self.decks.get(deck_id as usize)
     }
 
     /// Number of decks the pipeline mixes.
@@ -154,64 +154,34 @@ impl AudioPipeline {
         }
     }
 
-    /// Applies one command (everything except `Quit`, which ends the loop).
+    /// Applies one command (everything except `Quit`, which ends the loop). Every arm is a pure
+    /// engine action: no file IO, no analysis — those already happened in the CLI.
     fn handle_command(
         command: Command,
         decks: &[Arc<Mutex<Deck>>],
         response_tx: &Sender<CommandResponse>,
     ) {
         match command {
-            Command::Load { deck_id, path, bpm } => {
-                let Some(target) = decks.get(deck_id).cloned() else {
+            Command::Load {
+                deck_id,
+                source,
+                analysis,
+            } => {
+                let Some(target) = decks.get(deck_id as usize).cloned() else {
                     return unknown_deck(response_tx, deck_id, decks.len());
                 };
-                // Decoding is slow, so it gets its own thread; audio keeps running meanwhile.
-                let worker_tx = response_tx.clone();
-                let spawned = std::thread::Builder::new()
-                    .name(format!("hypermixx-decode-{deck_id}"))
-                    .spawn(move || match decode_file(&path) {
-                        Ok(decoded) => {
-                            let total_frames = decoded.total_frames;
-                            let pool: Arc<dyn Source> = Arc::new(PcmPool::from_decoded(decoded));
-                            let deck = Deck::new(pool);
-                            // A caller-supplied BPM builds a deterministic constant-tempo grid
-                            // now, so no async analysis is expected to overwrite it.
-                            let mut analyzed = false;
-                            if let Some(bpm) = bpm.filter(|b| *b > 0.0) {
-                                let beatgrid = BeatGrid::from_constant_bpm(
-                                    bpm,
-                                    0,
-                                    total_frames,
-                                    SAMPLE_RATE,
-                                );
-                                deck.set_analysis(TrackAnalysis {
-                                    beatgrid,
-                                    key: None,
-                                    bpm: Some(bpm),
-                                });
-                                analyzed = true;
-                            }
-                            // Replacing the deck resets its transport and joins the old warm-up
-                            // thread on drop; the other deck keeps playing untouched.
-                            *lock(&target) = deck;
-                            let _ = worker_tx.send(CommandResponse::Loaded {
-                                deck_id,
-                                total_frames,
-                                analyzed,
-                            });
-                        }
-                        Err(err) => {
-                            let _ = worker_tx.send(CommandResponse::Error(format!(
-                                "deck {deck_id}, {path}: {err}"
-                            )));
-                        }
-                    });
-                if let Err(err) = spawned {
-                    reject(
-                        response_tx,
-                        &format!("could not start decoder thread: {err}"),
-                    );
+                let total_frames = source.total_frames();
+                // Installing a fresh deck resets its transport and joins the old warm-up thread on
+                // drop; the other deck keeps playing untouched.
+                let deck = Deck::new(source);
+                if let Some(analysis) = analysis {
+                    deck.set_analysis(analysis);
                 }
+                *lock(&target) = deck;
+                let _ = response_tx.send(CommandResponse::Loaded {
+                    deck_id,
+                    total_frames,
+                });
             }
             Command::Play { deck_id } => {
                 on_deck(decks, deck_id, response_tx, |deck| {
@@ -241,7 +211,7 @@ impl AudioPipeline {
                 });
             }
             Command::SetAnalysis { deck_id, analysis } => {
-                let Some(deck) = decks.get(deck_id) else {
+                let Some(deck) = decks.get(deck_id as usize) else {
                     return unknown_deck(response_tx, deck_id, decks.len());
                 };
                 lock(deck).set_analysis(analysis);
@@ -271,7 +241,7 @@ impl AudioPipeline {
                 });
             }
             Command::GetState { deck_id } => {
-                let Some(deck) = decks.get(deck_id) else {
+                let Some(deck) = decks.get(deck_id as usize) else {
                     return unknown_deck(response_tx, deck_id, decks.len());
                 };
                 let _ = response_tx.send(CommandResponse::State(state_of(deck_id, deck)));
@@ -282,7 +252,7 @@ impl AudioPipeline {
                 let states = decks
                     .iter()
                     .enumerate()
-                    .map(|(deck_id, deck)| state_of(deck_id, deck))
+                    .map(|(i, deck)| state_of(i as DeckId, deck))
                     .collect();
                 let _ = response_tx.send(CommandResponse::States(states));
             }
@@ -439,7 +409,7 @@ fn fill_ring_with_silence(producer: &mut Producer<f32>, frames: usize) {
 }
 
 /// Reads one deck's transport. Called from the producer thread only.
-fn state_of(deck_id: usize, deck: &Arc<Mutex<Deck>>) -> DeckState {
+fn state_of(deck_id: DeckId, deck: &Arc<Mutex<Deck>>) -> DeckState {
     let deck = lock(deck);
     DeckState {
         deck_id,
@@ -447,18 +417,18 @@ fn state_of(deck_id: usize, deck: &Arc<Mutex<Deck>>) -> DeckState {
         playing: deck.is_playing(),
         total_frames: deck.total_frames(),
         bpm: deck.bpm(),
-        key: deck.key().map(|k| k.name()),
+        key: deck.key().map(|k| k.traditional()),
     }
 }
 
 /// Runs `apply` on a loaded deck, answering with `Error` for a bad id or an empty deck.
 fn on_deck(
     decks: &[Arc<Mutex<Deck>>],
-    deck_id: usize,
+    deck_id: DeckId,
     response_tx: &Sender<CommandResponse>,
     apply: impl FnOnce(&mut Deck) -> CommandResponse,
 ) {
-    let Some(deck) = decks.get(deck_id) else {
+    let Some(deck) = decks.get(deck_id as usize) else {
         return unknown_deck(response_tx, deck_id, decks.len());
     };
     if lock(deck).total_frames() == 0 {
@@ -470,7 +440,7 @@ fn on_deck(
     let _ = response_tx.send(apply(&mut lock(deck)));
 }
 
-fn unknown_deck(response_tx: &Sender<CommandResponse>, deck_id: usize, count: usize) {
+fn unknown_deck(response_tx: &Sender<CommandResponse>, deck_id: DeckId, count: usize) {
     let last = count.saturating_sub(1);
     reject(
         response_tx,

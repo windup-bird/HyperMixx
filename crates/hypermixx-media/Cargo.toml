@@ -1,0 +1,10 @@
+[package]
+name = "hypermixx-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PCM sources: decoding (symphonia) and the in-memory pool"
+
+[dependencies]
+hypermixx-core = { path = "../hypermixx-core" }
+symphonia = { workspace = true }

@@ -1,8 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/hypermixx-core",
+    "crates/hypermixx-media",
     "crates/hypermixx-audio",
-    "crates/hypermixx-analysis",
+    "crates/hypermixx-library",
     "crates/hypermixx-cli",
     "crates/stratum-dsp",
     "crates/timestretch",

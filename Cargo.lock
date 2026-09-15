@@ -359,22 +359,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
-name = "hypermixx-analysis"
-version = "0.1.0"
-dependencies = [
- "hypermixx-audio",
- "stratum-dsp",
-]
-
-[[package]]
 name = "hypermixx-audio"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
  "cpal",
  "crossbeam-channel",
+ "hypermixx-core",
+ "hypermixx-media",
  "rtrb",
- "symphonia",
  "timestretch",
 ]
 
@@ -383,8 +376,35 @@ name = "hypermixx-cli"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
- "hypermixx-analysis",
  "hypermixx-audio",
+ "hypermixx-core",
+ "hypermixx-library",
+ "hypermixx-media",
+]
+
+[[package]]
+name = "hypermixx-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "hypermixx-library"
+version = "0.1.0"
+dependencies = [
+ "hypermixx-core",
+ "hypermixx-media",
+ "serde",
+ "stratum-dsp",
+]
+
+[[package]]
+name = "hypermixx-media"
+version = "0.1.0"
+dependencies = [
+ "hypermixx-core",
+ "symphonia",
 ]
 
 [[package]]

@@ -10,6 +10,8 @@ name = "hypermixx-cli"
 path = "src/main.rs"
 
 [dependencies]
+hypermixx-core = { path = "../hypermixx-core" }
+hypermixx-media = { path = "../hypermixx-media" }
 hypermixx-audio = { path = "../hypermixx-audio" }
-hypermixx-analysis = { path = "../hypermixx-analysis" }
+hypermixx-library = { path = "../hypermixx-library" }
 crossbeam-channel = { workspace = true }

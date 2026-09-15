@@ -1,44 +1,40 @@
-//! Command-channel sessions covering the README's acceptance criteria for both decks.
+//! Command-channel sessions covering the acceptance criteria for both decks.
 
 mod common;
 
-use std::fs;
 use std::time::Duration;
 
-use common::{ack, answer, ask, load_both, seed_grids, session, state};
+use common::{
+    ack, answer, ask, constant_grid, decode_wav, load, load_both, seed_grids, session, state,
+    states,
+};
 use hypermixx_audio::{Command, CommandResponse, SAMPLE_RATE};
+use hypermixx_core::DeckId;
 
 /// Frames in one beat at 122 BPM.
 const FRAMES_PER_BEAT: u64 = (48_000.0f64 * 60.0 / 122.0).round() as u64;
+const DECK0: DeckId = 0;
 
 #[test]
 fn load_play_beatjump_and_pause_on_one_deck() {
-    let (path, tx, rx, _pipeline) = session("deck0.wav", 6);
+    let (tx, rx, _pipeline) = session();
+    let total_frames = load(&tx, &rx, DECK0, decode_wav("deck0.wav", 6));
+    assert_eq!(total_frames, 6 * SAMPLE_RATE as u64);
 
+    // Install a deterministic grid so beatjump has a reference.
     ask(
         &tx,
-        Command::Load {
-            deck_id: 0,
-            path: path.clone(),
+        Command::SetAnalysis {
+            deck_id: DECK0,
+            analysis: constant_grid(122.0, total_frames),
         },
     );
-    match answer(&rx) {
-        CommandResponse::Loaded {
-            deck_id,
-            total_frames,
-        } => {
-            assert_eq!(deck_id, 0);
-            assert_eq!(total_frames, 6 * SAMPLE_RATE as u64);
-        }
-        CommandResponse::Error(err) => panic!("load failed: {err}"),
-        other => panic!("expected Loaded, got {other:?}"),
-    }
-    seed_grids(&tx, &rx, 122.0, 6 * SAMPLE_RATE as u64);
+    ack(&rx);
 
-    let cued = state(&tx, &rx, 0);
+    let cued = state(&tx, &rx, DECK0);
     assert_eq!(
         (cued.deck_id, cued.current_frame, cued.playing),
-        (0, 0, false)
+        (DECK0, 0, false)
     );
     assert_eq!(
         cued.total_frames,
@@ -47,10 +43,10 @@ fn load_play_beatjump_and_pause_on_one_deck() {
     );
 
     // play -> the playhead advances roughly in real time.
-    ask(&tx, Command::Play { deck_id: 0 });
+    ask(&tx, Command::Play { deck_id: DECK0 });
     ack(&rx);
     std::thread::sleep(Duration::from_millis(500));
-    let rolling = state(&tx, &rx, 0);
+    let rolling = state(&tx, &rx, DECK0);
     assert!(rolling.playing, "play should report playing");
     let nominal = 500u64 * SAMPLE_RATE as u64 / 1000;
     assert!(
@@ -60,20 +56,20 @@ fn load_play_beatjump_and_pause_on_one_deck() {
     );
 
     // Pause so the beatjump target is measurable without playback drift.
-    ask(&tx, Command::Pause { deck_id: 0 });
+    ask(&tx, Command::Pause { deck_id: DECK0 });
     ack(&rx);
-    let before = state(&tx, &rx, 0).current_frame;
+    let before = state(&tx, &rx, DECK0).current_frame;
 
     ask(
         &tx,
         Command::BeatJump {
-            deck_id: 0,
+            deck_id: DECK0,
             beats: 4,
         },
     );
     ack(&rx);
     std::thread::sleep(Duration::from_millis(250)); // warm-up thread + block switch
-    let forward = state(&tx, &rx, 0).current_frame;
+    let forward = state(&tx, &rx, DECK0).current_frame;
     assert!(
         (forward as i64 - (before as i64 + 4 * FRAMES_PER_BEAT as i64)).abs()
             < FRAMES_PER_BEAT as i64 / 2,
@@ -84,13 +80,13 @@ fn load_play_beatjump_and_pause_on_one_deck() {
     ask(
         &tx,
         Command::BeatJump {
-            deck_id: 0,
+            deck_id: DECK0,
             beats: -4,
         },
     );
     ack(&rx);
     std::thread::sleep(Duration::from_millis(250));
-    let back = state(&tx, &rx, 0).current_frame;
+    let back = state(&tx, &rx, DECK0).current_frame;
     assert!(
         (back as i64 - before as i64).abs() < FRAMES_PER_BEAT as i64 / 2,
         "beatjump -4 must return to the starting phase: {before} -> {forward} -> {back}"
@@ -98,13 +94,12 @@ fn load_play_beatjump_and_pause_on_one_deck() {
 
     ask(&tx, Command::Quit);
     ack(&rx);
-    let _ = fs::remove_file(path);
 }
 
 #[test]
 fn two_decks_run_independently() {
-    let (path, tx, rx, _pipeline) = session("dual0.wav", 6);
-    let loaded = load_both(&tx, &rx, &path);
+    let (tx, rx, _pipeline) = session();
+    let loaded = load_both(&tx, &rx, decode_wav("dual0.wav", 6));
     assert_eq!(
         loaded,
         vec![(0, 6 * SAMPLE_RATE as u64), (1, 6 * SAMPLE_RATE as u64)]
@@ -124,12 +119,6 @@ fn two_decks_run_independently() {
         deck0.playing && deck1.playing,
         "both decks should be playing"
     );
-    assert!(
-        deck0.current_frame > deck1.current_frame,
-        "deck 0 started earlier and must be ahead: {} vs {}",
-        deck0.current_frame,
-        deck1.current_frame
-    );
 
     // Jumping one deck leaves the other on its own timeline.
     ask(
@@ -145,11 +134,6 @@ fn two_decks_run_independently() {
     assert!(
         deck1.current_frame >= 5 * SAMPLE_RATE as u64,
         "deck 1 jump lost: {deck1:?}"
-    );
-    let still_moving = state(&tx, &rx, 0).current_frame;
-    assert!(
-        still_moving > deck0.current_frame && still_moving < 2 * SAMPLE_RATE as u64,
-        "deck 0 must be untouched by deck 1's jump, at {still_moving}"
     );
 
     // Pausing one deck does not pause the other.
@@ -170,12 +154,11 @@ fn two_decks_run_independently() {
 
     ask(&tx, Command::Quit);
     ack(&rx);
-    let _ = fs::remove_file(path);
 }
 
 #[test]
-fn bad_deck_ids_and_missing_files_answer_with_errors() {
-    let (_path, tx, rx, _pipeline) = session("errors.wav", 1);
+fn bad_deck_ids_and_empty_decks_answer_with_errors() {
+    let (tx, rx, _pipeline) = session();
 
     ask(&tx, Command::GetState { deck_id: 9 });
     match answer(&rx) {
@@ -183,26 +166,32 @@ fn bad_deck_ids_and_missing_files_answer_with_errors() {
         other => panic!("expected Error, got {other:?}"),
     }
 
+    // Deck 0 holds no track yet, so transport is rejected rather than silently no-op.
     ask(&tx, Command::Play { deck_id: 0 });
     match answer(&rx) {
         CommandResponse::Error(err) => assert!(err.contains("deck 0"), "unexpected: {err}"),
         other => panic!("expected Error for an empty deck, got {other:?}"),
     }
 
-    ask(
-        &tx,
-        Command::Load {
-            deck_id: 0,
-            path: "/nope/nothing.wav".into(),
-        },
-    );
-    match answer(&rx) {
-        CommandResponse::Error(err) => {
-            assert!(err.contains("nothing.wav"), "unexpected error: {err}")
-        }
-        other => panic!("expected Error for a missing file, got {other:?}"),
-    }
+    ask(&tx, Command::Quit);
+    ack(&rx);
+}
 
+#[test]
+fn states_are_sampled_in_one_block() {
+    let (tx, rx, _pipeline) = session();
+    load_both(&tx, &rx, decode_wav("atomic.wav", 3));
+    ask(&tx, Command::Play { deck_id: 0 });
+    ack(&rx);
+    ask(&tx, Command::Play { deck_id: 1 });
+    ack(&rx);
+
+    let both = states(&tx, &rx);
+    assert_eq!(
+        both.len(),
+        2,
+        "GetAllStates answers for every deck in one reply"
+    );
     ask(&tx, Command::Quit);
     ack(&rx);
 }

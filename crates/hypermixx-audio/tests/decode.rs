@@ -5,8 +5,8 @@ mod common;
 use std::fs;
 
 use common::{temp_path, write_wav};
-use hypermixx_audio::source::decode_file;
 use hypermixx_audio::{CHANNELS, SAMPLE_RATE};
+use hypermixx_media::decode_file;
 
 #[test]
 fn decodes_native_rate_stereo() {

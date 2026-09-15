@@ -28,15 +28,14 @@ WAIT_SECS=${6:-30}
 
 INTERVAL=$(awk -v b="$BEATS" -v bpm="$BPM" 'BEGIN { printf "%.3f", b * 60 / bpm }')
 
-# 命令逐条喂给 CLI，CLI 每条都会等引擎回答后再读下一行，所以 load 天然串行。
+# 命令逐条喂给 CLI。load 现在在 CLI 侧后台解码后才把 source 送进引擎，所以要等 Loaded
+# 落地再 play/jump，否则命令会打到空 deck 上被拒。给每次 load 留出解码时间。
 {
   printf 'load 0 %s %s\n' "$FILE" "$BPM"
   printf 'load 1 %s %s\n' "$FILE" "$BPM"
+  sleep "$WAIT_SECS"          # 等两路解码完成、deck 装好并装填常网格
   printf 'play 0\nplay 1\n'
   sleep 0.3
-  # Wait for the async analysis to publish its grid (bpm > 0 in the state output).
-  echo "waiting ${WAIT_SECS}s for analysis..."
-  sleep "$WAIT_SECS"
   printf 'state\n'
   for _ in $(seq 1 "$ROUNDS"); do
     sleep "$INTERVAL"
