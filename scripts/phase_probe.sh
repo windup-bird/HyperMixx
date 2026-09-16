@@ -15,7 +15,7 @@ set -uo pipefail
 BIN=${1:-target/release/hypermixx-cli}
 FILE=${2:-test.mp3}
 BPM=${3:-122}
-BEATS=${4:-4}
+BEATS=${4:-16}
 ROUNDS=${5:-6}
 # Analysis runs asynchronously after load; the grid must be ready before beatjumping.
 WAIT_SECS=${6:-30}
