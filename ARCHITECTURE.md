@@ -62,7 +62,7 @@ crates/
 
 | crate | 来源 | 锁定 |
 |---|---|---|
-| `stratum-dsp` | `github.com/HLLMR/stratum-dsp`(自有仓库) | `rev = 758e0b6` |
+| `stratum-dsp` | `github.com/HLLMR/stratum-dsp`(第三方库) | `rev = 758e0b6` |
 | `timestretch` | `github.com/robmorgan/timestretch-rs`(经 gh-proxy 镜像地址) | `rev = 2628090` |
 
 不随本仓库分发;升级 = 改 rev + `cargo update -p <crate>`。
