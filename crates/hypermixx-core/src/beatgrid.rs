@@ -153,8 +153,8 @@ mod tests {
     use super::*;
     use crate::SAMPLE_RATE as SR;
 
-    // 122 BPM @ 48kHz: 23606.56 frames per beat.
-    const FPB: f64 = 48_000.0 * 60.0 / 122.0;
+    // 122 BPM @ 44.1kHz: 21688.52 frames per beat.
+    const FPB: f64 = 44_100.0 * 60.0 / 122.0;
 
     fn grid(bpm: f32, total_frames: u64) -> BeatGrid {
         BeatGrid::from_constant_bpm(bpm, 0, total_frames, SR)
@@ -182,10 +182,17 @@ mod tests {
 
     #[test]
     fn frame_at_beat_extrapolates_past_the_grid() {
-        let g = grid(122.0, 48_000 * 5);
-        let interval = g.beat_frames[9] - g.beat_frames[8];
-        assert_eq!(g.frame_at_beat(10), g.beat_frames[9] + interval);
-        assert_eq!(g.frame_at_beat(12), g.beat_frames[9] + 3 * interval);
+        let g = grid(122.0, 44_100 * 5);
+        let last = g.beat_frames.len() - 1;
+        let interval = g.beat_frames[last] - g.beat_frames[last - 1];
+        assert_eq!(
+            g.frame_at_beat(last as u64 + 1),
+            g.beat_frames[last] + interval
+        );
+        assert_eq!(
+            g.frame_at_beat(last as u64 + 3),
+            g.beat_frames[last] + 3 * interval
+        );
     }
 
     #[test]

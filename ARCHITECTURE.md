@@ -1,178 +1,142 @@
 # Hypermixx 架构
 
-Rust workspace,单二进制 + 库。CLI 发命令到 producer 线程,producer 驱动双 Deck 经 timestretch 引擎混音进 cpal。
+Rust workspace,五个 crate 单向分层:**core(类型) ← media(PCM) ← audio(引擎)**;
+library(分析)与 audio 零交叉依赖,只被 cli 调用。引擎域 **44.1 kHz 立体声**(与目标设备
+ALSA default 的原生时钟一致,cpal 回调直通,零转换)。
 
 ```
-hypermixx/
-├── Cargo.toml              # workspace,profiles
-├── scripts/phase_probe.sh  # 双 deck beatjump 相位差探针
-│
-├── crates/
-│   ├── hypermixx-audio/    # 引擎核心(lib)
-│   │   ├── src/
-│   │   │   ├── lib.rs              # 常量 + re-export
-│   │   │   ├── command.rs          # Command / CommandResponse / DeckState 协议
-│   │   │   ├── beatgrid.rs         # BeatGrid / TrackAnalysis / KeyReport / KeyMode
-│   │   │   ├── ringbuf.rs          # rtrb 封装 + 自由函数
-│   │   │   ├── pipeline.rs         # AudioPipeline:producer 线程 + cpal 输出
-│   │   │   ├── deck/
-│   │   │   │   ├── deck.rs         # Deck:流状态机 + 非阻塞跳转
-│   │   │   │   └── timeshift.rs    # TimeShift:后台预热线程
-│   │   │   ├── flow/
-│   │   │   │   ├── flow.rs         # Flow:单次播放单元(状态机)
-│   │   │   │   └── pitchshift.rs   # PitchShiftEngine:timestretch 引擎包装
-│   │   │   └── source/
-│   │   │       ├── mod.rs          # Source trait
-│   │   │       ├── decoder.rs      # symphonia 解码(重采样 / 声道合并)
-│   │   │       └── pool.rs         # PcmPool:内存池 Source 实现
-│   │   └── tests/                  # 集成测试(真实 wav/mp3)
-│   │
-│   ├── hypermixx-analysis/ # 节拍/调性分析适配层
-│   │   └── src/lib.rs      # stratum-dsp → TrackAnalysis
-│   │
-│   ├── hypermixx-cli/      # 命令行前端(二进制)
-│   │   └── src/main.rs     # 命令解析 + 分析编排 + 输出格式化
-│   │
-│   ├── stratum-dsp/        # vendored:symphonia 解码后的 DSP 分析
-│   └── timestretch/        # vendored:实时时间拉伸引擎
+cli ──→ core / media / audio / library
+audio ──→ core, media          (+ timestretch, vendored)
+library ──→ core, media        (+ stratum-dsp, vendored)
+media ──→ core                 (+ symphonia)
+core ──→ serde
 ```
+
+```
+crates/
+├── hypermixx-core/       # 协议与类型(仅依赖 serde)
+│   └── src/
+│       ├── beatgrid.rs   # BeatGrid:绝对帧拍网格 + 相位/拍宽查询
+│       ├── key.rs        # Key / KeyMode / KeyFormat(传统 + Camelot)
+│       ├── analysis.rs   # TrackAnalysis { beatgrid, key, bpm }
+│       ├── deck.rs       # DeckId = u8 / DeckState 快照
+│       ├── command.rs    # Command / CommandResponse / Backend
+│       └── source.rs     # Source trait + Shared = Arc<dyn Source>
+│
+├── hypermixx-media/      # PCM:解码 + 内存池(core + symphonia)
+│   └── src/
+│       ├── decoder.rs    # decode_file:symphonia → 44.1kHz 立体声 f32
+│       └── pool.rs       # PcmPool:不可变 Arc 数据的 Source 实现
+│
+├── hypermixx-audio/      # 实时引擎(core + media + timestretch)
+│   ├── src/
+│   │   ├── ringbuf.rs    # rtrb SPSC 封装 + 自由函数
+│   │   ├── pipeline.rs   # AudioPipeline:producer 线程 + cpal 输出
+│   │   ├── deck/
+│   │   │   ├── deck.rs      # Deck:流状态机 + cued_from 跳转补偿
+│   │   │   ├── jump.rs      # Seek{Frames,Beats,Beat,Quantized} + phase_preserving
+│   │   │   ├── flowshift.rs # FlowShift(原 TimeShift):后台流预热
+│   │   │   └── loop_.rs     # LoopState 占位(尚未生效)
+│   │   └── flow/
+│   │       ├── flow.rs      # Flow:单次播放单元(状态机)
+│   │       └── pitchshift.rs # PitchShiftEngine:timestretch 引擎包装
+│   └── tests/            # engine / beatlock / decode / tone_faithful
+│
+├── hypermixx-library/    # 分析与曲库(core + media + stratum-dsp)
+│   └── src/
+│       ├── beat_spec.rs     # BeatSpec/Segment:可编辑网格真源
+│       ├── grid_compiler.rs # GridCompiler:前填/等距/接缝去重/尾外推 → BeatGrid
+│       ├── track.rs         # TrackInfo:持 BeatSpec,惰性缓存编译结果
+│       ├── waveform.rs      # 峰值概览
+│       └── analyser/
+│           ├── mod.rs         # analyze(source) = backend → refine → compile
+│           ├── stratum.rs     # stratum-dsp 适配(兜 panic,关静音裁剪)
+│           ├── timestretch.rs # 占位:vendored 未暴露离线分析,返回 Unsupported
+│           └── refine.rs      # fit_rigid:中位数周期 + 最小二乘 + 倍频归位
+│
+├── hypermixx-cli/        # 前端(二进制,依赖全部四层)
+│   └── src/main.rs       # 行解析 / 后台 decode+analyse / 响应打印线程
+│
+├── stratum-dsp/          # vendored:节拍/调性分析(仅用公开入口)
+└── timestretch/          # vendored:实时时间拉伸引擎(仅用公开入口)
+```
+
+---
+
+## hypermixx-core
+
+只放类型与协议。`Source` 定义在这里是 `Command::Load` 能携带 `Arc<dyn Source>` 的前提
+(若在 media,core→media 成环);所有 crate 通过 `use hypermixx_core::…` 共享。
+
+### `BeatGrid`
+绝对帧位置 `Vec<u64>`(严格递增),BPM 永远派生、不存储。
+- `from_constant_bpm(bpm, first, total, sr)` — 恒速网格,无累积误差
+- `from_frames(beats, sr)` / `empty(sr)` / `is_empty()`
+- `frame_at_beat(beat)` — 存储范围内直接索引,越界按末拍间隔外推
+- `floor_beat(frame)` / `phase(frame)` / `beat_width(beat)` / `average_bpm()`
+
+### `Command` / `CommandResponse`
+- `Load { deck_id, source, analysis }` — source 已解码,analysis 可选(常网格快路径)
+- `Play` / `Pause` / `Jump { target_frame }` / `BeatJump { beats }`
+- `SetRate` / `SetProfile` / `SetAnalysis` — 分析结果从这里进入 deck,**没有 `Analyse` 命令**
+- `GetState` / `GetAllStates`(同块原子快照)/ `Quit`
+- `Backend { Auto, Stratum, Timestretch }` — 分析后端选择
+
+---
+
+## hypermixx-media
+
+- `decode_file(path)` — symphonia 解码 → 重采样到引擎率(44.1 kHz)→ 立体声交错 f32。
+  非 44.1k 素材在加载时一次性转换,引擎内不再有采样率概念。
+- `PcmPool` — `Arc<Vec<f32>>` 的 `Source` 实现,克隆即 Arc bump;deck 与分析器共享同一条数据。
 
 ---
 
 ## hypermixx-audio
 
-### `lib.rs`
-引擎常量和公开类型。
-
-| 名称 | 作用 |
-|---|---|
-| `SAMPLE_RATE` / `CHANNELS` / `BLOCK_SIZE` | 48 kHz / 立体声 / 256 帧 |
-| `DECK_COUNT` / `DECK_MIX_GAIN` | 双 Deck,每路 ×0.5 混音 |
-
-### `command.rs`
-CLI 与 producer 之间的请求-响应协议。
-
-**`Command`** — 发给 producer 的命令:
-- `Load { deck_id, path, bpm }` — 解码;bpm 给定则立即建常网格并跳过分析
-- `Play` / `Pause` / `Jump { target_frame }` / `BeatJump { beats }` — 传输控制
-- `SetRate { rate }` / `SetProfile { profile }` — 实时拉伸参数
-- `SetAnalysis { analysis }` — 异步分析结果回传
-- `GetState` / `GetAllStates` / `Quit`
-
-**`CommandResponse`** — producer 回复:
-- `Loaded { deck_id, total_frames, analyzed }` — analyzed=true 表示已有网格(CLI 应跳过分析)
-- `State(DeckState)` / `States(Vec<DeckState>)` / `Ok` / `Error`
-
-**`DeckState`** — `{ deck_id, current_frame, playing, total_frames, bpm, key }`
-
-### `beatgrid.rs`
-音乐节拍网格与调性。
-
-**`TrackAnalysis`** — `{ beatgrid: BeatGrid, key: Option<KeyReport>, bpm: Option<f32> }`
-
-**`BeatGrid`** — 绝对帧位置 `Vec<u64>` (严格递增)。
-- `from_seconds(beats_sec, sample)` — 秒制→帧(外部分析器用)
-- `from_constant_bpm(bpm, first, total, sample)` — 恒速网格(无累积误差)
-- `frame_at_beat(beat)` — 超界按末拍间隔外推
-- `nearest_beat` / `current_beat_frame` / `next_beat_frame` / `phase` — 二分查找
-- `beatjump_target(frame, beats)` — **相位保持跳转**:最近拍 + 拍内偏移 + 目标拍宽
-
-**`KeyReport`** — `{ pc: u8, mode, confidence }`,`name()` 输出 `"C"` / `"Am"`。
-
-### `ringbuf.rs`
-rtrb SPSC 环形缓冲(生产者线程 → 音频回调)。
-
-- `AudioRingBuffer { push, pop, available, split }`
-- `push_samples` / `pop_samples` / `fill_with_silence_on_underrun`
-
 ### `pipeline.rs`
-`AudioPipeline` — 引擎入口,拥有 producer 线程和 cpal stream。
+拓扑:`CLI → [producer: deck0 + deck1 → 混音 ×0.5] → ring → [cpal 回调] → 声卡`
+- 按设备**原生速率**打开输出(本机 44100 = 引擎率,直通);速率不符时打印警告
+- 回调零锁零分配,只读 ring;producer 以 ring 余量配速
 
-拓扑:`CLI → [producer 线程: deck0 + deck1 → 混音 × 0.5] → ring → [cpal 回调]`
+### `deck/`
+- `Deck` — 单 source、单活跃流;`jump()` 记 `cued_from`,`switch_to()` 把新流落点前移
+  预热期间已播放的帧量,保证跨 deck 相位锁定(`phase_probe.sh` 的 `err` 恒 +0)
+- `jump::phase_preserving` — 目标帧 = 目标拍位 + `phase(当前) × 目标拍宽`,兼容非均匀网格
+- `FlowShift` — 后台预热线程:submit Flow → `prepare()` → 入库 → 通报 id,deck 下个块切流
 
-- `start(command_rx, response_tx)` — 初始化双 deck、预填静音、起流
-- `handle_command` — 分发所有 Command(Load 起解码线程 / SetRate 调控制器 / ...)
-- 音频回调零锁零分配,仅从 ring 读
-
-### `deck/deck.rs`
-`Deck` — 单 source、一流、非阻塞跳转。
-
-- `play` / `pause` / `jump(target)` / `beatjump(beats)` — 传输
-- `process_block(output)` — 每块先 `poll_ready_flows()` 切流,活跃流采样;暂停/耗尽补静音
-- `set_analysis` — `ArcSwapOption` 无锁换入(分析可晚到)
-- `set_ratio` / `set_profile` — 切活跃流的拉伸引擎
-- **补偿逻辑**:jump 时记 `cued_from = current_frame()`,换流时新流定位 `flow.current + (current - cued_from)`,保证跨 deck 相位锁定
-
-**`TimeShift`** — 后台预热线程,接收 Flow,调用 `prepare()` 后入库并通报 id。
-
-### `flow/flow.rs`
-`Flow` — 单次播放单元,包 `PitchShiftEngine`。
-
-状态机:`Preparing → Ready → Active → Retired`
-
-- `prepare()` — 调用引擎 `prepare_jump(start_frame)`
-- `process_block` — 活跃时经引擎采样,非活跃补静音
-- `set_ratio` / `set_profile` — 委托引擎(切 profile 会重建引擎并重新定位)
-
-### `flow/pitchshift.rs`
-`PitchShiftEngine` — timestretch-rs 引擎包装(Tape / Keylock / WideKeylock)。
-
-- `process_block` — `feed(source → ring)` + `processor.process(output)`
-- `prepare_jump(target)` — **Tape 直接重定位**(零预热);**Keylock/WideKeylock** 走 `reset → set_track_position → warm_start` 三步协议
-- `set_ratio` → `controller.set_tempo_rate`(无 glide)
-
-### `source/`
-- `Source: { read_frames(start, output) -> usize, total_frames() }`
-- `decoder::decode_file` — symphonia 解码,重采样到 48 kHz,合并立体声,后台线程调用
-- `PcmPool` — 不可变 `Arc<Vec<f32>>` 的 `Source` 实现(克隆即 Arc bump)
+### `flow/`
+- `Flow` — `Preparing → Ready → Active → Retired`;活跃时经引擎采样,暂停/耗尽补静音
+- `PitchShiftEngine` — timestretch-rs 三 Profile:**Tape**(零延迟直通)/ **Keylock** /
+  **WideKeylock**(预热走 `reset → set_track_position → warm_start`)
 
 ---
 
-## hypermixx-analysis
-`lib.rs` — stratum-dsp → hypermixx 的适配层。
+## hypermixx-library
 
-调用:**`stratum_dsp::analyze_audio(&[f32] mono, u32 sr, AnalysisConfig) -> Result<AnalysisResult>`**
-调用:**`stratum_dsp::compute_confidence(&AnalysisResult) -> AnalysisConfidence`**
+分析管线:`Source → downmix_to_mono → backend → RawAnalysis → fit_rigid → BeatSpec
+→ GridCompiler → TrackAnalysis → SetAnalysis`
 
-- `analyze(mono, sr)` — 调 `analyze_audio` + catch_unwind(兜 panic)+ `validate`(bpm>0 / 非空网格)
-- `downmix_to_mono(source, total, channels)` — 交错立体声→单声道均值
-- `AnalysisError` — `Stratum` / `Panicked` / `NoGrid`
-
-转换:`AnalysisResult.beat_grid.beats`(秒)× sr → `BeatGrid.from_seconds`;`Key::Major/Minor` → `KeyReport`。
+- `BeatSpec` — 可编辑真源(段落化 BPM + 起点 + 拍数);刚性网格 = 单段
+- `GridCompiler` — 三段编译:起点前填至 frame 0 / 段内等距 / 接缝去重 + 末段外推到轨尾
+- `fit_rigid` — 中位数拍距 → 倍频归位(拉进 [60, 200] BPM)→ 整数拍号分配 + 最小二乘
+- `TrackInfo` — 持 `BeatSpec` 与 key;`Mutex<Option<TrackAnalysis>>` 惰性编译,改 spec 即失效
 
 ---
 
 ## hypermixx-cli
-`main.rs` — 前端,解析命令、编排分析、格式化输出。
 
-- `parse(line)` — 行→ `Vec<Command>`(load/play/pause/jump/beatjump/rate/profile/state/quit)
-- `report(rx)` — 收响应;`Loaded.analyzed == false` 时返回 `needs_analysis=true`
-- `spawn_analysis(deck_id, pipeline)` — 后台线程读 deck PCM → `analysis::analyze` → `SetAnalysis`
-- `state` 触发 `GetAllStates`,awk 格式化为 table
+- `load <deck> <path> [bpm]` — 后台解码;给 bpm 则建常网格跳过分析
+- `analyse <deck>` — 后台跑 `library::analyser::analyze`,完成后 `SetAnalysis`
+- `--backend auto|stratum|timestretch`;响应由独立打印线程渲染,输入永不阻塞
 
 ---
 
-## 外部依赖
+## 采样率约定
 
-### stratum-dsp(vendored `crates/stratum-dsp/`)
-仅调用公开入口:
-- `analyze_audio(mono_f32, sample_rate, AnalysisConfig) -> Result<AnalysisResult, AnalysisError>`
-- `compute_confidence(&AnalysisResult) -> AnalysisConfidence`
-- `AnalysisResult` 字段:`bpm`,`beat_grid.{downbeats, beats, bars}`(秒),`key: Key`,`key_confidence`,`grid_stability`
-
-内部(HMM Viterbi 拍跟踪 / onset / chroma / key 检测)不直接调用。
-
-### timestretch(vendored `crates/timestretch/`)
-调用公开入口:
-- `Engine::build(EngineConfig) -> Result<EngineHandles>` — 构造三件套
-- `EngineConfig { sample_rate, channels, profile, initial_tempo_rate, max_block_frames, source_capacity_frames, pre_analysis }`
-- `EngineProfile::Tape / Keylock / WideKeylock`
-- `EngineProcessor::process(&mut out)` — 拉输出(零分配零锁)
-- `EngineProcessor::reset()` / `warm_start_preroll_frames()`
-- `EngineController::set_tempo_rate(f64)` / `warm_start(preroll)`
-- `SourceProducer::push(interleaved)` / `set_track_position(frame)`
-
-内部(SOLA / phase vocoder / varispeed / stage 链)不直接调用。
+引擎域固定 44.1 kHz:目标设备(ALSA `default`)原生 44.1 kHz,`preferred_config` 按引擎率
+请求即直通。历史教训——引擎 48k 而设备 44.1k 时,ALSA 静默接受 48k 请求却按 44.1k 时钟
+消费 → 慢放 8.8% + 音调低 8.8%。多设备自适应(设备率≠引擎率时在回调内重采样)是后续工作。
 
 ---
 
@@ -180,13 +144,12 @@ rtrb SPSC 环形缓冲(生产者线程 → 音频回调)。
 
 ```
 CLI  stdin
-  │ crossbeam Command
-  ▼
-AudioPipeline ──producer thread──────────────────────────────────────┐
-  │ Load:起 decode 线程→Deck::new(+ 可选常网格)                     │
-  │       └─ 异步分析线程:Source→analysis::analyze→SetAnalysis       │
-  │ Jump/BeatJump:记 cued_from,Flow 提交 TimeShift                   │
-  │ TimeShift worker:Flow.prepare()→入库→mark_ready                  │
-  │ 每 tick:poll_ready→switch_to(补偿)→active.process_block→mix      │
-  └─ f32 ──→ ring ──→ cpal callback ──→ 声卡
+  │ spawn_load: decode → PcmPool ── Command::Load{source, analysis?} ──┐
+  │ spawn_analyse: analyser::analyze → Command::SetAnalysis ───────────┤ crossbeam
+  ▼                                                                    ▼
+AudioPipeline ──producer thread──────────────────────────────────────────┐
+  │ Jump/BeatJump: jump::resolve 算目标 → 记 cued_from → FlowShift       │
+  │ FlowShift worker: Flow.prepare() → 入库 → 通报                       │
+  │ 每 tick: poll_ready → switch_to(补偿) → active.process_block → mix   │
+  └─ f32 ──→ ring ──→ cpal 回调(44.1k 直通)──→ 声卡
 ```

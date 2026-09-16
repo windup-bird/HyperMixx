@@ -135,18 +135,18 @@ mod tests {
         GridCompiler::new(SAMPLE_RATE, total)
     }
 
-    // 122 BPM @ 48k => 23606.56 frames/beat.
-    const FPB: f64 = 48_000.0 * 60.0 / 122.0;
+    // 122 BPM @ 44.1k => 21688.52 frames/beat.
+    const FPB: f64 = 44_100.0 * 60.0 / 122.0;
 
     #[test]
     fn rigid_single_segment() {
         let spec = BeatSpec::rigid(122.0, 0);
-        let g = compiler(48_000 * 5).compile(&spec);
+        let g = compiler(44_100 * 5).compile(&spec);
         assert!(!g.is_empty());
         assert_eq!(g.beat_frames[0], 0);
         assert_eq!(g.beat_frames[1], FPB.round() as u64);
         // Tail covered to the end.
-        assert!(*g.beat_frames.last().unwrap() <= 48_000 * 5);
+        assert!(*g.beat_frames.last().unwrap() <= 44_100 * 5);
         assert!(
             g.beat_frames.windows(2).all(|w| w[0] < w[1]),
             "strictly increasing"
@@ -156,11 +156,11 @@ mod tests {
     #[test]
     fn front_fill_covers_a_late_downbeat() {
         // First real beat at 3 seconds, but beats exist from frame 0.
-        let spec = BeatSpec::rigid(122.0, 3 * 48_000);
-        let g = compiler(48_000 * 10).compile(&spec);
+        let spec = BeatSpec::rigid(122.0, 3 * 44_100);
+        let g = compiler(44_100 * 10).compile(&spec);
         assert!(g.beat_frames[0] < g.beat_frames[1]);
         assert!(
-            g.beat_frames[0] < 48_000,
+            g.beat_frames[0] < 44_100,
             "front-fill should start near the top, got {}",
             g.beat_frames[0]
         );
@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn mixed_segments_change_tempo_at_the_boundary() {
-        let half = 48_000 * 5;
+        let half = 44_100 * 5;
         let spec = BeatSpec {
             segments: vec![
                 Segment {
@@ -206,7 +206,7 @@ mod tests {
                 },
             ],
         };
-        let g = compiler(48_000 * 10).compile(&spec);
+        let g = compiler(44_100 * 10).compile(&spec);
         // Before the seam: ~0.5s beats; after: slightly tighter. Widths shrink across boundary.
         let i = g.beat_frames.iter().position(|&f| f >= half).unwrap();
         let before = g.beat_frames[i] - g.beat_frames[i - 1];
@@ -235,7 +235,7 @@ mod tests {
                 },
             ],
         };
-        let g = compiler(48_000 * 10).compile(&spec);
+        let g = compiler(44_100 * 10).compile(&spec);
         assert!(
             g.beat_frames.iter().filter(|&&f| f == start2).count() <= 1,
             "double beat at seam"

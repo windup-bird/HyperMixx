@@ -12,7 +12,7 @@ use hypermixx_audio::{Command, CommandResponse, SAMPLE_RATE};
 use hypermixx_core::DeckId;
 
 /// Frames in one beat at 122 BPM.
-const FRAMES_PER_BEAT: u64 = (48_000.0f64 * 60.0 / 122.0).round() as u64;
+const FRAMES_PER_BEAT: u64 = (44_100.0f64 * 60.0 / 122.0).round() as u64;
 const DECK0: DeckId = 0;
 
 #[test]

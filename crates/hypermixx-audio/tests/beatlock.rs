@@ -17,7 +17,7 @@ const BPM: f32 = 122.0;
 const BEATS: i64 = 4;
 const ROUNDS: usize = 3;
 /// Frames per beat, in float so the grid's per-beat rounding stays honest.
-const BEAT_FRAMES: f64 = 48_000.0 * 60.0 / 122.0;
+const BEAT_FRAMES: f64 = 44_100.0 * 60.0 / 122.0;
 /// The distance one 4-beat jump must add.
 const STEP_DELTA: i64 = (4.0 * BEAT_FRAMES).round() as i64;
 /// Slack for the grid's per-beat frame rounding (±1) plus one block of switch quantization.

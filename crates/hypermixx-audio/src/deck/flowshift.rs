@@ -134,7 +134,7 @@ mod tests {
                 .flat_map(|i| [i as f32, i as f32])
                 .collect(),
             total_frames: n_frames,
-            sample_rate: 48_000,
+            sample_rate: crate::SAMPLE_RATE,
             channels: CHANNELS,
         }))
     }

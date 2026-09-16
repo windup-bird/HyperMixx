@@ -47,7 +47,7 @@ INTERVAL=$(awk -v b="$BEATS" -v bpm="$BPM" 'BEGIN { printf "%.3f", b * 60 / bpm 
 } | "$BIN" 2>&1 | awk -v beats="$BEATS" -v bpm="$BPM" '
   # state 每次输出 deck0、deck1 两行，成对到达：[current/total] 里取 current
   BEGIN {
-    nominal_step = int(beats * 48000 * 60.0 / bpm + 0.5)
+    nominal_step = int(beats * 44100 * 60.0 / bpm + 0.5)
     printf "\n%5s %12s %12s %10s %10s %10s %8s %7s  %s\n", \
            "round", "deck0", "deck1", "delta", "expected", "err", "ms", "inc", "判定"
   }

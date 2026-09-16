@@ -18,6 +18,6 @@ pub use key::{Key, KeyFormat, KeyMode};
 pub use source::{Shared, Source};
 
 /// Engine-wide sample rate. Everything downstream of the decoder is 48kHz.
-pub const SAMPLE_RATE: u32 = 48_000;
+pub const SAMPLE_RATE: u32 = 44_100;
 /// Interleaved stereo.
 pub const CHANNELS: usize = 2;

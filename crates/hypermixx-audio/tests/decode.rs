@@ -16,17 +16,17 @@ fn decodes_native_rate_stereo() {
     assert_eq!(audio.sample_rate, SAMPLE_RATE);
     assert_eq!(audio.channels, CHANNELS);
     assert_eq!(audio.total_frames, 24_000);
-    assert_eq!(audio.pcm.len(), 48_000);
+    assert_eq!(audio.pcm.len(), 24_000 * CHANNELS);
     let _ = fs::remove_file(path);
 }
 
 #[test]
 fn resamples_foreign_rate() {
-    let path = temp_path("44k.wav");
-    write_wav(&path, 44_100, CHANNELS as u16, 44_100); // one second
+    let path = temp_path("48k.wav");
+    write_wav(&path, 48_000, CHANNELS as u16, 48_000); // one second
     let audio = decode_file(&path).unwrap();
     assert_eq!(audio.sample_rate, SAMPLE_RATE);
-    // A 44.1kHz second must become a 48kHz second, within a block of rounding.
+    // A 48kHz second must become a 44.1kHz second, within a block of rounding.
     assert!(
         (audio.total_frames as i64 - SAMPLE_RATE as i64).abs() < 256,
         "got {}",

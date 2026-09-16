@@ -21,7 +21,7 @@ fn main() {
     let pipeline = AudioPipeline::start(command_rx, response_tx);
 
     println!(
-        "hypermixx {VERSION} — {DECK_COUNT} decks, 48kHz stereo, backend {backend:?}. \
+        "hypermixx {VERSION} — {DECK_COUNT} decks, {SAMPLE_RATE}Hz stereo, backend {backend:?}. \
          `help` for commands, `quit` to exit."
     );
 

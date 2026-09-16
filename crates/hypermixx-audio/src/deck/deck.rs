@@ -236,7 +236,7 @@ mod tests {
                 .flat_map(|i| [i as f32, i as f32])
                 .collect(),
             total_frames: n_frames,
-            sample_rate: 48_000,
+            sample_rate: crate::SAMPLE_RATE,
             channels: CHANNELS,
         }))
     }
@@ -416,7 +416,7 @@ mod tests {
     fn beatjump_preview_matches_the_grid_formula() {
         let deck = Deck::new(pool(10_000));
         deck.set_analysis(grid_122bpm(10_000));
-        let frames_per_beat: f64 = 48_000.0 * 60.0 / 122.0;
+        let frames_per_beat: f64 = crate::SAMPLE_RATE as f64 * 60.0 / 122.0;
         assert_eq!(
             deck.beat_target_frame(1),
             Some(frames_per_beat.round() as u64)
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn beatjump_moves_by_beats_and_keeps_phase() {
-        let mut deck = Deck::new(pool(48_000 * 20));
+        let mut deck = Deck::new(pool(44_100 * 20));
         deck.set_analysis(grid_122bpm(48_000 * 20));
         deck.play();
         let mut out = vec![0.0f32; 256 * CHANNELS];
@@ -440,11 +440,11 @@ mod tests {
         settle_at(&mut deck, &mut out, 5_000);
         let before = deck.current_frame();
         deck.beatjump(4);
-        settle_at(&mut deck, &mut out, before + 4 * 23_000);
+        settle_at(&mut deck, &mut out, before + 4 * 21_000);
         let forward = deck.current_frame();
         assert!(
-            (forward as i64 - (before as i64 + 4 * 23_607)).abs() <= 2 * 256,
-            "four beats ahead should be ~94428 frames on: {before} -> {forward}"
+            (forward as i64 - (before as i64 + 4 * 21_689)).abs() <= 2 * 256,
+            "four beats ahead should be ~86754 frames on: {before} -> {forward}"
         );
 
         deck.beatjump(-4);
