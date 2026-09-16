@@ -8,5 +8,5 @@ description = "Track metadata, editable beat specs, the grid compiler, and the b
 [dependencies]
 hypermixx-core = { path = "../hypermixx-core" }
 hypermixx-media = { path = "../hypermixx-media" }
-stratum-dsp = { path = "../stratum-dsp" }
+stratum-dsp = { git = "https://github.com/HLLMR/stratum-dsp.git", rev = "758e0b6" }
 serde = { version = "1", features = ["derive"] }

@@ -6,8 +6,8 @@ ALSA default 的原生时钟一致,cpal 回调直通,零转换)。
 
 ```
 cli ──→ core / media / audio / library
-audio ──→ core, media          (+ timestretch, vendored)
-library ──→ core, media        (+ stratum-dsp, vendored)
+audio ──→ core, media          (+ timestretch, git 依赖 rev 锁定)
+library ──→ core, media        (+ stratum-dsp, git 依赖 rev 锁定)
 media ──→ core                 (+ symphonia)
 core ──→ serde
 ```
@@ -51,15 +51,21 @@ crates/
 │       └── analyser/
 │           ├── mod.rs         # analyze(source) = backend → refine → compile
 │           ├── stratum.rs     # stratum-dsp 适配(兜 panic,关静音裁剪)
-│           ├── timestretch.rs # 占位:vendored 未暴露离线分析,返回 Unsupported
+│           ├── timestretch.rs # 占位:上游未暴露离线分析,返回 Unsupported
 │           └── refine.rs      # fit_rigid:中位数周期 + 最小二乘 + 倍频归位
 │
 ├── hypermixx-cli/        # 前端(二进制,依赖全部四层)
 │   └── src/main.rs       # 行解析 / 后台 decode+analyse / 响应打印线程
-│
-├── stratum-dsp/          # vendored:节拍/调性分析(仅用公开入口)
-└── timestretch/          # vendored:实时时间拉伸引擎(仅用公开入口)
 ```
+
+### 外部依赖(git,rev 锁定)
+
+| crate | 来源 | 锁定 |
+|---|---|---|
+| `stratum-dsp` | `github.com/HLLMR/stratum-dsp`(自有仓库) | `rev = 758e0b6` |
+| `timestretch` | `github.com/robmorgan/timestretch-rs`(经 gh-proxy 镜像地址) | `rev = 2628090` |
+
+不随本仓库分发;升级 = 改 rev + `cargo update -p <crate>`。
 
 ---
 

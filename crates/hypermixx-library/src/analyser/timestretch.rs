@@ -1,9 +1,10 @@
 //! timestretch backend — placeholder.
 //!
-//! The vendored `timestretch` exposes offline analysis only through its `analysis` module, which
-//! this crate does not yet depend on. Wiring it up is a follow-up (add a `timestretch` dependency
-//! and map its `analysis::beat::BeatGrid`, whose `beats` are already absolute sample positions).
-//! Until then this backend reports `Unsupported`, and `Backend::Auto` relies on stratum.
+//! The upstream `timestretch` (git dependency) exposes offline analysis only through its
+//! `analysis` module, which this crate does not yet depend on. Wiring it up is a follow-up
+//! (add the module path and map its `analysis::beat::BeatGrid`, whose `beats` are already
+//! absolute sample positions). Until then this backend reports `Unsupported`, and
+//! `Backend::Auto` relies on stratum.
 
 use super::{AnalyserError, RawAnalysis};
 

@@ -11,5 +11,5 @@ hypermixx-media = { path = "../hypermixx-media" }
 cpal = { workspace = true }
 rtrb = { workspace = true }
 crossbeam-channel = { workspace = true }
-timestretch = { path = "../timestretch" }
+timestretch = { git = "https://v6.gh-proxy.org/https://github.com/robmorgan/timestretch-rs.git", rev = "2628090" }
 arc-swap = "1"
