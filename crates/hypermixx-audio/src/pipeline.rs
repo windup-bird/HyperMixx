@@ -1,460 +1,384 @@
-//! Producer thread + cpal output: the only place the engine touches a sound card.
+//! Producer thread + command channel: the boundary between "someone asked" and "the mix heard it".
 //!
 //! Topology:
-//!   CLI --Command--> [producer thread: deck0 + deck1 -> mix] --f32--> ring --f32--> [cpal callback]
+//!   CLI ──Command──► [producer thread: Mixer::process] ──blocks──► Outputs ──► cpal ──► hardware
 //!
-//! The two ends of the ring are split to their threads at construction, so the audio callback only
-//! touches the ring buffer: no locks, no allocation, no decoding. Commands carry already-decoded
-//! sources and already-compiled analysis — this thread never opens a file or runs an analyser.
+//! Nothing in this module names a cpal type. Device opening, the rings, the sample-format conversions
+//! and the real-time callbacks live in [`crate::mixer::output`], the one place a cpal type appears.
+//!
+//! The mixer is **built on the producer thread**, not handed to it. That is not tidiness:
+//! `cpal::Stream` is deliberately not `Send`, so a mixer holding streams cannot cross a thread
+//! boundary. Building here keeps every stream created and dropped on the thread that runs them, and
+//! lets `start` still report a bad config synchronously — the constructor's result travels back over
+//! a private channel before the first block is rendered.
+//!
+//! Pacing has two sources of truth, in this order: free space in the output rings (a callback draining
+//! at the hardware rate is the only honest metronome, and producing into a full ring drops samples)
+//! and, with no device attached, the wall clock. Sleeping a hair under a block's duration in both
+//! cases is what keeps two playheads locked to real time instead of drifting while a buffer has slack.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
-use hypermixx_core::{Command, CommandResponse, DeckId, DeckState};
-use hypermixx_media::PcmPool;
-use rtrb::{Consumer, Producer};
+use hypermixx_core::{Command, CommandResponse, DeckId, DeckState, Shared};
 
 use crate::deck::Deck;
-use crate::ringbuf::{fill_with_silence_on_underrun, pop_samples, push_samples, AudioRingBuffer};
-use crate::{
-    BLOCK_SAMPLES, BLOCK_SIZE, CHANNELS, DECK_COUNT, DECK_MIX_GAIN, OUTPUT_RING_CAPACITY,
-    OUTPUT_RING_SAMPLES, PREFILL_FRAMES, SAMPLE_RATE,
-};
+use crate::mixer::config::{MixerConfig, MixerError};
+use crate::mixer::{Mixer, OutputError};
+use crate::BLOCK_SIZE;
+use crate::SAMPLE_RATE;
 
-/// Sleep between produced blocks: deliberately shorter than the block's audio duration (90% of
-/// 5.33ms) so the producer keeps a margin in the ring instead of drifting into underrun.
-const BLOCK_PACE: Duration =
-    Duration::from_nanos(BLOCK_SIZE as u64 * 900_000_000 / SAMPLE_RATE as u64);
+/// Why the engine could not start.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PipelineError {
+    /// The mixer's topology was invalid (unknown FX name, no channels, ...).
+    Config(String),
+    /// An output could not be opened.
+    Device(String),
+    /// The producer thread could not be spawned.
+    Thread(String),
+    /// The producer thread died before it reported back.
+    Lost,
+}
 
-/// Owns the audio stream, the producer thread and the decks.
+impl PipelineError {
+    pub fn message(&self) -> String {
+        match self {
+            PipelineError::Config(what) => format!("mixer config: {what}"),
+            PipelineError::Device(what) => format!("output device: {what}"),
+            PipelineError::Thread(what) => format!("producer thread: {what}"),
+            PipelineError::Lost => "the audio thread exited before reporting".into(),
+        }
+    }
+}
+
+impl std::fmt::Display for PipelineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for PipelineError {}
+
+impl From<MixerError> for PipelineError {
+    fn from(err: MixerError) -> Self {
+        PipelineError::Config(err.message())
+    }
+}
+
+impl From<OutputError> for PipelineError {
+    fn from(err: OutputError) -> Self {
+        PipelineError::Device(err.message())
+    }
+}
+
+/// Owns the producer thread and the mixer it drives.
+///
+/// The command and response channels belong to the pipeline rather than being passed in: a `start`
+/// that hands back both ends cannot be wired wrongly, and a caller that wants to send commands has to
+/// keep the pipeline alive — which is the lifetime rule the engine wants anyway.
 pub struct AudioPipeline {
-    /// Fixed set of decks indexed by `deck_id`. Only the producer thread and the commands it
-    /// handles take these locks, so the audio callback never does.
-    decks: Vec<Arc<Mutex<Deck>>>,
-    shutdown: Arc<AtomicBool>,
     producer: Option<JoinHandle<()>>,
-    /// The cpal stream must outlive the producer thread; dropping it stops the sound card.
-    _stream: Option<cpal::Stream>,
+    /// `None` once dropped, which closes the channel and ends the thread.
+    cmd_tx: Option<Sender<Command>>,
+    resp_rx: Receiver<CommandResponse>,
+    /// Requests that need the mixer's own data, served by the producer thread. Only the deck's
+    /// `Source` is fetched this way today (the CLI reads it back to analyse a track); a UI would add
+    /// getters here rather than reaching into the engine.
+    query_tx: Option<Sender<(Query, Sender<QueryResponse>)>>,
+}
+
+/// A read that has to happen on the mixer's thread.
+enum Query {
+    /// The PCM a deck is playing, for out-of-band analysis.
+    DeckSource(DeckId),
+}
+
+enum QueryResponse {
+    Source(Option<Shared>),
 }
 
 impl AudioPipeline {
-    /// Spins up the producer thread and the audio output.
-    ///
-    /// With no usable output device the engine still runs — blocks keep being produced and drained
-    /// internally, so the CLI stays usable on headless machines.
-    pub fn start(command_rx: Receiver<Command>, response_tx: Sender<CommandResponse>) -> Self {
-        let decks: Vec<Arc<Mutex<Deck>>> = (0..DECK_COUNT)
-            .map(|_| Arc::new(Mutex::new(Deck::new(Arc::new(PcmPool::empty())))))
-            .collect();
-        let shutdown = Arc::new(AtomicBool::new(false));
+    /// Builds the mixer from `cfg` at the engine rate and starts the producer thread.
+    pub fn start(cfg: MixerConfig) -> Result<Self, PipelineError> {
+        Self::start_at(cfg, SAMPLE_RATE)
+    }
 
-        let (mut producer, consumer) = AudioRingBuffer::new(OUTPUT_RING_CAPACITY).split();
-        fill_ring_with_silence(&mut producer, PREFILL_FRAMES);
+    /// As [`start`](Self::start) with an explicit rate, for a test that wants a specific clock.
+    /// Production callers want [`start`](Self::start): the decoder resamples to the engine rate, so
+    /// any other value would make the two disagree about what a second is.
+    pub fn start_at(cfg: MixerConfig, sample_rate: u32) -> Result<Self, PipelineError> {
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<Command>();
+        let (resp_tx, resp_rx) = crossbeam_channel::unbounded::<CommandResponse>();
+        let (query_tx, query_rx) = crossbeam_channel::unbounded::<(Query, Sender<QueryResponse>)>();
+        // Carries "did the mixer build?" out of the thread that had to build it. The mixer itself
+        // never crosses back — it cannot, which is why it is built on that thread in the first place.
+        let (boot_tx, boot_rx) = mpsc::channel::<Result<(), PipelineError>>();
 
-        let (stream, drain) = Self::open_output_stream(consumer);
-        if stream.is_none() {
-            eprintln!("[audio] headless mode: blocks are produced into a silent sink");
-        }
-
-        let thread_decks = decks.clone();
-        let thread_shutdown = Arc::clone(&shutdown);
-        let producer_thread = std::thread::Builder::new()
+        let thread_cfg = cfg;
+        let producer = std::thread::Builder::new()
             .name("hypermixx-producer".into())
             .spawn(move || {
-                Self::producer_loop(
-                    producer,
-                    drain,
-                    thread_decks,
-                    command_rx,
-                    response_tx,
-                    thread_shutdown,
-                )
+                let mixer = match Mixer::new(thread_cfg, sample_rate) {
+                    Ok(mixer) => mixer,
+                    Err(err) => {
+                        let _ = boot_tx.send(Err(err.into()));
+                        return;
+                    }
+                };
+                let _ = boot_tx.send(Ok(()));
+                Self::producer_loop(mixer, cmd_rx, query_rx, resp_tx, sample_rate);
             })
-            .expect("failed to spawn producer thread");
+            .map_err(|err| PipelineError::Thread(err.to_string()))?;
 
-        Self {
-            decks,
-            shutdown,
-            producer: Some(producer_thread),
-            _stream: stream,
+        // The thread answers this before its first block, so there is nothing to wait on.
+        match boot_rx.recv() {
+            Err(_) => Err(PipelineError::Lost),
+            Ok(Err(err)) => {
+                drop(cmd_tx);
+                let _ = producer.join();
+                Err(err)
+            }
+            Ok(Ok(())) => Ok(Self {
+                producer: Some(producer),
+                cmd_tx: Some(cmd_tx),
+                resp_rx,
+                query_tx: Some(query_tx),
+            }),
         }
     }
 
-    /// The deck behind `deck_id`, for consumers that inspect a transport directly (a future UI or
-    /// mixer) instead of going through the command channel.
-    pub fn deck(&self, deck_id: DeckId) -> Option<&Arc<Mutex<Deck>>> {
-        self.decks.get(deck_id as usize)
+    /// The command entry point. Clone it into whichever thread asks for things.
+    pub fn command_tx(&self) -> Sender<Command> {
+        self.cmd_tx
+            .clone()
+            .expect("the pipeline is shutting down")
     }
 
-    /// Number of decks the pipeline mixes.
-    pub fn deck_count(&self) -> usize {
-        self.decks.len()
+    pub fn response_rx(&self) -> &Receiver<CommandResponse> {
+        &self.resp_rx
     }
 
-    /// The producer thread body: drain commands, then push one mixed block into the output ring.
+    /// The PCM a deck is playing, or `None` for an empty deck or a bad id.
+    ///
+    /// Round-trips through the producer thread rather than reaching into the mixer: the engine's data
+    /// is only ever touched by the thread that renders it, which is why there is no `deck()` accessor
+    /// handing out a `&Mutex<Deck>` at all.
+    pub fn deck_source(&self, deck_id: DeckId) -> Option<Shared> {
+        let (answer_tx, answer_rx) = crossbeam_channel::unbounded::<QueryResponse>();
+        self.query_tx
+            .as_ref()?
+            .send((Query::DeckSource(deck_id), answer_tx))
+            .ok()?;
+        match answer_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(QueryResponse::Source(source)) => source,
+            Err(_) => None,
+        }
+    }
+
+    /// The producer thread body: drain commands, serve queries, render one block, keep pace.
+    ///
+    /// The mixer is owned outright here — no `Mutex`, no lock ordering to reason about, and a reader
+    /// on another thread can only ever ask via a query, which is answered between blocks.
     fn producer_loop(
-        mut producer: Producer<f32>,
-        mut drain: Option<Consumer<f32>>,
-        decks: Vec<Arc<Mutex<Deck>>>,
-        command_rx: Receiver<Command>,
-        response_tx: Sender<CommandResponse>,
-        shutdown: Arc<AtomicBool>,
+        mut mixer: Mixer,
+        cmd_rx: Receiver<Command>,
+        query_rx: Receiver<(Query, Sender<QueryResponse>)>,
+        resp_tx: Sender<CommandResponse>,
+        sample_rate: u32,
     ) {
-        let mut mix = [0.0f32; BLOCK_SAMPLES];
-        let mut deck_block = [0.0f32; BLOCK_SAMPLES];
-        'engine: loop {
+        // Deliberately shorter than a block's audio duration, so the producer keeps a margin in the
+        // rings instead of drifting into underrun.
+        let pace = Duration::from_nanos(BLOCK_SIZE as u64 * 900_000_000 / sample_rate as u64);
+        loop {
+            let started = Instant::now();
+            let mut quit = false;
             loop {
-                match command_rx.try_recv() {
-                    Ok(Command::Quit) => {
-                        shutdown.store(true, Ordering::Relaxed);
-                        let _ = response_tx.send(CommandResponse::Ok);
-                        break 'engine;
+                match cmd_rx.try_recv() {
+                    Ok(Command::Quit) => quit = true,
+                    Ok(command) => {
+                        if let Some(response) = route(&mut mixer, command) {
+                            if resp_tx.send(response).is_err() {
+                                return; // nobody left to answer
+                            }
+                        }
                     }
-                    Ok(command) => Self::handle_command(command, &decks, &response_tx),
                     Err(TryRecvError::Empty) => break,
-                    // CLI gone: shut down instead of spinning forever.
-                    Err(TryRecvError::Disconnected) => break 'engine,
+                    // Nobody left sending: stop rather than spin.
+                    Err(TryRecvError::Disconnected) => return,
                 }
+                // Queries are non-urgent but must not starve behind a command burst.
+                drain_queries(&mut mixer, &query_rx);
             }
-            if shutdown.load(Ordering::Relaxed) {
-                break;
+            if quit {
+                drain_queries(&mut mixer, &query_rx);
+                let _ = resp_tx.send(CommandResponse::Ok);
+                return;
             }
 
-            // Pace on ring room, not on the clock: the callback drains at the device rate, so
-            // producing only when a whole block fits keeps both playheads locked to wall time
-            // instead of drifting ~10% fast while the ring has slack. With no sound card there is
-            // no consumer at all, so `drain` plays that role and the decks never stall.
-            if drain.is_none() && producer.slots() < BLOCK_SAMPLES {
-                std::thread::sleep(BLOCK_PACE);
+            // Backpressure from the devices, not from a clock: with a live output the callback drains
+            // at the hardware rate, so producing only when a whole block fits keeps the transport
+            // locked to real time. With no output there is no consumer, and only the sleep paces.
+            if !mixer.outputs().has_room(BLOCK_SIZE) {
+                sleep_until_next(started, pace);
                 continue;
             }
-
-            mix.fill(0.0);
-            for deck in &decks {
-                // A paused or exhausted deck writes a fully populated silent block, so every deck
-                // advances one block per tick and both transports share the same clock.
-                lock(deck).process_block(&mut deck_block);
-                for (mixed, sample) in mix.iter_mut().zip(deck_block) {
-                    *mixed += sample;
-                }
-            }
-            for sample in &mut mix {
-                *sample *= DECK_MIX_GAIN;
-            }
-            push_samples(&mut producer, &mix);
-            if let Some(sink) = drain.as_mut() {
-                let mut discard = [0.0f32; BLOCK_SAMPLES];
-                pop_samples(sink, &mut discard);
-            }
-            std::thread::sleep(BLOCK_PACE);
+            let ctx = mixer.make_ctx(sample_rate);
+            mixer.process(&ctx);
+            sleep_until_next(started, pace);
         }
-    }
-
-    /// Applies one command (everything except `Quit`, which ends the loop). Every arm is a pure
-    /// engine action: no file IO, no analysis — those already happened in the CLI.
-    fn handle_command(
-        command: Command,
-        decks: &[Arc<Mutex<Deck>>],
-        response_tx: &Sender<CommandResponse>,
-    ) {
-        match command {
-            Command::Load {
-                deck_id,
-                source,
-                analysis,
-            } => {
-                let Some(target) = decks.get(deck_id as usize).cloned() else {
-                    return unknown_deck(response_tx, deck_id, decks.len());
-                };
-                let total_frames = source.total_frames();
-                // Installing a fresh deck resets its transport and joins the old warm-up thread on
-                // drop; the other deck keeps playing untouched.
-                let deck = Deck::new(source);
-                if let Some(analysis) = analysis {
-                    deck.set_analysis(analysis);
-                }
-                *lock(&target) = deck;
-                let _ = response_tx.send(CommandResponse::Loaded {
-                    deck_id,
-                    total_frames,
-                });
-            }
-            Command::Play { deck_id } => {
-                on_deck(decks, deck_id, response_tx, |deck| {
-                    deck.play();
-                    CommandResponse::Ok
-                });
-            }
-            Command::Pause { deck_id } => {
-                on_deck(decks, deck_id, response_tx, |deck| {
-                    deck.pause();
-                    CommandResponse::Ok
-                });
-            }
-            Command::Jump {
-                deck_id,
-                target_frame,
-            } => {
-                on_deck(decks, deck_id, response_tx, move |deck| {
-                    deck.jump(target_frame);
-                    CommandResponse::Ok
-                });
-            }
-            Command::BeatJump { deck_id, beats } => {
-                on_deck(decks, deck_id, response_tx, move |deck| {
-                    deck.beatjump(beats);
-                    CommandResponse::Ok
-                });
-            }
-            Command::SetAnalysis { deck_id, analysis } => {
-                let Some(deck) = decks.get(deck_id as usize) else {
-                    return unknown_deck(response_tx, deck_id, decks.len());
-                };
-                lock(deck).set_analysis(analysis);
-                let _ = response_tx.send(CommandResponse::Ok);
-            }
-            Command::SetRate { deck_id, rate } => {
-                on_deck(decks, deck_id, response_tx, move |deck| {
-                    deck.set_ratio(rate);
-                    CommandResponse::Ok
-                });
-            }
-            Command::SetProfile { deck_id, profile } => {
-                let ep = match profile.as_str() {
-                    "tape" => timestretch::engine::EngineProfile::Tape,
-                    "keylock" => timestretch::engine::EngineProfile::Keylock,
-                    "wide" | "widekeylock" => timestretch::engine::EngineProfile::WideKeylock,
-                    other => {
-                        return reject(
-                            response_tx,
-                            &format!("unknown profile `{other}`, use tape/keylock/wide"),
-                        );
-                    }
-                };
-                on_deck(decks, deck_id, response_tx, move |deck| {
-                    deck.set_profile(ep);
-                    CommandResponse::Ok
-                });
-            }
-            Command::GetState { deck_id } => {
-                let Some(deck) = decks.get(deck_id as usize) else {
-                    return unknown_deck(response_tx, deck_id, decks.len());
-                };
-                let _ = response_tx.send(CommandResponse::State(state_of(deck_id, deck)));
-            }
-            Command::GetAllStates => {
-                // One pass over every deck: all frames in the answer come from the same block, so
-                // differences between decks are free of sampling skew.
-                let states = decks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, deck)| state_of(i as DeckId, deck))
-                    .collect();
-                let _ = response_tx.send(CommandResponse::States(states));
-            }
-            Command::Quit => {
-                // The producer loop intercepts `Quit` before calling this function; stopping the
-                // engine from here would be a silent no-op, so nothing to do.
-            }
-        }
-    }
-
-    /// Opens the default output device, preferring 48kHz stereo f32.
-    ///
-    /// Returns the stream (if any) plus the ring's read end when it could stay unused: handing the
-    /// consumer back lets the producer thread drain the ring itself instead of stalling forever.
-    fn open_output_stream(
-        mut consumer: Consumer<f32>,
-    ) -> (Option<cpal::Stream>, Option<Consumer<f32>>) {
-        let host = cpal::default_host();
-        let Some(device) = host.default_output_device() else {
-            eprintln!("[audio] no output device found");
-            return (None, Some(consumer));
-        };
-        let name = device.name().unwrap_or_else(|_| "audio device".into());
-
-        let config = match preferred_config(&device) {
-            Some(config) => config,
-            None => match device.default_output_config() {
-                Ok(config) => config,
-                Err(err) => {
-                    eprintln!("[audio] {name}: cannot read default config ({err})");
-                    return (None, Some(consumer));
-                }
-            },
-        };
-        let (rate, channels) = (config.sample_rate().0, config.channels() as usize);
-        if rate != SAMPLE_RATE || channels != CHANNELS {
-            eprintln!(
-                "[audio] warning: device pinned to {rate}Hz/{channels}ch but the engine produces \
-                 {SAMPLE_RATE}Hz/{CHANNELS}ch, so playback timing will be off"
-            );
-        }
-        let stream_config = config.config();
-        eprintln!(
-            "[audio] {name}: {}/{channels}ch/{:?}",
-            stream_config.sample_rate.0,
-            config.sample_format()
-        );
-
-        let errors = |err: cpal::StreamError| eprintln!("[audio] stream error: {err}");
-        let built = match config.sample_format() {
-            cpal::SampleFormat::F32 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    fill_with_silence_on_underrun(&mut consumer, data);
-                },
-                errors,
-                None,
-            ),
-            cpal::SampleFormat::I16 => {
-                // Pre-sized outside the callback: the real-time thread must not allocate.
-                let mut scratch = vec![0.0f32; OUTPUT_RING_SAMPLES];
-                device.build_output_stream(
-                    &stream_config,
-                    move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                        grow(&mut scratch, data.len());
-                        let (buffer, _spare) = scratch.split_at_mut(data.len());
-                        fill_with_silence_on_underrun(&mut consumer, buffer);
-                        for (out, sample) in data.iter_mut().zip(&*buffer) {
-                            *out = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
-                        }
-                    },
-                    errors,
-                    None,
-                )
-            }
-            cpal::SampleFormat::U16 => {
-                let mut scratch = vec![0.0f32; OUTPUT_RING_SAMPLES];
-                device.build_output_stream(
-                    &stream_config,
-                    move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
-                        grow(&mut scratch, data.len());
-                        let (buffer, _spare) = scratch.split_at_mut(data.len());
-                        fill_with_silence_on_underrun(&mut consumer, buffer);
-                        for (out, sample) in data.iter_mut().zip(&*buffer) {
-                            *out = ((sample.clamp(-1.0, 1.0) + 1.0) * 0.5 * f32::from(u16::MAX))
-                                as u16;
-                        }
-                    },
-                    errors,
-                    None,
-                )
-            }
-            format => {
-                eprintln!("[audio] unsupported sample format {format:?}");
-                return (None, Some(consumer));
-            }
-        };
-        let stream = match built {
-            Ok(stream) => stream,
-            Err(err) => {
-                eprintln!("[audio] {name}: failed to build stream ({err})");
-                return (None, None);
-            }
-        };
-        if let Err(err) = stream.play() {
-            eprintln!("[audio] {name}: failed to start stream ({err})");
-            return (None, None);
-        }
-        (Some(stream), None)
     }
 }
 
 impl Drop for AudioPipeline {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
+        // Closing the command channel is enough: the loop returns on a disconnected receiver, and
+        // dropping the mixer on that thread stops every output.
+        self.query_tx = None;
+        self.cmd_tx = None;
         if let Some(worker) = self.producer.take() {
             let _ = worker.join();
         }
     }
 }
 
-/// Picks a 48kHz stereo config if the device advertises one.
-fn preferred_config(device: &cpal::Device) -> Option<cpal::SupportedStreamConfig> {
-    let ranges = device.supported_output_configs().ok()?;
-    ranges
-        .filter(|range| {
-            range.channels() as usize == CHANNELS
-                && range.min_sample_rate().0 <= SAMPLE_RATE
-                && range.max_sample_rate().0 >= SAMPLE_RATE
-        })
-        .max_by_key(|range| range.sample_format() == cpal::SampleFormat::F32)
-        .map(|range| range.with_sample_rate(cpal::SampleRate(SAMPLE_RATE)))
-}
-
-/// Grows a reusable real-time scratch buffer. Reallocating here is a cold path: the buffer starts
-/// out as large as the whole output ring, which any sane callback fits into.
-fn grow(scratch: &mut Vec<f32>, needed: usize) {
-    if scratch.len() < needed {
-        scratch.resize(needed, 0.0);
+fn drain_queries(mixer: &mut Mixer, rx: &Receiver<(Query, Sender<QueryResponse>)>) {
+    while let Ok((query, answer)) = rx.try_recv() {
+        let response = match query {
+            Query::DeckSource(deck_id) => {
+                let source = mixer
+                    .deck(deck_id as usize)
+                    .filter(|deck| deck.total_frames() > 0)
+                    .map(Deck::source);
+                QueryResponse::Source(source)
+            }
+        };
+        // A dropped receiver means the caller gave up; not an error here.
+        let _ = answer.send(response);
     }
 }
 
-/// Pre-fills the output ring with silence so the callback never starts from empty.
-fn fill_ring_with_silence(producer: &mut Producer<f32>, frames: usize) {
-    let silence = [0.0f32; BLOCK_SAMPLES];
-    let mut remaining = frames * CHANNELS;
-    while remaining > 0 {
-        let written = push_samples(producer, &silence[..remaining.min(BLOCK_SAMPLES)]);
-        if written == 0 {
-            break; // ring is full; the prefill target is already met
+/// Paces one iteration so the loop's period is `pace` rather than `pace` + a block's work.
+fn sleep_until_next(started: Instant, pace: Duration) {
+    match pace.checked_sub(started.elapsed()) {
+        Some(remaining) => std::thread::sleep(remaining),
+        // Fell behind: skip the sleep, not the block. Underruns from here are reported by
+        // `Output::underruns`, and dropping a block is better than backing the whole pipeline up.
+        None => {}
+    }
+}
+
+/// Applies one command, returning the answer when the caller expects one.
+///
+/// Transport commands go to the deck inside a channel; FX commands are the mixer's own business.
+/// `Quit` is handled by the loop, so it never reaches here.
+fn route(mixer: &mut Mixer, command: Command) -> Option<CommandResponse> {
+    use Command::*;
+    match command {
+        Load { deck_id, source, analysis } => {
+            let total_frames = source.total_frames();
+            let Some(channel) = mixer.channel_mut(deck_id as usize) else {
+                return Some(error(unknown_deck(deck_id, mixer.channel_count())));
+            };
+            // A fresh transport resets this deck's position and joins its old warm-up thread on drop;
+            // the other channels keep playing untouched. Faders and FX deliberately survive, because
+            // reloading a track should not reset the mixer a user is standing at.
+            // `set_analysis` takes `&self` (the grid swaps in lock-free), so no `mut` needed.
+            let deck = Deck::new(source);
+            if let Some(analysis) = analysis {
+                deck.set_analysis(analysis);
+            }
+            channel.replace_deck(deck);
+            Some(CommandResponse::Loaded { deck_id, total_frames })
         }
-        remaining -= written;
+        Play { deck_id } => transport(mixer, deck_id, |deck| deck.play()),
+        Pause { deck_id } => transport(mixer, deck_id, |deck| deck.pause()),
+        Jump { deck_id, target_frame } => {
+            transport(mixer, deck_id, move |deck| deck.jump(target_frame))
+        }
+        BeatJump { deck_id, beats } => transport(mixer, deck_id, move |deck| deck.beatjump(beats)),
+        SetRate { deck_id, rate } => transport(mixer, deck_id, move |deck| deck.set_ratio(rate)),
+        SetProfile { deck_id, profile } => {
+            let engine_profile = match profile.as_str() {
+                "tape" => Some(timestretch::engine::EngineProfile::Tape),
+                "keylock" => Some(timestretch::engine::EngineProfile::Keylock),
+                "wide" | "widekeylock" => Some(timestretch::engine::EngineProfile::WideKeylock),
+                _ => None,
+            };
+            match engine_profile {
+                Some(engine_profile) => {
+                    transport(mixer, deck_id, move |deck| deck.set_profile(engine_profile))
+                }
+                None => Some(error("unknown profile, use tape/keylock/wide".to_owned())),
+            }
+        }
+        SetAnalysis { deck_id, analysis } => match mixer.deck_mut(deck_id as usize) {
+            Some(deck) => {
+                deck.set_analysis(analysis);
+                Some(CommandResponse::Ok)
+            }
+            None => Some(error(unknown_deck(deck_id, mixer.channel_count()))),
+        },
+        GetState { deck_id } => match mixer.deck(deck_id as usize) {
+            Some(deck) => Some(CommandResponse::State(state_of(deck_id, deck))),
+            None => Some(error(unknown_deck(deck_id, mixer.channel_count()))),
+        },
+        GetAllStates => {
+            // One pass over every channel: all frames in the answer come from the same block, so
+            // differences between decks are free of sampling skew.
+            let states = (0..mixer.channel_count())
+                .filter_map(|index| mixer.deck(index).map(|deck| state_of(index as DeckId, deck)))
+                .collect();
+            Some(CommandResponse::States(states))
+        }
+        fx @ (AddFx { .. }
+        | RemoveFx { .. }
+        | SetFxEnabled { .. }
+        | SetFxParam { .. }
+        | FxTrigger { .. }
+        | PadPress { .. }
+        | PadRelease { .. }
+        | ListFx { .. }) => Some(mixer.handle_fx_command(fx)),
+        Quit => None,
     }
 }
 
-/// Reads one deck's transport. Called from the producer thread only.
-fn state_of(deck_id: DeckId, deck: &Arc<Mutex<Deck>>) -> DeckState {
-    let deck = lock(deck);
+/// Runs `apply` on a loaded deck; an empty deck is answered with an error rather than ignored, so a
+/// mistyped deck id is visible instead of silent.
+fn transport(mixer: &mut Mixer, deck_id: DeckId, apply: impl FnOnce(&mut Deck)) -> Option<CommandResponse> {
+    let count = mixer.channel_count();
+    let Some(channel) = mixer.channel_mut(deck_id as usize) else {
+        return Some(error(unknown_deck(deck_id, count)));
+    };
+    if channel.deck().total_frames() == 0 {
+        return Some(error(format!(
+            "deck {deck_id} holds no track, use `load {deck_id} <path>`"
+        )));
+    }
+    apply(channel.deck_mut());
+    Some(CommandResponse::Ok)
+}
+
+fn state_of(deck_id: DeckId, deck: &Deck) -> DeckState {
     DeckState {
         deck_id,
         current_frame: deck.current_frame(),
         playing: deck.is_playing(),
         total_frames: deck.total_frames(),
         bpm: deck.bpm(),
-        key: deck.key().map(|k| k.traditional()),
+        key: deck.key().map(|key| key.traditional()),
     }
 }
 
-/// Runs `apply` on a loaded deck, answering with `Error` for a bad id or an empty deck.
-fn on_deck(
-    decks: &[Arc<Mutex<Deck>>],
-    deck_id: DeckId,
-    response_tx: &Sender<CommandResponse>,
-    apply: impl FnOnce(&mut Deck) -> CommandResponse,
-) {
-    let Some(deck) = decks.get(deck_id as usize) else {
-        return unknown_deck(response_tx, deck_id, decks.len());
-    };
-    if lock(deck).total_frames() == 0 {
-        return reject(
-            response_tx,
-            &format!("deck {deck_id} holds no track, use `load {deck_id} <path>`"),
-        );
-    }
-    let _ = response_tx.send(apply(&mut lock(deck)));
+fn unknown_deck(deck_id: DeckId, count: usize) -> String {
+    format!(
+        "unknown deck {deck_id}, valid ids are 0..={}",
+        count.saturating_sub(1)
+    )
 }
 
-fn unknown_deck(response_tx: &Sender<CommandResponse>, deck_id: DeckId, count: usize) {
-    let last = count.saturating_sub(1);
-    reject(
-        response_tx,
-        &format!("unknown deck {deck_id}, valid ids are 0..={last}"),
-    );
-}
-
-fn reject(response_tx: &Sender<CommandResponse>, reason: &str) {
-    let _ = response_tx.send(CommandResponse::Error(reason.into()));
-}
-
-/// Locks without ever panicking on poisoning: a panic elsewhere must not kill audio.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+fn error(message: String) -> CommandResponse {
+    CommandResponse::Error(message)
 }

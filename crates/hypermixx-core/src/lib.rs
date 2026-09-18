@@ -12,7 +12,7 @@ pub mod source;
 
 pub use analysis::TrackAnalysis;
 pub use beatgrid::BeatGrid;
-pub use command::{Backend, Command, CommandResponse};
+pub use command::{Backend, Command, CommandResponse, FxChainId, FxSlotRef, FxSlotStatus};
 pub use deck::{DeckId, DeckState};
 pub use key::{Key, KeyFormat, KeyMode};
 pub use source::{Shared, Source};

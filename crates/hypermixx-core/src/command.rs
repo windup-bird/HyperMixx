@@ -8,6 +8,45 @@ use crate::analysis::TrackAnalysis;
 use crate::deck::{DeckId, DeckState};
 use crate::source::Shared;
 
+/// Which FX chain a command addresses. `Deck` is the per-deck insert chain the mixer owns; a deck
+/// itself knows nothing about FX, which keeps the transport logic free of audio effects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FxChainId {
+    /// The chain belonging to one deck (a mono-style insert on that deck's signal).
+    Deck(DeckId),
+    /// The summed output chain, before the master limiter.
+    Master,
+}
+
+impl FxChainId {
+    /// A stable label for logs and errors.
+    pub fn label(&self) -> String {
+        match self {
+            FxChainId::Deck(deck_id) => format!("deck{deck_id}"),
+            FxChainId::Master => "master".into(),
+        }
+    }
+}
+
+/// Names one slot inside a chain: `(chain, index)`. Indices are assigned by [`Command::AddFx`]
+/// and shift down when an earlier slot is removed, which is acceptable for a live-coded front-end
+/// and avoids the lifetime bookkeeping stable ids would cost on the audio thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FxSlotRef {
+    pub chain: FxChainId,
+    pub index: usize,
+}
+
+/// One FX slot as reported back to the caller.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FxSlotStatus {
+    pub index: usize,
+    pub kind: String,
+    pub enabled: bool,
+    /// `(name, value)` pairs, in the order the effect declares them.
+    pub params: Vec<(String, f32)>,
+}
+
 /// Which analyser backend to use for a track.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Backend {
@@ -67,6 +106,48 @@ pub enum Command {
     },
     /// Every deck's state, sampled inside the same production block.
     GetAllStates,
+
+    // ---- FX ---------------------------------------------------------------
+    // Everything below is applied by the producer thread at a block boundary; `Box<dyn Fx>` is
+    // moved in/out of a chain there, so the audio path never takes a lock for it.
+    /// Appends a new effect instance to the end of a chain ("eq", "filter", "gain", "limiter", ...).
+    AddFx {
+        chain: FxChainId,
+        kind: String,
+    },
+    /// Drops the effect in `index`, shifting later slots down.
+    RemoveFx {
+        chain: FxChainId,
+        index: usize,
+    },
+    /// Bypasses or engages a slot. Enabling resets the instance so it can't carry stale state.
+    SetFxEnabled {
+        slot: FxSlotRef,
+        enabled: bool,
+    },
+    /// Sets one named parameter. The value lands on the audio thread through a smoothing filter,
+    /// so sweeping a cutoff never clicks.
+    SetFxParam {
+        slot: FxSlotRef,
+        name: String,
+        value: f32,
+    },
+    /// Fires the effect's one-shot hook (re-trigger an envelope, restart a sweep).
+    FxTrigger {
+        slot: FxSlotRef,
+    },
+    /// Held pad: engages the slot for as long as the pad is down, restoring the previous
+    /// engagement on [`Command::PadRelease`] (momentary FX such as a beat gate or a roll).
+    PadPress {
+        slot: FxSlotRef,
+    },
+    PadRelease {
+        slot: FxSlotRef,
+    },
+    /// Reports every slot in a chain with its parameters, so a UI can build its controls.
+    ListFx {
+        chain: FxChainId,
+    },
     Quit,
 }
 
@@ -81,6 +162,17 @@ pub enum CommandResponse {
     State(DeckState),
     /// One answer holding every deck, sampled in the same block (skew-free comparison).
     States(Vec<DeckState>),
+    /// A slot was appended; carries its assigned index and canonical kind name.
+    FxAdded {
+        chain: FxChainId,
+        index: usize,
+        kind: String,
+    },
+    /// The answer to [`Command::ListFx`].
+    FxListed {
+        chain: FxChainId,
+        slots: Vec<FxSlotStatus>,
+    },
     Ok,
     Error(String),
 }
@@ -133,6 +225,31 @@ impl std::fmt::Debug for Command {
                 .field("deck_id", deck_id)
                 .finish(),
             Command::GetAllStates => f.write_str("GetAllStates"),
+            Command::AddFx { chain, kind } => {
+                f.debug_struct("AddFx").field("chain", chain).field("kind", kind).finish()
+            }
+            Command::RemoveFx { chain, index } => f
+                .debug_struct("RemoveFx")
+                .field("chain", chain)
+                .field("index", index)
+                .finish(),
+            Command::SetFxEnabled { slot, enabled } => f
+                .debug_struct("SetFxEnabled")
+                .field("slot", slot)
+                .field("enabled", enabled)
+                .finish(),
+            Command::SetFxParam { slot, name, value } => f
+                .debug_struct("SetFxParam")
+                .field("slot", slot)
+                .field("name", name)
+                .field("value", value)
+                .finish(),
+            Command::FxTrigger { slot } => f.debug_struct("FxTrigger").field("slot", slot).finish(),
+            Command::PadPress { slot } => f.debug_struct("PadPress").field("slot", slot).finish(),
+            Command::PadRelease { slot } => {
+                f.debug_struct("PadRelease").field("slot", slot).finish()
+            }
+            Command::ListFx { chain } => f.debug_struct("ListFx").field("chain", chain).finish(),
             Command::Quit => f.write_str("Quit"),
         }
     }

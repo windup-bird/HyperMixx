@@ -9,7 +9,10 @@ use hypermixx_core::{Key, Source, TrackAnalysis};
 use super::jump::{resolve, Seek};
 use super::FlowShift;
 use crate::flow::{Flow, FlowState};
+use crate::fx::FxContext;
+use crate::mixer::Bus;
 use crate::CHANNELS;
+use hypermixx_media::PcmPool;
 
 /// A single playback deck.
 ///
@@ -48,6 +51,12 @@ impl Deck {
             playing: AtomicBool::new(false),
             analysis: ArcSwapOption::empty(),
         }
+    }
+
+    /// A deck with nothing loaded, which is what a mixer built from a config needs: channels exist
+    /// before any track does, and an empty deck contributes silence.
+    pub fn empty() -> Self {
+        Self::new(Arc::new(PcmPool::empty()))
     }
 
     pub fn play(&self) {
@@ -175,6 +184,37 @@ impl Deck {
         }
     }
 
+    /// Renders one block into a [`Bus`], de-interleaving the transport's output as it goes.
+    ///
+    /// A thin wrapper on [`process_block`](Self::process_block) — the state machine, the jump
+    /// compensation and the silence rules are unchanged, so a mixer and a ring buffer can never see
+    /// two different decks. The tail of `bus` beyond the block length is zeroed, so a bus reused
+    /// across blocks cannot leak the previous block into a short one.
+    ///
+    /// Returns the frames of actual audio (0 while paused or at the end), same contract as
+    /// [`process_block`](Self::process_block).
+    pub fn pull_into(&mut self, bus: &mut Bus, ctx: &FxContext) -> usize {
+        let frames = ctx.block_frames.min(bus.frames());
+        // Stack scratch for the interleaved block: no allocation on the audio path, and one
+        // `BLOCK_SIZE` block is exactly what the transport produces.
+        let mut block = [0.0f32; crate::BLOCK_SAMPLES];
+        let want = frames.min(crate::BLOCK_SIZE) * CHANNELS;
+        let written = self.process_block(&mut block[..want]);
+        for (i, (left, right)) in bus.l[..frames].iter_mut().zip(&mut bus.r[..frames]).enumerate() {
+            let base = i * CHANNELS;
+            if base + 1 < want {
+                *left = block[base];
+                *right = block[base + 1];
+            } else {
+                // A bus longer than one transport block stays zero, so a reused bus cannot leak the
+                // previous block into the tail of this one.
+                *left = 0.0;
+                *right = 0.0;
+            }
+        }
+        written
+    }
+
     /// Current playhead position, in frames.
     pub fn current_frame(&self) -> u64 {
         self.flows
@@ -277,6 +317,79 @@ mod tests {
         assert!(!deck.is_playing());
         assert_eq!(deck.current_frame(), 0);
         assert_eq!(deck.total_frames(), 10_000);
+    }
+
+    #[test]
+    fn an_empty_deck_is_silent_and_holds_no_audio() {
+        let mut deck = Deck::empty();
+        deck.play();
+        let mut out = vec![1.0f32; 256 * CHANNELS];
+        assert_eq!(deck.process_block(&mut out), 256);
+        assert!(out.iter().all(|s| *s == 0.0));
+        assert_eq!(deck.total_frames(), 0);
+        assert!(deck.is_at_end());
+    }
+
+    /// `pull_into` is a wrapper, not a second transport: it must agree with `process_block` exactly.
+    #[test]
+    fn pull_into_matches_process_block_sample_for_sample() {
+        let mut via_bus = Deck::new(pool(10_000));
+        let mut via_block = Deck::new(pool(10_000));
+        via_bus.play();
+        via_block.play();
+        let ctx = crate::fx::FxContext::gridless(crate::SAMPLE_RATE, 256);
+        let mut bus = Bus::stereo(256);
+        let mut out = vec![0.0f32; 256 * CHANNELS];
+        for block in 0..5 {
+            assert_eq!(via_bus.pull_into(&mut bus, &ctx), 256);
+            assert_eq!(via_block.process_block(&mut out), 256);
+            for i in 0..256 {
+                // The ramp source encodes the frame index in the sample value, so this also checks
+                // that the de-interleave picked the right channel.
+                assert_eq!(bus.l[i], out[i * CHANNELS], "block {block} frame {i} left");
+                assert_eq!(bus.r[i], out[i * CHANNELS + 1], "block {block} frame {i} right");
+            }
+            assert_eq!(via_bus.current_frame(), via_block.current_frame());
+        }
+    }
+
+    #[test]
+    fn a_paused_deck_pulls_silence_into_a_bus_that_had_signal() {
+        let mut deck = Deck::new(pool(10_000));
+        deck.play();
+        let ctx = crate::fx::FxContext::gridless(crate::SAMPLE_RATE, 256);
+        let mut bus = Bus::stereo(256);
+        deck.pull_into(&mut bus, &ctx);
+        assert!(bus.peak() > 0.0);
+        deck.pause();
+        deck.pull_into(&mut bus, &ctx);
+        assert!(bus.is_silent(), "a paused deck must zero the whole bus");
+    }
+
+    #[test]
+    fn pull_into_zeroes_the_tail_of_an_oversized_bus() {
+        // A bus longer than one transport block must not keep the previous block in its tail, or a
+        // mixer configured for a bigger block would hear an echo of the last one.
+        let mut deck = Deck::new(pool(10_000));
+        deck.play();
+        let ctx = crate::fx::FxContext::gridless(crate::SAMPLE_RATE, 256);
+        let mut bus = Bus::stereo(1_024);
+        deck.pull_into(&mut bus, &ctx);
+        assert!(bus.l[300..].iter().all(|s| *s == 0.0), "tail was not cleared");
+        assert!(bus.l[1] > 0.0, "the head must still carry audio");
+    }
+
+    #[test]
+    fn pull_into_respects_a_short_bus() {
+        let mut deck = Deck::new(pool(10_000));
+        deck.play();
+        let ctx = crate::fx::FxContext::gridless(crate::SAMPLE_RATE, 64);
+        let mut bus = Bus::stereo(64);
+        // The transport is asked for 64 frames, so it advances 64: same clock, smaller block.
+        assert_eq!(deck.pull_into(&mut bus, &ctx), 64);
+        assert_eq!(bus.frames(), 64);
+        assert!(bus.peak() > 0.0);
+        assert_eq!(deck.current_frame(), 64);
     }
 
     #[test]
