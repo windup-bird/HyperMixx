@@ -13,3 +13,5 @@ rtrb = { workspace = true }
 crossbeam-channel = { workspace = true }
 timestretch = { git = "https://v6.gh-proxy.org/https://github.com/robmorgan/timestretch-rs.git", rev = "2628090" }
 arc-swap = "1"
+serde = { workspace = true }
+toml = { workspace = true }

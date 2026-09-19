@@ -41,7 +41,8 @@ use crate::BLOCK_SIZE;
 /// The four points of the chain, in order. [`CueTap::PostDeckFader`] is the usual DJ choice ("what
 /// I monitor is what would go out"); earlier taps are what you want when cueing while the channel
 /// fader is down.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CueTap {
     /// After the flow chain, before the flow fader: the raw voice, ignoring all level.
     PostFlowFx,
@@ -55,7 +56,8 @@ pub enum CueTap {
 }
 
 /// Which half of the crossfader a channel is on.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeckSide {
     /// Fades out as the crossfader moves right.
     #[default]
@@ -67,7 +69,8 @@ pub enum DeckSide {
 }
 
 /// How a crossfader position maps to per-side gain.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CrossfaderCurve {
     /// Straight taper: `left = 1-t`, `right = t`. Sum of amplitudes stays at 1.
     Linear,

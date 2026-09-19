@@ -27,6 +27,8 @@ pub enum MixerError {
     Empty,
     /// An output could not be opened.
     Output(String),
+    /// A config file could not be parsed.
+    Parse(String),
 }
 
 impl MixerError {
@@ -45,6 +47,7 @@ impl MixerError {
             }
             MixerError::Empty => "no channels configured".into(),
             MixerError::Output(what) => format!("output: {what}"),
+            MixerError::Parse(what) => format!("config: {what}"),
         }
     }
 }
@@ -67,7 +70,8 @@ impl From<FxError> for MixerError {
 }
 
 /// One mixer input.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
 pub struct ChannelConfig {
     /// FX between the deck and the flow fader. Empty for "no per-stream inserts".
     pub flow_fx: Vec<String>,
@@ -135,24 +139,55 @@ pub enum SlotPlace {
 }
 
 /// One destination.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutputConfig {
+    /// `id` is optional in a file (and ignored: the mixer renumbers outputs by position), so a
+    /// destination needs only a `name` and a `role`.
+    #[serde(default)]
     pub id: OutputId,
     pub name: String,
     /// `(left, right)` device channel indices.
+    #[serde(default = "default_channels")]
     pub channels: (u16, u16),
     pub role: OutputRole,
     /// Trim applied when the bus is handed over, so two destinations can differ in level without
     /// the mixer knowing about it.
+    #[serde(default = "default_gain")]
     pub gain: f32,
 }
 
+#[inline]
+fn default_channels() -> (u16, u16) {
+    (0, 1)
+}
+
+#[inline]
+fn default_gain() -> f32 {
+    1.0
+}
+
 /// Whether an output carries the mix or the cue.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OutputRole {
     #[default]
     Main,
     Headphones,
+}
+
+impl Default for OutputConfig {
+    /// The plain stereo default: channels (0,1), main role, unity gain. `name` still has to come
+    /// from the config — an anonymous destination cannot be named in a log line.
+    fn default() -> Self {
+        Self {
+            id: 0,
+            name: String::new(),
+            channels: (0, 1),
+            role: OutputRole::Main,
+            gain: 1.0,
+        }
+    }
 }
 
 impl OutputConfig {
@@ -186,7 +221,7 @@ impl OutputConfig {
 }
 
 /// Everything a [`Mixer`](super::Mixer) needs to exist.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MixerConfig {
     pub channels: Vec<ChannelConfig>,
     /// FX on the summed mix, before the safety limiter.
@@ -222,6 +257,57 @@ impl MixerConfig {
     pub fn output_for(&self, index: usize) -> Option<&OutputConfig> {
         self.outputs.get(index)
     }
+
+    /// Parses a mixer topology from TOML text.
+    ///
+    /// This is the parser half of the "config is plain data" rule: the file schema is spelled out
+    /// by [`MixerFile`] right below — a small mirror of [`MixerConfig`] whose only job is naming
+    /// (`[[channel]]` singular, a `[master]` table), so the Rust type and the file format can each
+    /// keep the names that suit them. File IO stays with the caller — a front-end decides where
+    /// topologies come from, the engine only reads the text.
+    ///
+    /// A config that parses but names an unknown effect still succeeds here; that is a
+    /// *construction* error ([`MixerError::UnknownFx`] from `build_chains`), surfaced when a mixer
+    /// is built rather than when the text is read, because that is where the registry is consulted.
+    pub fn from_toml_str(text: &str) -> Result<Self, MixerError> {
+        let file: MixerFile = toml::from_str(text).map_err(|err| MixerError::Parse(err.to_string()))?;
+        Ok(file.into())
+    }
+}
+
+/// The TOML schema for a whole mixer: one `[[channel]]` per deck, one `[master]` table, any number
+/// of `[[output]]`s. Every field defaults, so the smallest legal file is a single `[[channel]]`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct MixerFile {
+    channel: Vec<ChannelConfig>,
+    master: MasterFile,
+    output: Vec<OutputConfig>,
+}
+
+/// The `[master]` table: `fx`, `limiter`, `fader`, `cue_fader`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct MasterFile {
+    fx: Vec<String>,
+    /// The safety stage. Opt-in from a file (the built-in reference turns it on; a hand-written
+    /// config that omits it gets exactly what it asked for, and the mixer docs say so).
+    limiter: bool,
+    fader: f32,
+    cue_fader: f32,
+}
+
+impl From<MixerFile> for MixerConfig {
+    fn from(file: MixerFile) -> Self {
+        Self {
+            channels: file.channel,
+            master_fx: file.master.fx,
+            master_limiter: file.master.limiter,
+            master_fader: file.master.fader,
+            cue_fader: file.master.cue_fader,
+            outputs: file.output,
+        }
+    }
 }
 
 /// The reference topology: two decks, each with an EQ and a sweep, a limiting master, and main plus
@@ -255,6 +341,51 @@ pub fn simple_dj() -> MixerConfig {
             OutputConfig::headphones(1, "headphones"),
         ],
     }
+}
+
+/// The reference topology as TOML — the starting point for a custom config (`--print-config`
+/// emits it). Parsing this text must yield exactly [`simple_dj`], which is the test that keeps the
+/// schema and the constructor honest with each other.
+pub fn reference_toml() -> &'static str {
+    r#"# Hypermixx mixer topology. `--print-config` prints this; edit and pass back via --config.
+
+# One [[channel]] per deck. Omitted keys take the defaults shown in comments.
+[[channel]]
+side = "left"                 # left | right | center
+# crossfader = 0.0            # starting position, -1 hard left .. 1 hard right
+# flow_fader = 0.0            # per-stream level (0 = unity)
+# deck_fader = 0.0            # deck level (0 = unity)
+cue_send = 1.0                # linear 0..1 into the cue bus
+cue_tap = "post_deck_fx"      # post_flow_fx | post_flow_fader | post_deck_fx | post_deck_fader
+# crossfader_curve = "equal_power" # equal_power | linear
+deck_fx = ["eq", "filter"]    # per-deck inserts; names from `fx help`
+# flow_fx = []                # per-stream inserts
+
+[[channel]]
+side = "right"
+cue_send = 1.0
+cue_tap = "post_deck_fx"
+deck_fx = ["eq", "filter"]
+
+[master]
+# fx = []                     # inserts on the summed mix
+limiter = true                # the safety stage; strongly recommended
+# fader = 0.0                 # master trim (0 = unity)
+# cue_fader = 0.0             # cue bus trim (0 = unity)
+
+# One [[output]] per destination. `name` and `role` are required; the rest has defaults.
+# NOTE: every output opens on the system default device, and the mixer keeps only one stream
+# per physical device — a second output on the same device is dropped (see mixer docs).
+[[output]]
+name = "main"
+role = "main"                  # main | headphones
+# channels = [0, 1]           # device channel pair
+# gain = 1.0                  # per-destination trim
+
+[[output]]
+name = "headphones"
+role = "headphones"
+"#
 }
 
 /// A single-channel config with no outputs at all: the mixer computes and writes nothing, which is
@@ -367,6 +498,74 @@ mod tests {
         {
             build_slot(name).unwrap_or_else(|err| panic!("{name}: {err}"));
         }
+    }
+
+    #[test]
+    fn the_reference_toml_parses_into_simple_dj() {
+        // The contract `--print-config` → edit → `--config` depends on: the emitted text and the
+        // built-in constructor describe the same mixer. Ids are positional (the mixer renumbers),
+        // so they are normalised before the comparison.
+        let mut parsed = MixerConfig::from_toml_str(reference_toml())
+            .unwrap_or_else(|err| panic!("reference toml does not parse: {err}"));
+        for (index, output) in parsed.outputs.iter_mut().enumerate() {
+            output.id = index as OutputId;
+        }
+        let mut expected = simple_dj();
+        for (index, output) in expected.outputs.iter_mut().enumerate() {
+            output.id = index as OutputId;
+        }
+        assert_eq!(parsed, expected);
+        // And it must actually build: chains resolve, limiter wires.
+        assert!(parsed.build_chains().is_ok());
+        assert!(parsed.master_limiter);
+    }
+
+    #[test]
+    fn toml_fields_default_to_the_documented_values() {
+        // A minimal channel: everything optional takes the defaults the comments promise.
+        let cfg = MixerConfig::from_toml_str(
+            r#"
+            [[channel]]
+            side = "center"
+            [[output]]
+            name = "only"
+            role = "main"
+            "#,
+        )
+        .unwrap();
+        let channel = &cfg.channels[0];
+        assert_eq!(channel.flow_fader, 0.0, "unity by default");
+        assert_eq!(channel.deck_fader, 0.0);
+        assert_eq!(channel.cue_send, 0.0, "a default channel does not spam the cue");
+        assert_eq!(channel.cue_tap, CueTap::PostDeckFader);
+        assert_eq!(channel.crossfader_curve, CrossfaderCurve::EqualPower);
+        assert!(channel.flow_fx.is_empty() && channel.deck_fx.is_empty());
+        assert_eq!(cfg.outputs[0].channels, (0, 1));
+        assert_eq!(cfg.outputs[0].gain, 1.0);
+        assert!(!cfg.master_limiter, "the safety stage is opt-in from a file");
+        assert_eq!(cfg.master_fader, 0.0);
+    }
+
+    #[test]
+    fn toml_errors_name_their_location_and_refuse_unknown_keys() {
+        // A syntax error carries the line; a typo'd key is refused rather than ignored.
+        let err = MixerConfig::from_toml_str("[[channel]]
+side = \"spinward\"".into()).unwrap_err();
+        assert!(matches!(err, MixerError::Parse(_)));
+        assert!(err.message().contains("spinward"), "got: {}", err.message());
+
+        let err = MixerConfig::from_toml_str(
+            "[[channel]]\nside = \"left\"\nbass_boost = 12.0\n".into(),
+        )
+        .unwrap_err();
+        assert!(
+            err.message().contains("bass_boost"),
+            "unknown keys must be named, got: {}",
+            err.message()
+        );
+
+        // An output without a name has nothing to log against.
+        assert!(MixerConfig::from_toml_str("[[output]]\nrole = \"main\"".into()).is_err());
     }
 
     #[test]
