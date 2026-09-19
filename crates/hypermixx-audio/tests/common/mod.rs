@@ -51,9 +51,10 @@ pub fn temp_path(name: &str) -> String {
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::{
-    AudioPipeline, BeatGrid, Command, CommandResponse, DeckId, DeckState, TrackAnalysis,
+    AudioPipeline, BeatGrid, Command, CommandResponse, DeckId, DeckState, MixerConfig,
+    TrackAnalysis, simple_dj,
 };
 use hypermixx_core::Shared;
 use hypermixx_media::{decode_file, PcmPool};
@@ -75,10 +76,19 @@ pub fn decode_wav(name: &str, seconds: u64) -> Shared {
 }
 
 /// Starts an engine and hands back a command line plus its answers.
+///
+/// The same two-channel topology the CLI uses, but with no outputs: a test must not blast a 440 Hz
+/// probe tone through whoever is listening, and `Mixer::process` is device-free by design.
+fn headless_dj() -> MixerConfig {
+    MixerConfig { outputs: vec![], ..simple_dj() }
+}
+
 pub fn session() -> (Sender<Command>, Receiver<CommandResponse>, AudioPipeline) {
-    let (command_tx, command_rx) = unbounded();
-    let (response_tx, response_rx) = unbounded();
-    let pipeline = AudioPipeline::start(command_rx, response_tx);
+    let pipeline = AudioPipeline::start(headless_dj()).expect("engine should start headless");
+    let command_tx = pipeline.command_tx();
+    // The response channel belongs to the pipeline; a clone keeps the printer fed while the caller
+    // still owns the pipeline (whose `Drop` is what ends the stream).
+    let response_rx = pipeline.response_rx().clone();
     (command_tx, response_rx, pipeline)
 }
 
