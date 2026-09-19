@@ -26,9 +26,9 @@ pub(crate) mod output;
 pub use bus::Bus;
 pub use channel::{ChainSlot, Channel, CueTap, CrossfaderCurve, DeckSide, SlotChain};
 pub use config::{
-    build_chain, build_slot, build_slot_disabled, build_slots, defaults_for, simple_dj,
-    silent_test_channel, ChainRef, ChannelConfig, MixerConfig, MixerError, OutputConfig,
-    OutputRole, SlotPlace,
+    build_chain, build_slot, build_slot_disabled, build_slots, defaults_for, reference_toml,
+    simple_dj, silent_test_channel, ChainRef, ChannelConfig, MixerConfig, MixerError,
+    OutputConfig, OutputRole, SlotPlace,
 };
 pub use output::{Output, OutputError, OutputId, Outputs};
 
@@ -38,7 +38,9 @@ use channel::Channel as ChannelInner;
 use crate::deck::Deck;
 use crate::fx::sample::Fader;
 use crate::fx::{FxChain, FxContext, FxSlot, FxTarget};
-use crate::{BLOCK_SIZE, SAMPLE_RATE};
+use crate::BLOCK_SIZE;
+#[cfg(test)]
+use crate::SAMPLE_RATE;
 
 /// The summed destination. `outputs` names entries in [`Mixer::outputs`].
 pub struct MasterBus {
@@ -80,7 +82,11 @@ impl Mixer {
     ///
     /// A single output failing is logged and downgraded to a sink rather than aborting the whole
     /// engine: losing the headphones should not stop a performance. A *device-less* machine is not a
-    /// failure at all — [`Output::open`] already returns a sink for that.
+    /// failure at all — [`Output::open`] already returns a sink for that. Two outputs that land on
+    /// the same physical device are also resolved here: the server (PipeWire's graph, ALSA's dmix)
+    /// sums two streams with no limiter in sight, so the second stream is dropped and its bus
+    /// simply goes unrouted — otherwise "main + headphones on the default device" plays both buses
+    /// on top of each other and clips the DAC even though the master meter reads −1 dBFS.
     pub fn new(cfg: MixerConfig, sample_rate: u32) -> Result<Self, MixerError> {
         if cfg.channels.is_empty() {
             return Err(MixerError::Empty);
@@ -99,32 +105,74 @@ impl Mixer {
             ));
         }
 
-        let mut outputs = Outputs::new();
+        let mut opened: Vec<Output> = Vec::with_capacity(cfg.outputs.len());
         for output_cfg in &cfg.outputs {
             match Output::open(output_cfg, sample_rate, block_frames) {
-                Ok(output) => {
-                    outputs.push(output);
-                }
+                Ok(output) => opened.push(output),
                 Err(err) => {
-                    eprintln!(
-                        "[audio] {}: {err}; continuing without it",
-                        output_cfg.name
-                    );
-                    outputs.push(Output::sink(output_cfg, block_frames));
+                    eprintln!("[audio] {}: {err}; continuing without it", output_cfg.name);
+                    opened.push(Output::sink(output_cfg, block_frames));
                 }
             }
         }
-        // Route by role: whoever configures `Headphones` gets the cue bus, everything else the mix.
+        // One stream per physical device. The first output on a device wins; later ones are
+        // downgraded to sinks and left unrouted, which is also the honest state: without device
+        // selection a second *logical* output cannot be made audible separately anyway.
+        let mut duplicate = vec![false; opened.len()];
+        {
+            let mut first_on_device = std::collections::HashMap::<String, usize>::new();
+            for (index, output) in opened.iter().enumerate() {
+                if let Some(device) = output.device() {
+                    match first_on_device.get(device) {
+                        Some(&first) => {
+                            eprintln!(
+                                "[audio] {}: `{}` is already on {device}; dropping this stream \
+                                 so the server does not sum two buses outside the limiter \
+                                 (device selection is future work)",
+                                cfg.outputs[index].name, cfg.outputs[first].name
+                            );
+                            duplicate[index] = true;
+                        }
+                        None => {
+                            first_on_device.insert(device.to_owned(), index);
+                        }
+                    }
+                }
+            }
+        }
+        for (index, taken) in duplicate.iter().enumerate() {
+            if *taken {
+                // Replacing the element drops the cpal stream on the spot, freeing the device
+                // slot the duplicate needlessly held.
+                opened[index] = Output::sink(&cfg.outputs[index], block_frames);
+            }
+        }
+        let mut outputs = Outputs::new();
+        for output in opened {
+            outputs.push(output);
+        }
+        // Ids are positional: a config (or a TOML file that omitted them) cannot make two outputs
+        // share an id, and a dropped duplicate does not leave a hole in the numbering.
+        for (index, output) in outputs.items_mut().enumerate() {
+            output.id = index as OutputId;
+        }
+        // Route by role, skipping the duplicates: whoever configures `Headphones` gets the cue
+        // bus, everything else the mix.
         let mut master_outputs = Vec::new();
         let mut cue_outputs = Vec::new();
         for (index, output_cfg) in cfg.outputs.iter().enumerate() {
+            if duplicate[index] {
+                continue;
+            }
             match output_cfg.role {
                 OutputRole::Main => master_outputs.push(index),
                 OutputRole::Headphones => cue_outputs.push(index),
             }
         }
-        if master_outputs.is_empty() && !outputs.is_empty() {
-            // A config that named only headphones still needs to be audible somewhere.
+        let any_live = outputs.iter().any(|output| !output.is_sink());
+        if master_outputs.is_empty() && any_live {
+            // A config that named only headphones (or whose mains all failed to open) still needs
+            // to be audible somewhere.
             master_outputs.extend(0..outputs.len());
             cue_outputs.clear();
         }
@@ -843,7 +891,14 @@ mod tests {
         let mixer = Mixer::new(cfg.clone(), SAMPLE_RATE);
         if let Ok(mixer) = mixer {
             assert_eq!(mixer.master().outputs, vec![0]);
-            assert_eq!(mixer.cue().outputs, vec![1]);
+            // On a machine where both outputs land on the same physical device, the headphones
+            // stream is dropped (one stream per device) and the cue goes unrouted; on a headless
+            // machine both are sinks and the configured route stands.
+            assert!(
+                mixer.cue().outputs == vec![1] || mixer.cue().outputs.is_empty(),
+                "cue routed to {:?}",
+                mixer.cue().outputs
+            );
         }
         // With no outputs at all, both route lists are empty and `process` still runs.
         let mut mixer = headless(cfg);

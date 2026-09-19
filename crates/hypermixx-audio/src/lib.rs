@@ -25,8 +25,8 @@ pub use deck::{Deck, FlowShift, LoopState, Seek};
 pub use flow::{Flow, FlowState, PitchShiftEngine};
 pub use fx::{Fx, FxChain, FxContext, FxError, FxKind, FxSlot, FxTarget, Param};
 pub use mixer::{
-    simple_dj, Bus, Channel, ChannelConfig, CueTap, MasterBus, Mixer, MixerConfig, MixerError,
-    Output, OutputConfig, OutputError, OutputId, Outputs,
+    reference_toml, simple_dj, Bus, Channel, ChannelConfig, CueTap, MasterBus, Mixer, MixerConfig,
+    MixerError, Output, OutputConfig, OutputError, OutputId, Outputs,
 };
 pub use pipeline::{AudioPipeline, PipelineError};
 pub use ringbuf::AudioRingBuffer;
@@ -42,7 +42,8 @@ pub use hypermixx_core::{
 pub const BLOCK_SIZE: usize = 256;
 /// Output ring buffer capacity, in frames.
 pub const OUTPUT_RING_CAPACITY: usize = 4096;
-/// Frames pre-filled into the output ring before the audio stream starts.
+/// Frames of silence pre-filled into each output ring before its stream starts, so the device is
+/// never waiting on the producer's first block. Capped at half the ring.
 pub const PREFILL_FRAMES: usize = 2048;
 /// Number of decks the default topology owns: 0 and 1.
 pub const DECK_COUNT: usize = 2;

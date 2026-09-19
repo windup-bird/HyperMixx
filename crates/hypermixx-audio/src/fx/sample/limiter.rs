@@ -4,7 +4,9 @@
 //!
 //! 1. **Peak look-ahead.** The sidechain reads the *incoming* sample while the output still emits
 //!    the one [`LOOKAHEAD`] frames ago, so gain is pulled down before a transient arrives instead of
-//!    chasing it. At 44.1 kHz that is 0.18 ms: inaudible as delay, long enough to catch a kick edge.
+//!    chasing it. At 44.1 kHz that is 1.45 ms: inaudible as delay (and it sits after the mix, so deck
+//!    phase alignment is untouched), long enough for the gain envelope to complete its attack
+//!    before the transient that caused it is emitted.
 //! 2. **Asymmetric time constants.** Attack is instantaneous (the gain snaps down the moment the
 //!    sidechain sees an over-level); release is a slow ramp in tens of milliseconds. Symmetric
 //!    settings pump.
@@ -17,8 +19,10 @@
 use super::super::{Fx, FxContext, FxError, Param};
 use crate::mixer::Bus;
 
-/// Frames of look-ahead delay. 8 @ 44.1 kHz = 0.18 ms.
-pub const LOOKAHEAD: usize = 8;
+/// Frames of look-ahead delay. 64 @ 44.1 kHz = 1.45 ms: long enough for the gain envelope to
+/// finish its attack before the transient that caused it is emitted, short enough to be
+/// inaudible as latency — and it sits after the mix, so deck phase alignment is untouched.
+pub const LOOKAHEAD: usize = 64;
 /// How far the threshold may back off under sustained over-level.
 pub const RELEASE_RANGE_DB: f32 = 6.0;
 /// Where the soft knee begins, as a fraction of the ceiling.
@@ -155,39 +159,43 @@ impl Fx for Limiter {
             .fold(0.0f32, |m, s| m.max(s.abs()));
         self.input_peak_db = lin_to_db(block_peak);
 
-        let mut gain = self.gain;
+        let mut env = self.gain;
         // The threshold in force for this block, derived (see `backoff_db`).
         let live = self.effective_ceiling();
 
-        // The sidechain reads the *whole* incoming block before any of it is emitted. That is the
-        // look-ahead, and it is why attack is free to be instantaneous: the peak is known one block
-        // early, so nothing slips past a per-block step.
-        let wanted = if block_peak > live && block_peak > 0.0 {
-            (live / block_peak).max(0.0)
-        } else {
-            1.0
-        };
-        if wanted < gain {
-            gain = wanted;
-        } else {
-            let block_seconds = frames as f32 / sr.max(1) as f32;
-            let release_alpha = 1.0 - (-block_seconds / release).exp();
-            gain += (1.0 - gain) * release_alpha;
-            if 1.0 - gain < 1e-5 {
-                gain = 1.0;
-            }
-        }
+        // Per-sample envelope coefficients. Attack settles ~95% within the look-ahead (three time
+        // constants across LOOKAHEAD frames), so the gain is already down when the transient that
+        // asked for it is emitted — while staying *continuous*, because a gain that steps at a
+        // block boundary is a click however correct its level. Release is the same one-pole at its
+        // own leisurely rate. Any momentary overshoot the ramp allows is caught by the knee, which
+        // bounds the output at the ceiling regardless of gain.
+        let attack_alpha = 1.0 - (-(3.0 / LOOKAHEAD as f32)).exp();
+        let release_alpha = 1.0 - (-1.0 / (release * sr.max(1) as f32)).exp();
 
-        // Emit what entered `LOOKAHEAD` frames ago, now that its gain is decided. The head advances
-        // once per frame and both channels share it, so the delay is exactly `LOOKAHEAD` and L/R
-        // stay sample-aligned (a half-frame offset would smear the stereo image).
-        let gain_target = gain;
+        // The sidechain watches the *incoming* sample while the output emits the one from
+        // LOOKAHEAD frames ago: the envelope leads the signal by exactly the attack window.
         let mut head = self.write_head;
         for i in 0..frames {
+            let incoming = bus.l[i].abs().max(bus.r[i].abs());
+            let wanted = if incoming > live && incoming > 0.0 {
+                (live / incoming).min(1.0)
+            } else {
+                1.0
+            };
+            let alpha = if wanted < env { attack_alpha } else { release_alpha };
+            env += (wanted - env) * alpha;
+            if 1.0 - env < 1e-5 {
+                env = 1.0;
+            }
+            // Emit what entered `LOOKAHEAD` frames ago, now that its gain is decided. The head
+            // advances once per frame and both channels share it, so the delay is exactly
+            // `LOOKAHEAD` and L/R stay sample-aligned (a half-frame offset would smear the stereo
+            // image). Both channels share one envelope — a stereo-linked limiter, so the image
+            // does not lurch sideways on a kick that only one channel carries.
             for (channel, plane) in [(0usize, &mut bus.l), (1, &mut bus.r)] {
                 let history = &mut self.delay[channel];
                 let input = plane[i];
-                plane[i] = shape(history[head], gain_target, live);
+                plane[i] = shape(history[head], env, live);
                 history[head] = input;
             }
             head = (head + 1) % LOOKAHEAD;
@@ -206,8 +214,8 @@ impl Fx for Limiter {
             self.backoff_db * (-block_seconds / recovery).exp()
         };
         self.backoff_db = backoff_amount.max(0.0);
-        self.gain = gain;
-        self.reduction_db = lin_to_db(gain.min(1.0));
+        self.gain = env;
+        self.reduction_db = lin_to_db(env.min(1.0));
     }
 
     fn reset(&mut self) {
@@ -365,6 +373,45 @@ mod tests {
             "GR stuck at {}",
             lim.reduction_db()
         );
+    }
+
+    #[test]
+    fn gain_moves_smoothly_across_block_boundaries() {
+        // The regression this pins: a gain computed once per block and stepped at the boundary is
+        // a click on every transient (the step lands on whatever signal happens to be at the
+        // boundary, up to ~0.5 of full scale here). A per-sample envelope rides the signal's own
+        // slope instead. The input is a sine whose amplitude ramps 0.7 -> 1.8 across four blocks,
+        // so the signal itself never steps and any output jump is the limiter's fault.
+        let mut lim = Limiter::new();
+        let ctx = ctx();
+        let blocks = 4;
+        let mut max_jump = 0.0f32;
+        let mut prev: Option<f32> = None;
+        for block in 0..blocks {
+            let mut b = Bus::new(BLOCK);
+            for i in 0..BLOCK {
+                let t = (block * BLOCK + i) as f32;
+                let amp = 0.7 + 1.1 * (t / (blocks * BLOCK) as f32);
+                let s = ((2.0 * std::f64::consts::PI * 440.0 * f64::from(t)
+                    / f64::from(SAMPLE_RATE))
+                    .sin()
+                    * f64::from(amp)) as f32;
+                b.l[i] = s;
+                b.r[i] = s;
+            }
+            lim.process(&mut b, &ctx);
+            for sample in &b.l {
+                if let Some(p) = prev {
+                    max_jump = max_jump.max((sample - p).abs());
+                }
+                prev = Some(*sample);
+            }
+        }
+        assert!(
+            max_jump < 0.2,
+            "the envelope stepped by {max_jump:.3} in one sample; a block-quantised gain is a click"
+        );
+        assert!(lim.reduction_db() < -1.0, "the ramp must have engaged the limiter");
     }
 
     #[test]

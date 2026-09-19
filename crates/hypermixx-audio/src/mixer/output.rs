@@ -19,7 +19,7 @@ use rtrb::{Consumer, Producer};
 use super::bus::Bus;
 use super::config::OutputConfig;
 use crate::ringbuf::{fill_with_silence_on_underrun, push_samples, AudioRingBuffer};
-use crate::{CHANNELS, OUTPUT_RING_CAPACITY};
+use crate::{CHANNELS, OUTPUT_RING_CAPACITY, OUTPUT_RING_SAMPLES, PREFILL_FRAMES};
 
 /// Identifies one output. Stable for the life of a `Mixer`; `MixerConfig` assigns them.
 pub type OutputId = u8;
@@ -76,7 +76,17 @@ pub struct Output {
     device_channels: usize,
     /// True when nothing is connected: writes are counted and dropped.
     sink: bool,
-    underruns: u64,
+    /// The cpal device name this output's stream lives on, `None` for a sink. Two outputs on
+    /// the same device are the mixer's business to detect — the server (PipeWire's graph,
+    /// ALSA's dmix) sums two streams with no limiter in sight.
+    device: Option<String>,
+    /// Output trim from [`OutputConfig::gain`] — the field existed but was never applied, so
+    /// two destinations could not differ in level no matter what the config said.
+    gain: f32,
+    /// Producer-side overruns: blocks whose tail could not fit in the ring and was dropped.
+    /// With the pipeline's room-gated production this stays at zero; a non-zero value means the
+    /// device drained slower than the mixer produced.
+    overruns: u64,
     writes: u64,
 }
 
@@ -118,6 +128,11 @@ impl Output {
             cfg.name, config.sample_rate().0
         );
         let mapping = cfg.channel_pair(device_channels);
+        let gain = if cfg.gain.is_finite() && cfg.gain >= 0.0 {
+            cfg.gain
+        } else {
+            1.0
+        };
         let mut output = Self {
             id: cfg.id,
             name: cfg.name.clone(),
@@ -128,11 +143,23 @@ impl Output {
             frame: vec![0.0; block_frames * device_channels.max(1)],
             device_channels: device_channels.max(1),
             sink: false,
-            underruns: 0,
+            device: Some(device_name.clone()),
+            gain,
+            overruns: 0,
             writes: 0,
         };
 
-        let (producer, consumer) = AudioRingBuffer::new(OUTPUT_RING_CAPACITY).split();
+        let (mut producer, consumer) = AudioRingBuffer::new(OUTPUT_RING_CAPACITY).split();
+        // Prefill: the callback starts draining the instant the stream is built. Without a
+        // cushion the first seconds are a race between the producer's first blocks and the
+        // device, and every lost race is a silence gap the listener hears as a click. Half a
+        // ring of silence buys the producer a standing head start; the mix simply starts
+        // ~46 ms later, which nothing can hear.
+        let prefill = (PREFILL_FRAMES * CHANNELS).min(OUTPUT_RING_SAMPLES / 2);
+        if prefill > 0 {
+            let silence = vec![0.0f32; prefill];
+            push_samples(&mut producer, &silence);
+        }
         output.producer = Some(producer);
         let stream = build_stream(&device, &config, consumer, &cfg.name)?;
         output._stream = Some(stream);
@@ -142,6 +169,11 @@ impl Output {
     /// An output that accepts audio and throws it away — the headless case, and the default for
     /// tests that only care about the mix.
     pub fn sink(cfg: &OutputConfig, block_frames: usize) -> Self {
+        let gain = if cfg.gain.is_finite() && cfg.gain >= 0.0 {
+            cfg.gain
+        } else {
+            1.0
+        };
         Self {
             id: cfg.id,
             name: cfg.name.clone(),
@@ -152,7 +184,9 @@ impl Output {
             frame: vec![0.0; block_frames],
             device_channels: CHANNELS,
             sink: true,
-            underruns: 0,
+            device: None,
+            gain,
+            overruns: 0,
             writes: 0,
         }
     }
@@ -166,7 +200,17 @@ impl Output {
         self.sink
     }
 
-    /// Blocks written since construction. Together with [`Output::underruns`] this says whether a
+    /// The cpal device name this output's stream lives on, or `None` for a sink.
+    pub fn device(&self) -> Option<&str> {
+        self.device.as_deref()
+    }
+
+    /// The trim applied on write, from [`OutputConfig::gain`].
+    pub fn gain(&self) -> f32 {
+        self.gain
+    }
+
+    /// Blocks written since construction. Together with [`Output::overruns`] this says whether a
     /// device is keeping up.
     pub fn writes(&self) -> u64 {
         self.writes
@@ -182,11 +226,12 @@ impl Output {
         self.free_samples().map(|free| free / self.device_channels.max(1))
     }
 
-    /// Callback-side starves, as counted by the ring consumer's padding. Best-effort: an underrun is
-    /// detected by the callback writing silence, which is also what a genuinely silent block looks
-    /// like, so treat this as an upper bound.
-    pub fn underruns(&self) -> u64 {
-        self.underruns
+    /// Producer-side overruns since construction: samples the ring could not take and were
+    /// dropped. Callback-side underruns (silence padding) are *not* counted anywhere today — a
+    /// padded gap and a genuinely silent block look identical from the consumer side, so this
+    /// counter is the honest half of the story.
+    pub fn overruns(&self) -> u64 {
+        self.overruns
     }
 
     /// Hands one block to the device.
@@ -202,20 +247,23 @@ impl Output {
         if frames == 0 {
             return;
         }
-        // De-interleave -> remap -> interleave into the device-shaped frame buffer, then one push.
+        // De-interleave -> remap -> trim -> interleave into the device-shaped frame buffer, then
+        // one push. The trim is the output's own gain, applied here because it is per-destination
+        // (a quiet pair of speakers, a hot headphone amp), not per-signal.
         self.frame[..frames * self.device_channels].fill(0.0);
         let (l, r) = (self.channels.0 as usize, self.channels.1 as usize);
+        let gain = self.gain;
         for i in 0..frames {
             let base = i * self.device_channels;
             match (l < self.device_channels, r < self.device_channels) {
                 (true, true) => {
-                    self.frame[base + l] = bus.l[i];
-                    self.frame[base + r] = bus.r[i];
+                    self.frame[base + l] = bus.l[i] * gain;
+                    self.frame[base + r] = bus.r[i] * gain;
                 }
                 // A mono destination gets the sum, not the left channel: a cue on a 1ch device must
                 // still tell you what is happening on both sides.
                 _ => {
-                    self.frame[base] = (bus.l[i] + bus.r[i]) * 0.5;
+                    self.frame[base] = (bus.l[i] + bus.r[i]) * 0.5 * gain;
                 }
             }
         }
@@ -223,7 +271,7 @@ impl Output {
         if let Some(producer) = self.producer.as_mut() {
             let written = push_samples(producer, &self.frame[..len]);
             if written < len {
-                self.underruns += 1;
+                self.overruns += 1;
             }
         }
         self.writes += 1;
@@ -375,6 +423,11 @@ impl Outputs {
         self.items.iter().map(Output::writes).sum()
     }
 
+    /// Mutable access to the outputs, for a caller renumbering or swapping them.
+    pub(crate) fn items_mut(&mut self) -> std::slice::IterMut<'_, Output> {
+        self.items.iter_mut()
+    }
+
     /// True when every live output can take another `frames` without dropping a sample. A mixer with
     /// no outputs (headless, or a unit test) always has room, which is what lets the producer pace
     /// itself on the clock instead of deadlocking on a device that will never drain.
@@ -394,7 +447,7 @@ impl Clone for Output {
                 name: self.name.clone(),
                 channels: self.channels,
                 role: super::config::OutputRole::Main,
-                gain: 1.0,
+                gain: self.gain,
             },
             self.block_frames,
         )
@@ -426,7 +479,7 @@ mod tests {
         out.write(&bus(1.0, -1.0));
         out.write(&bus(1.0, -1.0));
         assert_eq!(out.writes(), 2);
-        assert_eq!(out.underruns(), 0);
+        assert_eq!(out.overruns(), 0);
     }
 
     #[test]

@@ -94,10 +94,13 @@ pub struct AudioPipeline {
 enum Query {
     /// The PCM a deck is playing, for out-of-band analysis.
     DeckSource(DeckId),
+    /// How many channels the mixer owns — the deck-id range a front-end should accept.
+    ChannelCount,
 }
 
 enum QueryResponse {
     Source(Option<Shared>),
+    Count(usize),
 }
 
 impl AudioPipeline {
@@ -174,7 +177,22 @@ impl AudioPipeline {
             .ok()?;
         match answer_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(QueryResponse::Source(source)) => source,
-            Err(_) => None,
+            Ok(QueryResponse::Count(_)) | Err(_) => None,
+        }
+    }
+
+    /// How many channels (deck slots) the engine was configured with. A front-end validating
+    /// deck ids should ask this rather than assuming a count — a custom `--config` topology may
+    /// name any number of channels.
+    pub fn channel_count(&self) -> Option<usize> {
+        let (answer_tx, answer_rx) = crossbeam_channel::unbounded::<QueryResponse>();
+        self.query_tx
+            .as_ref()?
+            .send((Query::ChannelCount, answer_tx))
+            .ok()?;
+        match answer_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(QueryResponse::Count(count)) => Some(count),
+            Ok(QueryResponse::Source(_)) | Err(_) => None,
         }
     }
 
@@ -205,7 +223,14 @@ impl AudioPipeline {
                             }
                         }
                     }
-                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Empty) => {
+                        // No commands waiting — but a query may be. The first thing a front-end
+                        // does after `start` is ask how many channels the engine owns, and a
+                        // query drained only on command arrival would sit unanswered until
+                        // something else happened. So drain here too, on the way out.
+                        drain_queries(&mut mixer, &query_rx);
+                        break;
+                    }
                     // Nobody left sending: stop rather than spin.
                     Err(TryRecvError::Disconnected) => return,
                 }
@@ -254,6 +279,7 @@ fn drain_queries(mixer: &mut Mixer, rx: &Receiver<(Query, Sender<QueryResponse>)
                     .map(Deck::source);
                 QueryResponse::Source(source)
             }
+            Query::ChannelCount => QueryResponse::Count(mixer.channel_count()),
         };
         // A dropped receiver means the caller gave up; not an error here.
         let _ = answer.send(response);
@@ -264,8 +290,8 @@ fn drain_queries(mixer: &mut Mixer, rx: &Receiver<(Query, Sender<QueryResponse>)
 fn sleep_until_next(started: Instant, pace: Duration) {
     match pace.checked_sub(started.elapsed()) {
         Some(remaining) => std::thread::sleep(remaining),
-        // Fell behind: skip the sleep, not the block. Underruns from here are reported by
-        // `Output::underruns`, and dropping a block is better than backing the whole pipeline up.
+        // Fell behind: skip the sleep, not the block. If that keeps happening the rings fill and
+        // `Output::overruns` starts counting dropped samples; better than backing the pipeline up.
         None => {}
     }
 }

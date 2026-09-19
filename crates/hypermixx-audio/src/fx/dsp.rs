@@ -78,6 +78,7 @@ impl Biquad {
     }
 
     /// The section's own coefficients, normalised so `a0 == 1`.
+    #[cfg(test)]
     pub fn coeffs(&self) -> [f32; 5] {
         [self.b0, self.b1, self.b2, self.a1, self.a2]
     }
