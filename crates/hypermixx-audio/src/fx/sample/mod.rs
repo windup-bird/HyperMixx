@@ -12,6 +12,6 @@ mod gain;
 mod limiter;
 
 pub use eq::{Eq, DEFAULT_HIGH_HZ, DEFAULT_LOW_HZ, DEFAULT_MID_HZ};
-pub use filter::{Filter, FilterMode, MAX_HZ, MIN_HZ};
+pub use filter::{Filter, MAX_HZ, MIN_HZ};
 pub use gain::{Fader, Gain};
 pub use limiter::{Limiter, LOOKAHEAD, RELEASE_RANGE_DB};

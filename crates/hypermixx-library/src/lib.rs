@@ -14,7 +14,7 @@ pub use analyser::{analyze, AnalyserError, Backend, RawAnalysis, RefineConfig};
 pub use beat_spec::{BeatSpec, Segment};
 pub use grid_compiler::GridCompiler;
 pub use track::{Metadata, TrackId, TrackInfo};
-pub use waveform::{peaks, Waveform};
+pub use waveform::{BandPeaks, Waveform, BASE_BUCKET};
 
 // Re-exported so callers get an end-to-end path without naming core directly.
 pub use hypermixx_core::{Key, KeyMode, TrackAnalysis};

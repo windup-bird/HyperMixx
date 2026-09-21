@@ -93,13 +93,11 @@ impl Biquad {
 
 }
 
-/// One low-pass / high-pass / band-pass / bell / shelf section.
+/// One low-pass / high-pass / bell / shelf section.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Section {
     LowPass { freq: f64, q: f64 },
     HighPass { freq: f64, q: f64 },
-    /// Resonant band-pass, `bandwidth_hz` wide at −3 dB, unity gain at the centre.
-    BandPass { freq: f64, bandwidth_hz: f64 },
     Bell { freq: f64, gain_db: f64, q: f64 },
     /// Shelf with `slope` (RBJ's `S`): 1.0 is maximally flat. Clamped to (0, 1] because the
     /// `alpha` term's square root goes imaginary past that on a deep shelf, which would hand the
@@ -157,28 +155,6 @@ impl Section {
                     b2: (1.0 + cos_w) / 2.0,
                     a0: 1.0 + alpha,
                     a1: -2.0 * cos_w,
-                    a2: 1.0 - alpha,
-                }
-            }
-            Section::BandPass { freq, bandwidth_hz } => {
-                // The "constant peak gain" form: |H| at the centre is 1 whatever the bandwidth, so a
-                // resonant filter can never add the gain a Q-driven low-pass peak does.
-                let omega = w(freq);
-                let sin_w = omega.sin().max(1e-9);
-                let centre = freq_of(freq);
-                let width = finite_or(bandwidth_hz, centre).clamp(1.0, centre * 2.0);
-                // The −3 dB points, expressed as the octave span the cookbook's `BW` wants.
-                let lo = (centre - width / 2.0).max(5.0);
-                let hi = (centre + width / 2.0).min(nyquist);
-                let bw_octaves = (f64::from(hi / lo).log2()).clamp(0.02, 8.0);
-                let alpha =
-                    sin_w * (std::f64::consts::LN_2 / 2.0 * bw_octaves * omega / sin_w).sinh();
-                BiquadCoeffs {
-                    b0: alpha,
-                    b1: 0.0,
-                    b2: -alpha,
-                    a0: 1.0 + alpha,
-                    a1: -2.0 * omega.cos(),
                     a2: 1.0 - alpha,
                 }
             }
@@ -475,52 +451,12 @@ mod tests {
     }
 
     #[test]
-    fn bandpass_never_adds_gain_and_its_width_controls_the_skirt() {
-        // The property that makes a resonant filter safe on a deck: the constant-*peak*-gain form is
-        // normalised so the response tops out at unity, so sweeping it can never blow out the master
-        // the way a Q-driven low-pass peak does.
-        for width in [50.0f64, 400.0, 4_000.0] {
-            let bp = [Section::BandPass { freq: 1_000.0, bandwidth_hz: width }];
-            for probe in [20.0, 200.0, 1_000.0, 2_000.0, 8_000.0, 18_000.0] {
-                let got = gain_at(&bp, probe);
-                assert!(got < 0.6, "{width}Hz-wide bp *added* gain at {probe}Hz: {got:.1} dB");
-            }
-            // The centre is always in the passband, so it stays near unity whatever the width.
-            assert!(gain_at(&bp, 1_000.0).abs() < 1.5, "{width}Hz-wide bp dipped at centre");
-            // Rejection is only meaningful outside the passband, and a band wider than the spectrum
-            // below the centre simply cannot reject the bottom of it.
-            if width * 3.0 < 1_000.0 {
-                assert!(
-                    gain_at(&bp, (1_000.0 - width * 3.0).max(20.0)) < -6.0,
-                    "{width}Hz-wide bp passed below its skirt"
-                );
-            }
-            // Well past Nyquist-ish, every width must be down: the whole point of a band-pass.
-            assert!(gain_at(&bp, 20_000.0) < -6.0, "{width}Hz bp passed 20kHz");
-        }
-        // A narrow band rejects harder than a wide one at the same distance from centre (both inside
-        // their own skirts' reach, so the comparison is about slope rather than reachability.
-        let narrow = gain_at(
-            &[Section::BandPass { freq: 1_000.0, bandwidth_hz: 60.0 }],
-            2_000.0,
-        );
-        let wide = gain_at(
-            &[Section::BandPass { freq: 1_000.0, bandwidth_hz: 3_000.0 }],
-            2_000.0,
-        );
-        assert!(narrow < wide - 3.0, "bandwidth did nothing: {narrow:.1} vs {wide:.1}");
-    }
-
-    #[test]
     fn degenerate_controls_stay_stable() {
         // These are the values a fader hits at its extremes and a bad parse can produce.
         for design in [
             vec![Section::LowPass { freq: 0.0, q: 0.0 }],
             vec![Section::LowPass { freq: 1e9, q: 1e9 }],
             vec![Section::HighPass { freq: f64::NAN, q: f64::NAN }],
-            vec![Section::BandPass { freq: 1_000.0, bandwidth_hz: 0.0 }],
-            vec![Section::BandPass { freq: 1_000.0, bandwidth_hz: 1e9 }],
-            vec![Section::BandPass { freq: f64::NAN, bandwidth_hz: f64::NAN }],
             vec![Section::Bell { freq: 1e12, gain_db: 1e6, q: 0.001 }],
             vec![Section::LowShelf { freq: 100.0, gain_db: f64::NEG_INFINITY, slope: 1.0 }],
             vec![Section::HighShelf { freq: 100.0, gain_db: 1e6, slope: 1e-9 }],

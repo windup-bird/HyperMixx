@@ -112,17 +112,20 @@ cargo run -p hypermixx-cli
 ```
 hypermixx> help
 commands (2 decks, ids 0..1):
-  load <deck> <path> [bpm]   decode a file; a given bpm builds a fixed grid, skipping analysis
-  analyse <deck>             run the analyser on the deck's track and publish its grid
-  play <deck>                start that deck
-  pause <deck>               stop it, keeping the position
-  jump <deck> <frame>        seek to a frame (1 second = 44100 frames)
-  beatjump <deck> <beats>    seek by whole beats, keeping the phase
-  rate <deck> <ratio>        set tempo rate (1.0 = unity, 0.5 = half speed)
-  profile <deck> <name>      tape / keylock / wide (default: tape)
-  state                      show every deck
-  quit                       exit
+  [deck] load <path> [bpm]     decode a file (deck defaults to the focused one)
+  [deck] analyse               run the analyser and publish its grid
+  [deck] play | pause          transport
+  [deck] jump <frame>          seek to a frame (1 second = 44100 frames)
+  [deck] beatjump <beats>      seek by whole beats, keeping the phase
+  [deck] rate <ratio>          set tempo rate (1.0 = unity, 0.5 = half speed)
+  [deck] profile <name>        tape / keylock / wide (default: tape)
+  [deck|master] fx ...         effects on a chain (see `fx help`)
+  state                        show every deck
+  zoom in|out|fit              waveform zoom (UI only)
+  quit                         exit
 ```
+
+命令是 target-first：行首可写 `deck0` / `0` / `master` 覆盖默认目标，省略时作用于 REPL 的 deck0（TUI 里是焦点 deck，`Tab` 切换）。
 
 ### 示例会话
 
@@ -130,18 +133,26 @@ commands (2 decks, ids 0..1):
 $ cargo run -p hypermixx-cli
 hypermixx 0.1.0 — 2 decks, 44100Hz stereo, backend Auto. `help` for commands, `quit` to exit.
 
-hypermixx> load 0 test.mp3 122
+hypermixx> load test.mp3 122
 deck0 loaded: 18462369 frames (7:00.648)
 
-hypermixx> play 0
+hypermixx> play
 hypermixx> state
 deck0  playing 0:00.123 / 7:00.648  [5403/18462369]  122.0 BPM  --
 
-hypermixx> beatjump 0 16
+hypermixx> beatjump 16
 hypermixx> state
 deck0  playing 0:04.567 / 7:00.648  [203456/18462369]  122.0 BPM  --
 
-hypermixx> pause 0
+hypermixx> fx add filter
+hypermixx> fx list
+deck0 fx[0] filter [on]
+    value = 0.0000
+    resonance = 0.2000
+
+hypermixx> fx set filter value -0.3     # 槽位可用名称,不必记序号
+hypermixx> fx set filter resonance 0.6 # -1..+1:负=低通、正=高通、0=全开;共振=峰值增益
+hypermixx> pause
 hypermixx> quit
 ```
 
@@ -152,6 +163,21 @@ cargo run -p hypermixx-cli -- --backend auto       # 默认: stratum 优先, 失
 cargo run -p hypermixx-cli -- --backend stratum    # 仅 stratum-dsp
 cargo run -p hypermixx-cli -- --backend timestretch # 仅 timestretch(当前返回 Unsupported)
 ```
+
+### 终端 UI(`--tui`)
+
+```bash
+cargo run -p hypermixx-cli -- --tui
+```
+
+自上而下:全局 TOP 栏 / 每个 deck 一块（文件名 / 三频段波形 / 传输信息，多 deck 纵向排列）/ response 日志 / command 输入框。
+
+- 波形为 ratatui `Canvas` + Braille:playhead 固定在面板水平中心,视口每帧按当前播放帧重算,波形右→左滚动;两 deck 共用同一缩放。三个频段**在同一基线上叠加**（不是各占一行），每个边界是该频段真实幅度；绘制顺序 low→mid→high 使颜色自下而上为 白=高频、绿=中频、蓝=低频。beatgrid 暗色叠加。
+- TOP 栏:采样率、后端、deck 数、UI 帧耗时、引擎响应延迟、输出环标称延迟、master/cue 电平与丢样本数。
+- command 是一个常驻边框输入框，**直接打字即可**（无需 `:` 前缀）。行首显示当前 deck (`deck0 ▸`)，省略 deck 的命令就作用于它；`Tab` / `Shift+Tab` 切换焦点 deck（输入框前缀与 deck 边框高亮同步）。
+- 编辑：`Enter` 执行（当前词有补全且候选与已输入不同时，先应用补全，再按一次才提交）、`Esc` 清空、`Tab` 切换 deck（有补全弹窗时接受补全）、`↑/↓` 选补全（无补全时翻命令历史）、`←/→/Home/End/Backspace/Delete` 编辑、`PgUp/PgDn` 滚 response、`Ctrl+C` 退出。除此之外没有单键快捷键，所有引擎操作都通过命令完成。
+- 补全：命令、路径、`fx` 子命令/效果名/参数；fx 槽位既可用**效果名**也可用序号，候选里名字带 `slot N` 提示、序号带名字提示。启动时会**静默预取**各链槽位并在本地跟踪 add/remove，所以直接用效果名即可，**不需要先 `fx list`**（预取不会写进 response）。
+- `zoom in|out|fit` 控制波形缩放。
 
 ## 测试
 

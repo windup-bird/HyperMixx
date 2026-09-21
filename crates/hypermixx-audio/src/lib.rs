@@ -28,7 +28,7 @@ pub use mixer::{
     reference_toml, simple_dj, Bus, Channel, ChannelConfig, CueTap, MasterBus, Mixer, MixerConfig,
     MixerError, Output, OutputConfig, OutputError, OutputId, Outputs,
 };
-pub use pipeline::{AudioPipeline, PipelineError};
+pub use pipeline::{AudioPipeline, Meters, PipelineError};
 pub use ringbuf::AudioRingBuffer;
 
 pub use {hypermixx_core as core, hypermixx_media as media};

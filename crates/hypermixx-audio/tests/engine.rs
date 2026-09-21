@@ -195,3 +195,23 @@ fn states_are_sampled_in_one_block() {
     ask(&tx, Command::Quit);
     ack(&rx);
 }
+
+/// The `--tui` front-end reads `meters()` every few frames; the producer must answer with a real
+/// snapshot (and the master meter must be live while a deck plays).
+#[test]
+fn meters_answer_with_a_live_snapshot() {
+    let (tx, rx, pipeline) = session();
+    load(&tx, &rx, DECK0, decode_wav("meters.wav", 3));
+    ask(&tx, Command::Play { deck_id: DECK0 });
+    ack(&rx);
+    std::thread::sleep(Duration::from_millis(250));
+    let meters = pipeline.meters().expect("the engine should answer meters");
+    assert!(meters.master_peak > 0.0, "master meter stayed silent while playing");
+    assert!(meters.cue_peak >= 0.0);
+    assert_eq!(meters.overruns, 0, "headless outputs cannot overrun");
+
+    // Tests that keep a command sender alive must still quit explicitly: `AudioPipeline::drop`
+    // joins the producer, which only returns on `Quit` or a disconnected channel.
+    ask(&tx, Command::Quit);
+    ack(&rx);
+}

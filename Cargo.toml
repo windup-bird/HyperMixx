@@ -32,6 +32,10 @@ symphonia = { version = "0.5", default-features = false, features = [
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# TUI only. Minimal features: `crossterm` pulls in std + the widgets crate; the default
+# `all-widgets` would drag in the calendar/time stack we never draw.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
 
 [profile.release]
 opt-level = 3

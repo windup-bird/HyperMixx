@@ -74,6 +74,21 @@ impl From<OutputError> for PipelineError {
     }
 }
 
+/// A read-only snapshot of the mixer's output, sampled on the producer thread between blocks.
+///
+/// Modelled as a query rather than a pushed response: a UI wants the meters when it draws, and a
+/// front-end that never asks pays nothing. The values are the fields `Mixer::process` already
+/// maintains, so reading them costs no DSP work.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Meters {
+    /// Peak of the last master block, linear (1.0 = full scale).
+    pub master_peak: f32,
+    /// Peak of the last cue block, linear.
+    pub cue_peak: f32,
+    /// Producer-side samples dropped because an output ring was full, summed over all outputs.
+    pub overruns: u64,
+}
+
 /// Owns the producer thread and the mixer it drives.
 ///
 /// The command and response channels belong to the pipeline rather than being passed in: a `start`
@@ -96,11 +111,14 @@ enum Query {
     DeckSource(DeckId),
     /// How many channels the mixer owns — the deck-id range a front-end should accept.
     ChannelCount,
+    /// The last master/cue block peaks and the dropped-sample count.
+    Meters,
 }
 
 enum QueryResponse {
     Source(Option<Shared>),
     Count(usize),
+    Meters(Meters),
 }
 
 impl AudioPipeline {
@@ -177,7 +195,23 @@ impl AudioPipeline {
             .ok()?;
         match answer_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(QueryResponse::Source(source)) => source,
-            Ok(QueryResponse::Count(_)) | Err(_) => None,
+            Ok(_) | Err(_) => None,
+        }
+    }
+
+    /// The mixer's output meters, or `None` if the engine is gone or slow to answer.
+    ///
+    /// Answers on the producer thread between blocks, exactly like [`deck_source`](Self::deck_source),
+    /// so calling this from a 30Hz UI neither blocks nor disturbs the audio thread.
+    pub fn meters(&self) -> Option<Meters> {
+        let (answer_tx, answer_rx) = crossbeam_channel::unbounded::<QueryResponse>();
+        self.query_tx
+            .as_ref()?
+            .send((Query::Meters, answer_tx))
+            .ok()?;
+        match answer_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(QueryResponse::Meters(meters)) => Some(meters),
+            Ok(_) | Err(_) => None,
         }
     }
 
@@ -192,7 +226,7 @@ impl AudioPipeline {
             .ok()?;
         match answer_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(QueryResponse::Count(count)) => Some(count),
-            Ok(QueryResponse::Source(_)) | Err(_) => None,
+            Ok(_) | Err(_) => None,
         }
     }
 
@@ -280,6 +314,12 @@ fn drain_queries(mixer: &mut Mixer, rx: &Receiver<(Query, Sender<QueryResponse>)
                 QueryResponse::Source(source)
             }
             Query::ChannelCount => QueryResponse::Count(mixer.channel_count()),
+            Query::Meters => QueryResponse::Meters(Meters {
+                master_peak: mixer.master_peak(),
+                cue_peak: mixer.cue_peak(),
+                // `Outputs` has no aggregate today; summing here keeps the change to this file.
+                overruns: mixer.outputs().iter().map(|output| output.overruns()).sum(),
+            }),
         };
         // A dropped receiver means the caller gave up; not an error here.
         let _ = answer.send(response);

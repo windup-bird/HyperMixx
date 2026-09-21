@@ -91,10 +91,10 @@ impl TrackInfo {
         *self.compiled.lock().unwrap() = None;
     }
 
-    /// Peak overview for waveform drawing, computed once and memoized.
-    pub fn waveform(&self, source: &dyn hypermixx_media::Source, bucket_frames: u64) -> &Waveform {
+    /// Peak overview for waveform drawing, built once and memoized.
+    pub fn waveform(&self, source: &dyn hypermixx_media::Source) -> &Waveform {
         self.waveform
-            .get_or_init(|| crate::waveform::peaks(source, bucket_frames))
+            .get_or_init(|| crate::waveform::Waveform::build(source))
     }
 }
 
