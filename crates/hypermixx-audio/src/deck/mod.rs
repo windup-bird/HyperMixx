@@ -12,6 +12,9 @@ mod loop_;
 pub use deck::Deck;
 pub use flowshift::FlowShift;
 pub use jump::{phase_preserving, Seek};
-pub use loop_::LoopState;
+pub use loop_::{
+    beats_after, beat_shift, provisional_range, quantize_offset, quantize_to_beat, LoopRange,
+    LoopRangeCell, LoopSource,
+};
 
 pub use hypermixx_core::{BeatGrid, Key, KeyFormat, KeyMode, TrackAnalysis};

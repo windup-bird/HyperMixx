@@ -69,6 +69,7 @@ cargo run -p hypermixx-cli -- --print-config        # 打印参考 TOML
 2. midi control
 3. network streamming
 4. realtime stems
+5. slip loop(循环退出落 virtual/slip 位置;当前退出=落旧流停止处无缝续播、自然越过 out)
 
 ## 许可证
 

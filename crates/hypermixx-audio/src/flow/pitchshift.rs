@@ -12,12 +12,18 @@ use timestretch::engine::{
 };
 use timestretch::error::StretchError;
 
+use crate::deck::LoopRangeCell;
 use crate::{CHANNELS, SAMPLE_RATE};
 use hypermixx_core::Source;
 
-/// How many source frames to push into the engine's ring per process_block.
-/// The ring absorbs excess; the engine consumes at its own tempo rate.
+/// How many source frames to push into the engine's ring per feed batch.
 const FEED_CHUNK_FRAMES: usize = 1024;
+/// Upper bound on feed batches per `process_block`: an empty ring refills to the engine's demand
+/// (`demand_hint` ≈ one block at 4× tempo + the resampler's taps, ~1100 frames) in two.
+const MAX_FEED_BATCHES: usize = 8;
+/// Tempo clamp mirroring `EngineConfig`'s: the controller clamps writes, so feeding must too.
+const MIN_TEMPO_RATE: f64 = 0.25;
+const MAX_TEMPO_RATE: f64 = 4.0;
 
 /// A real-time time-stretch engine for one flow.
 pub struct PitchShiftEngine {
@@ -36,12 +42,20 @@ pub struct PitchShiftEngine {
     /// Output frames remaining in the current warm-start priming (silence).
     priming_remaining: usize,
     profile: EngineProfile,
+    /// The loop mapping the feed reads through. Shared with the flow that owns this engine: the
+    /// engine sees nothing but ever-increasing virtual positions, and this folds each read into
+    /// the range (identity below `out`, modulo above it).
+    loop_cell: Arc<LoopRangeCell>,
 }
 
 impl PitchShiftEngine {
     /// Creates an engine with the default Tape profile (zero latency, passthrough at ratio 1.0).
-    pub fn new(source: Arc<dyn Source>, ratio: f32) -> Self {
-        Self::with_profile(source, ratio, EngineProfile::Tape)
+    pub fn new(
+        source: Arc<dyn Source>,
+        ratio: f32,
+        loop_cell: Arc<LoopRangeCell>,
+    ) -> Self {
+        Self::with_profile(source, ratio, EngineProfile::Tape, loop_cell)
             .expect("timestretch engine config is statically valid")
     }
 
@@ -50,6 +64,7 @@ impl PitchShiftEngine {
         source: Arc<dyn Source>,
         ratio: f32,
         profile: EngineProfile,
+        loop_cell: Arc<LoopRangeCell>,
     ) -> Result<Self, StretchError> {
         let total = source.total_frames();
         let config = EngineConfig {
@@ -74,6 +89,7 @@ impl PitchShiftEngine {
             feed_buf: vec![0.0; FEED_CHUNK_FRAMES * CHANNELS],
             priming_remaining: 0,
             profile,
+            loop_cell,
         })
     }
 
@@ -126,6 +142,25 @@ impl PitchShiftEngine {
         self.prepare_jump(target_frame);
     }
 
+    /// Runs the warm-start priming (engine-side preroll plus the declick fade) right now,
+    /// discarding the output, and returns with the clock still on the prepared target.
+    ///
+    /// [`Flow::prepare`](crate::flow::Flow::prepare) calls this on the warm-up thread, so
+    /// "warm-up finished" means *converged*: a flow that is announced ready plays steady audio
+    /// on its first audible block — which is what lets a loop-in's LoopFlow be promoted without
+    /// playing priming silence.
+    pub fn drain_priming(&mut self) {
+        let mut scratch = [0.0f32; crate::BLOCK_SAMPLES];
+        // Bounded well past any real preroll (the wide keylock's is two FFT windows): a guard
+        // against an engine that cannot converge (an empty source), not a normal exit.
+        for _ in 0..4096 {
+            if self.priming_remaining == 0 {
+                break;
+            }
+            self.process_block(&mut scratch);
+        }
+    }
+
     /// Current output playhead (what the listener hears), in source frames.
     /// At ratio=1.0 this equals the source position.
     pub fn current_frame(&self) -> u64 {
@@ -134,6 +169,11 @@ impl PitchShiftEngine {
 
     pub fn ratio(&self) -> f32 {
         self.ratio
+    }
+
+    /// The profile this engine was built with.
+    pub fn profile(&self) -> EngineProfile {
+        self.profile
     }
 
     /// Sets the tempo rate. ratio=1.0 is unity, >1 speeds up, <1 slows down.
@@ -152,17 +192,50 @@ impl PitchShiftEngine {
         Arc::clone(&self.source)
     }
 
-    /// Pushes source audio into the engine's ring buffer.
+    /// Pushes source audio into the engine's ring buffer — only up to the engine's own demand.
+    ///
+    /// The old behaviour kept the ring *full* (32 768 frames), which puts 0.74 s of already-fed
+    /// audio between a `loop_range` change and the listener: a loop could not engage or edit
+    /// without replaying the stale mapping for the better part of a second. `demand_hint` is the
+    /// engine's contract for "the next callback renders without underrun", so topping up to it
+    /// keeps the read-ahead window at ~1 100 frames (~25 ms) — and feeds exactly enough after a
+    /// tempo change, since the demand is recomputed from the current ratio every block.
+    ///
+    /// Each batch is also *segmented at the loop boundary* and re-anchored with
+    /// `set_track_position(actual)`: the frame pushed next carries its true track position, so a
+    /// wrap re-anchors the engine's timeline without any engine reset.
     fn feed(&mut self) {
         if self.track_position >= self.total {
             return;
         }
-        let read = self
-            .source
-            .read_frames(self.track_position, &mut self.feed_buf);
-        if read > 0 {
+        let rate = f64::from(self.ratio).clamp(MIN_TEMPO_RATE, MAX_TEMPO_RATE);
+        let demand = self.source_producer.demand_hint(crate::BLOCK_SIZE, rate);
+        for _ in 0..MAX_FEED_BATCHES {
+            let deficit = demand.saturating_sub(self.source_producer.occupied_frames());
+            if deficit == 0 {
+                break;
+            }
+            let range = self.loop_cell.load();
+            let want = deficit.min(FEED_CHUNK_FRAMES);
+            let (actual, frames) = match &range {
+                Some(range) => range.segment(self.track_position, want),
+                None => (self.track_position, want),
+            };
+            // The next pushed frame carries `actual` — true even across a wrap, because the
+            // segment stops exactly on the boundary (and the next batch re-anchors at `in`).
+            self.source_producer.set_track_position(actual);
+            let read = self
+                .source
+                .read_frames(self.track_position, &mut self.feed_buf[..frames * CHANNELS]);
+            if read == 0 {
+                break;
+            }
             let pushed = self.source_producer.push(&self.feed_buf[..read * CHANNELS]);
             self.track_position += pushed as u64;
+            if pushed < read {
+                // The ring refused the rest (can't happen: `want ≤ deficit`) — retry next block.
+                break;
+            }
         }
     }
 }

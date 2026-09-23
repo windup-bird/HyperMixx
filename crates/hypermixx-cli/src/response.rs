@@ -102,13 +102,25 @@ pub fn deck_line(state: &DeckState) -> String {
         "no grid".into()
     };
     let key = state.key.as_deref().unwrap_or("--");
-    format!(
+    let mut line = format!(
         "deck{}  {transport:<7} {} / {duration}  [{}/{}]  {tempo}  {key}",
         state.deck_id,
         time(state.current_frame),
         state.current_frame,
         state.total_frames,
-    )
+    );
+    // Loop furniture, when there is any: the engaged range, a pending manual in point, and the
+    // slip clock whenever it has drifted away from what is being heard.
+    if let Some((in_frame, out_frame)) = state.loop_range {
+        line.push_str(&format!("  loop [{in_frame}-{out_frame}]"));
+    }
+    if let Some(armed) = state.loop_in_armed {
+        line.push_str(&format!("  in armed@{armed}"));
+    }
+    if state.virtual_frame != state.current_frame {
+        line.push_str(&format!("  slip {}", state.virtual_frame));
+    }
+    line
 }
 
 /// The root command list.
@@ -122,6 +134,12 @@ pub fn help_text(decks: usize) -> String {
   [deck] beatjump <beats>      seek by whole beats, keeping the phase
   [deck] rate <ratio>          set tempo rate (1.0 = unity, 0.5 = half speed)
   [deck] profile <name>        tape / keylock / wide (default: tape)
+  [deck] loop in | out         manual loop: arm at the beat, engage at the quantized out
+  [deck] loop <beats>          beat loop; while looping it re-times out to in+n (halve/double)
+  [deck] loop exit | cancel    leave the loop (slip resumes) / drop an armed in
+  [deck] loop edit <len|move|in|out> <beats>   retime a running loop in place (no gap)
+  [deck] loop halve | double     ÷2 / ×2 the running loop's length (clamped 1/32 .. 64 beats)
+  [deck] loop quantum <q>      out-point grid: beat | half | quarter | eighth
   [deck|master] fx ...         effects on a chain — `fx help` for the subcommands
   state                        show every deck
   zoom in|out|fit              waveform zoom (UI only)

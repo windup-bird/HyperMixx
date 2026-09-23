@@ -366,6 +366,9 @@ fn route(mixer: &mut Mixer, command: Command) -> Option<CommandResponse> {
         }
         BeatJump { deck_id, beats } => transport(mixer, deck_id, move |deck| deck.beatjump(beats)),
         SetRate { deck_id, rate } => transport(mixer, deck_id, move |deck| deck.set_ratio(rate)),
+        Loop { deck_id, op } => {
+            transport_result(mixer, deck_id, move |deck| deck.apply_loop(op))
+        }
         SetProfile { deck_id, profile } => {
             let engine_profile = match profile.as_str() {
                 "tape" => Some(timestretch::engine::EngineProfile::Tape),
@@ -414,6 +417,19 @@ fn route(mixer: &mut Mixer, command: Command) -> Option<CommandResponse> {
 /// Runs `apply` on a loaded deck; an empty deck is answered with an error rather than ignored, so a
 /// mistyped deck id is visible instead of silent.
 fn transport(mixer: &mut Mixer, deck_id: DeckId, apply: impl FnOnce(&mut Deck)) -> Option<CommandResponse> {
+    transport_result(mixer, deck_id, |deck| {
+        apply(deck);
+        Ok(())
+    })
+}
+
+/// [`transport`] for commands that can refuse: the deck's message rides back as `Error` instead of
+/// being swallowed — a loop without a grid or an `out` without an `in` must reach the caller.
+fn transport_result(
+    mixer: &mut Mixer,
+    deck_id: DeckId,
+    apply: impl FnOnce(&mut Deck) -> Result<(), String>,
+) -> Option<CommandResponse> {
     let count = mixer.channel_count();
     let Some(channel) = mixer.channel_mut(deck_id as usize) else {
         return Some(error(unknown_deck(deck_id, count)));
@@ -423,8 +439,10 @@ fn transport(mixer: &mut Mixer, deck_id: DeckId, apply: impl FnOnce(&mut Deck)) 
             "deck {deck_id} holds no track, use `load {deck_id} <path>`"
         )));
     }
-    apply(channel.deck_mut());
-    Some(CommandResponse::Ok)
+    match apply(channel.deck_mut()) {
+        Ok(()) => Some(CommandResponse::Ok),
+        Err(message) => Some(error(message)),
+    }
 }
 
 fn state_of(deck_id: DeckId, deck: &Deck) -> DeckState {
@@ -435,6 +453,11 @@ fn state_of(deck_id: DeckId, deck: &Deck) -> DeckState {
         total_frames: deck.total_frames(),
         bpm: deck.bpm(),
         key: deck.key().map(|key| key.traditional()),
+        virtual_frame: deck.virtual_frame(),
+        loop_range: deck
+            .loop_range()
+            .map(|range| (range.in_frame, range.out_frame)),
+        loop_in_armed: deck.loop_in_armed(),
     }
 }
 

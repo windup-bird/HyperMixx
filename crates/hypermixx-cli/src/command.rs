@@ -15,7 +15,10 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::fx::FxKind;
 use hypermixx_audio::{AudioPipeline, Command, SAMPLE_RATE};
-use hypermixx_core::{Backend, CommandResponse, FxChainId, FxSlotRef, Shared, TrackAnalysis};
+use hypermixx_core::{
+    Backend, CommandResponse, FxChainId, FxSlotRef, LoopEditOp, LoopOp, LoopQuantum, Shared,
+    TrackAnalysis,
+};
 
 use crate::notices::{self, NoticeTx};
 use crate::response::{fx_help_text, help_text};
@@ -274,11 +277,91 @@ pub fn dispatch(
                 None => Action::Failed("usage: [deck] profile <tape|keylock|wide>".into()),
             }
         }),
+        "loop" => with_deck(target, "loop", |deck_id| {
+            loop_command(&mut words, deck_id, command_tx)
+        }),
         "fx" => fx(&mut words, dispatcher, target),
         "state" => send(command_tx, Command::GetAllStates),
         "help" | "h" | "?" => Action::Message(help_text(decks)),
         "quit" | "exit" => Action::Quit,
         other => Action::Failed(format!("unknown command `{other}` — `help` lists them")),
+    }
+}
+
+/// The `loop` family. Parsing mistakes come back as `Failed` immediately; refusals from the engine
+/// (no grid, `out` without `in`) arrive later as `Error` responses, printed like any other.
+fn loop_command<'a>(
+    words: &mut impl Iterator<Item = &'a str>,
+    deck_id: u8,
+    command_tx: &Sender<Command>,
+) -> Action {
+    let usage = "usage: [deck] loop in | out | <beats> | exit | cancel | halve | double | edit <len|move|in|out> <beats> | quantum <beat|half|quarter|eighth>";
+    let Some(sub) = words.next() else {
+        return Action::Message(usage.into());
+    };
+    let op = match sub {
+        "in" => LoopOp::In,
+        "out" => LoopOp::Out,
+        "cancel" => LoopOp::Cancel,
+        "exit" | "off" => LoopOp::Exit,
+        "quantum" => match words.next() {
+            Some(token) => match LoopQuantum::parse(token) {
+                Some(quantum) => LoopOp::SetQuantum(quantum),
+                None => {
+                    return Action::Failed(format!(
+                        "unknown quantum `{token}` — beat|half|quarter|eighth"
+                    ));
+                }
+            },
+            None => {
+                return Action::Failed(
+                    "usage: [deck] loop quantum <beat|half|quarter|eighth>".into(),
+                );
+            }
+        },
+        "edit" => match loop_edit_op(words) {
+            Ok(op) => LoopOp::Edit(op),
+            Err(message) => return Action::Failed(message),
+        },
+        // The dedicated ÷2/×2 length keys — relative to whatever the loop runs right now,
+        // clamped to 1/32..=64 beats by the engine.
+        "halve" | "/2" | "÷2" => LoopOp::Edit(LoopEditOp::Halve),
+        "double" | "x2" | "*2" | "×2" => LoopOp::Edit(LoopEditOp::Double),
+        raw => match raw.parse::<u64>() {
+            Ok(beats) if beats > 0 => LoopOp::Beats(beats),
+            Ok(_) => return Action::Failed("a loop needs at least 1 beat".into()),
+            Err(_) => {
+                return Action::Failed(format!("unknown loop subcommand `{raw}`\n{usage}"));
+            }
+        },
+    };
+    send(command_tx, Command::Loop { deck_id, op })
+}
+
+/// One `loop edit` argument pair: `<len|move|in|out> <beats>`.
+fn loop_edit_op<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<LoopEditOp, String> {
+    let usage = "usage: [deck] loop edit <len|move|in|out> <beats>";
+    let what = words.next().ok_or_else(|| usage.to_owned())?;
+    let raw = words.next().ok_or_else(|| usage.to_owned())?;
+    let number = |raw: &str| format!("beats must be a number, got `{raw}`");
+    match what {
+        "len" | "length" | "size" => raw
+            .parse::<f64>()
+            .map(|beats| LoopEditOp::Length { beats })
+            .map_err(|_| number(raw)),
+        "move" | "shift" => raw
+            .parse::<i64>()
+            .map(|beats| LoopEditOp::Move { beats })
+            .map_err(|_| number(raw)),
+        "in" => raw
+            .parse::<i64>()
+            .map(|beats| LoopEditOp::In { beats })
+            .map_err(|_| number(raw)),
+        "out" => raw
+            .parse::<i64>()
+            .map(|beats| LoopEditOp::Out { beats })
+            .map_err(|_| number(raw)),
+        other => Err(format!("unknown edit `{other}` — len|move|in|out\n{usage}")),
     }
 }
 

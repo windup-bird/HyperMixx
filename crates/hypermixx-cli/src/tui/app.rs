@@ -106,6 +106,9 @@ impl App {
                     total_frames: 0,
                     bpm: 0.0,
                     key: None,
+                    virtual_frame: 0,
+                    loop_range: None,
+                    loop_in_armed: None,
                 })
                 .collect(),
             titles: vec![None; decks],

@@ -16,4 +16,11 @@ pub struct DeckState {
     pub bpm: f32,
     /// Detected key name (e.g. `"Am"`), or `None` without analysis.
     pub key: Option<String>,
+    /// The slip clock: the position playback would be at with no loop, advanced monotonically
+    /// while a loop wraps around underneath it. Equals `current_frame` when no loop is engaged.
+    pub virtual_frame: u64,
+    /// The active loop as `(in, out)` source frames, half-open, or `None`.
+    pub loop_range: Option<(u64, u64)>,
+    /// A manual loop-in point waiting for its out press, as the quantized `in` frame.
+    pub loop_in_armed: Option<u64>,
 }

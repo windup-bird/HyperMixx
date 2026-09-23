@@ -31,15 +31,15 @@ INTERVAL=$(awk -v b="$BEATS" -v bpm="$BPM" 'BEGIN { printf "%.3f", b * 60 / bpm 
 # 命令逐条喂给 CLI。load 现在在 CLI 侧后台解码后才把 source 送进引擎，所以要等 Loaded
 # 落地再 play/jump，否则命令会打到空 deck 上被拒。给每次 load 留出解码时间。
 {
-  printf 'load 0 %s %s\n' "$FILE" "$BPM"
-  printf 'load 1 %s %s\n' "$FILE" "$BPM"
+  printf 'deck0 load %s %s\n' "$FILE" "$BPM"
+  printf 'deck1 load %s %s\n' "$FILE" "$BPM"
   sleep "$WAIT_SECS"          # 等两路解码完成、deck 装好并装填常网格
-  printf 'play 0\nplay 1\n'
+  printf 'deck0 play\ndeck1 play\n'
   sleep 0.3
   printf 'state\n'
   for _ in $(seq 1 "$ROUNDS"); do
     sleep "$INTERVAL"
-    printf 'beatjump 1 %s\n' "$BEATS"
+    printf 'deck1 beatjump %s\n' "$BEATS"
     sleep 0.25            # 等预热线程 + 下一个块切换完成
     printf 'state\n'
   done

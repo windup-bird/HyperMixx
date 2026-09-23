@@ -45,6 +45,7 @@ const VERBS: &[(&str, &str)] = &[
     ("beatjump", "seek by beats"),
     ("rate", "set tempo rate"),
     ("profile", "time-stretch profile"),
+    ("loop", "loop family"),
     ("fx", "effect chain commands"),
     ("state", "show decks"),
     ("zoom", "waveform zoom"),
@@ -125,6 +126,35 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
         "profile" => {
             if rest.len() == 1 {
                 pairs(&[("tape", ""), ("keylock", ""), ("wide", "")], partial)
+            } else {
+                Vec::new()
+            }
+        }
+        "loop" => {
+            if rest.len() == 1 {
+                pairs(
+                    &[
+                        ("in", "arm loop in"),
+                        ("out", "engage at out"),
+                        ("exit", "leave the loop"),
+                        ("cancel", "drop armed in"),
+                        ("halve", "÷2 the loop"),
+                        ("double", "×2 the loop"),
+                        ("edit", "retime in place"),
+                        ("quantum", "out-point grid"),
+                    ],
+                    partial,
+                )
+            } else if rest[0] == "edit" && rest.len() == 2 {
+                pairs(
+                    &[
+                        ("len", "set length"),
+                        ("move", "shift the loop"),
+                        ("in", "move in"),
+                        ("out", "move out"),
+                    ],
+                    partial,
+                )
             } else {
                 Vec::new()
             }
@@ -354,7 +384,7 @@ mod tests {
     #[test]
     fn root_words() {
         let fixture = Fixture::new();
-        assert_eq!(fixture.complete("lo", 2), vec!["load"]);
+        assert_eq!(fixture.complete("lo", 2), vec!["load", "loop"]);
         assert!(fixture.complete("p", 1).contains(&"play".to_owned()));
         assert!(fixture.complete("ma", 2).contains(&"master".to_owned()));
     }

@@ -17,12 +17,17 @@ use crate::flow::Flow;
 /// `submit_prepare` moves a `Flow` to the worker, which warms it up and parks it in `warm` before
 /// announcing its id on the ready channel. Announcing after parking means `poll_ready() -> Some(id)`
 /// always guarantees `take_ready_flow(id)` succeeds.
+///
+/// Two lanes: a jump's flow supersedes any earlier jump (the newest jump wins), while a loop's
+/// LoopFlow never supersedes and is never superseded — `loop in` arms a LoopFlow *and* may spawn
+/// an exit flow at the same moment, and neither is allowed to silently discard the other.
 pub struct FlowShift {
-    prepare_tx: Sender<Flow>,
+    prepare_tx: Sender<(Flow, bool)>,
     ready_rx: Receiver<u64>,
     ready_tx: Sender<u64>,
     warm: Arc<Mutex<HashMap<u64, Flow>>>,
-    /// Only the newest submitted flow is announced; a newer jump supersedes an in-flight warm-up.
+    /// Only the newest supersede-able submission is announced; a newer jump supersedes an
+    /// in-flight warm-up. Loop flows never write or read this.
     latest: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
@@ -30,7 +35,7 @@ pub struct FlowShift {
 
 impl FlowShift {
     pub fn new() -> Self {
-        let (prepare_tx, prepare_rx) = unbounded::<Flow>();
+        let (prepare_tx, prepare_rx) = unbounded::<(Flow, bool)>();
         let (ready_tx, ready_rx) = unbounded::<u64>();
         let warm: Arc<Mutex<HashMap<u64, Flow>>> = Arc::new(Mutex::new(HashMap::new()));
         let latest = Arc::new(AtomicU64::new(0));
@@ -44,11 +49,14 @@ impl FlowShift {
             .spawn(move || {
                 while !thread_shutdown.load(Ordering::Relaxed) {
                     match prepare_rx.recv_timeout(Duration::from_millis(2)) {
-                        Ok(mut flow) => {
+                        Ok((mut flow, supersede)) => {
                             // A real time-stretch engine fills its overlap window here; that work
-                            // must never happen on the audio thread.
+                            // must never happen on the audio thread. This also runs the warm-start
+                            // priming, so "ready" means converged — not merely repositioned.
                             flow.prepare();
-                            if flow.id != thread_latest.load(Ordering::Relaxed) {
+                            if supersede
+                                && flow.id != thread_latest.load(Ordering::Relaxed)
+                            {
                                 // A newer jump made this warm-up irrelevant; drop it silently.
                                 continue;
                             }
@@ -83,10 +91,18 @@ impl FlowShift {
         self.ready_tx.clone()
     }
 
-    /// Queues a flow for warm-up. Never blocks (unbounded channel).
+    /// Queues a jump/exit/beat-loop flow for warm-up. Never blocks (unbounded channel).
+    /// Supersede-able: the newest submission wins, older in-flight ones are dropped.
     pub fn submit_prepare(&self, flow: Flow) {
         self.latest.store(flow.id, Ordering::Relaxed);
-        let _ = self.prepare_tx.send(flow);
+        let _ = self.prepare_tx.send((flow, true));
+    }
+
+    /// Queues an armed loop's LoopFlow for warm-up. Never supersedes and is never superseded:
+    /// it is announced whenever it finishes, however many jumps happened in the meantime, and a
+    /// jump issued after it does not silently discard it.
+    pub fn submit_prepare_loop_flow(&self, flow: Flow) {
+        let _ = self.prepare_tx.send((flow, false));
     }
 
     /// Non-blocking peek at the id of a flow that finished warming up.
@@ -165,7 +181,7 @@ mod tests {
         assert_eq!(wait_for("ready id", || ready_rx.try_recv().ok()), 1);
         let warmed = ts.take_ready_flow(1).expect("warmed flow missing");
         assert_eq!(warmed.state, FlowState::Ready);
-        assert_eq!(warmed.current_frame(), 123);
+        assert_eq!(warmed.virtual_frame(), 123);
         assert!(
             ts.take_ready_flow(1).is_none(),
             "a parked flow may be taken only once"
@@ -179,7 +195,7 @@ mod tests {
         ts.submit_prepare(flow);
         assert_eq!(wait_for("deck announcement", || ts.poll_ready()), 3);
         assert_eq!(
-            ts.take_ready_flow(3).map(|flow| flow.current_frame()),
+            ts.take_ready_flow(3).map(|flow| flow.virtual_frame()),
             Some(200)
         );
     }
@@ -192,7 +208,36 @@ mod tests {
             ts.submit_prepare(flow);
         }
         let warmed = wait_for("newest flow", || ts.take_ready_flow(13));
-        assert_eq!(warmed.current_frame(), 1300);
+        assert_eq!(warmed.virtual_frame(), 1300);
+    }
+
+    #[test]
+    fn a_loop_flow_neither_supersedes_nor_is_superseded() {
+        // The "`loop in` while looping" shape: an exit jump and a LoopFlow are in flight at the
+        // same time, and then a third (newer) jump arrives.
+        let ts = FlowShift::new();
+        let (exit_flow, _exit_rx) = dummy_flow(10, 1_000);
+        ts.submit_prepare(exit_flow);
+        let (loop_flow, loop_rx) = dummy_flow(11, 2_000);
+        ts.submit_prepare_loop_flow(loop_flow);
+        let (jump, jump_rx) = dummy_flow(12, 3_000);
+        ts.submit_prepare(jump);
+
+        // The armed LoopFlow is announced no matter how many jumps surround it…
+        assert_eq!(
+            wait_for("loop-flow announcement", || loop_rx.try_recv().ok()),
+            11
+        );
+        // …and the newest jump still wins its own lane.
+        assert_eq!(
+            wait_for("newest jump announcement", || jump_rx.try_recv().ok()),
+            12
+        );
+        assert!(
+            ts.take_ready_flow(11).is_some(),
+            "the LoopFlow must stay claimable by the deck"
+        );
+        assert!(ts.take_ready_flow(12).is_some());
     }
 
     #[test]

@@ -36,7 +36,7 @@ crates/
 │   │   │   ├── deck.rs      # Deck:流状态机 + cued_from 跳转补偿 + pull_into
 │   │   │   ├── jump.rs      # Seek{Frames,Beats,Beat,Quantized} + phase_preserving
 │   │   │   ├── flowshift.rs # FlowShift(原 TimeShift):后台流预热
-│   │   │   └── loop_.rs     # LoopState 占位(尚未生效)
+│   │   │   └── loop_.rs     # LoopRange/原子 cell/LoopSource(virtual→actual 映射读) + 量化
 │   │   ├── flow/
 │   │   │   ├── flow.rs       # Flow:单次播放单元(状态机)
 │   │   │   └── pitchshift.rs # PitchShiftEngine:timestretch 引擎包装
@@ -196,16 +196,35 @@ fader 起始位、cue_send/cue_tap/side/curve、master fx/limiter/fader、输出
   一个 variant + 一个 `build` arm + 一行 `ALL`,无插件面
 
 ### `deck/`
-- `Deck` — 单 source、单活跃流;`jump()` 记 `cued_from`,`switch_to()` 把新流落点前移
-  预热期间已播放的帧量,保证跨 deck 相位锁定(`phase_probe.sh` 的 `err` 恒 +0);
+- `Deck` — 单 source、单活跃流;`jump()` 记 `cued_from`(**virtual 时钟**),`switch_to()` 把新流
+  落点前移预热期间已播放的帧量,保证跨 deck 相位锁定(`phase_probe.sh` 的 `err` 恒 +0);
   `pull_into(&mut Bus, &FxContext)` 是 `process_block` 的面内薄包装
+- **两个时钟**:`virtual_frame()` = 引擎播放头,只增不减、loop 不碰(slip);
+  `current_frame()` = `map(virtual)` = 听到的位置(波形/state/beatjump 都读它)
+- **Loop 状态机**:`loop_range` 挂在 Flow 上(切流即消亡,从不原地清);手动 in 生成
+  **LoopFlow**(预热流,存于 deck 而非 flows 向量)——预热完后**与主流逐块同速跑、输出丢弃**,
+  每块按“此刻按 out 会得到的区间”更新临时 range,`out` 按下存的就是该值(no-op store)⇒
+  主流 retire、LoopFlow 原地转正,**无 cued_from、零延迟**;beatloop 不跟跑(建流即带 range,
+  预热完经 FlowShift 换流);`loop <n>` 循环中=只调 out(halve/double);循环中编辑=整段
+  Range 一次原子 store(不换流);退出 = 按下即预热换流、**落点 = 旧流输出停止处**
+  (`pending_exit_resume`)——无缝:当前圈自然播完、越过 out 续行;旧 range 随流消亡;
+  slip 落位是单列功能 `slip loop`;LoopFlow 驱动遇换流重锚时钟走 **rebase 分支**
+  (倒退/大步 → `reset_to` 对齐)
 - `jump::phase_preserving` — 目标帧 = 目标拍位 + `phase(当前) × 目标拍宽`,兼容非均匀网格
-- `FlowShift` — 后台预热线程:submit Flow → `prepare()` → 入库 → 通报 id,deck 下个块切流
+- `FlowShift` — 后台预热线程,双通道:**jump 通道**保留 supersede(快跳只认最新);
+  **LoopFlow 通道**双向豁免(`loop in` 循环中 = exit 换流 + 新 LoopFlow 同时在飞);
+  被作废的 LoopFlow 记入 reap,通报时回收,不漏在 warm map 里
 
 ### `flow/`
-- `Flow` — `Preparing → Ready → Active → Retired`;活跃时经引擎采样,暂停/耗尽补静音
+- `Flow` — `Preparing → Ready → Active → Retired`;活跃时经引擎采样,暂停/耗尽补静音;
+  持有自己的 `LoopRangeCell`,`render()` 无状态门(LoopFlow 的同速驱动用它),
+  `prepare()` 与 `reset_to()` = seek 协议 + **排空 warm-start 锄热**——宣布 ready 与
+  换流后的第一块都已是收敛音频(任何切换都不呼吸锄热间隙,换流无缝)
 - `PitchShiftEngine` — timestretch-rs 三 Profile:**Tape**(零延迟直通)/ **Keylock** /
-  **WideKeylock**(预热走 `reset → set_track_position → warm_start`)
+  **WideKeylock**(预热走 `reset → set_track_position → warm_start`);`feed()` 按
+  `demand_hint` **按需喂入**(超前量 32768→~1100 帧 ≈25ms,loop_range 变更影响窗口小到
+  可被 overlap 淡化),按 LoopRange **分段读 + 每段 `set_track_position(实际位置)`**——
+  wrap 只是喂入流内的 splice,引擎永不复位(Keylock 下无瞬态)
 
 ---
 
@@ -227,10 +246,13 @@ fader 起始位、cue_send/cue_tap/side/curve、master fx/limiter/fader、输出
 (输出参考拓扑)/ `--backend auto|stratum|timestretch`;deck 数量启动时从引擎查询
 (`channel_count`,自定义拓扑可配任意通道)。
 
-会话命令:
-- `load <deck> <path> [bpm]` — 后台解码;给 bpm 则建常网格跳过分析
-- `analyse <deck>` — 后台跑 `library::analyser::analyze`,完成后 `SetAnalysis`
-- `play / pause / jump / beatjump / rate / profile / state / quit`
+会话命令(target-first:行首 `deck0`/`0`/`master` 选目标,缺省用焦点 deck):
+- `load <path> [bpm]` — 后台解码;给 bpm 则建常网格跳过分析
+- `analyse` — 后台跑 `library::analyser::analyze`,完成后 `SetAnalysis`
+- `play / pause / jump <frame> / beatjump <beats> / rate / profile / state / quit`
+- `loop` 族:`loop in|out|<n>|exit|cancel|halve|double|edit <len|move|in|out> <beats>|quantum <q>`
+  (手动 in/out 带量化与 LoopFlow 锄热,`<n>` 循环中 = 只调 out,halve/double = 当前长度
+  ÷2/×2、域 1/32..64 拍,循环中编辑原地原子 store,exit 无缝续播越过 out)
 - `fx` 族:`fx add|remove|list|set|on|off|trigger|pad press|release`,chain 地址
   `master`/`m`/`deck0`/`d0`/`0`;`fx help` 从注册表生成 kind/参数清单(永不与引擎脱节)
 

@@ -47,6 +47,88 @@ pub struct FxSlotStatus {
     pub params: Vec<(String, f32)>,
 }
 
+/// How `loop out` and loop edits snap to the beat grid: the granularity of the out offset,
+/// measured in beats from the loop's in point.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoopQuantum {
+    /// Whole beats (1.0).
+    #[default]
+    Beat,
+    /// Half beats (0.5).
+    Half,
+    /// Quarter beats (0.25).
+    Quarter,
+    /// Eighth beats (0.125).
+    Eighth,
+}
+
+impl LoopQuantum {
+    /// The quantum's length in beats.
+    pub fn beats(self) -> f64 {
+        match self {
+            LoopQuantum::Beat => 1.0,
+            LoopQuantum::Half => 0.5,
+            LoopQuantum::Quarter => 0.25,
+            LoopQuantum::Eighth => 0.125,
+        }
+    }
+
+    /// Parses a CLI token.
+    pub fn parse(token: &str) -> Option<Self> {
+        match token.to_ascii_lowercase().as_str() {
+            "beat" | "b" | "1" => Some(LoopQuantum::Beat),
+            "half" | "1/2" | "2" => Some(LoopQuantum::Half),
+            "quarter" | "1/4" | "4" => Some(LoopQuantum::Quarter),
+            "eighth" | "1/8" | "8" => Some(LoopQuantum::Eighth),
+            _ => None,
+        }
+    }
+}
+
+/// An in-loop edit: the range is recomputed as a whole and stored in one shot, so the feed's
+/// mapping never sees a half-moved range. `virtual_pos` never moves — only `loop_range` does.
+///
+/// `Halve`/`Double` are the dedicated relative length keys (the DJ ÷2/×2 buttons): they scale
+/// the *current* length, clamped to the domain **1/32 beat ..= 64 beats** — below the
+/// quantization floor on purpose (a loop roll may want a 32nd) and above it so a runaway double
+/// can't swallow the track.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LoopEditOp {
+    /// Keep `in`, move `out` to `in + beats` (beats may be fractional, down to one quantum).
+    Length { beats: f64 },
+    /// Halve the running length (`in` fixed); floors at 1/32 beat.
+    Halve,
+    /// Double the running length (`in` fixed); caps at 64 beats.
+    Double,
+    /// Shift `in` and `out` together by whole beats.
+    Move { beats: i64 },
+    /// Move only `in`; the length changes with it.
+    In { beats: i64 },
+    /// Move only `out`; the length changes with it.
+    Out { beats: i64 },
+}
+
+/// One loop command. The whole family rides a single [`Command::Loop`] variant so the deck's
+/// loop state machine stays one match arm.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LoopOp {
+    /// Arm a manual loop-in: quantize `in` to the beat and start the LoopFlow warm-up.
+    In,
+    /// Set the quantized `out` and engage: the LoopFlow becomes the active flow, zero delay.
+    Out,
+    /// Drop an armed loop-in (a pending LoopFlow).
+    Cancel,
+    /// Leave the active loop, continuing from the slipped `virtual_pos` (a flow change).
+    Exit,
+    /// Beat loop: with no loop engaged, open an N-beat loop at the quantized current beat; while
+    /// looping, re-time the current loop's `out` to `in + N` beats (halve/double), in place.
+    Beats(u64),
+    /// Edit the active loop's range in place — no flow change.
+    Edit(LoopEditOp),
+    /// Set the deck's out-point quantization granularity.
+    SetQuantum(LoopQuantum),
+}
+
 /// Which analyser backend to use for a track.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Backend {
@@ -88,6 +170,11 @@ pub enum Command {
     SetRate {
         deck_id: DeckId,
         rate: f32,
+    },
+    /// The loop family: manual in/out, beat loops, exit, in-loop edits and quantization.
+    Loop {
+        deck_id: DeckId,
+        op: LoopOp,
     },
     /// Switches the time-stretch profile ("tape", "keylock", "wide").
     SetProfile {
@@ -211,6 +298,9 @@ impl std::fmt::Debug for Command {
                 .field("deck_id", deck_id)
                 .field("rate", rate)
                 .finish(),
+            Command::Loop { deck_id, op } => {
+                f.debug_struct("Loop").field("deck_id", deck_id).field("op", op).finish()
+            }
             Command::SetProfile { deck_id, profile } => f
                 .debug_struct("SetProfile")
                 .field("deck_id", deck_id)
