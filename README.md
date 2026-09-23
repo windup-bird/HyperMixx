@@ -52,6 +52,13 @@ hypermixx> fx list                    # 列出fx
 hypermixx> fx set eq low -0.5         # -1~1
 hypermixx> fx set filter value  0.5
 hypermixx> master fx list
+
+# 拍同步：deck1 对 deck0
+hypermixx> deck1 sync phase pid        # 先对 BPM，再用 PI 追相位（pll 收敛后归零）
+hypermixx> deck1 sync tempolock        # 两边共享一个 tempo，任一边 fader 都带动对方
+hypermixx> deck0 sync set-leader       # 指定 master（target 即 leader，无参数）
+hypermixx> deck1 nudge 0.04 0.5        # 临时 +4% 挪相位，0.5s 后自己松开（tempo 不变）
+hypermixx> deck1 sync unlock           # 解锁：清 lock/align/nudgerate，tempo 保留
 hypermixx> quit
 ```
 
@@ -63,6 +70,26 @@ cargo run -p hypermixx-cli -- --config topo.toml    # 自定义拓扑
 cargo run -p hypermixx-cli -- --print-config        # 打印参考 TOML
 ```
 
+## 脚本
+
+```bash
+cargo build --release --workspace   # 两个脚本默认吃 target/release 的二进制
+
+./scripts/phase_probe.sh            # beatjump 精度：相位差增量是否恒定
+./scripts/sync_phase.sh             # 双 deck 先后起播 → sync phase pid → 报稳态相位差
+./scripts/sync_phase.sh target/release/hypermixx-cli test.mp3 122 0.75 24 none
+                                    # 最后一个 mode 换 pid|linear|instant|tempo|none
+```
+
+`sync_phase.sh` 实测（122 BPM，起播差 0.75 拍 ≈ −120ms）：
+
+| mode | 稳态相位差 | |
+|---|---|---|
+| `pid` | 0.0050 拍 (2.4ms) | 指数收敛，带 PI 超调 |
+| `linear 2.0` | 0.0009 拍 (0.5ms) | 定斜率单调 |
+| `instant` | 0.0000 拍 | 一次换流直接落点 |
+| `tempo` / `none` | 漂移 0.0000 | 只对速不追相位，相位差恒定 |
+
 ## todo
 
 1. loop sync
@@ -70,6 +97,8 @@ cargo run -p hypermixx-cli -- --print-config        # 打印参考 TOML
 3. network streamming
 4. realtime stems
 5. slip loop(循环退出落 virtual/slip 位置;当前退出=落旧流停止处无缝续播、自然越过 out)
+6. 收敛超时检测(目前只有 PLL 输出 ±5% 限幅兑底,误差关不上时会一直以 5% 跑,不会自动清 align)
+7. TUI 按键式 nudge(需放行 `KeyEventKind::Release`,目前只支持定时/命令式)
 
 ## 许可证
 

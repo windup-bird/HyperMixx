@@ -46,7 +46,8 @@ pub struct App {
     pub titles: Vec<Option<String>>,
     pub waveforms: Vec<Option<Arc<hypermixx_library::Waveform>>>,
     pub grids: Vec<Option<BeatGrid>>,
-    /// CLI-side rate mirror; the engine does not report it back.
+    /// CLI-side tempo mirror; refreshed from every state answer so the header tracks the engine
+    /// (a lock or a fader on the other deck moves it without this front-end doing anything).
     pub rates: Vec<f32>,
     pub profiles: Vec<&'static str>,
 
@@ -109,6 +110,15 @@ impl App {
                     virtual_frame: 0,
                     loop_range: None,
                     loop_in_armed: None,
+                    tempo: 1.0,
+                    nudgerate: 0.0,
+                    playing_rate: 1.0,
+                    lock: false,
+                    align: None,
+                    nudge: 0.0,
+                    sync_leader: None,
+                    sync_mode: "free".to_owned(),
+                    group_bpm: 0.0,
                 })
                 .collect(),
             titles: vec![None; decks],
@@ -193,6 +203,9 @@ impl App {
     fn set_state(&mut self, state: &DeckState) {
         if let Some(slot) = self.states.get_mut(state.deck_id as usize) {
             *slot = state.clone();
+        }
+        if let Some(rate) = self.rates.get_mut(state.deck_id as usize) {
+            *rate = state.tempo;
         }
     }
 

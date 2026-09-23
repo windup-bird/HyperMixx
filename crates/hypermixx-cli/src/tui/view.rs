@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::response::{time, Level, LogLine};
+use crate::response::{sync_badge, time, Level, LogLine};
 use crate::tui::app::{App, COMPLETION_ROWS};
 use crate::tui::waveform_view;
 
@@ -131,16 +131,23 @@ fn deck_header(app: &App, index: usize) -> Line<'static> {
         "-- BPM".to_owned()
     };
     let key = state.key.clone().unwrap_or_else(|| "--".to_owned());
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!(" {title}"),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            "   {bpm}  {key}   rate {:.2}  {}",
+            "   {bpm}  {key}   tempo {:.3}  {}",
             app.rates[index], app.profiles[index]
         )),
-    ])
+    ];
+    if let Some(badge) = sync_badge(&app.states[index]) {
+        spans.push(Span::styled(
+            format!("   {badge}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn deck_info(app: &App, index: usize) -> Line<'static> {

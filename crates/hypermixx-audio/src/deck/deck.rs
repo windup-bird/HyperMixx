@@ -32,6 +32,7 @@ use super::jump::{resolve, Seek};
 use super::loop_::{
     beats_after, beat_shift, provisional_range, quantize_offset, quantize_to_beat, LoopRange,
 };
+use super::sync::{MAX_RATE, MIN_RATE, PhaseAlign, Playhead, SyncCtx};
 use super::FlowShift;
 use crate::flow::{Flow, FlowState};
 use crate::fx::FxContext;
@@ -86,8 +87,17 @@ pub struct Deck {
     pending_exit_resume: bool,
     /// Out-point quantization for `loop out`, the LoopFlow's provisional range, and edits.
     loop_quantum: LoopQuantum,
-    /// Transport every spawned flow inherits: a rate (or profile) the DJ set must survive jumps.
-    rate: f32,
+    /// Transport every spawned flow inherits: a tempo (or profile) the DJ set must survive jumps.
+    ///
+    /// Split in two on purpose: `tempo` is what the fader, `sync tempo` and a lock write, and
+    /// `nudgerate` is what phase tracking and `nudge` bend it by. See [`Playhead`].
+    playhead: Playhead,
+    /// The rate last handed to the engines, so an idle deck does not rewrite it every block.
+    applied_rate: f64,
+    /// The sync view for the block about to render, stashed by the mixer right before it drives
+    /// this deck. `None` for a caller that drives a deck directly (the raw-transport tests), which
+    /// then gets no group tempo and no phase correction — but still a ticking nudge.
+    sync: Option<SyncCtx>,
     profile: EngineProfile,
 }
 
@@ -111,7 +121,9 @@ impl Deck {
             loop_reap: Vec::new(),
             pending_exit_resume: false,
             loop_quantum: LoopQuantum::default(),
-            rate: 1.0,
+            playhead: Playhead::new(),
+            applied_rate: 1.0,
+            sync: None,
             profile: EngineProfile::Tape,
         }
     }
@@ -213,20 +225,145 @@ impl Deck {
         }
     }
 
-    /// Sets the tempo rate on the active flow's time-stretch engine — and remembers it, so the
-    /// next spawned flow (or an armed LoopFlow warming right now) is built at the same rate.
-    pub fn set_ratio(&mut self, rate: f32) {
-        self.rate = rate;
+    /// The BPM in force at the position the listener hears, straight off the grid — `0.0` while
+    /// the deck has no grid (an average over a track whose tempo changes would be a lie here).
+    pub fn bpm_at_frame(&self) -> f64 {
+        self.analysis()
+            .map(|analysis| f64::from(analysis.beatgrid.bpm_at_frame(self.current_frame())))
+            .unwrap_or(0.0)
+    }
+
+    /// Where inside its beat the deck sits, `0.0` on the beat — `None` while it has no grid.
+    pub fn beat_phase(&self) -> Option<f32> {
+        let analysis = self.analysis()?;
+        if analysis.beatgrid.is_empty() {
+            return None;
+        }
+        Some(analysis.beatgrid.phase(self.current_frame()))
+    }
+
+    /// The stable tempo: what the fader and `sync tempo` set, and what survives `sync unlock`.
+    pub fn tempo(&self) -> f64 {
+        self.playhead.tempo
+    }
+
+    /// The temporary rate stacked on `tempo` — phase correction plus nudge, `0.0` when idle.
+    pub fn nudgerate(&self) -> f64 {
+        self.playhead.nudgerate
+    }
+
+    /// `tempo + nudgerate`: the rate the engine is actually playing at.
+    pub fn playing_rate(&self) -> f64 {
+        self.playhead.playing_rate()
+    }
+
+    /// Whether this deck's tempo follows the group's shared BPM.
+    pub fn lock(&self) -> bool {
+        self.playhead.lock
+    }
+
+    /// The current nudge bend, a rate (`0.0` when idle).
+    pub fn nudge_rate(&self) -> f64 {
+        self.playhead.nudge_rate()
+    }
+
+    /// The running phase correction as a label (`"instant"`/`"linear"`/`"pid"`), or `None`.
+    pub fn align_label(&self) -> Option<&'static str> {
+        self.playhead.align_label()
+    }
+
+    /// Installs this block's sync view. The mixer calls this right before it renders the deck.
+    pub fn set_sync(&mut self, sync: Option<SyncCtx>) {
+        self.sync = sync;
+    }
+
+    /// Writes the stable tempo and pushes it to the engines. How a lock or the fader route a
+    /// caller's intent *into* this is the mixer's decision, not the deck's.
+    pub fn set_tempo(&mut self, rate: f64) {
+        self.playhead.tempo = rate.clamp(MIN_RATE, MAX_RATE);
+        self.push_rate();
+    }
+
+    /// Whether this deck derives its tempo from the group's shared BPM.
+    pub fn set_lock(&mut self, lock: bool) {
+        self.playhead.lock = lock;
+        self.push_rate();
+    }
+
+    /// Installs (or drops) this deck's phase correction.
+    pub fn set_align(&mut self, align: Option<PhaseAlign>) {
+        self.playhead.align = align;
+        self.push_rate();
+    }
+
+    /// Starts a temporary rate bend; `seconds` releases it on its own, `None` holds it until
+    /// [`stop_nudge`](Self::stop_nudge). The tempo is untouched — only `nudgerate` moves.
+    pub fn start_nudge(&mut self, delta: f64, seconds: Option<f64>) {
+        self.playhead.start_nudge(delta, seconds);
+        self.push_rate();
+    }
+
+    /// Releases a running bend; it ramps back to zero rather than snapping.
+    pub fn stop_nudge(&mut self) {
+        self.playhead.stop_nudge();
+        self.push_rate();
+    }
+
+    /// Tears down the lock, the phase correction and any bend, keeping the tempo. `sync unlock`.
+    pub fn clear_sync(&mut self) {
+        self.playhead.unlock();
+        self.push_rate();
+    }
+
+    /// Hand the engine the current rate, writing only when it actually moved. A controller that
+    /// converges stops writing, so an idle deck leaves the timestretch engine alone.
+    fn push_rate(&mut self) {
+        let rate = self.playhead.playing_rate().clamp(MIN_RATE, MAX_RATE);
+        if (rate - self.applied_rate).abs() < 1e-6 {
+            return;
+        }
+        self.apply_rate(rate);
+    }
+
+    /// Writes `rate` to every flow this deck is driving — the active one and an armed LoopFlow
+    /// that has already arrived — and remembers it as the last rate sent.
+    fn apply_rate(&mut self, rate: f64) {
+        self.applied_rate = rate;
+        let ratio = rate as f32;
         if let Some(flow) = self.flows.get_mut(self.active_index) {
-            flow.set_ratio(rate);
+            flow.set_ratio(ratio);
         }
         if let Some(flow) = self
             .loop_arm
             .as_mut()
             .and_then(|arm| arm.flow.as_mut())
         {
-            flow.set_ratio(rate);
+            flow.set_ratio(ratio);
         }
+    }
+
+    /// Runs the sync math for the block about to render: the group recompute, the phase controller
+    /// and the nudge all land in `playhead`, then whatever they settled on is pushed to the engine.
+    fn apply_sync(&mut self) {
+        let analysis = self.analysis(); // Arc bump — no allocation on this path
+        let (own_bpm, own_phase) = match &analysis {
+            Some(analysis) if !analysis.beatgrid.is_empty() => {
+                let position = self.current_frame();
+                (
+                    f64::from(analysis.beatgrid.bpm_at_frame(position)),
+                    Some(analysis.beatgrid.phase(position)),
+                )
+            }
+            _ => (0.0, None),
+        };
+        self.playhead.update(self.sync.as_ref(), own_bpm, own_phase);
+        self.push_rate();
+    }
+
+    /// Sets the tempo rate on the active flow's time-stretch engine — and remembers it, so the
+    /// next spawned flow (or an armed LoopFlow warming right now) is built at the same rate.
+    pub fn set_ratio(&mut self, rate: f32) {
+        self.set_tempo(f64::from(rate));
     }
 
     /// Rebuilds the active flow's engine with a different time-stretch profile, remembering the
@@ -250,6 +387,9 @@ impl Deck {
     /// the number of frames carrying actual audio.
     pub fn process_block(&mut self, output: &mut [f32]) -> usize {
         self.poll_ready_flows();
+        // Sync runs first so the rate handed to the engine belongs to the same block as the
+        // positions the leader was sampled at — a follower must never compare against last block.
+        self.apply_sync();
         let capacity = output.len() / CHANNELS;
         if !self.is_playing() {
             output[..capacity * CHANNELS].fill(0.0);
@@ -563,9 +703,9 @@ impl Deck {
         Ok(())
     }
 
-    /// The analysis a loop command needs: present *and* non-empty (quantization is meaningless
-    /// without beats — same rule as `beatjump`).
-    fn require_grid(&self) -> Result<Arc<TrackAnalysis>, String> {
+    /// The analysis a loop (or a sync command) needs: present *and* non-empty (quantization is
+    /// meaningless without beats — same rule as `beatjump`).
+    pub fn require_grid(&self) -> Result<Arc<TrackAnalysis>, String> {
         let analysis = self.analysis().ok_or_else(|| LOOP_NO_GRID.to_owned())?;
         if analysis.beatgrid.is_empty() {
             return Err(LOOP_NO_GRID.to_owned());
@@ -658,7 +798,7 @@ impl Deck {
         }
     }
 
-    /// Builds a flow at `start_frame`, inheriting this deck's transport (rate and profile), and
+    /// Builds a flow at `start_frame`, inheriting this deck's transport (tempo and profile), and
     /// stamps its loop range before anything warms.
     fn make_flow(&mut self, start_frame: u64, range: Option<LoopRange>) -> Flow {
         let id = self.next_flow_id;
@@ -669,7 +809,7 @@ impl Deck {
             start_frame,
             None,
             self.flowshift.ready_sender(),
-            self.rate,
+            self.playhead.playing_rate() as f32,
             self.profile,
         );
         flow.set_loop_range(range);
@@ -682,7 +822,7 @@ impl Deck {
                 let Some(flow) = self.flowshift.take_ready_flow(id) else {
                     continue;
                 };
-                let rate = self.rate;
+                let rate = self.playhead.playing_rate() as f32;
                 let Some(arm) = self.loop_arm.as_mut() else {
                     continue; // disarmed between announcement and poll: fall through to reaping
                 };
@@ -744,6 +884,13 @@ impl Deck {
             .iter()
             .position(|f| f.id == flow_id)
             .unwrap_or(self.active_index);
+        // The new flow was built at the rate it was spawned with; the playhead may have moved
+        // since (a controller runs while it warms), so land it on today's rate rather than
+        // replaying a stale one for a block.
+        self.apply_rate(self.playhead.playing_rate().clamp(MIN_RATE, MAX_RATE));
+        // The playhead moved because of the switch, not because of tempo — tell the controller not
+        // to read the jump as a phase error.
+        self.playhead.suppress();
     }
 }
 

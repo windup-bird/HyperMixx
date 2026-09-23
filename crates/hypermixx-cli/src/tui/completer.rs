@@ -46,6 +46,8 @@ const VERBS: &[(&str, &str)] = &[
     ("rate", "set tempo rate"),
     ("profile", "time-stretch profile"),
     ("loop", "loop family"),
+    ("sync", "beat-sync against the other deck"),
+    ("nudge", "temporary rate bend"),
     ("fx", "effect chain commands"),
     ("state", "show decks"),
     ("zoom", "waveform zoom"),
@@ -153,6 +155,42 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
                         ("in", "move in"),
                         ("out", "move out"),
                     ],
+                    partial,
+                )
+            } else {
+                Vec::new()
+            }
+        }
+        "sync" => {
+            if rest.len() == 1 {
+                pairs(
+                    &[
+                        ("tempo", "match the other BPM once"),
+                        ("phase", "tempo + close the phase"),
+                        ("tempolock", "share one tempo"),
+                        ("phaselock", "follow the leader exactly"),
+                        ("set-leader", "name this deck the leader"),
+                        ("unlock", "drop lock + correction"),
+                    ],
+                    partial,
+                )
+            } else if (rest[0] == "phase" || rest[0] == "phaselock") && rest.len() == 2 {
+                pairs(
+                    &[
+                        ("instant", "jump once"),
+                        ("linear", "fixed slope over seconds"),
+                        ("pid", "PI controller"),
+                    ],
+                    partial,
+                )
+            } else {
+                Vec::new()
+            }
+        }
+        "nudge" => {
+            if rest.len() == 1 {
+                pairs(
+                    &[("off", "release the bend"), ("0.04", "4% fast"), ("-0.04", "4% slow")],
                     partial,
                 )
             } else {

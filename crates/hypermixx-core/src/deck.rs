@@ -23,4 +23,24 @@ pub struct DeckState {
     pub loop_range: Option<(u64, u64)>,
     /// A manual loop-in point waiting for its out press, as the quantized `in` frame.
     pub loop_in_armed: Option<u64>,
+    /// The stable tempo: what the DJ's fader, `sync tempo` and a lock's group recompute write.
+    /// This is the rate that survives `sync unlock`.
+    pub tempo: f32,
+    /// The temporary rate stacked on top of `tempo`: phase correction plus nudge. `0.0` when
+    /// nothing is correcting.
+    pub nudgerate: f32,
+    /// `tempo + nudgerate` — the rate the deck actually plays at.
+    pub playing_rate: f32,
+    /// This deck's tempo follows the group's shared BPM.
+    pub lock: bool,
+    /// The active phase correction, as a label (`"instant"`/`"linear"`/`"pid"`), or `None`.
+    pub align: Option<String>,
+    /// The current nudge bend, a rate (also part of `nudgerate`), `0.0` when idle.
+    pub nudge: f32,
+    /// The deck this one tracks, or `None` when it leads or stands alone.
+    pub sync_leader: Option<DeckId>,
+    /// The pair's sync mode: `"free"`, `"tempolock"` or `"phaselock"`.
+    pub sync_mode: String,
+    /// The shared BPM the group's tempos derive from (`0.0` while free).
+    pub group_bpm: f32,
 }

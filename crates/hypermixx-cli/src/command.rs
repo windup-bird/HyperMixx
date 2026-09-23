@@ -16,8 +16,8 @@ use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::fx::FxKind;
 use hypermixx_audio::{AudioPipeline, Command, SAMPLE_RATE};
 use hypermixx_core::{
-    Backend, CommandResponse, FxChainId, FxSlotRef, LoopEditOp, LoopOp, LoopQuantum, Shared,
-    TrackAnalysis,
+    Backend, CommandResponse, FxChainId, FxSlotRef, LoopEditOp, LoopOp, LoopQuantum, NudgeOp,
+    PhaseMode, Shared, SyncOp, TrackAnalysis,
 };
 
 use crate::notices::{self, NoticeTx};
@@ -280,12 +280,131 @@ pub fn dispatch(
         "loop" => with_deck(target, "loop", |deck_id| {
             loop_command(&mut words, deck_id, command_tx)
         }),
+        "sync" => with_deck(target, "sync", |deck_id| {
+            sync_command(&mut words, deck_id, command_tx)
+        }),
+        "nudge" => with_deck(target, "nudge", |deck_id| {
+            nudge_command(&mut words, deck_id, command_tx)
+        }),
         "fx" => fx(&mut words, dispatcher, target),
         "state" => send(command_tx, Command::GetAllStates),
         "help" | "h" | "?" => Action::Message(help_text(decks)),
         "quit" | "exit" => Action::Quit,
         other => Action::Failed(format!("unknown command `{other}` — `help` lists them")),
     }
+}
+
+/// The `sync` family. Parsing mistakes come back as `Failed` immediately; refusals from the engine
+/// (no grid, a reversed lock, a deck that is already the leader) arrive later as `Error` responses.
+///
+/// `phase` includes `tempo`, `phaselock` includes `tempolock` — the subcommand says how far the
+/// deck ends up committed, not which arithmetic it runs first.
+fn sync_command<'a>(
+    words: &mut impl Iterator<Item = &'a str>,
+    deck_id: u8,
+    command_tx: &Sender<Command>,
+) -> Action {
+    let usage = "usage: [deck] sync tempo | phase <mode> [seconds] | tempolock | phaselock <mode> [seconds] | set-leader | unlock";
+    let Some(sub) = words.next() else {
+        return Action::Message(usage.into());
+    };
+    let op = match sub {
+        "tempo" => SyncOp::Tempo,
+        "phase" => {
+            let (mode, t_seconds) = match phase_mode(words, "phase") {
+                Ok(parsed) => parsed,
+                Err(message) => return Action::Failed(message),
+            };
+            SyncOp::Phase { mode, t_seconds }
+        }
+        "tempolock" | "lock" => SyncOp::TempoLock,
+        "phaselock" => {
+            let (mode, t_seconds) = match phase_mode(words, "phaselock") {
+                Ok(parsed) => parsed,
+                Err(message) => return Action::Failed(message),
+            };
+            SyncOp::PhaseLock { mode, t_seconds }
+        }
+        // Target-first grammar: the deck named before `sync` *is* the leader, so no argument.
+        "set-leader" | "leader" => SyncOp::SetLeader,
+        "unlock" | "off" => SyncOp::Unlock,
+        other => {
+            return Action::Failed(format!(
+                "unknown sync subcommand `{other}` — tempo|phase|tempolock|phaselock|set-leader|unlock"
+            ));
+        }
+    };
+    send(command_tx, Command::Sync { deck_id, op })
+}
+
+/// `<mode> [seconds]` for `sync phase` / `sync phaselock`. Only `linear` takes a duration — a
+/// duration on `pid` would be a typo the user should see rather than an argument silently ignored.
+fn phase_mode<'a>(
+    words: &mut impl Iterator<Item = &'a str>,
+    what: &str,
+) -> Result<(PhaseMode, Option<f64>), String> {
+    let usage = format!("usage: [deck] sync {what} <instant|linear [seconds]|pid>");
+    let Some(token) = words.next() else {
+        return Err(usage);
+    };
+    let Some(mode) = PhaseMode::parse(token) else {
+        return Err(format!("unknown phase mode `{token}` — instant|linear|pid\n{usage}"));
+    };
+    let t_seconds = match words.next() {
+        Some(raw) => match raw.parse::<f64>() {
+            Ok(seconds) => {
+                if mode != PhaseMode::Linear {
+                    return Err(format!(
+                        "`{}` does not take a duration — only `linear` does (e.g. `sync {what} linear 2.0`)",
+                        mode.label()
+                    ));
+                }
+                Some(seconds)
+            }
+            Err(_) => return Err(format!("duration must be a number of seconds, got `{raw}`")),
+        },
+        None => None,
+    };
+    Ok((mode, t_seconds))
+}
+
+/// The `nudge` family: a temporary rate bend that changes phase while it runs and leaves the
+/// tempo alone when it ends.
+fn nudge_command<'a>(
+    words: &mut impl Iterator<Item = &'a str>,
+    deck_id: u8,
+    command_tx: &Sender<Command>,
+) -> Action {
+    let usage = "usage: [deck] nudge <delta> [seconds] | [deck] nudge off";
+    let Some(raw) = words.next() else {
+        return Action::Message(usage.into());
+    };
+    let op = match raw {
+        "off" | "stop" | "release" | "reset" => NudgeOp::Stop,
+        other => {
+            let delta = match other.parse::<f32>() {
+                Ok(delta) => delta,
+                Err(_) => {
+                    return Action::Failed(format!(
+                        "nudge needs a rate (0.04 = 4% fast), got `{other}`\n{usage}"
+                    ));
+                }
+            };
+            let seconds = match words.next() {
+                Some(raw_seconds) => match raw_seconds.parse::<f64>() {
+                    Ok(seconds) => Some(seconds),
+                    Err(_) => {
+                        return Action::Failed(format!(
+                            "nudge duration must be a number of seconds, got `{raw_seconds}`"
+                        ));
+                    }
+                },
+                None => None,
+            };
+            NudgeOp::Start { delta, seconds }
+        }
+    };
+    send(command_tx, Command::Nudge { deck_id, op })
 }
 
 /// The `loop` family. Parsing mistakes come back as `Failed` immediately; refusals from the engine

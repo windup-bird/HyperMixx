@@ -6,7 +6,7 @@
 //! Layering inside the crate, top to bottom:
 //!
 //! ```text
-//! pipeline ──► mixer ──► deck ──► flow ──► fx
+//! pipeline ──► sync ──► mixer ──► deck ──► flow ──► fx
 //!                 └────► output ─► cpal (the only device user in the crate)
 //! ```
 
@@ -19,6 +19,7 @@ pub mod fx;
 pub mod mixer;
 pub mod pipeline;
 pub mod ringbuf;
+pub mod sync;
 
 // The engine's public surface: the core types it trades in, plus its own runtime types.
 pub use deck::{Deck, FlowShift, LoopRange, Seek};
@@ -30,12 +31,13 @@ pub use mixer::{
 };
 pub use pipeline::{AudioPipeline, Meters, PipelineError};
 pub use ringbuf::AudioRingBuffer;
+pub use sync::{SyncGroup, SyncMode};
 
 pub use {hypermixx_core as core, hypermixx_media as media};
 
 pub use hypermixx_core::{
     Backend, BeatGrid, Command, CommandResponse, DeckId, DeckState, FxChainId, Key, KeyFormat,
-    KeyMode, Source, TrackAnalysis, CHANNELS, SAMPLE_RATE,
+    KeyMode, NudgeOp, PhaseMode, Source, SyncOp, TrackAnalysis, CHANNELS, SAMPLE_RATE,
 };
 
 /// Frames per processing block: one deck tick, and the mixer's block length.

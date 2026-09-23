@@ -13,12 +13,12 @@ pub mod source;
 pub use analysis::TrackAnalysis;
 pub use beatgrid::BeatGrid;
 pub use command::{Backend, Command, CommandResponse, FxChainId, FxSlotRef, FxSlotStatus,
-    LoopEditOp, LoopOp, LoopQuantum};
+    LoopEditOp, LoopOp, LoopQuantum, NudgeOp, PhaseMode, SyncOp};
 pub use deck::{DeckId, DeckState};
 pub use key::{Key, KeyFormat, KeyMode};
 pub use source::{Shared, Source};
 
-/// Engine-wide sample rate. Everything downstream of the decoder is 48kHz.
+/// Engine-wide sample rate. The decoder resamples everything to it at load time.
 pub const SAMPLE_RATE: u32 = 44_100;
 /// Interleaved stereo.
 pub const CHANNELS: usize = 2;

@@ -504,7 +504,9 @@ fn unknown_chain(chain: &FxChainId) -> String {
     format!("no such FX chain `{}`", chain.label())
 }
 
-fn unknown_deck(deck_id: u8, count: usize) -> String {
+/// The shared message for a deck id outside the configured topology; the transport and the sync
+/// coordinator both answer with it so a mistyped id reads the same everywhere.
+pub(crate) fn unknown_deck(deck_id: u8, count: usize) -> String {
     format!("unknown deck {deck_id}, valid ids are 0..={}", count.saturating_sub(1))
 }
 

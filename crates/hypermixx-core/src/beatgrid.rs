@@ -116,6 +116,28 @@ impl BeatGrid {
             .saturating_sub(self.frame_at_beat(beat))
     }
 
+    /// BPM of the beat at `beat`, derived from that beat's own width — so a grid whose tempo
+    /// changes reports the tempo in force *there*, while a constant grid reports the same number
+    /// everywhere. `0.0` when the width degenerates (empty grid, zero sample rate).
+    pub fn bpm_at_beat(&self, beat: u64) -> f32 {
+        if self.sample_rate == 0 {
+            return 0.0;
+        }
+        let width = self.beat_width(beat);
+        if width == 0 {
+            return 0.0;
+        }
+        (60.0 * f64::from(self.sample_rate) / width as f64) as f32
+    }
+
+    /// BPM in force at `frame` — the width of the beat containing it, converted to a tempo.
+    ///
+    /// Sync reads this every block: the leader's tempo at the position it is actually at, not a
+    /// track-wide average that would drift against a grid with tempo changes.
+    pub fn bpm_at_frame(&self, frame: u64) -> f32 {
+        self.bpm_at_beat(self.floor_beat(frame))
+    }
+
     /// Mean BPM over the whole grid, the value a static tempo display shows.
     pub fn average_bpm(&self) -> f32 {
         let (Some(&first), Some(&last)) = (self.beat_frames.first(), self.beat_frames.last())
@@ -232,5 +254,29 @@ mod tests {
             (g.phase(10_000) - 0.5).abs() < 0.001,
             "uneven beats still report phase"
         );
+    }
+
+    #[test]
+    fn bpm_at_frame_follows_the_beat_that_contains_the_position() {
+        let constant = grid(122.0, 48_000 * 5);
+        for probe in [0, 10_000, FPB as u64 + 1, 44_100 * 4] {
+            let bpm = constant.bpm_at_frame(probe);
+            assert!((bpm - 122.0).abs() < 0.01, "at {probe}: {bpm}");
+        }
+
+        // A grid that doubles its tempo: the reported BPM must follow the beat, not the average.
+        let half = (f64::from(SR) * 60.0 / 122.0).round() as u64;
+        let g = BeatGrid::from_frames(vec![0, half, half * 2, half * 2 + half / 2], SR);
+        let slow = g.bpm_at_frame(0);
+        let fast = g.bpm_at_frame(half * 2 + 1);
+        assert!((slow - 122.0).abs() < 0.01, "first segment: {slow}");
+        assert!((fast - 244.0).abs() < 0.1, "second segment: {fast}");
+    }
+
+    #[test]
+    fn bpm_at_frame_is_zero_without_a_grid() {
+        let g = grid(0.0, 48_000);
+        assert_eq!(g.bpm_at_beat(0), 0.0);
+        assert_eq!(g.bpm_at_frame(44_100), 0.0);
     }
 }

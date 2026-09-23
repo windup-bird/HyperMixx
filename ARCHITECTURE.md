@@ -33,16 +33,18 @@ crates/
 │   │   ├── ringbuf.rs    # rtrb SPSC 封装 + 自由函数
 │   │   ├── pipeline.rs   # AudioPipeline:producer 线程 + 命令/查询通道
 │   │   ├── deck/
-│   │   │   ├── deck.rs      # Deck:流状态机 + cued_from 跳转补偿 + pull_into
+│   │   │   ├── deck.rs      # Deck:流状态机 + cued_from 跳转补偿 + pull_into + apply_sync
 │   │   │   ├── jump.rs      # Seek{Frames,Beats,Beat,Quantized} + phase_preserving
 │   │   │   ├── flowshift.rs # FlowShift(原 TimeShift):后台流预热
-│   │   │   └── loop_.rs     # LoopRange/原子 cell/LoopSource(virtual→actual 映射读) + 量化
+│   │   │   ├── loop_.rs     # LoopRange/原子 cell/LoopSource(virtual→actual 映射读) + 量化
+│   │   │   └── sync.rs      # Playhead(tempo+nudgerate)/PhaseAlign/Pll/Nudge/SyncCtx
 │   │   ├── flow/
 │   │   │   ├── flow.rs       # Flow:单次播放单元(状态机)
 │   │   │   └── pitchshift.rs # PitchShiftEngine:timestretch 引擎包装
+│   │   ├── sync.rs          # SyncGroup:谁领谁跟 + 每块预扫(编排,不进 mixer)
 │   │   ├── mixer/         # 混音拓扑(见下)
 │   │   └── fx/            # 效果子系统(见下)
-│   └── tests/            # engine / beatlock / decode / tone_faithful
+│   └── tests/            # engine / beatlock / loop / sync / decode / tone_faithful
 │
 ├── hypermixx-library/    # 分析与曲库(core + media + stratum-dsp)
 │   └── src/
@@ -82,11 +84,21 @@ crates/
 - `from_frames(beats, sr)` / `empty(sr)` / `is_empty()`
 - `frame_at_beat(beat)` — 存储范围内直接索引,越界按末拍间隔外推
 - `floor_beat(frame)` / `phase(frame)` / `beat_width(beat)` / `average_bpm()`
+- `bpm_at_beat(beat)` / `bpm_at_frame(frame)` — 逐拍派生的**瞬时 BPM**,sync 用它而不是
+  全轨均值(带段落变速的网格必须知道“此刻这里多快”)
 
 ### `Command` / `CommandResponse`
 - `Load { deck_id, source, analysis }` — source 已解码,analysis 可选(常网格快路径)
 - `Play` / `Pause` / `Jump { target_frame }` / `BeatJump { beats }`
 - `SetRate` / `SetProfile` / `SetAnalysis` — 分析结果从这里进入 deck,**没有 `Analyse` 命令**
+- sync 族:`Sync { deck_id, op }`,op = `Tempo` / `Phase{mode,t}` / `TempoLock` /
+  `PhaseLock{mode,t}` / `SetLeader` / `Unlock`;`PhaseMode = Instant | Linear | Pid`。
+  **`phase` 包含 `tempo`,`phaselock` 包含 `tempolock`**;`SetLeader` 不带参数(target-first
+  语法下 `deck0 sync set-leader` 即“deck0 是 leader”)
+- `Nudge { deck_id, op }`,`op = Start{delta, seconds} | Stop` — 临时速率弯折,
+  只动 `nudgerate`,结束时 `tempo` 原封不动
+- `DeckState` 除 transport 外还报 `tempo` / `nudgerate` / `playing_rate` / `lock` / `align` /
+  `nudge` / `sync_leader` / `sync_mode` / `group_bpm` —— TUI 徽标与 `sync_phase.sh` 的判据都读它
 - `GetState` / `GetAllStates`(同块原子快照)/ `Quit`
 - FX 族:`AddFx { chain, kind }` / `RemoveFx { chain, index }` / `SetFxEnabled` /
   `SetFxParam { slot, name, value }` / `FxTrigger` / `PadPress` / `PadRelease` / `ListFx`;
@@ -112,8 +124,40 @@ crates/
   (`cpal::Stream` 是 `!Send`,不能跨线程交接;坏配置同步回报,启动失败即干净退出)
 - 命令(`Command`)与查询(`deck_source` / `channel_count`)各一条 crossbeam 通道;
   查询在命令队列空时也 drain(否则启动后立即发出的查询会饿死)
-- 热路径:`make_ctx → Mixer::process`,零锁零分配;回调只读 ring
+- 热路径:`SyncGroup::prepare → make_ctx → Mixer::process`,零锁零分配;回调只读 ring。
+  `prepare` 在任何 deck 渲染**之前**取样全 deck 位置并把各自的 `SyncCtx` 塞回去——
+  follower 比的必须是 leader **同一块**的位置,不是上一块的
 - 配速双源:ring 余量(设备钟)优先,无设备时挂钟;sleep 取 0.9× 块时长保持余量
+  (所以无设备时比挂钟快 11%,有设备时由 ring 反压纠正回来)
+- `Drop` **发 `Quit`** 而不是只关 channel:调用方可能还握着 `command_tx` 的 clone,
+  等它断开才能退出会死锁(测试 panic 时就是这个形状)
+
+### `sync/` — 拍同步编排(**不是 mixer 的事**)
+
+mixer 只负责把 deck 变成采样;谁跟谁、共享 BPM 是什么,是**关于 deck 的编辑决策**。
+所以独立成模块,由 producer 与 mixer **并列持有**,经 mixer 已有的 `deck()`/`deck_mut()`
+访问——`Mixer::process` 里没有一行 tempo / 相位代码。
+
+- `SyncGroup` — `leader` / `follower` / `mode`(`Free|Tempolock|Phaselock`)/ `group_bpm`
+  + 每块位置快照
+  - `prepare(&mut Mixer)` — 每块渲染前:取样全 deck(phase / `bpm_at_frame` / `tempo`)、
+    phaselock 下用 `leader.tempo × bpm` 重算 `group_bpm`、给每个 deck 塞 `SyncCtx`(`Copy`)
+  - `handle_sync` / `set_tempo` / `nudge` — 命令入口。**fader 三分支**:
+    phaselock+follower → 忽略(单向)/ tempolock → 写 `group_bpm`(双向)/ 其余 → 写自己 `tempo`
+  - **单向规则**:`track()` 拒绝反向——两 deck 互相同步拒绝第二条;显式 leader 拒绝自同步
+  - **锁下不再接受一次性匹配**:`sync tempo` 在 `Tempolock`/`Phaselock` 下直接拒绝——它只会写
+    `tempo`,而下一块就会被 `group_bpm` 重算盖回,回 `Ok` 却什么也没发生,比报错更糟。
+    `sync phase` 在锁下则**跳过对拍那一步、只装 align**(组已经管着 tempo,方向照样校验),
+    所以“锁定期间改相位模式”是合法操作。对照:**phaselock 下 follower 的 fader 是故意忽略**的
+    ——那是连续控制,演出中途不能抛错
+  - **`tempo` 与 `nudgerate` 永不混**:`group_bpm` 只由 `tempo` 派生,所以 nudge 与相位修正
+    是个人行为,不会反馈进组速度再弹回来
+  - 领袖必须有网格,否则拒绝(拿 0 BPM 当 leader 比静音还糟)
+  - **`sync unlock` 解的是整组**:命令只带一个 `deck_id`,但 lock 本来就是**两个 deck** 的事——
+    不清对侧,就会留下一个还在向一个已不存在的组取速度的 deck。所以 `[deck_id, leader, follower]`
+    三者的 playhead 一起清(`lock`/`align`/`nudgerate` 归零),`mode` 回 `Free`、`follower` 置空、
+    `group_bpm = 0`;**`tempo` 一个都不动,`leader` 也保留**(`set-leader` 是关于谁领的声明,
+    不是锁的一部分)
 
 ### `mixer/` — 拓扑与混音
 
@@ -211,6 +255,17 @@ fader 起始位、cue_send/cue_tap/side/curve、master fx/limiter/fader、输出
   slip 落位是单列功能 `slip loop`;LoopFlow 驱动遇换流重锚时钟走 **rebase 分支**
   (倒退/大步 → `reset_to` 对齐)
 - `jump::phase_preserving` — 目标帧 = 目标拍位 + `phase(当前) × 目标拍宽`,兼容非均匀网格
+- `sync.rs` — **`Playhead { tempo, nudgerate, align, lock }`**,引擎拿到的是
+  `playing_rate = tempo + nudgerate`:
+  - `tempo` = fader / `sync tempo` / 组速度反算写的,**`sync unlock` 保留的就是它**
+  - `nudgerate` = 相位修正(PLL/Linear)与 `nudge` 叠加的临时量,收敛或松手即归零
+  - 每块 `apply_sync()` 在渲染**之前**跑;`push_rate()` **变化才下发**(控制器收敛后就不再写引擎)
+  - 换流 `switch_to()` 后 `suppress()` 跳过一次控制器读数——位置跳变不是相位误差
+- `PhaseAlign::{Instant, Linear, Pid}`:`Instant` 是换流跳位置(命令时执行完就清空,**不留**
+  控制器,否则会自己去追那次跳转);`Linear` 定斜率 `err_sec/t`;`Pid` 是 PI(`kp`1.0 / `ki`0.2,
+  积分抗饱和,输出 ±5% 限幅 = 收敛超时的兜底)。**相位差先包裹到 [-0.5, 0.5]、再换算成秒**
+  (`err_beats × 60/bpm`):秒÷秒才是无量纲比率,增益与限幅才量纲自洽
+  - **`nudgerate` 总限幅 ±15%** = PLL ±5%(收敛兜底)+ nudge ±10%(DJ 手掰),两者同向叠满也不越界
 - `FlowShift` — 后台预热线程,双通道:**jump 通道**保留 supersede(快跳只认最新);
   **LoopFlow 通道**双向豁免(`loop in` 循环中 = exit 换流 + 新 LoopFlow 同时在飞);
   被作废的 LoopFlow 记入 reap,通报时回收,不漏在 warm map 里
@@ -225,6 +280,11 @@ fader 起始位、cue_send/cue_tap/side/curve、master fx/limiter/fader、输出
   `demand_hint` **按需喂入**(超前量 32768→~1100 帧 ≈25ms,loop_range 变更影响窗口小到
   可被 overlap 淡化),按 LoopRange **分段读 + 每段 `set_track_position(实际位置)`**——
   wrap 只是喂入流内的 splice,引擎永不复位(Keylock 下无瞬态)
+- **播放头是曲目帧,不是输出帧**:`output_frame_exact += capacity × ratio`(f64 累加,
+  逐块取整不累积漂移)。数输出帧会让位置与 tempo 脱钩——波形、beatjump 的 `cued_from`
+  补偿、loop 映射、相位同步在**任何非 1.0 速度**下都会读到错的钟。ratio=1.0 时两者逐位
+  相同,所以 `phase_probe.sh` / `beatlock` 这类恒速回归看不出来;上游引擎自己也是拿
+  `source_position()` 当播放头的
 
 ---
 
@@ -255,6 +315,18 @@ fader 起始位、cue_send/cue_tap/side/curve、master fx/limiter/fader、输出
   ÷2/×2、域 1/32..64 拍,循环中编辑原地原子 store,exit 无缝续播越过 out)
 - `fx` 族:`fx add|remove|list|set|on|off|trigger|pad press|release`,chain 地址
   `master`/`m`/`deck0`/`d0`/`0`;`fx help` 从注册表生成 kind/参数清单(永不与引擎脱节)
+- `sync` 族:`sync tempo | phase <instant|linear [秒]|pid> | tempolock |
+  phaselock <mode> [秒] | set-leader | unlock`;`nudge <delta> [秒] | nudge off`。
+  解析错误(`linear 0`、非数字秒数)前端直接 `Failed`;引擎拒绝(无网格、反向同步)后到为 `Error`
+- TUI deck 头行多一枚黄色徽标:`sync phaselock 122.0 BPM ← deck0 phase pid locked`,
+  与 CLI 的 `deck_line` 共用 `response::sync_badge`(所以测它就同时覆盖两边)
+
+### 脚本
+- `scripts/phase_probe.sh` — 双 deck 反复 `beatjump`,看相位差**增量**是否恒定(跳转精度)
+- `scripts/sync_phase.sh` — 双 deck **先后起播**制造相位差,再 `sync <mode>`,每拍采样,报
+  **稳态相位差**(末 5 轮 |diff| 均值);mode = `pid|linear|instant|tempo|none`。
+  起播差按**拍**给而不是按秒(按秒换个 BPM 可能恰成整数拍,相位差直接归零、看不出效果);
+  等两路 `loaded:` 而非盲等固定时长;播放头没走一律判失败(全 0 不算通过)
 
 响应由独立打印线程渲染(`thread::scope`,response channel 属于 pipeline),输入永不阻塞。
 
@@ -279,7 +351,7 @@ CLI  stdin
 AudioPipeline ──producer thread──────────────────────────────────────────┐
   │ 命令分发(块边界): transport → deck / FX → Mixer::handle_fx_command   │
   │ 查询: deck_source / channel_count(命令空队列时也 drain)             │
-  │ 每 tick: make_ctx → Mixer::process                                   │
+  │ 每 tick: SyncGroup::prepare → make_ctx → Mixer::process              │
   │   ├ channel × N: deck.pull_into → flow_fx → fader → deck_fx → fader │
   │   │              → crossfader → master.sum;cue tap → cue.sum         │
   │   ├ master: fx → fader → limiter(安全级)                            │

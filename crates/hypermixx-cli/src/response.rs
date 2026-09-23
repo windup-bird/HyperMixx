@@ -117,10 +117,42 @@ pub fn deck_line(state: &DeckState) -> String {
     if let Some(armed) = state.loop_in_armed {
         line.push_str(&format!("  in armed@{armed}"));
     }
+    if let Some(badge) = sync_badge(state) {
+        line.push_str(&format!("  {badge}"));
+    }
     if state.virtual_frame != state.current_frame {
         line.push_str(&format!("  slip {}", state.virtual_frame));
     }
     line
+}
+
+/// The sync/nudge tail of a deck line: its shared-tempo mode, the group BPM, who it tracks, the
+/// running phase correction and any bend. `None` for a deck with nothing to report, so an idle
+/// `state` line stays exactly as short as it always was (and `phase_probe.sh`'s parsing is unchanged).
+pub fn sync_badge(state: &DeckState) -> Option<String> {
+    if state.group_bpm <= 0.0 && state.nudgerate.abs() < 1e-4 && state.sync_leader.is_none() {
+        return None;
+    }
+    let mut parts = vec![format!("sync {}", state.sync_mode)];
+    if state.group_bpm > 0.0 {
+        parts.push(format!("{:.1} BPM", state.group_bpm));
+    }
+    if let Some(leader) = state.sync_leader {
+        parts.push(format!("← deck{leader}"));
+    }
+    if let Some(align) = &state.align {
+        parts.push(format!("phase {align}"));
+    }
+    if state.nudge.abs() > 1e-4 {
+        parts.push(format!("nudge {:+.3}", state.nudge));
+    }
+    if state.nudgerate.abs() > 1e-4 && state.nudge.abs() < 1e-4 {
+        parts.push(format!("pll {:+.3}", state.nudgerate));
+    }
+    if state.lock {
+        parts.push("locked".to_owned());
+    }
+    Some(parts.join("  "))
 }
 
 /// The root command list.
@@ -132,7 +164,16 @@ pub fn help_text(decks: usize) -> String {
   [deck] play | pause          transport
   [deck] jump <frame>          seek to a frame (1 second = {SAMPLE_RATE} frames)
   [deck] beatjump <beats>      seek by whole beats, keeping the phase
-  [deck] rate <ratio>          set tempo rate (1.0 = unity, 0.5 = half speed)
+  [deck] rate <ratio>          set the tempo (1.0 = unity, 0.5 = half speed)
+  [deck] sync tempo            match the other deck's BPM once
+  [deck] sync phase <mode>     match tempo, then close the beat phase
+                               mode: instant | linear [seconds] | pid
+  [deck] sync tempolock        both decks share one tempo — either fader moves both
+  [deck] sync phaselock <mode> follower tracks the leader exactly (its own fader is ignored)
+  [deck] sync set-leader       name *this* deck as the one the others follow
+  [deck] sync unlock           drop the lock and the correction, keeping the tempo
+  [deck] nudge <delta> [sec]   temporary rate bend to hand-align phase (0.04 = 4% fast)
+  [deck] nudge off             release the bend (it ramps back, no click)
   [deck] profile <name>        tape / keylock / wide (default: tape)
   [deck] loop in | out         manual loop: arm at the beat, engage at the quantized out
   [deck] loop <beats>          beat loop; while looping it re-times out to in+n (halve/double)
@@ -186,4 +227,101 @@ pub fn time(frames: u64) -> String {
     let seconds = (millis / 1000.0) as u64 % 60;
     let remainder = (millis % 1000.0) as u32;
     format!("{minutes}:{seconds:02}.{remainder:03}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fully idle deck: nothing to report, so no badge.
+    fn idle() -> DeckState {
+        DeckState {
+            deck_id: 1,
+            current_frame: 0,
+            playing: true,
+            total_frames: 1000,
+            bpm: 122.0,
+            key: None,
+            virtual_frame: 0,
+            loop_range: None,
+            loop_in_armed: None,
+            tempo: 1.0,
+            nudgerate: 0.0,
+            playing_rate: 1.0,
+            lock: false,
+            align: None,
+            nudge: 0.0,
+            sync_leader: None,
+            sync_mode: "free".to_owned(),
+            group_bpm: 0.0,
+        }
+    }
+
+    #[test]
+    fn an_idle_deck_reports_nothing() {
+        assert_eq!(sync_badge(&idle()), None);
+        // …so an ordinary `state` line is exactly as short as it was before sync existed, which
+        // is what keeps phase_probe.sh's `deck[01][^[]*\[[0-9]+` match working.
+        assert!(deck_line(&idle()).ends_with("122.0 BPM  --"), "{}", deck_line(&idle()));
+    }
+
+    #[test]
+    fn a_locked_pair_reports_its_group() {
+        let mut state = idle();
+        state.sync_mode = "tempolock".to_owned();
+        state.group_bpm = 122.0;
+        state.lock = true;
+        let badge = sync_badge(&state).expect("a locked deck must show its group");
+        assert!(badge.contains("sync tempolock"), "{badge}");
+        assert!(badge.contains("122.0 BPM"), "{badge}");
+        assert!(badge.contains("locked"), "{badge}");
+    }
+
+    #[test]
+    fn a_follower_names_its_leader_and_the_leader_names_nobody() {
+        let mut follower = idle();
+        follower.sync_mode = "phaselock".to_owned();
+        follower.group_bpm = 128.0;
+        follower.lock = true;
+        follower.align = Some("pid".to_owned());
+        follower.sync_leader = Some(0);
+        let badge = sync_badge(&follower).unwrap();
+        assert!(badge.contains("← deck0"), "{badge}");
+        assert!(badge.contains("phase pid"), "{badge}");
+
+        // The leader tracks nobody: the engine filters `leader == deck_id`, and the badge must
+        // not claim otherwise (a wrong arrow here reads as "deck0 follows itself").
+        let mut leader = follower.clone();
+        leader.sync_leader = None;
+        let badge = sync_badge(&leader).unwrap();
+        assert!(!badge.contains("← deck"), "{badge}");
+    }
+
+    #[test]
+    fn a_bend_is_reported_apart_from_the_controller() {
+        let mut bent = idle();
+        bent.nudge = 0.04;
+        bent.nudgerate = 0.04;
+        let badge = sync_badge(&bent).unwrap();
+        assert!(badge.contains("nudge +0.040"), "{badge}");
+        assert!(!badge.contains("pll"), "a bend must not also read as a controller: {badge}");
+
+        let mut corrected = idle();
+        corrected.nudgerate = 0.02; // phase correction only, no nudge
+        let badge = sync_badge(&corrected).unwrap();
+        assert!(badge.contains("pll +0.020"), "{badge}");
+        assert!(!badge.contains("nudge"), "{badge}");
+    }
+
+    #[test]
+    fn the_badge_rides_after_the_position_so_parsers_still_see_it() {
+        let mut state = idle();
+        state.sync_mode = "phaselock".to_owned();
+        state.group_bpm = 122.0;
+        state.sync_leader = Some(0);
+        let line = deck_line(&state);
+        let position = line.find("[0/1000]").expect("position bracket must survive");
+        let badge = line.find("sync phaselock").expect("badge must be rendered");
+        assert!(badge > position, "the badge must come after `[current/total]`: {line}");
+    }
 }

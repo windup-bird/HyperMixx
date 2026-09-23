@@ -141,6 +141,73 @@ pub enum Backend {
     Timestretch,
 }
 
+/// How a phase correction closes the gap: the `sync phase` / `sync phaselock` argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhaseMode {
+    /// One flow switch that lands the follower on the leader's phase. Nothing keeps it there —
+    /// this is a correction, not a controller.
+    Instant,
+    /// Close the gap at a fixed slope over `t_seconds` (default 2.0).
+    Linear,
+    /// PI controller with integral anti-windup and a ±5% output clamp.
+    Pid,
+}
+
+impl PhaseMode {
+    /// Parses a CLI token.
+    pub fn parse(token: &str) -> Option<Self> {
+        match token.to_ascii_lowercase().as_str() {
+            "instant" | "jump" => Some(PhaseMode::Instant),
+            "linear" | "lin" => Some(PhaseMode::Linear),
+            "pid" | "pi" | "pll" => Some(PhaseMode::Pid),
+            _ => None,
+        }
+    }
+
+    /// A stable label for logs, state readouts and errors.
+    pub fn label(&self) -> &'static str {
+        match self {
+            PhaseMode::Instant => "instant",
+            PhaseMode::Linear => "linear",
+            PhaseMode::Pid => "pid",
+        }
+    }
+}
+
+/// One `sync` command. `phase` includes `tempo`; `phaselock` includes `tempolock`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SyncOp {
+    /// One-shot tempo match: the target's rate becomes `leader_bpm / own_bpm`.
+    Tempo,
+    /// `Tempo`, then a phase correction (`t_seconds` belongs to [`PhaseMode::Linear`]).
+    Phase {
+        mode: PhaseMode,
+        t_seconds: Option<f64>,
+    },
+    /// Bidirectional shared tempo: one `group_bpm` both decks derive their rate from.
+    TempoLock,
+    /// One-way shared tempo — the follower tracks the leader — plus a phase correction.
+    PhaseLock {
+        mode: PhaseMode,
+        t_seconds: Option<f64>,
+    },
+    /// Make the *target* deck the sync leader (target-first grammar: `deck0 sync set-leader`).
+    SetLeader,
+    /// Drop the lock and the phase correction and any nudge; the tempo stays where it is.
+    Unlock,
+}
+
+/// One `nudge` command: a temporary rate bend that changes phase while it runs and leaves
+/// [`SyncOp::Tempo`]'s tempo untouched when it ends.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NudgeOp {
+    /// Start bending by `delta` (a rate, `0.04` = 4% fast). `seconds` releases it on its own;
+    /// `None` holds until [`NudgeOp::Stop`].
+    Start { delta: f32, seconds: Option<f64> },
+    /// Release the bend (ramps back to zero, it is not cut off).
+    Stop,
+}
+
 /// A command sent to the pipeline's producer thread.
 pub enum Command {
     /// Installs a decoded `source` into `deck_id`, cued at frame 0.
@@ -175,6 +242,16 @@ pub enum Command {
     Loop {
         deck_id: DeckId,
         op: LoopOp,
+    },
+    /// Beat-sync against another deck: tempo matching, shared-tempo locks and phase correction.
+    Sync {
+        deck_id: DeckId,
+        op: SyncOp,
+    },
+    /// A temporary rate bend to nudge the beat into alignment by hand.
+    Nudge {
+        deck_id: DeckId,
+        op: NudgeOp,
     },
     /// Switches the time-stretch profile ("tape", "keylock", "wide").
     SetProfile {
@@ -300,6 +377,12 @@ impl std::fmt::Debug for Command {
                 .finish(),
             Command::Loop { deck_id, op } => {
                 f.debug_struct("Loop").field("deck_id", deck_id).field("op", op).finish()
+            }
+            Command::Sync { deck_id, op } => {
+                f.debug_struct("Sync").field("deck_id", deck_id).field("op", op).finish()
+            }
+            Command::Nudge { deck_id, op } => {
+                f.debug_struct("Nudge").field("deck_id", deck_id).field("op", op).finish()
             }
             Command::SetProfile { deck_id, profile } => f
                 .debug_struct("SetProfile")

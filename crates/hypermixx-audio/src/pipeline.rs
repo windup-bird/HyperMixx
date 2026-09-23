@@ -27,6 +27,7 @@ use hypermixx_core::{Command, CommandResponse, DeckId, DeckState, Shared};
 use crate::deck::Deck;
 use crate::mixer::config::{MixerConfig, MixerError};
 use crate::mixer::{Mixer, OutputError};
+use crate::sync::SyncGroup;
 use crate::BLOCK_SIZE;
 use crate::SAMPLE_RATE;
 
@@ -150,7 +151,7 @@ impl AudioPipeline {
                     }
                 };
                 let _ = boot_tx.send(Ok(()));
-                Self::producer_loop(mixer, cmd_rx, query_rx, resp_tx, sample_rate);
+                Self::producer_loop(mixer, SyncGroup::default(), cmd_rx, query_rx, resp_tx, sample_rate);
             })
             .map_err(|err| PipelineError::Thread(err.to_string()))?;
 
@@ -236,6 +237,7 @@ impl AudioPipeline {
     /// on another thread can only ever ask via a query, which is answered between blocks.
     fn producer_loop(
         mut mixer: Mixer,
+        mut sync: SyncGroup,
         cmd_rx: Receiver<Command>,
         query_rx: Receiver<(Query, Sender<QueryResponse>)>,
         resp_tx: Sender<CommandResponse>,
@@ -251,7 +253,7 @@ impl AudioPipeline {
                 match cmd_rx.try_recv() {
                     Ok(Command::Quit) => quit = true,
                     Ok(command) => {
-                        if let Some(response) = route(&mut mixer, command) {
+                        if let Some(response) = route(&mut mixer, &mut sync, command) {
                             if resp_tx.send(response).is_err() {
                                 return; // nobody left to answer
                             }
@@ -284,6 +286,9 @@ impl AudioPipeline {
                 sleep_until_next(started, pace);
                 continue;
             }
+            // Beat-sync samples positions *before* anything renders, so every follower compares
+            // itself against its leader's position from this block rather than the last one.
+            sync.prepare(&mut mixer);
             let ctx = mixer.make_ctx(sample_rate);
             mixer.process(&ctx);
             sleep_until_next(started, pace);
@@ -293,10 +298,14 @@ impl AudioPipeline {
 
 impl Drop for AudioPipeline {
     fn drop(&mut self) {
-        // Closing the command channel is enough: the loop returns on a disconnected receiver, and
-        // dropping the mixer on that thread stops every output.
+        // Quit rather than merely closing the channel. A caller may still hold a *clone* of the
+        // command sender (the front-end's own copy, a test's handle), and waiting for that clone
+        // to be dropped before the producer notices a disconnect would hang shutdown — a panic in
+        // a test would then deadlock instead of reporting its failure.
         self.query_tx = None;
-        self.cmd_tx = None;
+        if let Some(tx) = self.cmd_tx.take() {
+            let _ = tx.send(Command::Quit);
+        }
         if let Some(worker) = self.producer.take() {
             let _ = worker.join();
         }
@@ -340,7 +349,11 @@ fn sleep_until_next(started: Instant, pace: Duration) {
 ///
 /// Transport commands go to the deck inside a channel; FX commands are the mixer's own business.
 /// `Quit` is handled by the loop, so it never reaches here.
-fn route(mixer: &mut Mixer, command: Command) -> Option<CommandResponse> {
+fn route(
+    mixer: &mut Mixer,
+    sync: &mut SyncGroup,
+    command: Command,
+) -> Option<CommandResponse> {
     use Command::*;
     match command {
         Load { deck_id, source, analysis } => {
@@ -365,7 +378,9 @@ fn route(mixer: &mut Mixer, command: Command) -> Option<CommandResponse> {
             transport(mixer, deck_id, move |deck| deck.jump(target_frame))
         }
         BeatJump { deck_id, beats } => transport(mixer, deck_id, move |deck| deck.beatjump(beats)),
-        SetRate { deck_id, rate } => transport(mixer, deck_id, move |deck| deck.set_ratio(rate)),
+        SetRate { deck_id, rate } => answered(sync.set_tempo(mixer, deck_id, rate)),
+        Sync { deck_id, op } => answered(sync.handle_sync(mixer, deck_id, op)),
+        Nudge { deck_id, op } => answered(sync.nudge(mixer, deck_id, op)),
         Loop { deck_id, op } => {
             transport_result(mixer, deck_id, move |deck| deck.apply_loop(op))
         }
@@ -391,14 +406,18 @@ fn route(mixer: &mut Mixer, command: Command) -> Option<CommandResponse> {
             None => Some(error(unknown_deck(deck_id, mixer.channel_count()))),
         },
         GetState { deck_id } => match mixer.deck(deck_id as usize) {
-            Some(deck) => Some(CommandResponse::State(state_of(deck_id, deck))),
+            Some(deck) => Some(CommandResponse::State(state_of(deck_id, deck, sync))),
             None => Some(error(unknown_deck(deck_id, mixer.channel_count()))),
         },
         GetAllStates => {
             // One pass over every channel: all frames in the answer come from the same block, so
             // differences between decks are free of sampling skew.
             let states = (0..mixer.channel_count())
-                .filter_map(|index| mixer.deck(index).map(|deck| state_of(index as DeckId, deck)))
+                .filter_map(|index| {
+                    mixer
+                        .deck(index)
+                        .map(|deck| state_of(index as DeckId, deck, sync))
+                })
                 .collect();
             Some(CommandResponse::States(states))
         }
@@ -445,7 +464,7 @@ fn transport_result(
     }
 }
 
-fn state_of(deck_id: DeckId, deck: &Deck) -> DeckState {
+fn state_of(deck_id: DeckId, deck: &Deck, sync: &SyncGroup) -> DeckState {
     DeckState {
         deck_id,
         current_frame: deck.current_frame(),
@@ -458,7 +477,27 @@ fn state_of(deck_id: DeckId, deck: &Deck) -> DeckState {
             .loop_range()
             .map(|range| (range.in_frame, range.out_frame)),
         loop_in_armed: deck.loop_in_armed(),
+        tempo: deck.tempo() as f32,
+        nudgerate: deck.nudgerate() as f32,
+        playing_rate: deck.playing_rate() as f32,
+        lock: deck.lock(),
+        align: deck.align_label().map(str::to_owned),
+        nudge: deck.nudge_rate() as f32,
+        // Reported as "who do I follow": a deck that leads nobody shows `None` even while it is
+        // the group's leader, which the `sync_mode` / `group_bpm` fields already describe.
+        sync_leader: sync.leader.filter(|&leader| leader != deck_id),
+        sync_mode: sync.mode_label().to_owned(),
+        group_bpm: sync.group_bpm as f32,
     }
+}
+
+/// Wraps a coordinator result into an answer: refusals must reach the caller as `Error`, not be
+/// swallowed — a sync with no grid or a reversed lock is the user's mistake and they need to see it.
+fn answered(result: Result<(), String>) -> Option<CommandResponse> {
+    Some(match result {
+        Ok(()) => CommandResponse::Ok,
+        Err(message) => error(message),
+    })
 }
 
 fn unknown_deck(deck_id: DeckId, count: usize) -> String {

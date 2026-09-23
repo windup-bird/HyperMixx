@@ -33,9 +33,16 @@ pub struct PitchShiftEngine {
     source: Arc<dyn Source>,
     /// Absolute frame position in the source that we've fed up to.
     track_position: u64,
-    /// Output playhead (what the listener hears). At ratio=1.0 this equals the
-    /// source position.
+    /// Output playhead (what the listener hears), as an **absolute track position**.
+    ///
+    /// It advances by `ratio × block`, not by the block: `ratio` is source frames per output
+    /// frame, so this is the only accounting that lands where the music actually is. Counting
+    /// output frames instead would make the position independent of tempo — every read (waveform,
+    /// beat phase, jump compensation, loop mapping) would silently disagree with the audio as
+    /// soon as the tempo left unity. `exact` carries the fraction so per-block rounding never
+    /// accumulates into drift.
     output_frame: u64,
+    output_frame_exact: f64,
     ratio: f32,
     total: u64,
     feed_buf: Vec<f32>,
@@ -84,6 +91,7 @@ impl PitchShiftEngine {
             source,
             track_position: 0,
             output_frame: 0,
+            output_frame_exact: 0.0,
             ratio,
             total,
             feed_buf: vec![0.0; FEED_CHUNK_FRAMES * CHANNELS],
@@ -108,7 +116,9 @@ impl PitchShiftEngine {
             }
             // output_frame stays frozen during priming (the listener hears silence).
         } else {
-            self.output_frame += capacity as u64;
+            let rate = f64::from(self.ratio).clamp(MIN_TEMPO_RATE, MAX_TEMPO_RATE);
+            self.output_frame_exact += capacity as f64 * rate;
+            self.output_frame = self.output_frame_exact as u64;
         }
         capacity
     }
@@ -119,6 +129,7 @@ impl PitchShiftEngine {
         let target = target_frame.min(self.total);
         self.processor.reset();
         self.output_frame = target;
+        self.output_frame_exact = target as f64;
 
         if self.profile == EngineProfile::Tape {
             // Tape has no stages to converge: re-anchor and go.
@@ -161,8 +172,10 @@ impl PitchShiftEngine {
         }
     }
 
-    /// Current output playhead (what the listener hears), in source frames.
-    /// At ratio=1.0 this equals the source position.
+    /// Current playhead: the absolute track position the listener is hearing.
+    /// At ratio=1.0 this is also the source position fed to the engine; at any other ratio the two
+    /// differ by exactly the ring's read-ahead, which is why it is accounted here rather than
+    /// inferred from what has been fed.
     pub fn current_frame(&self) -> u64 {
         self.output_frame
     }
