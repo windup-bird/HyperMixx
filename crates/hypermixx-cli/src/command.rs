@@ -288,9 +288,29 @@ pub fn dispatch(
         }),
         "fx" => fx(&mut words, dispatcher, target),
         "state" => send(command_tx, Command::GetAllStates),
+        "midi" => midi_command(&mut words),
         "help" | "h" | "?" => Action::Message(help_text(decks)),
         "quit" | "exit" => Action::Quit,
         other => Action::Failed(format!("unknown command `{other}` — `help` lists them")),
+    }
+}
+
+/// The `midi` family. Only port listing lands here: opening an input happens at launch
+/// (`--midi`), because a mapping is wired to the running engine once, not toggled mid-session.
+fn midi_command<'a>(words: &mut impl Iterator<Item = &'a str>) -> Action {
+    match words.next() {
+        Some("ports") | Some("list") => match hypermixx_midi::list_ports() {
+            Ok(ports) if ports.is_empty() => Action::Message("midi: no input ports".into()),
+            Ok(ports) => {
+                let mut text = String::from("midi input ports:");
+                for port in ports {
+                    text.push_str(&format!("\n  {}  {}", port.index, port.name));
+                }
+                Action::Message(text)
+            }
+            Err(err) => Action::Failed(format!("midi: {err}")),
+        },
+        _ => Action::Message("usage: midi ports".into()),
     }
 }
 
@@ -671,10 +691,13 @@ fn parse_target(token: &str, decks: usize) -> Option<Target> {
 }
 
 /// Decodes on a worker thread, then hands the pipeline a ready source (+ optional constant grid).
-fn spawn_load(deck_id: u8, path: String, bpm: Option<f32>, dispatcher: &Dispatcher) {
+pub(crate) fn spawn_load(deck_id: u8, path: String, bpm: Option<f32>, dispatcher: &Dispatcher) {
     let command_tx = dispatcher.command_tx.clone();
     let notices_tx = dispatcher.notices.clone();
     let events = dispatcher.events.clone();
+    // Decoding a long track takes seconds; say so immediately so the user does not think the
+    // command was ignored.
+    notices::info(&notices_tx, format!("[load] deck{deck_id}: decoding {path}..."));
     std::thread::Builder::new()
         .name(format!("hypermixx-load-{deck_id}"))
         .spawn(move || match hypermixx_media::decode_file(&path) {

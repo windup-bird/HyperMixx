@@ -1,0 +1,13 @@
+[package]
+name = "hypermixx-midi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Class-compliant MIDI input: byte parsing, TOML maps, translation to engine Commands"
+
+[dependencies]
+hypermixx-core = { path = "../hypermixx-core" }
+crossbeam-channel = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+midir = { workspace = true }

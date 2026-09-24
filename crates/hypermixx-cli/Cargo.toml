@@ -14,6 +14,7 @@ hypermixx-core = { path = "../hypermixx-core" }
 hypermixx-media = { path = "../hypermixx-media" }
 hypermixx-audio = { path = "../hypermixx-audio" }
 hypermixx-library = { path = "../hypermixx-library" }
+hypermixx-midi = { path = "../hypermixx-midi" }
 crossbeam-channel = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }

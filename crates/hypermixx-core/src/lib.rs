@@ -12,8 +12,8 @@ pub mod source;
 
 pub use analysis::TrackAnalysis;
 pub use beatgrid::BeatGrid;
-pub use command::{Backend, Command, CommandResponse, FxChainId, FxSlotRef, FxSlotStatus,
-    LoopEditOp, LoopOp, LoopQuantum, NudgeOp, PhaseMode, SyncOp};
+pub use command::{Backend, Command, CommandResponse, FaderTarget, FxChainId, FxSlotRef,
+    FxSlotStatus, LoopEditOp, LoopOp, LoopQuantum, NudgeOp, PhaseMode, SyncOp};
 pub use deck::{DeckId, DeckState};
 pub use key::{Key, KeyFormat, KeyMode};
 pub use source::{Shared, Source};

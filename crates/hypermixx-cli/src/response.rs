@@ -183,13 +183,18 @@ pub fn help_text(decks: usize) -> String {
   [deck] loop quantum <q>      out-point grid: beat | half | quarter | eighth
   [deck|master] fx ...         effects on a chain — `fx help` for the subcommands
   state                        show every deck
+  midi ports                   list MIDI input ports (open one at launch with --midi)
   zoom in|out|fit              waveform zoom (UI only)
   quit                         exit
+
+In the TUI: `load` with no path opens a file picker; F2 picks a MIDI port and F3 the map file.
 
 A leading `deck0` / `0` selects a deck, `master` the summed output. Without one the command
 follows the focused deck (TUI: `Tab` switches it).
 startup flags: --config <file> (custom topology), --print-config (reference TOML),
-               --backend auto|stratum|timestretch, --tui (terminal UI)",
+               --backend auto|stratum|timestretch, --tui (terminal UI),
+               --midi <port> [--midi-map <file>] (MIDI input; default map midi-map.toml),
+               --midi-guide [<file>] [--midi <port>] [--decks <n>] (learn-mode map editor)",
         decks - 1
     )
 }

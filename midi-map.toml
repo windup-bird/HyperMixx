@@ -1,0 +1,253 @@
+[meta]
+name = "example"
+
+[[bind]]
+type = "note"
+channel = 0
+id = 0
+deck = 0
+action = "play"
+
+[[bind]]
+type = "note"
+channel = 0
+id = 49
+deck = 0
+action = "pause"
+
+[[bind]]
+type = "note"
+channel = 0
+id = 70
+deck = 0
+action = "beatjump-"
+
+[[bind]]
+type = "note"
+channel = 0
+id = 72
+deck = 0
+action = "beatjump+"
+
+[[bind]]
+type = "cc"
+mode = "abs"
+channel = 0
+id = 28
+deck = 0
+action = "fader.flow"
+
+[[bind]]
+type = "cc"
+mode = "abs"
+channel = 1
+id = 28
+deck = 1
+action = "fader.flow"
+
+[[bind]]
+type = "cc"
+mode = "abs"
+channel = 15
+id = 8
+action = "fader.cross"
+
+[[bind]]
+type = "cc"
+mode = "abs"
+channel = 15
+id = 10
+action = "fader.master"
+
+[[bind]]
+type = "cc"
+mode = "rel1"
+channel = 0
+id = 41
+deck = 0
+action = "rate"
+
+[[bind]]
+type = "note"
+channel = 4
+id = 20
+deck = 0
+action = "loop.in"
+
+[[bind]]
+type = "note"
+channel = 4
+id = 21
+deck = 0
+action = "loop.out"
+
+[[bind]]
+type = "note"
+channel = 0
+id = 66
+deck = 0
+action = "loop.beat"
+beats = 4
+
+[[bind]]
+type = "note"
+channel = 0
+id = 80
+deck = 1
+action = "sync.tempo"
+
+[[bind]]
+type = "note"
+channel = 1
+id = 2
+deck = 1
+action = "sync.phase"
+
+[[bind]]
+type = "cc"
+mode = "abs"
+channel = 0
+id = 74
+deck = 0
+action = "fx.param"
+chain = "deck0"
+fx = "filter"
+param = "value"
+
+[[bind]]
+type = "note"
+channel = 0
+id = 96
+deck = 0
+action = "fx.toggle"
+chain = "deck0"
+fx = "filter"
+
+[[bind]]
+type = "note"
+channel = 1
+id = 0
+deck = 1
+action = "play"
+
+[[bind]]
+type = "note"
+channel = 1
+id = 72
+deck = 1
+action = "beatjump+"
+
+[[bind]]
+type = "note"
+channel = 1
+id = 70
+deck = 1
+action = "beatjump-"
+
+[[bind]]
+type = "cc"
+mode = "abs"
+channel = 15
+id = 12
+action = "fader.cue"
+
+[[bind]]
+type = "cc"
+mode = "rel1"
+channel = 1
+id = 41
+deck = 1
+action = "rate"
+
+[[bind]]
+type = "cc"
+mode = "rel1"
+channel = 0
+id = 6
+deck = 0
+action = "nudge"
+
+[[bind]]
+type = "cc"
+mode = "rel1"
+channel = 1
+id = 6
+deck = 1
+action = "nudge"
+
+[[bind]]
+type = "note"
+channel = 5
+id = 20
+deck = 1
+action = "loop.in"
+
+[[bind]]
+type = "note"
+channel = 5
+id = 21
+deck = 1
+action = "loop.out"
+
+[[bind]]
+type = "note"
+channel = 4
+id = 22
+deck = 0
+action = "loop.exit"
+
+[[bind]]
+type = "note"
+channel = 5
+id = 22
+deck = 1
+action = "loop.exit"
+
+[[bind]]
+type = "note"
+channel = 4
+id = 23
+deck = 0
+action = "loop.cancel"
+
+[[bind]]
+type = "note"
+channel = 5
+id = 23
+deck = 1
+action = "loop.cancel"
+
+[[bind]]
+type = "note"
+channel = 4
+id = 24
+deck = 0
+action = "loop.halve"
+
+[[bind]]
+type = "note"
+channel = 5
+id = 24
+deck = 1
+action = "loop.halve"
+
+[[bind]]
+type = "note"
+channel = 4
+id = 25
+deck = 0
+action = "loop.double"
+
+[[bind]]
+type = "note"
+channel = 5
+id = 25
+deck = 1
+action = "loop.double"
+
+[[bind]]
+type = "note"
+channel = 0
+id = 2
+deck = 0
+action = "sync.phase"

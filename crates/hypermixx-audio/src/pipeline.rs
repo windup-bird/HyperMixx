@@ -381,6 +381,7 @@ fn route(
         SetRate { deck_id, rate } => answered(sync.set_tempo(mixer, deck_id, rate)),
         Sync { deck_id, op } => answered(sync.handle_sync(mixer, deck_id, op)),
         Nudge { deck_id, op } => answered(sync.nudge(mixer, deck_id, op)),
+        SetFader { target, value } => answered(mixer.set_fader(target, value)),
         Loop { deck_id, op } => {
             transport_result(mixer, deck_id, move |deck| deck.apply_loop(op))
         }

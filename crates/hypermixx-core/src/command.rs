@@ -10,7 +10,7 @@ use crate::source::Shared;
 
 /// Which FX chain a command addresses. `Deck` is the per-deck insert chain the mixer owns; a deck
 /// itself knows nothing about FX, which keeps the transport logic free of audio effects.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FxChainId {
     /// The chain belonging to one deck (a mono-style insert on that deck's signal).
     Deck(DeckId),
@@ -208,6 +208,42 @@ pub enum NudgeOp {
     Stop,
 }
 
+/// Which mixer fader a [`Command::SetFader`] addresses.
+///
+/// The value domain belongs to the target, not the protocol: bipolar positions are
+/// `-1.0..=1.0`, sends and bus levels are `0.0..=1.0`. The mixer's own setters clamp and sanitise
+/// the value, so a mapping layer never has to duplicate that knowledge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaderTarget {
+    /// One channel's flow fader (the deck level while a track holds a single stream).
+    Flow(DeckId),
+    /// One channel's deck fader (unity until a track exposes stems).
+    Deck(DeckId),
+    /// One channel's cue send, linear `0.0..=1.0` (a send level, not a bipolar fader).
+    CueSend(DeckId),
+    /// The single crossfader, broadcast to every channel (`-1.0` hard left .. `1.0` hard right).
+    Crossfader,
+    /// The master bus fader.
+    Master,
+    /// The cue bus fader.
+    Cue,
+}
+
+impl FaderTarget {
+    /// Whether the target is a bipolar position (`-1.0..=1.0`, `0.0` = unity) rather than a
+    /// linear level (`0.0..=1.0`). A mapping layer uses this to pick the default value range.
+    pub fn is_bipolar(self) -> bool {
+        match self {
+            FaderTarget::CueSend(..) => false,
+            FaderTarget::Flow(..)
+            | FaderTarget::Deck(..)
+            | FaderTarget::Crossfader
+            | FaderTarget::Master
+            | FaderTarget::Cue => true,
+        }
+    }
+}
+
 /// A command sent to the pipeline's producer thread.
 pub enum Command {
     /// Installs a decoded `source` into `deck_id`, cued at frame 0.
@@ -252,6 +288,12 @@ pub enum Command {
     Nudge {
         deck_id: DeckId,
         op: NudgeOp,
+    },
+    /// Sets one mixer fader. The mixer clamps the value per target kind; the only failure is an
+    /// unknown deck.
+    SetFader {
+        target: FaderTarget,
+        value: f32,
     },
     /// Switches the time-stretch profile ("tape", "keylock", "wide").
     SetProfile {
@@ -384,6 +426,11 @@ impl std::fmt::Debug for Command {
             Command::Nudge { deck_id, op } => {
                 f.debug_struct("Nudge").field("deck_id", deck_id).field("op", op).finish()
             }
+            Command::SetFader { target, value } => f
+                .debug_struct("SetFader")
+                .field("target", target)
+                .field("value", value)
+                .finish(),
             Command::SetProfile { deck_id, profile } => f
                 .debug_struct("SetProfile")
                 .field("deck_id", deck_id)

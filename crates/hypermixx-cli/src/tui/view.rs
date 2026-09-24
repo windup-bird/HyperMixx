@@ -13,7 +13,8 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use crate::response::{sync_badge, time, Level, LogLine};
-use crate::tui::app::{App, COMPLETION_ROWS};
+use crate::tui::app::{App, Overlay, COMPLETION_ROWS};
+use crate::tui::picker;
 use crate::tui::waveform_view;
 
 /// Share of the height the response log gets. The decks split the rest evenly, so the log stays
@@ -30,6 +31,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let command_area = chunks[2 + app.decks];
     render_command(frame, command_area, app);
     render_completion(frame, frame.area(), command_area, app);
+    // A picker draws over everything, including the completion popup.
+    if let Some(overlay) = &app.overlay {
+        match overlay {
+            Overlay::Ports { list } => {
+                picker::render_port_list(frame, frame.area(), list, "MIDI input (Enter)")
+            }
+            Overlay::Files { picker, .. } => {
+                picker::render_file_picker(frame, frame.area(), picker)
+            }
+        }
+    }
 }
 
 fn layout_constraints(decks: usize) -> Vec<Constraint> {
@@ -215,7 +227,7 @@ fn log_line(line: &LogLine) -> Line<'static> {
 fn render_command(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered()
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" command — Enter 执行/补全 · Tab 切换 deck · ↑↓ 历史 ");
+        .title(" command — Enter 执行/补全 · Tab 切换 deck · ↑↓ 历史 · F2 MIDI · F3 map ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {

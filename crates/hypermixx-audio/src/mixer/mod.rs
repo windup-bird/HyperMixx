@@ -217,6 +217,42 @@ impl Mixer {
         self.channels.get_mut(index)
     }
 
+    /// Applies a [`Command::SetFader`](hypermixx_core::Command::SetFader) at a block boundary.
+    ///
+    /// Every setter below is `&self` (the faders smooth through interior atomics), so this takes
+    /// the mixer by shared reference and never fights the audio path. The only failure is an
+    /// unknown deck; out-of-range values are clamped by the setter, not rejected.
+    pub fn set_fader(
+        &self,
+        target: hypermixx_core::FaderTarget,
+        value: f32,
+    ) -> Result<(), String> {
+        use hypermixx_core::FaderTarget;
+        match target {
+            FaderTarget::Flow(deck_id) => self.fader_channel(deck_id)?.set_flow_fader(value),
+            FaderTarget::Deck(deck_id) => self.fader_channel(deck_id)?.set_deck_fader(value),
+            FaderTarget::CueSend(deck_id) => self.fader_channel(deck_id)?.set_cue_send(value),
+            FaderTarget::Crossfader => {
+                // One physical fader: every channel is written the same position; the pan law is
+                // the channel's business, not the command's.
+                for channel in &self.channels {
+                    channel.set_crossfader(value);
+                }
+            }
+            FaderTarget::Master => self.master.set_fader(value),
+            FaderTarget::Cue => self.cue.set_fader(value),
+        }
+        Ok(())
+    }
+
+    /// Resolves a deck id to its channel. A mistyped id is an error, not a silent no-op, so a
+    /// mapping layer's mistake is visible in the log instead of swallowing the fader move.
+    fn fader_channel(&self, deck_id: u8) -> Result<&Channel, String> {
+        self.channels.get(deck_id as usize).ok_or_else(|| {
+            format!("unknown deck {deck_id} (mixer has {} channels)", self.channels.len())
+        })
+    }
+
     /// The deck behind `deck_id`, for consumers that drive a transport directly (a UI reading
     /// positions, the CLI fetching a track to analyse).
     pub fn deck(&self, deck_id: usize) -> Option<&Deck> {
@@ -550,6 +586,7 @@ impl CueBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hypermixx_core::FaderTarget;
     use hypermixx_media::{DecodedAudio, PcmPool};
     use std::sync::Arc;
 
@@ -604,6 +641,41 @@ mod tests {
             let ctx = mixer.make_ctx(SAMPLE_RATE);
             mixer.process(&ctx);
         }
+    }
+
+    #[test]
+    fn set_fader_addresses_each_target_and_clamps() {
+        let mixer = loaded(simple_dj(), 2);
+
+        // An unknown deck is the one reportable failure.
+        assert!(mixer.set_fader(FaderTarget::Flow(9), 0.0).is_err());
+
+        // Flow: bipolar, clamped at +1.
+        mixer.set_fader(FaderTarget::Flow(0), 0.5).unwrap();
+        assert_eq!(mixer.channel(0).unwrap().levels().0, 0.5);
+        mixer.set_fader(FaderTarget::Flow(0), 9.0).unwrap();
+        assert_eq!(mixer.channel(0).unwrap().levels().0, 1.0);
+
+        // Deck fader is its own target, not an alias of flow.
+        mixer.set_fader(FaderTarget::Deck(1), -0.25).unwrap();
+        assert_eq!(mixer.channel(1).unwrap().levels().1, -0.25);
+
+        // Cue send is a linear level: a negative value clamps to 0, not -1.
+        mixer.set_fader(FaderTarget::CueSend(1), -3.0).unwrap();
+        assert_eq!(mixer.channel(1).unwrap().levels().3, 0.0);
+        mixer.set_fader(FaderTarget::CueSend(1), 0.25).unwrap();
+        assert_eq!(mixer.channel(1).unwrap().levels().3, 0.25);
+
+        // The crossfader is one physical fader broadcast to every channel.
+        mixer.set_fader(FaderTarget::Crossfader, -1.0).unwrap();
+        assert_eq!(mixer.channel(0).unwrap().levels().2, -1.0);
+        assert_eq!(mixer.channel(1).unwrap().levels().2, -1.0);
+
+        // Bus faders reach the master/cue trims, not a channel.
+        mixer.set_fader(FaderTarget::Master, 0.25).unwrap();
+        mixer.set_fader(FaderTarget::Cue, 0.75).unwrap();
+        assert_eq!(mixer.master().fader.target(), 0.25);
+        assert_eq!(mixer.cue().fader.target(), 0.75);
     }
 
     #[test]

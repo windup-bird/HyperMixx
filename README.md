@@ -9,6 +9,7 @@
 ```
 cli ─┬─► audio ───┐
      ├─► library ─┼─► media ──► core
+     ├─► midi ────┤
      └─► core ────┘
 ```
 
@@ -18,9 +19,10 @@ cli ─┬─► audio ───┐
 | `hypermixx-media` | 解码与内存池：`decode_file`（symphonia → 44.1k 立体声）、`PcmPool` | core |
 | `hypermixx-audio` | 实时引擎：producer 线程 + cpal 输出、mixer/通道/FX 链、时间拉伸 | core, media |
 | `hypermixx-library` | 离线分析：beat 网格编译、stratum-dsp 适配、波形峰值 | core, media |
+| `hypermixx-midi` | MIDI 输入：字节解析、TOML 映射表、`Event → Command` 翻译（纯逻辑，可无硬件单测） | core, midir |
 | `hypermixx-cli` | 前端：行 REPL、`--tui` 终端界面、命令解析与补全 | 全部 |
 
-外部依赖：`stratum-dsp`、`timestretch`。
+外部依赖：`stratum-dsp`、`timestretch`、`midir`。
 
 
 ## 安装
@@ -68,7 +70,15 @@ hypermixx> quit
 cargo run -p hypermixx-cli -- --backend auto        # 分析后端 auto | stratum | timestretch
 cargo run -p hypermixx-cli -- --config topo.toml    # 自定义拓扑
 cargo run -p hypermixx-cli -- --print-config        # 打印参考 TOML
+cargo run -p hypermixx-cli -- --midi 0              # 打开 0 号 MIDI 输入，用默认 midi-map.toml
+cargo run -p hypermixx-cli -- --midi 0 --midi-map my.toml   # 指定映射文件
+cargo run -p hypermixx-cli -- --midi-guide          # learn 模式编辑映射（不启动引擎，端口/文件在 TUI 里选）
 ```
+
+TUI 内尽量不用启动参数:`--tui` 下按 `F2` 选 MIDI 端口、`F3` 选映射文件；`load` 不带路径则弹出
+文件浏览器；`--midi-guide` 即使不跟路径也会在 TUI 里选端口与文件。
+
+终端内 `midi ports` 列出可用 MIDI 输入端口；映射表格式与全部 action 见 `midi-map.toml` 注释与 [`docs/midi-mapping.md`](docs/midi-mapping.md)。
 
 ## 脚本
 

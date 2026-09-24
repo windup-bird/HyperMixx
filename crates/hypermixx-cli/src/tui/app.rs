@@ -10,11 +10,13 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::{AudioPipeline, Meters};
-use hypermixx_core::{Backend, BeatGrid, CommandResponse, DeckState};
+use hypermixx_core::{Backend, BeatGrid, Command, CommandResponse, DeckState};
 
 use crate::command::{Slots, UiEvent};
+use crate::notices::NoticeTx;
 use crate::response::{self, LogLine};
 use crate::tui::completer::{self, Completion, Ctx};
+use crate::tui::picker::{FilePicker, PortList};
 
 /// Waveform zoom bounds, in frames per braille dot. 256 frames is ~5.8ms, the finest bucket the
 /// peak pyramid holds; 65536 is ~1.5s per dot (a very wide overview).
@@ -31,6 +33,26 @@ pub const COMPLETION_ROWS: usize = 8;
 pub struct CompletionState {
     pub completion: Completion,
     pub selected: usize,
+}
+
+/// A modal picker drawn over the UI. While set, the keyboard belongs to it.
+pub enum Overlay {
+    /// Choosing a MIDI input port.
+    Ports { list: PortList },
+    /// Choosing a file: a track to load, or a MIDI map.
+    Files {
+        picker: FilePicker,
+        purpose: FilePurpose,
+    },
+}
+
+/// What the file picker's choice means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilePurpose {
+    /// Decode and install into this deck.
+    Load { deck: usize },
+    /// Use as the MIDI mapping file (and connect if a port is known).
+    MidiMap,
 }
 
 /// A deck's transport, as the TUI sees it. Mirrors [`DeckState`] plus front-end-only data.
@@ -76,6 +98,15 @@ pub struct App {
     pub meters: Option<Meters>,
     pub ui_frame_ms: f32,
     pub quit: bool,
+
+    /// A modal picker, if one is open.
+    pub overlay: Option<Overlay>,
+    /// The live MIDI input, when connected; dropping the app closes the port.
+    pub midi: Option<crate::midi::MidiSession>,
+    /// The chosen (or flag-supplied) port, remembered across reconnects.
+    pub midi_port: Option<String>,
+    /// The chosen (or flag-supplied) map path.
+    pub midi_map: Option<String>,
 
     notice_rx: Receiver<LogLine>,
     event_rx: Receiver<UiEvent>,
@@ -142,10 +173,65 @@ impl App {
             meters: None,
             ui_frame_ms: 0.0,
             quit: false,
+            overlay: None,
+            midi: None,
+            midi_port: None,
+            midi_map: None,
             notice_rx,
             event_rx,
             waveform_tx,
             waveform_rx,
+        }
+    }
+
+    /// Opens the remembered port with the remembered map, replacing any current input.
+    ///
+    /// FX names are resolved from the **already-primed slot book**, not by asking the engine: it
+    /// runs inside the UI thread, and reading the shared response channel here would swallow a
+    /// `Loaded`/`States`/`Error` answer meant for the UI. On failure the reason is logged and the
+    /// matching picker reopens so another choice can be made.
+    pub fn connect_midi(&mut self, command_tx: Sender<Command>, notices: &NoticeTx) {
+        let Some(port) = self.midi_port.clone() else {
+            return;
+        };
+        let map_path = self
+            .midi_map
+            .clone()
+            .unwrap_or_else(|| "midi-map.toml".to_owned());
+        let mut map = match crate::midi::read_map(&map_path) {
+            Ok(map) => map,
+            Err(err) => {
+                self.push_log(LogLine::error(format!("midi: {err}")));
+                self.overlay = Some(Overlay::Files {
+                    picker: FilePicker::new(
+                        Some(std::path::Path::new(&map_path)),
+                        &["toml"],
+                        "midi map",
+                    ),
+                    purpose: FilePurpose::MidiMap,
+                });
+                return;
+            }
+        };
+        let slots = self.fx_slots.clone();
+        let unresolved = crate::midi::resolve_with(&mut map, |chain, fx| {
+            slots.resolve(&chain.label(), fx).ok()
+        });
+        crate::midi::report_unresolved(notices, unresolved);
+        match crate::midi::attach(&port, map, command_tx) {
+            Ok(session) => {
+                // Replacing the old session closes its port before the new one is held.
+                self.midi = Some(session);
+                self.push_log(LogLine::info(format!(
+                    "[midi] connected `{port}` ({map_path})"
+                )));
+            }
+            Err(err) => {
+                self.push_log(LogLine::error(format!("midi: {err}")));
+                self.overlay = Some(Overlay::Ports {
+                    list: PortList::refresh(),
+                });
+            }
         }
     }
 

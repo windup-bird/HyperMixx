@@ -5,6 +5,7 @@ members = [
     "crates/hypermixx-media",
     "crates/hypermixx-audio",
     "crates/hypermixx-library",
+    "crates/hypermixx-midi",
     "crates/hypermixx-cli",
 ]
 
@@ -36,6 +37,10 @@ toml = "0.8"
 # `all-widgets` would drag in the calendar/time stack we never draw.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = "0.29"
+# MIDI input. `midir`'s ALSA backend rides the `alsa`/`alsa-sys` crates cpal already pulls in, so
+# this adds no new C dependency. Input and output share one API, which keeps LED feedback (future)
+# on the same library.
+midir = "0.11"
 
 [profile.release]
 opt-level = 3

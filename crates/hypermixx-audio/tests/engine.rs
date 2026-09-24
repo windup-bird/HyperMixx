@@ -9,7 +9,7 @@ use common::{
     states,
 };
 use hypermixx_audio::{Command, CommandResponse, SAMPLE_RATE};
-use hypermixx_core::DeckId;
+use hypermixx_core::{DeckId, FaderTarget};
 
 /// Frames in one beat at 122 BPM.
 const FRAMES_PER_BEAT: u64 = (44_100.0f64 * 60.0 / 122.0).round() as u64;
@@ -171,6 +171,37 @@ fn bad_deck_ids_and_empty_decks_answer_with_errors() {
     match answer(&rx) {
         CommandResponse::Error(err) => assert!(err.contains("deck 0"), "unexpected: {err}"),
         other => panic!("expected Error for an empty deck, got {other:?}"),
+    }
+
+    ask(&tx, Command::Quit);
+    ack(&rx);
+}
+
+#[test]
+fn set_fader_reaches_the_mixer_through_the_command_channel() {
+    let (tx, rx, _pipeline) = session();
+
+    // Every channel-scoped and bus-scoped target is accepted at a block boundary.
+    for target in [
+        FaderTarget::Flow(0),
+        FaderTarget::Deck(1),
+        FaderTarget::CueSend(0),
+        FaderTarget::Crossfader,
+        FaderTarget::Master,
+        FaderTarget::Cue,
+    ] {
+        ask(&tx, Command::SetFader { target, value: 0.25 });
+        ack(&rx);
+    }
+
+    // An unknown deck is the one reportable failure.
+    ask(
+        &tx,
+        Command::SetFader { target: FaderTarget::Flow(9), value: 0.0 },
+    );
+    match answer(&rx) {
+        CommandResponse::Error(err) => assert!(err.contains('9'), "unexpected error: {err}"),
+        other => panic!("expected Error, got {other:?}"),
     }
 
     ask(&tx, Command::Quit);

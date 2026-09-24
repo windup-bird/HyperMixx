@@ -1,13 +1,14 @@
 # Hypermixx 架构
 
-Rust workspace,五个 crate 单向分层:**core(类型) ← media(PCM) ← audio(引擎)**;
+Rust workspace,六个 crate 单向分层:**core(类型) ← media(PCM) ← audio(引擎)**;
 library(分析)与 audio 零交叉依赖,只被 cli 调用。引擎域 **44.1 kHz 立体声**(与目标设备
 ALSA default 的原生时钟一致,cpal 回调直通,零转换)。
 
 ```
-cli ──→ core / media / audio / library
+cli ──→ core / media / audio / library / midi
 audio ──→ core, media          (+ timestretch, git 依赖 rev 锁定; serde + toml)
 library ──→ core, media        (+ stratum-dsp, git 依赖 rev 锁定)
+midi ───→ core                 (+ midir, serde + toml)
 media ──→ core                 (+ symphonia)
 core ──→ serde
 ```
@@ -58,7 +59,15 @@ crates/
 │           ├── timestretch.rs # 占位:上游未暴露离线分析,返回 Unsupported
 │           └── refine.rs      # fit_rigid:中位数周期 + 最小二乘 + 倍频归位
 │
-└── hypermixx-cli/        # 前端(二进制,依赖全部四层)
+├── hypermixx-midi/       # MIDI 输入映射(core + midir + serde/toml)
+│   └── src/
+│       ├── msg.rs        # Decoder:字节流 → Event(丢 clock/sysex,归一 vel0)
+│       ├── map.rs        # TOML schema + action 注册表(manifest)+ 校验/序列化
+│       ├── translate.rs  # translate():Event → Command(pickup/相对编码器/latest-wins)
+│       ├── guide.rs      # guide:learn 状态机(纯逻辑,无 I/O/渲染)
+│       └── ports.rs      # midir 端口枚举/打开 → Sender<Received>
+│
+└── hypermixx-cli/        # 前端(二进制,依赖全部五层)
     └── src/main.rs       # 行解析 / fx 命令族 / 后台 decode+analyse / 打印线程
 ```
 
@@ -70,6 +79,8 @@ crates/
 | `timestretch` | `github.com/robmorgan/timestretch-rs`(经 gh-proxy 镜像地址) | `rev = 2628090` |
 
 不随本仓库分发;升级 = 改 rev + `cargo update -p <crate>`。
+此外 `midir` 0.11 为 crates.io 依赖(MIDI 输入);其 ALSA 后端复用 cpal 已引入的
+`alsa`/`alsa-sys`,不新增 C 依赖。
 
 ---
 
@@ -303,8 +314,9 @@ fader 起始位、cue_send/cue_tap/side/curve、master fx/limiter/fader、输出
 ## hypermixx-cli
 
 启动参数:`--config <file>`(TOML 拓扑,自定义通道/链/输出)/ `--print-config`
-(输出参考拓扑)/ `--backend auto|stratum|timestretch`;deck 数量启动时从引擎查询
-(`channel_count`,自定义拓扑可配任意通道)。
+(输出参考拓扑)/ `--backend auto|stratum|timestretch` / `--midi <port> [--midi-map <file>]`
+(打开 MIDI 输入,缺省映射 `midi-map.toml`;端口名或序号,`midi ports` 可列);deck 数量启动时
+从引擎查询(`channel_count`,自定义拓扑可配任意通道)。
 
 会话命令(target-first:行首 `deck0`/`0`/`master` 选目标,缺省用焦点 deck):
 - `load <path> [bpm]` — 后台解码;给 bpm 则建常网格跳过分析
@@ -320,6 +332,14 @@ fader 起始位、cue_send/cue_tap/side/curve、master fx/limiter/fader、输出
   解析错误(`linear 0`、非数字秒数)前端直接 `Failed`;引擎拒绝(无网格、反向同步)后到为 `Error`
 - TUI deck 头行多一枚黄色徽标:`sync phaselock 122.0 BPM ← deck0 phase pid locked`,
   与 CLI 的 `deck_line` 共用 `response::sync_badge`(所以测它就同时覆盖两边)
+- `midi ports` — 列出 MIDI 输入端口(`--midi` 在启动时打开并把映射翻译成 `Command`,
+  接线在 `src/midi.rs`:translator 线程 + 1ms 合并 flush + `ListFx` 名字解析)
+- TUI 内选择器(`src/tui/picker.rs`,两个前端共用):`--tui` 下 `F2` 选 MIDI 端口、`F3` 选映射
+  文件、`load` 不带路径弹文件浏览器;`Load` 完成后 `App::connect_midi` 连上,`--midi/--midi-map`
+  仅是免选择的快捷方式
+- `--midi-guide [<file>] [--midi <port>] [--decks <n>]` — learn 模式地图编辑器(`src/tui/guide.rs`),
+  **不启动引擎**;左目标清单/右原始事件监视器(PgUp/PgDn 滚动)/底部提示,键位
+  `↑↓ Enter 空格 m x s p f q`,端口/文件也可在 TUI 里选;逻辑在 `hypermixx_midi::guide`(纯状态机)
 
 ### 脚本
 - `scripts/phase_probe.sh` — 双 deck 反复 `beatjump`,看相位差**增量**是否恒定(跳转精度)

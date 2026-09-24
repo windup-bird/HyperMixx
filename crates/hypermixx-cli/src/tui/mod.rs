@@ -7,7 +7,9 @@
 
 pub mod app;
 pub mod completer;
+pub mod guide;
 pub mod input;
+pub mod picker;
 pub mod view;
 pub mod waveform_view;
 
@@ -30,6 +32,10 @@ const TICK: Duration = Duration::from_millis(33);
 const METERS_EVERY: u64 = 3;
 
 /// Runs the TUI until the user quits. Restores the terminal and stops the engine on the way out.
+///
+/// `midi_port` / `midi_map` come from the startup flags; when a port is given the TUI connects it
+/// itself (so the in-TUI pickers can replace it), otherwise it stays disconnected until F2.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     pipeline: &AudioPipeline,
     command_tx: Sender<Command>,
@@ -37,12 +43,19 @@ pub fn run(
     decks: usize,
     notice_tx: NoticeTx,
     notice_rx: Receiver<LogLine>,
+    midi_port: Option<&str>,
+    midi_map: &str,
 ) {
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
     let dispatcher = Dispatcher::new(command_tx.clone(), notice_tx).tap_events(event_tx);
     // Prime every chain's slot list so `fx remove <name>` works from the first command.
     dispatcher.prime(decks, pipeline.response_rx());
     let mut app = App::new(decks, backend, notice_rx, event_rx, dispatcher.slots());
+    app.midi_map = Some(midi_map.to_owned());
+    if let Some(port) = midi_port {
+        app.midi_port = Some(port.to_owned());
+        app.connect_midi(dispatcher.command_tx.clone(), &dispatcher.notices);
+    }
 
     let mut terminal = match ratatui::try_init() {
         Ok(terminal) => terminal,
