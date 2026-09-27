@@ -16,8 +16,8 @@ use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::fx::FxKind;
 use hypermixx_audio::{AudioPipeline, Command, SAMPLE_RATE};
 use hypermixx_core::{
-    Backend, CommandResponse, FxChainId, FxSlotRef, LoopEditOp, LoopOp, LoopQuantum, NudgeOp,
-    PhaseMode, Shared, SyncOp, TrackAnalysis,
+    Backend, CommandResponse, CueOp, FxChainId, FxSlotRef, KeylockMode, LoopEditOp, LoopOp,
+    LoopQuantum, NudgeOp, PhaseMode, Shared, Stem, StemOp, StemPreset, SyncOp, TrackAnalysis,
 };
 
 use crate::notices::{self, NoticeTx};
@@ -133,6 +133,9 @@ pub type Slots = Arc<SlotBook>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Target {
     Deck(u8),
+    /// One stem of a deck: `deck0 vocals`. Everything a deck takes still applies to its deck (the
+    /// next word decides), and the stem-scoped verbs (`level`, `mute`, `solo`) use the stem.
+    Stem(u8, Stem),
     Master,
 }
 
@@ -203,10 +206,18 @@ pub fn dispatch(
         return Action::Continue;
     };
     // A leading deck/chain word overrides the focused deck; otherwise the verb is the first word.
-    let (target, verb) = match parse_target(first, decks) {
+    // A deck word may be followed by a stem name, which narrows the target to one stem:
+    // `deck0 vocals mute`, `deck0 vocals fx add filter`.
+    let (mut target, verb) = match parse_target(first, decks) {
         Some(target) => (target, words.next().unwrap_or_default()),
         None => (Target::Deck(focused), first),
     };
+    if let Target::Deck(deck_id) = target {
+        if let Some(stem) = Stem::parse(verb) {
+            target = Target::Stem(deck_id, stem);
+            return dispatch_stem(words, target, dispatcher, command_tx_of(dispatcher));
+        }
+    }
     let command_tx = &dispatcher.command_tx;
 
     match verb {
@@ -239,8 +250,11 @@ pub fn dispatch(
             spawn_analyse(deck_id, source, backend, dispatcher);
             Action::Continue
         }
-        "play" => forward(target, command_tx, |deck_id| Command::Play { deck_id }),
-        "pause" => forward(target, command_tx, |deck_id| Command::Pause { deck_id }),
+        "stem" => stem_family(&mut words, target, dispatcher, pipeline),
+        "play" => forward(target, command_tx, |deck_id| Command::TogglePlay { deck_id }),
+        "cue" => with_deck(target, "cue", |deck_id| {
+            cue_command(&mut words, deck_id, command_tx)
+        }),
         "jump" => with_deck(target, "jump", |deck_id| {
             match words.next().map(str::parse::<u64>) {
                 Some(Ok(target_frame)) => send(
@@ -259,22 +273,38 @@ pub fn dispatch(
                 _ => Action::Failed("usage: [deck] beatjump <beats>".into()),
             }
         }),
-        "rate" => with_deck(target, "rate", |deck_id| {
+        "tempo" => with_deck(target, "tempo", |deck_id| {
             match words.next().map(str::parse::<f32>) {
-                Some(Ok(rate)) => send(command_tx, Command::SetRate { deck_id, rate }),
-                _ => Action::Failed("usage: [deck] rate <ratio>".into()),
+                Some(Ok(tempo)) => send(command_tx, Command::SetTempo { deck_id, tempo }),
+                _ => Action::Failed("usage: [deck] tempo <ratio>".into()),
             }
         }),
-        "profile" => with_deck(target, "profile", |deck_id| {
-            match words.next() {
-                Some(profile) => send(
-                    command_tx,
-                    Command::SetProfile {
-                        deck_id,
-                        profile: profile.to_owned(),
-                    },
-                ),
-                None => Action::Failed("usage: [deck] profile <tape|keylock|wide>".into()),
+        "tempofader" => with_deck(target, "tempofader", |deck_id| {
+            match words.next().map(str::parse::<f32>) {
+                Some(Ok(position)) if position.is_finite() && (-1.0..=1.0).contains(&position) => {
+                    send(command_tx, Command::SetTempoFader { deck_id, position })
+                }
+                _ => Action::Failed("usage: [deck] tempofader <-1..1>".into()),
+            }
+        }),
+        "temporange" => with_deck(target, "temporange", |deck_id| {
+            match words.next().map(str::parse::<f32>) {
+                Some(Ok(range)) if range.is_finite() && range > 0.0 && range <= 1.0 => {
+                    send(command_tx, Command::SetTempoRange { deck_id, range })
+                }
+                _ => Action::Failed("usage: [deck] temporange <0..1> (0.1 = ±10%)".into()),
+            }
+        }),
+        "keylock" => with_deck(target, "keylock", |deck_id| {
+            match words.next().and_then(KeylockMode::parse) {
+                Some(mode) => send(command_tx, Command::SetKeylock { deck_id, mode }),
+                None => Action::Failed("usage: [deck] keylock on|off|wide".into()),
+            }
+        }),
+        "key" => with_deck(target, "key", |deck_id| {
+            match words.next().map(str::parse::<i32>) {
+                Some(Ok(semitones)) => send(command_tx, Command::SetKey { deck_id, semitones }),
+                _ => Action::Failed("usage: [deck] key <semitones>".into()),
             }
         }),
         "loop" => with_deck(target, "loop", |deck_id| {
@@ -388,14 +418,37 @@ fn phase_mode<'a>(
     Ok((mode, t_seconds))
 }
 
+/// The `cue` family. A bare `cue` is the smart gesture — the deck decides between "back to the
+/// cue point and pause" and "set the cue point here" from its own transport, so the front-end
+/// never has to guess. The explicit subcommands are for a held button (MIDI press/release).
+fn cue_command<'a>(
+    words: &mut impl Iterator<Item = &'a str>,
+    deck_id: u8,
+    command_tx: &Sender<Command>,
+) -> Action {
+    let op = match words.next() {
+        None => CueOp::Smart,
+        Some("play") => CueOp::Play,
+        Some("back") => CueOp::Back,
+        Some("set") => CueOp::Set,
+        Some(other) => {
+            return Action::Failed(format!(
+                "unknown cue subcommand `{other}` — play|back|set (or bare `cue`)"
+            ));
+        }
+    };
+    send(command_tx, Command::Cue { deck_id, op })
+}
+
 /// The `nudge` family: a temporary rate bend that changes phase while it runs and leaves the
-/// tempo alone when it ends.
+/// tempo alone when it ends. The duration is mandatory — a bend with no end is a tempo change the
+/// user did not ask for (hold-to-bend lives in MIDI's momentary binding).
 fn nudge_command<'a>(
     words: &mut impl Iterator<Item = &'a str>,
     deck_id: u8,
     command_tx: &Sender<Command>,
 ) -> Action {
-    let usage = "usage: [deck] nudge <delta> [seconds] | [deck] nudge off";
+    let usage = "usage: [deck] nudge <delta> <seconds> | [deck] nudge off";
     let Some(raw) = words.next() else {
         return Action::Message(usage.into());
     };
@@ -412,16 +465,19 @@ fn nudge_command<'a>(
             };
             let seconds = match words.next() {
                 Some(raw_seconds) => match raw_seconds.parse::<f64>() {
-                    Ok(seconds) => Some(seconds),
+                    Ok(seconds) => seconds,
                     Err(_) => {
                         return Action::Failed(format!(
                             "nudge duration must be a number of seconds, got `{raw_seconds}`"
                         ));
                     }
                 },
-                None => None,
+                None => return Action::Failed(format!("nudge needs a duration\n{usage}")),
             };
-            NudgeOp::Start { delta, seconds }
+            NudgeOp::Start {
+                delta,
+                seconds: Some(seconds),
+            }
         }
     };
     send(command_tx, Command::Nudge { deck_id, op })
@@ -505,7 +561,7 @@ fn loop_edit_op<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<LoopEdi
 }
 
 /// The `fx` family. The chain comes from the line's target, not from an argument:
-/// `fx add eq`, `deck1 fx list`, `master fx add limiter`.
+/// `fx add eq`, `deck1 fx list`, `deck0 vocals fx add filter`, `master fx add limiter`.
 fn fx<'a>(
     mut words: impl Iterator<Item = &'a str>,
     dispatcher: &Dispatcher,
@@ -513,6 +569,7 @@ fn fx<'a>(
 ) -> Action {
     let chain = match target {
         Target::Deck(deck_id) => FxChainId::Deck(deck_id),
+        Target::Stem(deck, stem) => FxChainId::Stem { deck, stem },
         Target::Master => FxChainId::Master,
     };
     let command_tx = &dispatcher.command_tx;
@@ -648,6 +705,9 @@ fn list_kinds(kinds: &[String]) -> String {
 fn deck_only(target: Target) -> Result<u8, String> {
     match target {
         Target::Deck(deck_id) => Ok(deck_id),
+        // `deck0 vocals play` is unambiguous — the stem only narrows *stem* commands — so it plays
+        // deck 0 rather than making the user retype the line.
+        Target::Stem(deck_id, _) => Ok(deck_id),
         Target::Master => Err("`master` only takes `fx` commands".into()),
     }
 }
@@ -688,6 +748,201 @@ fn parse_target(token: &str, decks: usize) -> Option<Target> {
         .unwrap_or(&lower);
     let id: u8 = digits.parse().ok()?;
     ((id as usize) < decks).then_some(Target::Deck(id))
+}
+
+/// The `stem` family on a deck: `stem separate`, `stem status`, `stem acapella`, …
+fn stem_family<'a>(
+    words: &mut impl Iterator<Item = &'a str>,
+    target: Target,
+    dispatcher: &Dispatcher,
+    pipeline: &AudioPipeline,
+) -> Action {
+    let Ok(deck_id) = deck_only(target) else {
+        return Action::Failed("`stem` needs a deck, not `master`".into());
+    };
+    let command_tx = &dispatcher.command_tx;
+    let Some(sub) = words.next() else {
+        return Action::Message(stem_help_text());
+    };
+    match sub {
+        "separate" | "split" => {
+            let mut model = None;
+            let mut shifts = 1;
+            while let Some(flag) = words.next() {
+                match flag {
+                    "--shifts" => {
+                        shifts = match words.next().and_then(|v| v.parse::<usize>().ok()) {
+                            Some(value) => value,
+                            None => return Action::Failed("--shifts needs a number".into()),
+                        }
+                    }
+                    "--model" => model = words.next().map(str::to_owned),
+                    other => {
+                        return Action::Failed(format!(
+                            "unknown stem separate option `{other}` (--shifts <n>, --model <name>)"
+                        ))
+                    }
+                }
+            }
+            let _ = (model, shifts);
+            let Some(source) = pipeline.deck_source(deck_id) else {
+                return Action::Failed(format!("deck {deck_id} holds no track to separate"));
+            };
+            spawn_separate(deck_id, source, dispatcher);
+            Action::Continue
+        }
+        "status" => send(command_tx, Command::GetStemState { deck_id }),
+        "cache" => {
+            let (bytes, entries) = hypermixx_stems::cache::cache_usage();
+            Action::Message(format!(
+                "stem cache: {entries} track(s), {:.1} MB in {}",
+                bytes as f64 / (1024.0 * 1024.0),
+                hypermixx_stems::cache::stems_root().display()
+            ))
+        }
+        "clear" => send(
+            command_tx,
+            Command::Stem {
+                deck_id,
+                op: StemOp::Clear,
+            },
+        ),
+        other => match StemPreset::parse(other) {
+            Some(preset) => send(
+                command_tx,
+                Command::Stem {
+                    deck_id,
+                    op: StemOp::Preset(preset),
+                },
+            ),
+            None => Action::Failed(format!("unknown stem command `{other}`\n{}", stem_help_text())),
+        },
+    }
+}
+
+/// The verbs a stem sub-target takes: `deck0 vocals mute on`, `deck0 vocals level -0.5`, …
+fn dispatch_stem<'a>(
+    mut words: impl Iterator<Item = &'a str>,
+    target: Target,
+    dispatcher: &Dispatcher,
+    command_tx: Sender<Command>,
+) -> Action {
+    let Target::Stem(deck_id, stem) = target else {
+        return Action::Continue;
+    };
+    let Some(verb) = words.next() else {
+        return Action::Failed(format!(
+            "`deck{deck_id} {stem}` needs a verb (level|mute|solo|unsolo|fx)"
+        ));
+    };
+    let on_off = |raw: Option<&str>| -> Result<bool, String> {
+        match raw.map(str::to_ascii_lowercase).as_deref() {
+            // A bare `mute` means "mute it": the common case should not need a second word.
+            None | Some("on") | Some("1") | Some("true") => Ok(true),
+            Some("off") | Some("0") | Some("false") => Ok(false),
+            Some(other) => Err(format!("expected on|off, got `{other}`")),
+        }
+    };
+    let op = match verb {
+        "level" | "fader" => {
+            let Some(raw) = words.next() else {
+                return Action::Failed(format!("usage: deck{deck_id} {stem} level <position>"));
+            };
+            match raw.parse::<f32>() {
+                Ok(position) if position.is_finite() => StemOp::Level { stem, position },
+                _ => return Action::Failed(format!("level must be a number, got `{raw}`")),
+            }
+        }
+        "mute" => match on_off(words.next()) {
+            Ok(on) => StemOp::Mute { stem, on },
+            Err(err) => return Action::Failed(err),
+        },
+        "solo" => match on_off(words.next()) {
+            Ok(on) => StemOp::Solo { stem, on },
+            Err(err) => return Action::Failed(err),
+        },
+        "unsolo" => StemOp::Solo { stem, on: false },
+        "fx" => return fx(words, dispatcher, Target::Stem(deck_id, stem)),
+        other => {
+            return Action::Failed(format!(
+                "unknown stem verb `{other}` (level|mute|solo|unsolo|fx)"
+            ))
+        }
+    };
+    send(&command_tx, Command::Stem { deck_id, op })
+}
+
+fn command_tx_of(dispatcher: &Dispatcher) -> Sender<Command> {
+    dispatcher.command_tx.clone()
+}
+
+/// Separates a deck's loaded track on a worker thread and installs the result.
+///
+/// The pipeline needs the *mix* to separate, and `deck_source` is exactly that (the deck's first
+/// stream). The four streams come back through `Command::SetStems`, which is a seamless source swap
+/// — so the user can keep playing, looping and beatmatching while this runs.
+pub(crate) fn spawn_separate(deck_id: u8, source: Shared, dispatcher: &Dispatcher) {
+    let command_tx = dispatcher.command_tx.clone();
+    let notices_tx = dispatcher.notices.clone();
+    std::thread::Builder::new()
+        .name(format!("hypermixx-stem-{deck_id}"))
+        .spawn(move || {
+            let progress = {
+                let notices_tx = notices_tx.clone();
+                // Report in 10% steps: one notice per model window would flood the log.
+                // An atomic rather than a captured `mut`: the sink must be `Fn`, and the model
+                // reports from its own thread.
+                let last = std::sync::atomic::AtomicU32::new(0);
+                std::sync::Arc::new(move |fraction: f32| {
+                    let percent = (fraction * 100.0) as u32;
+                    let previous = last.load(std::sync::atomic::Ordering::Relaxed);
+                    if percent >= previous + 10 {
+                        last.store(percent, std::sync::atomic::Ordering::Relaxed);
+                        notices::info(&notices_tx, format!("[stem] deck{deck_id}: {percent}%"));
+                    }
+                }) as hypermixx_stems::ProgressSink
+            };
+            notices::info(
+                &notices_tx,
+                format!("[stem] deck{deck_id}: preparing the separator (may fetch a model)..."),
+            );
+            let separator = match hypermixx_stems::default_separator(&progress) {
+                Ok(separator) => separator,
+                Err(err) => {
+                    notices::error(&notices_tx, format!("[stem] deck{deck_id}: {err}"));
+                    return;
+                }
+            };
+            let cancelled = hypermixx_stems::Cancelled::new();
+            let started = std::time::Instant::now();
+            match hypermixx_stems::separate_cached(
+                separator.as_ref(),
+                source.as_ref(),
+                &progress,
+                &cancelled,
+            ) {
+                Ok(stems) => {
+                    let frames = stems.total_frames();
+                    let seconds = started.elapsed().as_secs_f32();
+                    notices::info(
+                        &notices_tx,
+                        format!(
+                            "[stem] deck{deck_id}: {frames} frames in {seconds:.0}s — installing"
+                        ),
+                    );
+                    let _ = command_tx.send(Command::SetStems { deck_id, stems });
+                }
+                Err(err) => {
+                    notices::error(&notices_tx, format!("[stem] deck{deck_id}: {err}"));
+                }
+            }
+        })
+        .ok();
+}
+
+/// The reference to the always-available help text.
+fn stem_help_text() -> String {
+    crate::response::stem_help_text()
 }
 
 /// Decodes on a worker thread, then hands the pipeline a ready source (+ optional constant grid).

@@ -6,7 +6,7 @@
 //! [`MergeBuffer`] coalesces the floods a fast fader sweep produces.
 
 use hypermixx_core::{
-    Command, DeckId, FaderTarget, FxSlotRef, LoopEditOp, LoopOp, NudgeOp, PhaseMode, SyncOp,
+    Command, CueOp, DeckId, FaderTarget, FxSlotRef, LoopEditOp, LoopOp, NudgeOp, PhaseMode, SyncOp,
 };
 
 use crate::map::{
@@ -95,9 +95,9 @@ impl BindState {
 /// Where the engine leaves a control when the process starts. Used to seed soft-takeover.
 fn default_norm(action: &Action) -> f32 {
     match action {
-        // Bipolar faders and the rate fader are unity/centred at 0.
+        // Bipolar faders and the tempo fader are unity/centred at 0.
         Action::Fader(target) if target.is_bipolar() => 0.5,
-        Action::Rate { .. } => 0.5,
+        Action::TempoFader => 0.5,
         // `simple_dj` opens the cue send fully.
         Action::Fader(FaderTarget::CueSend(_)) => 1.0,
         // Everything else (FX params) starts at the bottom of its domain.
@@ -259,12 +259,12 @@ impl<'a> BindingOut<'a> {
                 target,
                 value: command_value(self.spec, norm),
             }),
-            Action::Rate { range } => {
+            Action::TempoFader => {
                 let Some(deck_id) = deck else { return };
-                let position = norm * 2.0 - 1.0;
-                self.out.push(Command::SetRate {
+                // The deck owns the range; the mapping only ever sends the fader position.
+                self.out.push(Command::SetTempoFader {
                     deck_id,
-                    rate: 1.0 + position * range,
+                    position: norm * 2.0 - 1.0,
                 });
             }
             Action::Fx(FxAction::Param { chain, fx, param }) => {
@@ -288,18 +288,22 @@ impl<'a> BindingOut<'a> {
             return;
         };
         match self.spec.action.clone() {
-            Action::Play => self.out.push(Command::Play { deck_id: deck }),
-            Action::Pause => self.out.push(Command::Pause { deck_id: deck }),
+            Action::Play => self.out.push(Command::TogglePlay { deck_id: deck }),
+            Action::Cue => self.out.push(Command::Cue {
+                deck_id: deck,
+                op: CueOp::Play,
+            }),
+            Action::CueSmart => self.out.push(Command::Cue {
+                deck_id: deck,
+                op: CueOp::Smart,
+            }),
             Action::BeatJump { beats } => self.out.push(Command::BeatJump {
                 deck_id: deck,
                 beats,
             }),
-            Action::Nudge { delta } => self.out.push(Command::Nudge {
+            Action::Nudge { delta, seconds } => self.out.push(Command::Nudge {
                 deck_id: deck,
-                op: NudgeOp::Start {
-                    delta,
-                    seconds: None,
-                },
+                op: NudgeOp::Start { delta, seconds },
             }),
             Action::Loop(op) => self.out.push(Command::Loop {
                 deck_id: deck,
@@ -365,9 +369,14 @@ impl<'a> BindingOut<'a> {
             return;
         };
         match self.spec.action.clone() {
-            Action::Nudge { .. } => self.out.push(Command::Nudge {
+            // A timed bend releases itself; the note-up edge must not cut it short.
+            Action::Nudge { seconds: None, .. } => self.out.push(Command::Nudge {
                 deck_id: deck,
                 op: NudgeOp::Stop,
+            }),
+            Action::Cue => self.out.push(Command::Cue {
+                deck_id: deck,
+                op: CueOp::Back,
             }),
             _ => self.release_deckless(),
         }
@@ -463,7 +472,7 @@ fn sync_op(op: SyncAction) -> SyncOp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MergeKey {
     Fader(FaderTarget),
-    Rate(DeckId),
+    Tempo(DeckId),
     FxParam(FxSlotRef, String),
 }
 
@@ -471,7 +480,9 @@ impl MergeKey {
     fn of(command: &Command) -> Option<Self> {
         match command {
             Command::SetFader { target, .. } => Some(MergeKey::Fader(*target)),
-            Command::SetRate { deck_id, .. } => Some(MergeKey::Rate(*deck_id)),
+            Command::SetTempo { deck_id, .. } | Command::SetTempoFader { deck_id, .. } => {
+                Some(MergeKey::Tempo(*deck_id))
+            }
             Command::SetFxParam { slot, name, .. } => Some(MergeKey::FxParam(*slot, name.clone())),
             _ => None,
         }
@@ -581,7 +592,7 @@ action = "play"
         let commands = translate(&map, &note(0, 48, true), &mut state);
         assert!(matches!(
             commands.as_slice(),
-            [Command::Play { deck_id: 1 }]
+            [Command::TogglePlay { deck_id: 1 }]
         ));
         // The release must not re-fire.
         assert!(translate(&map, &note(0, 48, false), &mut state).is_empty());
@@ -663,24 +674,23 @@ type = "cc"
 mode = "rel2"
 id = 10
 deck = 0
-action = "rate"
-step = 0.08
+action = "tempofader"
 "#);
         let mut state = TranslateState::new(&map);
-        // One detent up moves the normalised position by 1/64; the rate position is bipolar, so a
-        // detent is +2/64 of the range.
+        // One detent up moves the normalised position by 1/64; the fader is bipolar, so a detent
+        // is +2/64 of the travel.
         let commands = translate(&map, &cc(0, 10, 1), &mut state);
         match &commands[0] {
-            Command::SetRate { deck_id: 0, rate } => {
-                assert!(close(*rate, 1.0 + 0.08 * 2.0 / 64.0), "rate {rate}");
+            Command::SetTempoFader { deck_id: 0, position } => {
+                assert!(close(*position, 2.0 / 64.0), "position {position}");
             }
-            other => panic!("expected SetRate, got {other:?}"),
+            other => panic!("expected SetTempoFader, got {other:?}"),
         }
-        // One detent down brings it back to unity.
+        // One detent down brings it back to centre.
         let commands = translate(&map, &cc(0, 10, 127), &mut state);
         match &commands[0] {
-            Command::SetRate { rate, .. } => assert!(close(*rate, 1.0), "rate {rate}"),
-            other => panic!("expected SetRate, got {other:?}"),
+            Command::SetTempoFader { position, .. } => assert!(close(*position, 0.0), "position {position}"),
+            other => panic!("expected SetTempoFader, got {other:?}"),
         }
     }
 
@@ -696,8 +706,10 @@ step = 0.08
         assert_eq!(relative_delta(RelMode::Rel3, 64), 0);
     }
 
+    /// Every button edge in one place: a momentary hold pairs press/release, a smart cue fires
+    /// once, and a timed nudge ignores its release.
     #[test]
-    fn momentary_actions_pair_press_and_release() {
+    fn button_edges_pair_on_press_and_release() {
         let map = map(r#"
 [[bind]]
 type = "note"
@@ -705,24 +717,60 @@ id = 60
 deck = 0
 action = "nudge"
 step = 0.05
+
+[[bind]]
+type = "note"
+id = 61
+deck = 0
+action = "nudge"
+step = 0.05
+seconds = 0.5
+
+[[bind]]
+type = "note"
+id = 62
+deck = 0
+action = "cue"
+
+[[bind]]
+type = "note"
+id = 63
+deck = 0
+action = "cue.smart"
 "#);
         let mut state = TranslateState::new(&map);
-        let commands = translate(&map, &note(0, 60, true), &mut state);
+        let edge = |state: &mut TranslateState, key, down| translate(&map, &note(0, key, down), state);
+
+        // A plain nudge is momentary: press bends, release lets go.
         assert!(matches!(
-            commands.as_slice(),
-            [Command::Nudge {
-                deck_id: 0,
-                op: NudgeOp::Start { delta, seconds: None }
-            }] if close(*delta, 0.05)
+            edge(&mut state, 60, true).as_slice(),
+            [Command::Nudge { op: NudgeOp::Start { delta, seconds: None }, .. }] if close(*delta, 0.05)
         ));
-        let commands = translate(&map, &note(0, 60, false), &mut state);
         assert!(matches!(
-            commands.as_slice(),
-            [Command::Nudge {
-                deck_id: 0,
-                op: NudgeOp::Stop
-            }]
+            edge(&mut state, 60, false).as_slice(),
+            [Command::Nudge { op: NudgeOp::Stop, .. }]
         ));
+        // A timed nudge releases itself; the note-up edge must be silent.
+        assert!(matches!(
+            edge(&mut state, 61, true).as_slice(),
+            [Command::Nudge { op: NudgeOp::Start { seconds: Some(s), .. }, .. }] if close(*s as f32, 0.5)
+        ));
+        assert!(edge(&mut state, 61, false).is_empty());
+        // The cue button is a held pair: down plays from the cue, up returns to it.
+        assert!(matches!(
+            edge(&mut state, 62, true).as_slice(),
+            [Command::Cue { op: CueOp::Play, .. }]
+        ));
+        assert!(matches!(
+            edge(&mut state, 62, false).as_slice(),
+            [Command::Cue { op: CueOp::Back, .. }]
+        ));
+        // A smart cue fires once; its release is silent.
+        assert!(matches!(
+            edge(&mut state, 63, true).as_slice(),
+            [Command::Cue { op: CueOp::Smart, .. }]
+        ));
+        assert!(edge(&mut state, 63, false).is_empty());
     }
 
     #[test]

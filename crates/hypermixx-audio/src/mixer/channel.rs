@@ -24,7 +24,9 @@
 //! There is no routing graph. A channel owns its buses, its chains and its faders; the mixer owns
 //! the channels.
 
-use hypermixx_core::FxSlotStatus;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+
+use hypermixx_core::{FxSlotStatus, Stem, StemOp, StemStatus};
 
 use super::bus::Bus;
 use super::config::ChannelConfig;
@@ -101,18 +103,38 @@ impl DeckSide {
     }
 }
 
-/// One mixer input: a deck, two FX chains, four faders and a cue tap.
+/// One mixer input: a deck of 1..=4 streams, an insert chain per stream plus a shared deck chain,
+/// a fader per stream plus the channel faders, and a cue tap.
 pub struct Channel {
     deck: Deck,
-    flow_fx: FxChain,
+    /// One insert chain per **stream**: index 0 is the plain track, 0..4 are the stems. Built from
+    /// [`Channel::flow_fx_names`] (the config's template) and grown when the deck starts rendering
+    /// more streams — an [`FxChain`] is not `Clone` (its slots own `Box<dyn Fx>`), so growth rebuilds
+    /// from names rather than copying a chain.
+    flow_fx: Vec<FxChain>,
+    /// The names every stream's chain is built from. The config describes *a* flow chain, not four;
+    /// applying it to each stream is what makes it a template.
+    flow_fx_names: Vec<String>,
+    /// The channel's shared inserts — the tone controls that survive a jump, and the only chain a
+    /// track without stems ever has.
     deck_fx: FxChain,
     /// The channel's own signal, rendered in place. Allocated once by [`Channel::new`].
     bus: Bus,
+    /// One scratch bus per stream, summed into [`Channel::bus`] through that stream's inserts and
+    /// fader. This is what lets a stem have its own level and its own effects.
+    stream_buses: Vec<Bus>,
     /// The cue copy taken at [`Channel::cue_tap`], filled during [`Channel::process`].
     cue: Bus,
-    flow_fader: Fader,
-    /// Full range until a track exposes stems; separate from [`Channel::flow_fader`] so wiring stems
-    /// later means a new source, not a re-plumbing.
+    /// One level fader per stream, *derived* from the per-stem intent below (see
+    /// [`Channel::refresh_stem_faders`]). With one stream this is the channel's flow fader.
+    flow_fader: Vec<Fader>,
+    /// The DJ's per-stem intent. Three independent facts — level, mute, solo — whose combination is
+    /// computed in exactly one place, so they cannot disagree (a solo has to override a mute, and an
+    /// unmute has to restore the level rather than unity).
+    stem_level: [AtomicU32; Stem::COUNT],
+    stem_mute: [AtomicBool; Stem::COUNT],
+    /// The solo set as a bitmask of `1 << Stem::index()`; `0` = nothing soloed.
+    stem_solo: AtomicU8,
     deck_fader: Fader,
     crossfader: Fader,
     /// Cue send level: **linear 0.0 (off) ..= 1.0 (full)**, not a bipolar fader. A send knob reads
@@ -130,20 +152,32 @@ impl Channel {
     /// that a `simple_dj()` channel has an EQ and a filter.
     pub fn new(deck: Deck, cfg: &ChannelConfig, flow_fx: FxChain, deck_fx: FxChain) -> Self {
         let frames = BLOCK_SIZE;
-        Self {
+        let level = clamp_pos(cfg.flow_fader);
+        let mut channel = Self {
             deck,
-            flow_fx,
+            flow_fx: vec![flow_fx],
+            flow_fx_names: cfg.flow_fx.clone(),
             deck_fx,
             bus: Bus::stereo(frames),
+            stream_buses: vec![Bus::stereo(frames)],
             cue: Bus::stereo(frames),
-            flow_fader: Fader::new(cfg.flow_fader, FADER_TAU),
+            flow_fader: vec![Fader::new(level, FADER_TAU)],
+            stem_level: std::array::from_fn(|_| AtomicU32::new(level.to_bits())),
+            stem_mute: std::array::from_fn(|_| AtomicBool::new(false)),
+            stem_solo: AtomicU8::new(0),
             deck_fader: Fader::new(cfg.deck_fader, FADER_TAU),
             crossfader: Fader::new(cfg.crossfader, CROSSFADE_TAU),
             cue_send: Param::new(cfg.cue_send.clamp(0.0, 1.0), FADER_TAU),
             side: cfg.side,
             curve: cfg.crossfader_curve,
             cue_tap: cfg.cue_tap,
-        }
+        };
+        // A channel can carry up to `Stem::COUNT` streams, and an `fx` command may address any of
+        // them before the deck has grown — a stem chain is *configured*, not created, by being
+        // named. The spare chains cost nothing while idle because `process` only drives the live
+        // ones.
+        channel.sync_streams(Stem::COUNT);
+        channel
     }
 
     pub fn deck(&self) -> &Deck {
@@ -156,8 +190,22 @@ impl Channel {
 
     /// Installs a fresh transport (`Command::Load`). The chains and faders deliberately survive: a
     /// loaded track should not reset the mixer's tone controls.
+    ///
+    /// The per-stem intent is *not* cleared here either, and does not need to be: a reload drops
+    /// back to one stream, so no stem is audible until [`Channel::set_stems`] runs — and that resets
+    /// the intent, which is the moment a stale mute could have mattered.
     pub fn replace_deck(&mut self, deck: Deck) {
         self.deck = deck;
+    }
+
+    /// Installs a separated track into this channel's deck.
+    ///
+    /// The swap is a source change at the current position, so it is seamless and whether the audio
+    /// has stems yet is the *deck's* business ([`Channel::stem_status`] reports it). The intent is
+    /// reset to "all four, unity, nothing soloed": installing a fresh stem set is a fresh start.
+    pub fn set_stems(&mut self, stems: hypermixx_core::StemSet) {
+        self.deck.set_sources(stems.stems.to_vec());
+        self.reset_stem_intent();
     }
 
     pub fn side(&self) -> DeckSide {
@@ -172,8 +220,14 @@ impl Channel {
         self.cue_tap = tap;
     }
 
+    /// The first stream's insert chain — the only one a track without stems has.
     pub fn flow_fx(&self) -> &FxChain {
-        &self.flow_fx
+        &self.flow_fx[0]
+    }
+
+    /// One stream's insert chain, by stem.
+    pub fn stem_fx(&self, stem: Stem) -> Option<&FxChain> {
+        self.flow_fx.get(stem.index())
     }
 
     pub fn deck_fx(&self) -> &FxChain {
@@ -181,7 +235,7 @@ impl Channel {
     }
 
     pub fn flow_fx_mut(&mut self) -> &mut FxChain {
-        &mut self.flow_fx
+        &mut self.flow_fx[0]
     }
 
     pub fn deck_fx_mut(&mut self) -> &mut FxChain {
@@ -194,17 +248,127 @@ impl Channel {
 
     /// Fader positions (`-1.0 ..= 1.0`), for a UI mirror.
     /// `(flow, deck, crossfader)` as bipolar positions, `(cue send)` as a linear level.
+    ///
+    /// The flow fader is stream 0's; per-stem levels live in [`Channel::stem_status`].
     pub fn levels(&self) -> (f32, f32, f32, f32) {
         (
-            self.flow_fader.target(),
+            self.flow_fader[0].target(),
             self.deck_fader.target(),
             self.crossfader.target(),
             self.cue_send.target(),
         )
     }
 
+    /// The per-stem state: whether the audio is separated yet, plus level, mute and solo.
+    pub fn stem_status(&self) -> StemStatus {
+        let mut status = StemStatus {
+            // The audio has stems exactly when the active flow is rendering more than one stream.
+            // `SetStems` is warmed on another thread, so this is the honest answer rather than the
+            // intent.
+            ready: self.deck.stream_count() > 1,
+            solo: self.stem_solo.load(Ordering::Relaxed),
+            ..Default::default()
+        };
+        for (i, level) in status.level.iter_mut().enumerate() {
+            *level = f32::from_bits(self.stem_level[i].load(Ordering::Relaxed));
+            status.mute[i] = self.stem_mute[i].load(Ordering::Relaxed);
+        }
+        status
+    }
+
+    /// Whether this channel's deck is currently rendering stems.
+    pub fn has_stems(&self) -> bool {
+        self.deck.stream_count() > 1
+    }
+
+    /// The channel's per-stream level. With stems this writes **every** stem at once: one hardware
+    /// fader still has to work on a stem deck, and "the channel's level" is the least surprising
+    /// thing for it to mean. A single stem is addressed through
+    /// [`set_stem_level`](Self::set_stem_level).
     pub fn set_flow_fader(&self, position: f32) {
-        self.flow_fader.set(clamp_pos(position));
+        let level = clamp_pos(position);
+        for slot in &self.stem_level {
+            slot.store(level.to_bits(), Ordering::Relaxed);
+        }
+        self.refresh_stem_faders();
+    }
+
+    /// One stem's level (bipolar fader position).
+    pub fn set_stem_level(&self, stem: Stem, position: f32) {
+        self.stem_level[stem.index()].store(clamp_pos(position).to_bits(), Ordering::Relaxed);
+        self.refresh_stem_faders();
+    }
+
+    /// Applies one per-stem command.
+    ///
+    /// `&self`: the intent lives in atomics and the faders smooth through interior mutability,
+    /// exactly like every other mixer setter, so a controller thread never fights the audio path.
+    pub fn apply_stem(&self, op: StemOp) -> Result<(), String> {
+        match op {
+            StemOp::Level { stem, position } => {
+                self.stem_level[stem.index()]
+                    .store(clamp_pos(position).to_bits(), Ordering::Relaxed);
+            }
+            StemOp::Mute { stem, on } => {
+                self.stem_mute[stem.index()].store(on, Ordering::Relaxed);
+            }
+            StemOp::Solo { stem, on } => {
+                let bit = 1u8 << stem.index();
+                let current = self.stem_solo.load(Ordering::Relaxed);
+                self.stem_solo.store(
+                    if on { current | bit } else { current & !bit },
+                    Ordering::Relaxed,
+                );
+            }
+            StemOp::Clear => {
+                self.reset_stem_intent();
+                return Ok(());
+            }
+            StemOp::Preset(preset) => {
+                // A preset *is* a mute arrangement, so it also drops the solo set: leaving an old
+                // solo in place would mask the arrangement the user just asked for.
+                for (i, muted) in preset.mute().iter().enumerate() {
+                    self.stem_mute[i].store(*muted, Ordering::Relaxed);
+                }
+                self.stem_solo.store(0, Ordering::Relaxed);
+            }
+        }
+        self.refresh_stem_faders();
+        Ok(())
+    }
+
+    /// All four stems audible at unity, nothing muted, nothing soloed.
+    fn reset_stem_intent(&self) {
+        for slot in &self.stem_level {
+            slot.store(0.0f32.to_bits(), Ordering::Relaxed);
+        }
+        for slot in &self.stem_mute {
+            slot.store(false, Ordering::Relaxed);
+        }
+        self.stem_solo.store(0, Ordering::Relaxed);
+        self.refresh_stem_faders();
+    }
+
+    /// Recomputes every stream's fader from the intent.
+    ///
+    /// The one place level, mute and solo are combined, so they cannot disagree: a mute is `-1.0`
+    /// — `bipolar_amp`'s *exact* silence, not a −80 dB leak — an unmute restores the level rather
+    /// than unity, and a solo overrides the others' mutes.
+    fn refresh_stem_faders(&self) {
+        let solo = self.stem_solo.load(Ordering::Relaxed);
+        for (i, fader) in self.flow_fader.iter().enumerate() {
+            let audible = if solo != 0 {
+                solo & (1 << i) != 0
+            } else {
+                !self.stem_mute[i].load(Ordering::Relaxed)
+            };
+            let position = if audible {
+                f32::from_bits(self.stem_level[i].load(Ordering::Relaxed))
+            } else {
+                -1.0
+            };
+            fader.set(position);
+        }
     }
 
     pub fn set_deck_fader(&self, position: f32) {
@@ -228,38 +392,65 @@ impl Channel {
 
     /// Renders one block through the fixed chain, leaving the result in the channel's own bus.
     ///
+    /// The chain is now **per stream**: each stream takes its own inserts and its own level, and the
+    /// sum of those is what the shared deck chain then processes. With one stream this is the
+    /// historical chain exactly (`flow_fx` then `flow_fader` on the channel's signal), which is why
+    /// a track without stems is bit-identically unaffected.
+    ///
     /// Returns a borrow of that bus so the mixer can sum it; the data is the channel's, so a
     /// consumer must read it before driving this channel again.
     pub fn process(&mut self, ctx: &crate::fx::FxContext) -> &mut Bus {
-        // Move the scratch bus out so the deck, the chains and the cue copy can all be borrowed
-        // mutably while the signal is in flight. No allocation: this is a swap of two `Vec`s.
+        // A source swap lands in `begin_block`, so this block's stream count is only known after it —
+        // and the per-stream chains have to match it before anything renders.
+        self.deck.begin_block();
+        let streams = self.deck.stream_count().max(1);
+        self.sync_streams(streams);
+
+        // Move the scratch out so the deck, the chains and the cue copy can all be borrowed
+        // mutably while the signal is in flight. No allocation: a swap of three `Vec`s.
         let mut bus = std::mem::take(&mut self.bus);
         bus.ensure_frames(ctx.block_frames);
         bus.clear();
+        let mut stream_buses = std::mem::take(&mut self.stream_buses);
 
-        self.deck.pull_into(&mut bus, ctx);
-        if self.flow_fx.any_active() {
-            self.flow_fx.process(&mut bus, ctx);
-        }
+        // The cue send is an *advancing* smoother: one step per block. Stepping it once per stream
+        // would shorten its time constant by the stream count, so it is taken here and passed in.
+        let cue_gain = self.cue_send.next_block(ctx.block_frames, ctx.sample_rate);
         if self.cue_tap == CueTap::PostFlowFx {
-            self.take_cue_into(&bus, ctx);
+            self.cue.clear();
         }
 
-        bus.scale(self.flow_fader.next_amp(ctx));
+        let frames = ctx.block_frames;
+        let live = streams.min(stream_buses.len());
+        for stream in stream_buses[..live].iter_mut() {
+            stream.ensure_frames(frames);
+        }
+        self.deck.render_streams(&mut stream_buses[..live]);
+
+        for (stream, sb) in stream_buses[..live].iter_mut().enumerate() {
+            if self.flow_fx[stream].any_active() {
+                self.flow_fx[stream].process(sb, ctx);
+            }
+            if self.cue_tap == CueTap::PostFlowFx {
+                self.cue.add_scaled(sb, cue_gain);
+            }
+            sb.scale(self.flow_fader[stream].next_amp(ctx));
+            bus.add_from(sb);
+        }
         if self.cue_tap == CueTap::PostFlowFader {
-            self.take_cue_into(&bus, ctx);
+            self.take_cue_into(&bus, cue_gain);
         }
 
         if self.deck_fx.any_active() {
             self.deck_fx.process(&mut bus, ctx);
         }
         if self.cue_tap == CueTap::PostDeckFx {
-            self.take_cue_into(&bus, ctx);
+            self.take_cue_into(&bus, cue_gain);
         }
 
         bus.scale(self.deck_fader.next_amp(ctx));
         if self.cue_tap == CueTap::PostDeckFader {
-            self.take_cue_into(&bus, ctx);
+            self.take_cue_into(&bus, cue_gain);
         }
 
         // The crossfader is per-side and deliberately last: it is a routing decision, not tone, and
@@ -268,74 +459,78 @@ impl Channel {
         let side_gain = self.side.gain_at(position, self.curve);
         bus.scale(side_gain);
 
+        self.stream_buses = stream_buses;
         self.bus = bus;
+        self.deck.end_block();
         &mut self.bus
     }
 
+    /// Grows the per-stream scratch, chains and faders to `streams`.
+    ///
+    /// Chains are *rebuilt* from the config's names rather than copied — an [`FxSlot`] owns a
+    /// `Box<dyn Fx>`, so an [`FxChain`] is not `Clone`. The names were resolved when the mixer was
+    /// built, so a failure here is impossible.
+    fn sync_streams(&mut self, streams: usize) {
+        while self.flow_fx.len() < streams {
+            let slots = super::config::build_slots(&self.flow_fx_names)
+                .expect("flow_fx names were validated at mixer construction");
+            self.flow_fx.push(FxChain::from_slots(slots));
+            self.flow_fader.push(Fader::new(0.0, FADER_TAU));
+            self.stream_buses.push(Bus::stereo(BLOCK_SIZE));
+        }
+        // Shrinking is not undone: the extra chains stay warm and unused if a reload drops back to
+        // one stream, and are ready again when stems come back.
+        self.refresh_stem_faders();
+    }
+
     /// Copies `source` into the channel's cue bus at the current send level.
-    fn take_cue_into(&mut self, source: &Bus, ctx: &crate::fx::FxContext) {
-        let gain = self.cue_send.next_block(ctx.block_frames, ctx.sample_rate);
+    fn take_cue_into(&mut self, source: &Bus, gain: f32) {
         self.cue.clear();
         if gain > 0.0 {
             self.cue.add_scaled(source, gain);
         }
     }
 
-    /// The slot at a deck-level index, where the flow chain is addressed first.
-    pub fn slot(&self, index: usize) -> Option<&FxSlot> {
-        let flow = self.flow_fx.len();
-        if index < flow {
-            self.flow_fx.slot(index)
-        } else {
-            self.deck_fx.slot(index - flow)
-        }
-    }
-
-    pub fn slot_mut(&mut self, index: usize) -> Option<&mut FxSlot> {
-        let flow = self.flow_fx.len();
-        if index < flow {
-            self.flow_fx.slot_mut(index)
-        } else {
-            self.deck_fx.slot_mut(index - flow)
-        }
-    }
-
-    /// Which of the two chains `index` belongs to, and its local position there.
-    pub fn locate_slot(&self, index: usize) -> Option<ChainSlot> {
-        let flow = self.flow_fx.len();
-        if index < flow {
-            Some(ChainSlot { chain: SlotChain::Flow, local: index })
-        } else {
-            let local = index - flow;
-            (local < self.deck_fx.len()).then_some(ChainSlot { chain: SlotChain::Deck, local })
-        }
-    }
-
-    /// Every slot in the deck's merged index space.
-    pub fn slot_statuses(&self) -> Vec<FxSlotStatus> {
-        let mut out = self.flow_fx.statuses();
-        out.extend(self.deck_fx.statuses_at(self.flow_fx.len()));
-        out
-    }
-
-    /// Appends an effect to one of the channel's chains, returning the **merged** index (the one
-    /// [`Channel::slot`] and the protocol's `FxSlotRef::index` speak).
-    pub fn add_slot(&mut self, chain: SlotChain, slot: FxSlot) -> usize {
+    /// One chain, by address.
+    pub fn chain(&self, chain: SlotChain) -> Option<&FxChain> {
         match chain {
-            SlotChain::Flow => self.flow_fx.push_slot(slot),
-            SlotChain::Deck => {
-                let flow = self.flow_fx.len();
-                flow + self.deck_fx.push_slot(slot)
-            }
+            SlotChain::Flow(stem) => self.flow_fx.get(stem.index()),
+            SlotChain::Deck => Some(&self.deck_fx),
         }
     }
 
-    /// Removes a slot by merged index, returning it so a caller can inspect what it dropped.
-    pub fn remove_slot(&mut self, index: usize) -> Option<FxSlot> {
-        self.locate_slot(index).and_then(|at| match at.chain {
-            SlotChain::Flow => self.flow_fx.remove(at.local),
-            SlotChain::Deck => self.deck_fx.remove(at.local),
-        })
+    pub fn chain_mut(&mut self, chain: SlotChain) -> Option<&mut FxChain> {
+        match chain {
+            SlotChain::Flow(stem) => self.flow_fx.get_mut(stem.index()),
+            SlotChain::Deck => Some(&mut self.deck_fx),
+        }
+    }
+
+    /// The slot at `index` within one chain.
+    pub fn slot(&self, chain: SlotChain, index: usize) -> Option<&FxSlot> {
+        self.chain(chain)?.slot(index)
+    }
+
+    pub fn slot_mut(&mut self, chain: SlotChain, index: usize) -> Option<&mut FxSlot> {
+        self.chain_mut(chain)?.slot_mut(index)
+    }
+
+    /// Every slot in one chain.
+    pub fn slot_statuses(&self, chain: SlotChain) -> Option<Vec<FxSlotStatus>> {
+        Some(self.chain(chain)?.statuses())
+    }
+
+    /// Appends an effect to one chain, returning its index within *that* chain's own index space.
+    ///
+    /// There is no merged index space any more: with one chain per stream, "the deck's slot 2"
+    /// would be ambiguous, so a caller always names the chain.
+    pub fn add_slot(&mut self, chain: SlotChain, slot: FxSlot) -> Option<usize> {
+        Some(self.chain_mut(chain)?.push_slot(slot))
+    }
+
+    /// Removes a slot by index from one chain, returning it so a caller can inspect what it dropped.
+    pub fn remove_slot(&mut self, chain: SlotChain, index: usize) -> Option<FxSlot> {
+        self.chain_mut(chain)?.remove(index)
     }
 
     /// The last rendered block, post-crossfader: exactly what this channel sends to the master.
@@ -349,17 +544,13 @@ impl Channel {
     }
 }
 
-/// A slot address inside one channel, split by chain.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChainSlot {
-    pub chain: SlotChain,
-    pub local: usize,
-}
-
-/// Which of a channel's two chains a command means.
+/// A slot address inside one channel: which chain, and (implicitly, by the caller) where in it.
+/// The chain is named outright — with one chain per stream there is no single index space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotChain {
-    Flow,
+    /// One stream's insert chain.
+    Flow(Stem),
+    /// The channel's shared deck chain.
     Deck,
 }
 
@@ -384,7 +575,7 @@ mod tests {
     use crate::fx::sample::{Eq, Filter, Gain, Limiter};
     use crate::fx::{Fx, FxContext};
     use crate::{BeatGrid, CHANNELS, SAMPLE_RATE};
-    use hypermixx_core::Source;
+    use hypermixx_core::{Source, Stem, StemOp, StemPreset};
     use hypermixx_media::{DecodedAudio, PcmPool};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -644,8 +835,10 @@ mod tests {
         assert!(channel.peak() > 0.5);
     }
 
+    /// A chain is named outright. There is no merged index space any more: with one chain per
+    /// stream, "the channel's slot 2" could mean four different effects.
     #[test]
-    fn two_chains_are_addressed_through_one_index_space() {
+    fn each_chain_has_its_own_index_space() {
         let mut channel = channel_with(
             unity(),
             FxChain::from_parts([("filter", Box::new(Filter::new()) as Box<dyn Fx>)]),
@@ -654,35 +847,224 @@ mod tests {
                 ("limiter", Box::new(Limiter::new()) as Box<dyn Fx>),
             ]),
         );
-        assert_eq!(channel.slot_statuses().len(), 3);
-        assert_eq!(channel.slot(0).map(FxSlot::kind), Some("filter"));
-        assert_eq!(channel.slot(1).map(FxSlot::kind), Some("gain"));
-        assert_eq!(channel.slot(2).map(FxSlot::kind), Some("limiter"));
-        assert!(channel.slot(3).is_none());
-        assert_eq!(
-            channel.locate_slot(2),
-            Some(ChainSlot { chain: SlotChain::Deck, local: 1 })
-        );
-        assert_eq!(channel.locate_slot(3), None);
-        // Removal from the middle of the *flow* chain must renumber the deck slots.
-        let dropped = channel.remove_slot(0).map(|slot| slot.kind().to_owned());
+        let stream = SlotChain::Flow(Stem::Drums);
+        assert_eq!(channel.slot_statuses(stream).unwrap().len(), 1);
+        assert_eq!(channel.slot_statuses(SlotChain::Deck).unwrap().len(), 2);
+        assert_eq!(channel.slot(stream, 0).map(FxSlot::kind), Some("filter"));
+        assert_eq!(channel.slot(SlotChain::Deck, 0).map(FxSlot::kind), Some("gain"));
+        assert_eq!(channel.slot(SlotChain::Deck, 1).map(FxSlot::kind), Some("limiter"));
+        assert!(channel.slot(SlotChain::Deck, 2).is_none());
+        // Removing from the flow chain cannot renumber the deck chain.
+        let dropped = channel
+            .remove_slot(stream, 0)
+            .map(|slot| slot.kind().to_owned());
         assert_eq!(dropped.as_deref(), Some("filter"));
-        assert_eq!(channel.slot(0).map(FxSlot::kind), Some("gain"));
-        assert_eq!(channel.slot_statuses()[0].index, 0);
+        assert_eq!(channel.slot_statuses(stream).unwrap().len(), 0);
+        assert_eq!(channel.slot(SlotChain::Deck, 0).map(FxSlot::kind), Some("gain"));
+        // Every stem chain exists from construction (empty), so an `fx` command can address a stem
+        // before the deck has ever been separated.
+        assert_eq!(
+            channel.slot_statuses(SlotChain::Flow(Stem::Vocals)).unwrap().len(),
+            0
+        );
     }
 
     #[test]
-    fn adding_a_slot_returns_its_merged_index() {
+    fn adding_a_slot_returns_its_index_within_that_chain() {
         let mut channel = channel_with(unity(), FxChain::new(), FxChain::new());
+        let stream = SlotChain::Flow(Stem::Bass);
         assert_eq!(
-            channel.add_slot(SlotChain::Flow, FxSlot::new(Box::new(Gain::new(1.0)), "gain")),
+            channel
+                .add_slot(stream, FxSlot::new(Box::new(Gain::new(1.0)), "gain"))
+                .unwrap(),
             0
         );
+        // The deck chain counts from its own zero, not from the flow chain's length.
         assert_eq!(
-            channel.add_slot(SlotChain::Deck, FxSlot::new(Box::new(Gain::new(1.0)), "gain")),
-            1
+            channel
+                .add_slot(SlotChain::Deck, FxSlot::new(Box::new(Gain::new(1.0)), "gain"))
+                .unwrap(),
+            0
         );
-        assert_eq!(channel.slot_statuses().len(), 2);
+        assert_eq!(channel.slot_statuses(stream).unwrap().len(), 1);
+        assert_eq!(channel.slot_statuses(SlotChain::Deck).unwrap().len(), 1);
+    }
+
+    /// A constant DC source: the channel's output is then a plain sum of per-stream numbers, so a
+    /// wrong gain, a crossed stream or a mute that is not silence shows up as an exact mismatch.
+    fn dc_source(value: f32, frames: u64) -> Arc<dyn Source> {
+        Arc::new(PcmPool::from_decoded(DecodedAudio {
+            pcm: (0..frames as usize).flat_map(|_| [value, -value]).collect(),
+            total_frames: frames,
+            sample_rate: SAMPLE_RATE,
+            channels: CHANNELS,
+        }))
+    }
+
+    /// A channel with nothing in the way of a plain sum: `Center` (no crossfader pan law), unity
+    /// flow/deck faders, no cue send.
+    fn stem_channel() -> Channel {
+        Channel::new(
+            deck_at_zero(),
+            &ChannelConfig {
+                side: DeckSide::Center,
+                flow_fader: 0.0,
+                deck_fader: 0.0,
+                cue_send: 0.0,
+                ..Default::default()
+            },
+            FxChain::new(),
+            FxChain::new(),
+        )
+    }
+
+    const TAGS: [f32; 4] = [1.0, 1000.0, 2000.0, 3000.0];
+
+    /// Installs four tagged stems and settles until the swap has landed (it is warmed on another
+    /// thread), so the audio really has four streams.
+    fn install_stems(channel: &mut Channel) {
+        let sources = TAGS.map(|tag| dc_source(tag, 200_000) as Arc<dyn Source>);
+        channel.set_stems(hypermixx_core::StemSet::new(sources));
+        channel.deck_mut().play();
+        assert!(!channel.has_stems(), "the swap must not land before it is warmed");
+        for _ in 0..500 {
+            channel.process(&ctx());
+            if channel.has_stems() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("stems never installed");
+    }
+
+    /// Settles the fader smoothers, then reads the channel's left plane at frame 0.
+    fn settled_left(channel: &mut Channel) -> f32 {
+        for _ in 0..40 {
+            channel.process(&ctx());
+        }
+        channel.process(&ctx()).l[0]
+    }
+
+    #[test]
+    fn a_stem_deck_sums_its_four_streams_and_reports_them_ready() {
+        let mut channel = stem_channel();
+        install_stems(&mut channel);
+        let status = channel.stem_status();
+        assert!(status.ready, "four streams are rendering, so the stems are ready");
+        assert_eq!(status.level, [0.0; 4]);
+        assert!(!status.any_solo() && status.mute == [false; 4]);
+        assert!((settled_left(&mut channel) - TAGS.iter().sum::<f32>()).abs() < 1e-2);
+    }
+
+    #[test]
+    fn a_muted_stem_is_exactly_silent_and_an_unmute_restores_its_level() {
+        let mut channel = stem_channel();
+        install_stems(&mut channel);
+        channel
+            .apply_stem(StemOp::Level { stem: Stem::Bass, position: -0.5 })
+            .unwrap();
+        // Bass at -0.5 is a quarter of its amplitude (the squared lower half of the fader law).
+        let bass = TAGS[1] * 0.25;
+        let expected = TAGS[0] + bass + TAGS[2] + TAGS[3];
+        assert!((settled_left(&mut channel) - expected).abs() < 1e-2);
+
+        channel
+            .apply_stem(StemOp::Mute { stem: Stem::Vocals, on: true })
+            .unwrap();
+        let muted = settled_left(&mut channel);
+        assert!(
+            (muted - (expected - TAGS[3])).abs() < 1e-2,
+            "a muted stem must contribute nothing, got {muted}"
+        );
+
+        // Unmuting restores the *level* the DJ had set, it does not reset to unity — that is why
+        // mute is kept as its own fact rather than baked into the level.
+        channel
+            .apply_stem(StemOp::Mute { stem: Stem::Vocals, on: false })
+            .unwrap();
+        assert!((settled_left(&mut channel) - expected).abs() < 1e-2);
+    }
+
+    #[test]
+    fn solo_isolates_stems_and_wins_over_mute() {
+        let mut channel = stem_channel();
+        install_stems(&mut channel);
+        channel
+            .apply_stem(StemOp::Mute { stem: Stem::Drums, on: true })
+            .unwrap();
+        channel
+            .apply_stem(StemOp::Solo { stem: Stem::Drums, on: true })
+            .unwrap();
+        // Solo overrides everybody's mute, including its own target's.
+        assert!((settled_left(&mut channel) - TAGS[0]).abs() < 1e-2);
+
+        // The solo set is a *set* — a second solo adds to it rather than replacing, which is what
+        // makes "solo the drums and the vocals together" expressible with one button per stem.
+        channel
+            .apply_stem(StemOp::Solo { stem: Stem::Vocals, on: true })
+            .unwrap();
+        assert!((settled_left(&mut channel) - (TAGS[0] + TAGS[3])).abs() < 1e-2);
+
+        // Leaving the set re-masks everything else.
+        channel
+            .apply_stem(StemOp::Solo { stem: Stem::Drums, on: false })
+            .unwrap();
+        assert!((settled_left(&mut channel) - TAGS[3]).abs() < 1e-2);
+
+        channel.apply_stem(StemOp::Clear).unwrap();
+        assert!((settled_left(&mut channel) - TAGS.iter().sum::<f32>()).abs() < 1e-2);
+    }
+
+    #[test]
+    fn a_preset_is_a_mute_arrangement_that_keeps_the_djs_levels() {
+        let mut channel = stem_channel();
+        install_stems(&mut channel);
+        channel
+            .apply_stem(StemOp::Level { stem: Stem::Vocals, position: -0.5 })
+            .unwrap();
+        channel
+            .apply_stem(StemOp::Preset(StemPreset::Instrumental))
+            .unwrap();
+        let instrumental = TAGS[0] + TAGS[1] + TAGS[2];
+        assert!((settled_left(&mut channel) - instrumental).abs() < 1e-2);
+
+        channel
+            .apply_stem(StemOp::Preset(StemPreset::Acapella))
+            .unwrap();
+        // Acapella brings the vocals back at the level they were left at, not at unity.
+        assert!((settled_left(&mut channel) - TAGS[3] * 0.25).abs() < 1e-2);
+    }
+
+    /// The point of a chain per stream: an insert on one stem must not touch the others.
+    #[test]
+    fn a_stem_chain_only_processes_its_own_stream() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut channel = stem_channel();
+        install_stems(&mut channel);
+        let vocals = SlotChain::Flow(Stem::Vocals);
+        channel
+            .add_slot(
+                vocals,
+                FxSlot::new(Box::new(Counter(hits.clone())), "counter"),
+            )
+            .unwrap();
+        channel.process(&ctx());
+        assert_eq!(hits.load(Ordering::Relaxed), 1, "the stem's chain ran once");
+
+        // Bypassing it stops the work; the other streams never had it.
+        channel
+            .chain_mut(vocals)
+            .unwrap()
+            .slot_mut(0)
+            .unwrap()
+            .set_enabled(false);
+        channel.process(&ctx());
+        assert_eq!(hits.load(Ordering::Relaxed), 1, "a bypassed chain is not entered");
+
+        // A fresh insert lands on the *other* stream's chain and leaves this one alone.
+        let drums = SlotChain::Flow(Stem::Drums);
+        assert_eq!(channel.slot_statuses(drums).unwrap().len(), 0);
+        assert_eq!(channel.slot_statuses(vocals).unwrap().len(), 1);
     }
 
     #[test]
@@ -731,7 +1113,11 @@ mod tests {
         channel.deck_fx().slot(0).unwrap().set_param("low", 0.5).unwrap();
         channel.replace_deck(Deck::new(ramp_source(1_000)));
         assert_eq!(channel.levels().0, -0.25, "a load must not reset the fader");
-        assert_eq!(channel.slot_statuses()[0].params[0].1, 0.5, "...or the EQ");
+        assert_eq!(
+            channel.slot_statuses(SlotChain::Deck).unwrap()[0].params[0].1,
+            0.5,
+            "...or the EQ"
+        );
         assert_eq!(channel.deck().total_frames(), 1_000);
     }
 

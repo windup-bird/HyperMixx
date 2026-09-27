@@ -13,7 +13,7 @@ type = "note"
 channel = 0
 id = 49
 deck = 0
-action = "pause"
+action = "cue"
 
 [[bind]]
 type = "note"
@@ -65,7 +65,7 @@ mode = "rel1"
 channel = 0
 id = 41
 deck = 0
-action = "rate"
+action = "tempofader"
 
 [[bind]]
 type = "note"
@@ -157,7 +157,7 @@ mode = "rel1"
 channel = 1
 id = 41
 deck = 1
-action = "rate"
+action = "tempofader"
 
 [[bind]]
 type = "cc"
@@ -251,3 +251,17 @@ channel = 0
 id = 2
 deck = 0
 action = "sync.phase"
+
+[[bind]]
+type = "note"
+channel = 0
+id = 1
+deck = 0
+action = "cue.smart"
+
+[[bind]]
+type = "note"
+channel = 1
+id = 1
+deck = 1
+action = "cue.smart"

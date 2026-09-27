@@ -1,12 +1,14 @@
-//! 引擎忠实度回归:Deck(含 Flow + timestretch 引擎)在 ratio=1.0 时必须透传,
+//! 引擎忠实度回归:Deck(含 Flow + timestretch 引擎)在 Tape@ratio=1.0 时必须透传,
 //! 输出频率 = 输入频率。任何慢放/快放/伸缩都会直接体现为频率偏移。
+//!
+//! 生产默认是 keylock on,所以这里显式切到 Tape —— 测的是零延迟直通路径本身。
 //!
 //! 无需声卡:直接驱动 `Deck::process_block` 采集输出。
 
 use std::sync::Arc;
 
 use hypermixx_audio::{Deck, DECK_MIX_GAIN};
-use hypermixx_core::{Source, CHANNELS, SAMPLE_RATE};
+use hypermixx_core::{KeylockMode, Source, CHANNELS, SAMPLE_RATE};
 use hypermixx_media::{DecodedAudio, PcmPool};
 
 const TONE_HZ: f64 = 480.0;
@@ -42,6 +44,7 @@ fn measured_hz(samples: &[f32], skip_blocks: usize, block_frames: usize) -> f64 
 #[test]
 fn deck_is_faithful_at_ratio_one() {
     let mut deck = Deck::new(tone_pool());
+    deck.set_keylock_mode(KeylockMode::Off);
     deck.play();
 
     let block_frames = 256;

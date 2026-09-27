@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use hypermixx_audio::fx::FxKind;
+use hypermixx_core::Stem;
 
 /// One completion row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,20 +40,52 @@ pub struct Ctx<'a> {
 const VERBS: &[(&str, &str)] = &[
     ("load", "decode a file"),
     ("analyse", "run the analyser"),
-    ("play", "start deck"),
-    ("pause", "stop deck"),
+    ("play", "toggle play/pause"),
+    ("cue", "play from / return to / set the cue point"),
     ("jump", "seek to frame"),
     ("beatjump", "seek by beats"),
-    ("rate", "set tempo rate"),
-    ("profile", "time-stretch profile"),
+    ("tempo", "set the tempo"),
+    ("tempofader", "pitch fader position"),
+    ("temporange", "fader range (0.1 = ±10%)"),
+    ("keylock", "keylock profile"),
+    ("key", "pitch shift (placeholder)"),
     ("loop", "loop family"),
     ("sync", "beat-sync against the other deck"),
     ("nudge", "temporary rate bend"),
     ("fx", "effect chain commands"),
+    ("stem", "stem separation and per-stem control"),
     ("state", "show decks"),
     ("zoom", "waveform zoom"),
     ("help", "list commands"),
     ("quit", "exit"),
+];
+
+/// The `stem` family, plus the four stem names a deck target can be narrowed to.
+const STEM_SUBS: &[(&str, &str)] = &[
+    ("separate", "separate the track into 4 stems"),
+    ("status", "per-stem level / mute / solo"),
+    ("full", "all four at unity"),
+    ("acapella", "vocals only"),
+    ("instrumental", "everything but vocals"),
+    ("drums", "drums only"),
+    ("bass", "bass only"),
+    ("clear", "all four audible, nothing soloed"),
+    ("cache", "where stems are cached"),
+];
+
+const STEMS: &[(&str, &str)] = &[
+    ("drums", "percussion"),
+    ("bass", "low end"),
+    ("other", "everything else"),
+    ("vocals", "the voice"),
+];
+
+const STEM_VERBS: &[(&str, &str)] = &[
+    ("level", "this stem's level"),
+    ("mute", "silence this stem"),
+    ("solo", "add to the solo set"),
+    ("unsolo", "leave the solo set"),
+    ("fx", "inserts on this stem's chain"),
 ];
 
 const FX_SUBS: &[(&str, &str)] = &[
@@ -96,8 +129,9 @@ pub fn complete(command: &[char], cursor: usize, ctx: &Ctx) -> Option<Completion
 }
 
 fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
-    // Peel off a leading target word, if any.
-    let (chain, rest) = match prior.first() {
+    // Peel off a leading target word, if any, then a stem name if one follows: `deck0 vocals fx …`
+    // addresses `deck0/vocals`, and the slot book is keyed by exactly that label.
+    let (mut chain, mut rest) = match prior.first() {
         Some(token) => match parse_target(token, ctx.decks) {
             Some(Target::Deck(deck_id)) => (format!("deck{deck_id}"), &prior[1..]),
             Some(Target::Master) => ("master".to_owned(), &prior[1..]),
@@ -105,6 +139,14 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
         },
         None => (ctx.chain.clone(), prior),
     };
+    let mut stem: Option<&str> = None;
+    if let Some(name) = rest.first().map(String::as_str) {
+        if Stem::parse(name).is_some() {
+            stem = Some(name);
+            chain = format!("{chain}/{name}");
+            rest = &rest[1..];
+        }
+    }
     let master = chain == "master";
 
     // Still completing the verb (or the target word itself).
@@ -113,11 +155,40 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
             return pairs(&[("fx", "effect chain commands")], partial);
         }
         let mut items = pairs(VERBS, partial);
+        // A stem name narrows the target: `deck0 vocals mute`. Offered alongside the verbs, because
+        // that is the position it occupies on the line.
+        items.extend(pairs(STEMS, partial));
         items.extend(targets(ctx.decks, partial));
         return items;
     }
 
+    // A stem target takes its own verbs before falling through to the deck's.
+    if stem.is_some() {
+        return match rest.first().map(String::as_str) {
+            None => pairs(STEM_VERBS, partial),
+            Some("level") if rest.len() == 1 => pairs(
+                &[
+                    ("0.0", "unity"),
+                    ("-1.0", "exact silence"),
+                    ("-0.5", "-12 dB"),
+                ],
+                partial,
+            ),
+            // `deck0 vocals fx …` completes against this stem's own chain, which the slot book
+            // keys by `deck0/vocals`.
+            Some("fx") => fx_candidates(&rest[1..], partial, &chain, ctx),
+            Some(_) => Vec::new(),
+        };
+    }
+
     match rest[0].as_str() {
+        "stem" => {
+            if rest.len() == 1 {
+                pairs(STEM_SUBS, partial)
+            } else {
+                Vec::new()
+            }
+        }
         "load" => {
             if rest.len() == 1 {
                 path_candidates(partial)
@@ -125,13 +196,28 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
                 Vec::new()
             }
         }
-        "profile" => {
+        "cue" => {
             if rest.len() == 1 {
-                pairs(&[("tape", ""), ("keylock", ""), ("wide", "")], partial)
+                pairs(
+                    &[
+                        ("play", "play from the cue point"),
+                        ("back", "return to cue and pause"),
+                        ("set", "set the cue point here"),
+                    ],
+                    partial,
+                )
             } else {
                 Vec::new()
             }
         }
+        "keylock" => {
+            if rest.len() == 1 {
+                pairs(&[("on", ""), ("off", ""), ("wide", "")], partial)
+            } else {
+                Vec::new()
+            }
+        }
+        "key" => Vec::new(),
         "loop" => {
             if rest.len() == 1 {
                 pairs(
@@ -434,11 +520,11 @@ mod tests {
     }
 
     #[test]
-    fn profile_names_need_no_deck() {
+    fn keylock_names_need_no_deck() {
         let fixture = Fixture::new();
         assert_eq!(
-            fixture.complete("profile ", 8),
-            vec!["tape", "keylock", "wide"]
+            fixture.complete("keylock ", 8),
+            vec!["on", "off", "wide"]
         );
     }
 

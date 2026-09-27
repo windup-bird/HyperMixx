@@ -12,7 +12,9 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::response::{sync_badge, time, Level, LogLine};
+use hypermixx_core::Stem;
+
+use crate::response::{bpm_label, sync_badge, time, Level, LogLine};
 use crate::tui::app::{App, Overlay, COMPLETION_ROWS};
 use crate::tui::picker;
 use crate::tui::waveform_view;
@@ -137,11 +139,7 @@ fn render_deck(frame: &mut Frame, area: Rect, app: &mut App, index: usize) {
 fn deck_header(app: &App, index: usize) -> Line<'static> {
     let state = &app.states[index];
     let title = app.titles[index].as_deref().unwrap_or("<no track>");
-    let bpm = if state.bpm > 0.0 {
-        format!("{:.1} BPM", state.bpm)
-    } else {
-        "-- BPM".to_owned()
-    };
+    let bpm = bpm_label(state);
     let key = state.key.clone().unwrap_or_else(|| "--".to_owned());
     let mut spans = vec![
         Span::styled(
@@ -149,8 +147,10 @@ fn deck_header(app: &App, index: usize) -> Line<'static> {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            "   {bpm}  {key}   tempo {:.3}  {}",
-            app.rates[index], app.profiles[index]
+            "   {bpm}  {key}   tempo {:.3} (±{:.0}%)  keylock {}",
+            state.tempo,
+            state.tempo_range * 100.0,
+            state.keylock.label()
         )),
     ];
     if let Some(badge) = sync_badge(&app.states[index]) {
@@ -190,11 +190,41 @@ fn deck_info(app: &App, index: usize) -> Line<'static> {
             format!("   beat {beat:.1}")
         })
         .unwrap_or_default();
-    Line::raw(format!(
+    let mut spans = vec![Span::raw(format!(
         " {glyph} {} / {total}   remain {remaining}{phase}   [{}]",
         time(state.current_frame),
         state.current_frame,
-    ))
+    ))];
+
+    // The per-stem row, on the line that already carries the live transport state: colour says at a
+    // glance which stems are contributing (green), silenced (dim) or soloed (yellow), and the number
+    // is the level the same way `stems_badge` prints it in the REPL.
+    if state.stems.ready {
+        spans.push(Span::raw("   "));
+        for stem in Stem::ALL {
+            let (marker, style) = if state.stems.is_soloed(stem) {
+                (
+                    'S',
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else if state.stems.mute[stem.index()] {
+                ('M', Style::default().fg(Color::DarkGray))
+            } else {
+                (' ', Style::default().fg(Color::Green))
+            };
+            spans.push(Span::styled(
+                format!(
+                    "{}{:+.1}{marker} ",
+                    stem.name().chars().next().unwrap().to_ascii_uppercase(),
+                    state.stems.level[stem.index()]
+                ),
+                style,
+            ));
+        }
+    }
+    Line::from(spans)
 }
 
 fn render_log(frame: &mut Frame, area: Rect, app: &App) {

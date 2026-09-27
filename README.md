@@ -4,11 +4,12 @@
 
 ## 架构
 
-五层单向依赖，下层不感知上层：
+分层单向依赖，下层不感知上层：
 
 ```
 cli ─┬─► audio ───┐
      ├─► library ─┼─► media ──► core
+     ├─► stems ───┤
      ├─► midi ────┤
      └─► core ────┘
 ```
@@ -19,10 +20,12 @@ cli ─┬─► audio ───┐
 | `hypermixx-media` | 解码与内存池：`decode_file`（symphonia → 44.1k 立体声）、`PcmPool` | core |
 | `hypermixx-audio` | 实时引擎：producer 线程 + cpal 输出、mixer/通道/FX 链、时间拉伸 | core, media |
 | `hypermixx-library` | 离线分析：beat 网格编译、stratum-dsp 适配、波形峰值 | core, media |
+| `hypermixx-stems` | 离线 stem 分离：HTDemucs 模型获取/校验、内容寻址缓存、ONNX 后端（feature `onnx`，可关） | core, media, ort |
 | `hypermixx-midi` | MIDI 输入：字节解析、TOML 映射表、`Event → Command` 翻译（纯逻辑，可无硬件单测） | core, midir |
 | `hypermixx-cli` | 前端：行 REPL、`--tui` 终端界面、命令解析与补全 | 全部 |
 
-外部依赖：`stratum-dsp`、`timestretch`、`midir`。
+外部依赖：`stratum-dsp`、`timestretch`、`midir`、`charon-audio`/`ort`（仅 `hypermixx-stems` 的
+`onnx` feature，默认开）。
 
 
 ## 安装
@@ -48,12 +51,27 @@ cargo run -p hypermixx-cli - --tui
 hypermixx> load test.mp3 122
 deck0 loaded: 18462369 frames (7:00.648)
 
-hypermixx> play
+hypermixx> play                        # 切换播放/暂停（toggle）
+hypermixx> cue                         # smart：播放中回 cue 并暂停；暂停时把当前帧记为 cue 点
+hypermixx> cue set                     # 显式记 cue 点
+hypermixx> tempo 1.04                  # 设 tempo（1.0 = 原速）
+hypermixx> tempofader 0.5              # 推子位置（tempo = 1 + pos × temporange）
+hypermixx> temporange 0.16             # 推子满量程 ±16%（缺省 0.1）
+hypermixx> keylock wide                # 变调引擎：on（默认）| off | wide
+hypermixx> key 1                       # 变调半音（占位：只记录，暂不发声）
 hypermixx> beatjump 16
 hypermixx> fx list                    # 列出fx
 hypermixx> fx set eq low -0.5         # -1~1
 hypermixx> fx set filter value  0.5
 hypermixx> master fx list
+
+# stems：离线分离 4 条轨，然后逐条控制（分离在后台跑，期间照常 play/loop/jump/sync）
+hypermixx> deck0 stem separate         # 首次 ~80s（3:39 曲目）+ ~1.9GB 内存；之后命中缓存 0s
+hypermixx> deck0 stem acapella         # 只要人声（instrumental | drums | bass | full）
+hypermixx> deck0 vocals level -0.5     # 单条 stem 电平（-1 = 精确静音）
+hypermixx> deck0 vocals mute           # solo 仍然优先
+hypermixx> deck0 vocals fx add filter  # 只给人声加滤波（deck0 fx … 则是整 deck 共用）
+hypermixx> deck0 stem status           # 逐 stem 电平/静音/独奏
 
 # 拍同步：deck1 对 deck0
 hypermixx> deck1 sync phase pid        # 先对 BPM，再用 PI 追相位（pll 收敛后归零）
@@ -105,7 +123,8 @@ cargo build --release --workspace   # 两个脚本默认吃 target/release 的�
 1. loop sync
 2. midi control
 3. network streamming
-4. realtime stems
+4. realtime stems（离线分离 + 逐 stem 播放已完成：`docs/stem-plan.md`、`docs/commands.md` §3.7；
+   未做的是短窗在线分离、per-stem 波形、MIDI stem 映射）
 5. slip loop(循环退出落 virtual/slip 位置;当前退出=落旧流停止处无缝续播、自然越过 out)
 6. 收敛超时检测(目前只有 PLL 输出 ±5% 限幅兑底,误差关不上时会一直以 5% 跑,不会自动清 align)
 7. TUI 按键式 nudge(需放行 `KeyEventKind::Release`,目前只支持定时/命令式)

@@ -114,6 +114,10 @@ pub struct RawBinding {
     pub curve: Option<Curve>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<f32>,
+    /// Nudge duration in seconds; when present the bend releases itself and the note-up edge is
+    /// ignored (otherwise the binding is momentary — held for as long as the button is down).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub beats: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,13 +181,21 @@ impl BindingSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Play,
-    Pause,
+    /// Momentary cue button: press plays from the cue point, release returns to it and pauses.
+    Cue,
+    /// One-shot cue: the deck decides between "back to cue" and "set cue here".
+    CueSmart,
     BeatJump { beats: i64 },
     Fader(FaderTarget),
-    /// Tempo fader: `range` is the fraction of the rate at full deflection (0.08 = ±8%).
-    Rate { range: f32 },
-    /// Momentary bend, held while the control is down.
-    Nudge { delta: f32 },
+    /// Tempo fader: a bipolar position in `-1..=1`. The deck maps it to a rate under its own
+    /// `temporange`, so the range is a deck setting, not a per-binding constant.
+    TempoFader,
+    /// Rate bend. `seconds` set = timed (release edge ignored); `None` = momentary, held while
+    /// the control is down.
+    Nudge {
+        delta: f32,
+        seconds: Option<f64>,
+    },
     Loop(LoopAction),
     Sync(SyncAction),
     Fx(FxAction),
@@ -194,7 +206,7 @@ impl Action {
     pub fn is_continuous(&self) -> bool {
         matches!(
             self,
-            Action::Fader(_) | Action::Rate { .. } | Action::Fx(FxAction::Param { .. })
+            Action::Fader(_) | Action::TempoFader | Action::Fx(FxAction::Param { .. })
         )
     }
 
@@ -202,7 +214,7 @@ impl Action {
     pub fn is_momentary(&self) -> bool {
         matches!(
             self,
-            Action::Nudge { .. } | Action::Fx(FxAction::Pad { .. })
+            Action::Cue | Action::Fx(FxAction::Pad { .. }) | Action::Nudge { seconds: None, .. }
         )
     }
 
@@ -276,7 +288,8 @@ pub struct ActionSpec {
 /// Every action the mapping layer knows, in the order a guide should list them.
 pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec { name: "play", deck: true, momentary: false },
-    ActionSpec { name: "pause", deck: true, momentary: false },
+    ActionSpec { name: "cue", deck: true, momentary: true },
+    ActionSpec { name: "cue.smart", deck: true, momentary: false },
     ActionSpec { name: "beatjump+", deck: true, momentary: false },
     ActionSpec { name: "beatjump-", deck: true, momentary: false },
     ActionSpec { name: "fader.flow", deck: true, momentary: false },
@@ -285,7 +298,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec { name: "fader.cross", deck: false, momentary: false },
     ActionSpec { name: "fader.master", deck: false, momentary: false },
     ActionSpec { name: "fader.cue", deck: false, momentary: false },
-    ActionSpec { name: "rate", deck: true, momentary: false },
+    ActionSpec { name: "tempofader", deck: true, momentary: false },
     ActionSpec { name: "nudge", deck: true, momentary: true },
     ActionSpec { name: "loop.in", deck: true, momentary: false },
     ActionSpec { name: "loop.out", deck: true, momentary: false },
@@ -437,9 +450,13 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
             deck("play")?;
             Ok(Action::Play)
         }
-        "pause" => {
-            deck("pause")?;
-            Ok(Action::Pause)
+        "cue" => {
+            deck("cue")?;
+            Ok(Action::Cue)
+        }
+        "cue.smart" => {
+            deck("cue.smart")?;
+            Ok(Action::CueSmart)
         }
         "beatjump+" | "beatjump-" => {
             deck(name)?;
@@ -458,13 +475,9 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
         "fader.cross" => Ok(Action::Fader(FaderTarget::Crossfader)),
         "fader.master" => Ok(Action::Fader(FaderTarget::Master)),
         "fader.cue" => Ok(Action::Fader(FaderTarget::Cue)),
-        "rate" => {
+        "tempofader" => {
             deck(name)?;
-            let range = raw.step.unwrap_or(0.08);
-            if !range.is_finite() || range <= 0.0 {
-                return Err("`step` (rate range) must be positive".to_owned());
-            }
-            Ok(Action::Rate { range })
+            Ok(Action::TempoFader)
         }
         "nudge" => {
             deck(name)?;
@@ -472,7 +485,10 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
             if !delta.is_finite() || delta == 0.0 {
                 return Err("`step` (nudge delta) must be non-zero".to_owned());
             }
-            Ok(Action::Nudge { delta })
+            Ok(Action::Nudge {
+                delta,
+                seconds: raw.seconds,
+            })
         }
         "loop.in" => {
             deck(name)?;
@@ -647,7 +663,7 @@ param = "value"
             map.binds[0].action,
             Action::Fader(FaderTarget::Flow(0))
         );
-        assert_eq!(map.binds[1].action, Action::Nudge { delta: 0.05 });
+        assert_eq!(map.binds[1].action, Action::Nudge { delta: 0.05, seconds: None });
         assert_eq!(map.binds[1].kind, EventKind::Note);
         assert_eq!(map.binds[2].action, Action::Loop(LoopAction::Beats(8)));
         assert_eq!(

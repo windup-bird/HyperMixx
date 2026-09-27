@@ -7,22 +7,31 @@
 use crate::analysis::TrackAnalysis;
 use crate::deck::{DeckId, DeckState};
 use crate::source::Shared;
+use crate::stem::{Stem, StemOp, StemSet};
 
 /// Which FX chain a command addresses. `Deck` is the per-deck insert chain the mixer owns; a deck
 /// itself knows nothing about FX, which keeps the transport logic free of audio effects.
+///
+/// `Stem` addresses **one stream's** insert chain. With stems installed a deck has one flow chain
+/// per stream (its `flow_fx`), so the old "merged index space" (flow slots then deck slots) has no
+/// single meaning any more: a chain is named outright. On a track without stems the two are the
+/// same thing, because there is only one stream and its chain is the one the config describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FxChainId {
     /// The chain belonging to one deck (a mono-style insert on that deck's signal).
     Deck(DeckId),
+    /// One stem's insert chain — a per-stream insert inside that deck.
+    Stem { deck: DeckId, stem: Stem },
     /// The summed output chain, before the master limiter.
     Master,
 }
 
 impl FxChainId {
-    /// A stable label for logs and errors.
+    /// A stable label for logs, errors and the front-end's slot book.
     pub fn label(&self) -> String {
         match self {
             FxChainId::Deck(deck_id) => format!("deck{deck_id}"),
+            FxChainId::Stem { deck, stem } => format!("deck{deck}/{stem}"),
             FxChainId::Master => "master".into(),
         }
     }
@@ -208,6 +217,53 @@ pub enum NudgeOp {
     Stop,
 }
 
+/// One `cue` command. The cue point defaults to frame 0 (the loaded origin) and `Set` can move
+/// it; `Smart` folds the two-button DJ gesture into one command that the *engine* resolves, so a
+/// front-end never has to guess the deck's transport from a possibly-stale state snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CueOp {
+    /// Jump to the cue point, then play (the press edge of a held cue button).
+    Play,
+    /// Jump to the cue point and pause (the release edge of a held cue button).
+    Back,
+    /// Move the cue point to the current frame.
+    Set,
+    /// `Back` while playing, `Set` while paused — resolved by the deck itself.
+    Smart,
+}
+
+/// The keylock profile a deck runs: whether the time-stretch corrects pitch while the tempo moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeylockMode {
+    /// Pure varispeed: pitch follows tempo (timestretch `Tape`).
+    Off,
+    /// Keylock through the DJ range (timestretch `Keylock`).
+    On,
+    /// Full-spectrum keylock across the whole tempo range (timestretch `WideKeylock`).
+    Wide,
+}
+
+impl KeylockMode {
+    /// Parses a CLI token.
+    pub fn parse(token: &str) -> Option<Self> {
+        match token.to_ascii_lowercase().as_str() {
+            "off" | "tape" | "false" | "0" => Some(KeylockMode::Off),
+            "on" | "keylock" | "true" | "1" => Some(KeylockMode::On),
+            "wide" | "widekeylock" => Some(KeylockMode::Wide),
+            _ => None,
+        }
+    }
+
+    /// A stable label for state readouts and errors.
+    pub fn label(&self) -> &'static str {
+        match self {
+            KeylockMode::Off => "off",
+            KeylockMode::On => "on",
+            KeylockMode::Wide => "wide",
+        }
+    }
+}
+
 /// Which mixer fader a [`Command::SetFader`] addresses.
 ///
 /// The value domain belongs to the target, not the protocol: bipolar positions are
@@ -215,8 +271,12 @@ pub enum NudgeOp {
 /// the value, so a mapping layer never has to duplicate that knowledge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaderTarget {
-    /// One channel's flow fader (the deck level while a track holds a single stream).
+    /// One channel's flow fader (the deck level while a track holds a single stream). Once stems
+    /// are installed this writes **every** stem's level at once, because one hardware fader still
+    /// has to work; a single stem is addressed through [`FaderTarget::Stem`].
     Flow(DeckId),
+    /// One stem's level, as a bipolar fader position (`-1.0` = exact silence, `0.0` = unity).
+    Stem { deck: DeckId, stem: Stem },
     /// One channel's deck fader (unity until a track exposes stems).
     Deck(DeckId),
     /// One channel's cue send, linear `0.0..=1.0` (a send level, not a bipolar fader).
@@ -236,6 +296,7 @@ impl FaderTarget {
         match self {
             FaderTarget::CueSend(..) => false,
             FaderTarget::Flow(..)
+            | FaderTarget::Stem { .. }
             | FaderTarget::Deck(..)
             | FaderTarget::Crossfader
             | FaderTarget::Master
@@ -259,6 +320,16 @@ pub enum Command {
     Pause {
         deck_id: DeckId,
     },
+    /// Flips play/pause in one command, so a single button (or bare `play`) is a toggle without
+    /// the front-end having to know the current transport.
+    TogglePlay {
+        deck_id: DeckId,
+    },
+    /// The cue family: play from / return to / set the cue point.
+    Cue {
+        deck_id: DeckId,
+        op: CueOp,
+    },
     /// Sample-accurate seek, in frames.
     Jump {
         deck_id: DeckId,
@@ -269,10 +340,21 @@ pub enum Command {
         deck_id: DeckId,
         beats: i64,
     },
-    /// Sets the tempo rate (0.25 = quarter speed, 1.0 = unity, 4.0 = quadruple).
-    SetRate {
+    /// Sets the tempo (0.25 = quarter speed, 1.0 = unity, 4.0 = quadruple).
+    SetTempo {
         deck_id: DeckId,
-        rate: f32,
+        tempo: f32,
+    },
+    /// Sets the tempo fader position, `-1.0..=1.0`; the deck derives `tempo = 1 + position * range`.
+    SetTempoFader {
+        deck_id: DeckId,
+        position: f32,
+    },
+    /// Sets the fader's full-deflection range (`0.1` = ±10%). Only changes the mapping — the
+    /// running tempo stays where it is.
+    SetTempoRange {
+        deck_id: DeckId,
+        range: f32,
     },
     /// The loop family: manual in/out, beat loops, exit, in-loop edits and quantization.
     Loop {
@@ -295,10 +377,31 @@ pub enum Command {
         target: FaderTarget,
         value: f32,
     },
-    /// Switches the time-stretch profile ("tape", "keylock", "wide").
-    SetProfile {
+    /// Installs a separated track: four frame-aligned streams, one per [`Stem`].
+    ///
+    /// A source swap at the current position, so it is seamless (the same jump machinery a `Jump`
+    /// uses). Until the swap lands the deck keeps playing the plain mix — read
+    /// [`DeckState::stems`] to know which of the two the audio is.
+    SetStems {
         deck_id: DeckId,
-        profile: String,
+        stems: StemSet,
+    },
+    /// Per-stem level, mute, solo or a named arrangement. Only meaningful once stems are installed;
+    /// the mixer answers with an error on a track that has none.
+    Stem {
+        deck_id: DeckId,
+        op: StemOp,
+    },
+    /// Switches the keylock profile (`off` = tape, `on` = keylock, `wide` = wide keylock).
+    SetKeylock {
+        deck_id: DeckId,
+        mode: KeylockMode,
+    },
+    /// Sets the pitch shift in semitones. A **placeholder**: the streaming time-stretch engine has
+    /// no pitch axis yet, so the deck stores the value and reports it, but nothing audibly moves.
+    SetKey {
+        deck_id: DeckId,
+        semitones: i32,
     },
     /// Publishes a compiled analysis (beat grid + key + bpm) to a deck.
     SetAnalysis {
@@ -308,6 +411,12 @@ pub enum Command {
     /// One deck's state. Use [`Command::GetAllStates`] when comparing decks: two separate
     /// `GetState` commands are answered one production block apart.
     GetState {
+        deck_id: DeckId,
+    },
+    /// As [`Command::GetState`], but the answer is meant to be rendered as a per-stem report. The
+    /// payload is identical; the variant exists so a front-end does not have to remember which
+    /// request a [`CommandResponse::State`] came from.
+    GetStemState {
         deck_id: DeckId,
     },
     /// Every deck's state, sampled inside the same production block.
@@ -366,6 +475,8 @@ pub enum CommandResponse {
         total_frames: u64,
     },
     State(DeckState),
+    /// The answer to [`Command::GetStemState`]: the same snapshot, to be shown per stem.
+    Stems(DeckState),
     /// One answer holding every deck, sampled in the same block (skew-free comparison).
     States(Vec<DeckState>),
     /// A slot was appended; carries its assigned index and canonical kind name.
@@ -399,6 +510,13 @@ impl std::fmt::Debug for Command {
             Command::Pause { deck_id } => {
                 f.debug_struct("Pause").field("deck_id", deck_id).finish()
             }
+            Command::TogglePlay { deck_id } => f
+                .debug_struct("TogglePlay")
+                .field("deck_id", deck_id)
+                .finish(),
+            Command::Cue { deck_id, op } => {
+                f.debug_struct("Cue").field("deck_id", deck_id).field("op", op).finish()
+            }
             Command::Jump {
                 deck_id,
                 target_frame,
@@ -412,10 +530,20 @@ impl std::fmt::Debug for Command {
                 .field("deck_id", deck_id)
                 .field("beats", beats)
                 .finish(),
-            Command::SetRate { deck_id, rate } => f
-                .debug_struct("SetRate")
+            Command::SetTempo { deck_id, tempo } => f
+                .debug_struct("SetTempo")
                 .field("deck_id", deck_id)
-                .field("rate", rate)
+                .field("tempo", tempo)
+                .finish(),
+            Command::SetTempoFader { deck_id, position } => f
+                .debug_struct("SetTempoFader")
+                .field("deck_id", deck_id)
+                .field("position", position)
+                .finish(),
+            Command::SetTempoRange { deck_id, range } => f
+                .debug_struct("SetTempoRange")
+                .field("deck_id", deck_id)
+                .field("range", range)
                 .finish(),
             Command::Loop { deck_id, op } => {
                 f.debug_struct("Loop").field("deck_id", deck_id).field("op", op).finish()
@@ -431,17 +559,39 @@ impl std::fmt::Debug for Command {
                 .field("target", target)
                 .field("value", value)
                 .finish(),
-            Command::SetProfile { deck_id, profile } => f
-                .debug_struct("SetProfile")
+            Command::SetKeylock { deck_id, mode } => f
+                .debug_struct("SetKeylock")
                 .field("deck_id", deck_id)
-                .field("profile", profile)
+                .field("mode", mode)
+                .finish(),
+            Command::SetKey {
+                deck_id,
+                semitones,
+            } => f
+                .debug_struct("SetKey")
+                .field("deck_id", deck_id)
+                .field("semitones", semitones)
                 .finish(),
             Command::SetAnalysis { deck_id, .. } => f
                 .debug_struct("SetAnalysis")
                 .field("deck_id", deck_id)
                 .finish(),
+            Command::SetStems { deck_id, stems } => f
+                .debug_struct("SetStems")
+                .field("deck_id", deck_id)
+                .field("frames", &stems.total_frames())
+                .finish(),
+            Command::Stem { deck_id, op } => f
+                .debug_struct("Stem")
+                .field("deck_id", deck_id)
+                .field("op", op)
+                .finish(),
             Command::GetState { deck_id } => f
                 .debug_struct("GetState")
+                .field("deck_id", deck_id)
+                .finish(),
+            Command::GetStemState { deck_id } => f
+                .debug_struct("GetStemState")
                 .field("deck_id", deck_id)
                 .finish(),
             Command::GetAllStates => f.write_str("GetAllStates"),

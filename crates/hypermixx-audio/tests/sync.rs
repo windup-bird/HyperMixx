@@ -127,7 +127,7 @@ fn tempolock_shares_one_tempo_across_either_fader() {
     );
 
     // The leader's fader moves the group; the follower picks it up on the next block.
-    ask(&tx, Command::SetRate { deck_id: 0, rate: 1.1 });
+    ask(&tx, Command::SetTempo { deck_id: 0, tempo: 1.1 });
     ack(&rx);
     sleep(250);
     let moved = states(&tx, &rx);
@@ -135,7 +135,7 @@ fn tempolock_shares_one_tempo_across_either_fader() {
     assert!((moved[0].group_bpm - 1.1 * 122.0).abs() < 0.1);
 
     // …and it is genuinely bidirectional: the follower's fader moves the leader.
-    ask(&tx, Command::SetRate { deck_id: 1, rate: 0.95 });
+    ask(&tx, Command::SetTempo { deck_id: 1, tempo: 0.95 });
     ack(&rx);
     sleep(250);
     let back = states(&tx, &rx);
@@ -178,7 +178,7 @@ fn phaselock_ignores_the_followers_fader_and_follows_the_leader() {
     assert_eq!(locked[0].sync_leader, None, "the leader tracks nobody");
 
     // One-way: the follower's own fader is overridden.
-    ask(&tx, Command::SetRate { deck_id: 1, rate: 0.9 });
+    ask(&tx, Command::SetTempo { deck_id: 1, tempo: 0.9 });
     ack(&rx);
     sleep(250);
     let ignored = states(&tx, &rx);
@@ -189,7 +189,7 @@ fn phaselock_ignores_the_followers_fader_and_follows_the_leader() {
     );
 
     // The leader's fader *is* the group's tempo, so the follower tracks it.
-    ask(&tx, Command::SetRate { deck_id: 0, rate: 1.05 });
+    ask(&tx, Command::SetTempo { deck_id: 0, tempo: 1.05 });
     ack(&rx);
     sleep(250);
     let followed = states(&tx, &rx);
@@ -408,7 +408,7 @@ fn unlock_drops_the_lock_and_keeps_the_tempo() {
         },
     );
     ack(&rx);
-    ask(&tx, Command::SetRate { deck_id: 0, rate: 1.1 });
+    ask(&tx, Command::SetTempo { deck_id: 0, tempo: 1.1 });
     ack(&rx);
     sleep(250);
     let locked = states(&tx, &rx);
@@ -440,7 +440,7 @@ fn unlock_drops_the_lock_and_keeps_the_tempo() {
     }
 
     // The pair is genuinely independent again: one side's fader no longer moves the other.
-    ask(&tx, Command::SetRate { deck_id: 0, rate: 0.8 });
+    ask(&tx, Command::SetTempo { deck_id: 0, tempo: 0.8 });
     ack(&rx);
     sleep(250);
     let separate = states(&tx, &rx);

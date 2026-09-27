@@ -19,7 +19,8 @@ pub use loop_::{
 };
 pub use sync::{
     wrap_phase, LeaderSample, Nudge, PhaseAlign, Playhead, Pll, SyncCtx, BLOCK_SECONDS,
-    MAX_RATE, MIN_RATE, NUDGE_LIMIT, NUDGERATE_LIMIT, PLL_LIMIT,
+    DEFAULT_TEMPO_RANGE, MAX_RATE, MAX_TEMPO_RANGE, MIN_RATE, NUDGE_LIMIT, NUDGERATE_LIMIT,
+    PLL_LIMIT,
 };
 
 pub use hypermixx_core::{BeatGrid, Key, KeyFormat, KeyMode, TrackAnalysis};

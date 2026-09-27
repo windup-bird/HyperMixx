@@ -458,6 +458,9 @@ impl From<FxChainId> for ChainRef {
         match chain {
             FxChainId::Master => ChainRef::Master,
             FxChainId::Deck(deck_id) => ChainRef::Channel(deck_id as usize),
+            // A stream's chain belongs to the same channel; `ChainRef` is a *config* notion of
+            // "which list of names", and a stem has no separate list yet.
+            FxChainId::Stem { deck, .. } => ChainRef::Channel(deck as usize),
         }
     }
 }
@@ -544,6 +547,14 @@ mod tests {
         assert_eq!(cfg.outputs[0].gain, 1.0);
         assert!(!cfg.master_limiter, "the safety stage is opt-in from a file");
         assert_eq!(cfg.master_fader, 0.0);
+        // The struct default and the `dj` helper agree with the parsed channel above.
+        let default = ChannelConfig::default();
+        assert!(default.flow_fx.is_empty() && default.deck_fx.is_empty());
+        assert_eq!(default.cue_send, 0.0, "a default channel must not spam the cue");
+        assert_eq!(default.side, DeckSide::default());
+        let dj = ChannelConfig::dj(["eq"]);
+        assert_eq!(dj.deck_fx, vec!["eq".to_owned()]);
+        assert!(dj.flow_fx.is_empty());
     }
 
     #[test]
@@ -566,6 +577,15 @@ side = \"spinward\"".into()).unwrap_err();
 
         // An output without a name has nothing to log against.
         assert!(MixerConfig::from_toml_str("[[output]]\nrole = \"main\"".into()).is_err());
+        // Every error variant is displayable.
+        for err in [
+            MixerError::UnknownFx("x".into()),
+            MixerError::BadParam { kind: "eq".into(), name: "low".into() },
+            MixerError::Empty,
+            MixerError::Output("boom".into()),
+        ] {
+            assert!(!err.message().is_empty());
+        }
     }
 
     #[test]
@@ -600,17 +620,6 @@ side = \"spinward\"".into()).unwrap_err();
     }
 
     #[test]
-    fn a_default_channel_is_muted_and_effect_free() {
-        let cfg = ChannelConfig::default();
-        assert!(cfg.flow_fx.is_empty() && cfg.deck_fx.is_empty());
-        assert_eq!(cfg.cue_send, 0.0, "a default channel must not spam the cue");
-        assert_eq!(cfg.side, DeckSide::default());
-        let dj = ChannelConfig::dj(["eq"]);
-        assert_eq!(dj.deck_fx, vec!["eq".to_owned()]);
-        assert!(dj.flow_fx.is_empty());
-    }
-
-    #[test]
     fn silent_test_config_never_touches_a_device() {
         let cfg = silent_test_channel();
         assert!(cfg.outputs.is_empty());
@@ -633,23 +642,8 @@ side = \"spinward\"".into()).unwrap_err();
             channels: (4, 5),
             ..OutputConfig::main(0, "x")
         };
-        assert_eq!(cfg.channel_pair(2), (0, 1));
+        assert_eq!(cfg.channel_pair(2), (0, 1), "a 2ch device clamps rather than indexing out");
         assert_eq!(cfg.channel_pair(8), (4, 5));
-        assert_eq!(OutputConfig::main(0, "m").channel_pair(1), (0, 1));
-    }
-
-    #[test]
-    fn errors_are_displayable_and_specific() {
-        for err in [
-            MixerError::UnknownFx("x".into()),
-            MixerError::BadParam {
-                kind: "eq".into(),
-                name: "low".into(),
-            },
-            MixerError::Empty,
-            MixerError::Output("boom".into()),
-        ] {
-            assert!(!err.message().is_empty());
-        }
+        assert_eq!(OutputConfig::main(0, "m").channel_pair(1), (0, 1), "1ch writes the sum to ch0");
     }
 }

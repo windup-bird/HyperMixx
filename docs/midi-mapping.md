@@ -33,7 +33,7 @@ AudioPipeline producer:块边界 route → Mixer / Deck
 | **混音推子/交叉推子无命令** | `set_flow_fader` / `set_crossfader` / `set_cue_send` / master `set_fader` 只能靠 TOML 启动配置 | core 新增 `Command::SetFader`,`pipeline::route` 加 arm(mixer 侧 setter 均为 `&self`,无需 `&mut`) |
 | 推子位置无回读 | `Channel::levels()` 存在但无 query 暴露 | v1 **不需要**:soft-takeover 只比对映射层自己的镜像(初始值取自 `MixerConfig`),零协议成本 |
 | FX 参数按 index 寻址 | `SetFxParam { slot: FxSlotRef{index} }`,index 随 `RemoveFx` 漂移 | 映射文件按**名字**写(`chain/ fx / param`),启动时经 `ListFx` 解析成 index 注入 map,复用 cli 的 `Slots` 簿记 |
-| 无 cue 点概念 | 只有 `Jump` + `Play` | 映射层组合(hot cue = 记录 frame + `Jump`);不够用再补 `Command::Cue` |
+| 单一 cue 点 | 只有 `Jump` + `Play` | 已补 `Command::Cue`(`play`/`back`/`set`/`smart`);多 hot cue 槽位仍不做 |
 
 ---
 
@@ -136,10 +136,13 @@ action = "play"         # 按钮类:NoteOn 触发、NoteOff 视语义(toggle / m
   同一张表(`TargetManifest::standard(decks)`),永不脱节——对齐 `fx help` 从注册表
   生成的做法;
 - `action` v1 集:
-  - transport:`play` / `pause` / `beatjump±`(相对按钮步长可配)
+  - transport:`play`(toggle)/ `cue`(momentary:按下 `Cue::Play`、松开 `Cue::Back`)/ 
+    `cue.smart`(单边沿,引擎按走带决定 back 或 set)/ `beatjump±`(相对按钮步长可配)
   - fader 族:`fader.flow` `fader.deck` `fader.cuesend` `fader.cross` `fader.master` `fader.cue`
-  - tempo:`rate`(CC → `SetRate`,带 ±% 量程,默认 ±8%,映射层做量程换算)
-  - nudge:`nudge` — NoteOn → `Nudge::Start{delta, None}`,NoteOff → `Nudge::Stop`(momentary 天然对上)
+  - tempo:`tempofader`(CC → `SetTempoFader`,只发推子位置 -1..1;量程由 deck 的
+    `temporange` 管,映射层不再做量程换算)
+  - nudge:`nudge` — NoteOn → `Nudge::Start{delta, seconds}`;省略 `seconds` 时是 momentary
+    (NoteOff → `Nudge::Stop`),写了 `seconds` 就定时松开且忽略 NoteOff
   - loop:`loop.in` `loop.out` `loop.exit` `loop.cancel` `loop.halve` `loop.double`
     `loop.beat8`(N 可配 → `LoopOp::Beats(n)`)
   - sync:`sync.tempo` `sync.phase` `sync.phaselock` `sync.tempolock` `sync.leader`
@@ -195,7 +198,7 @@ action = "play"         # 按钮类:NoteOn 触发、NoteOff 视语义(toggle / m
 ```
 ┌─ 待配目标 ──────────────┬─ 原始事件监视器 ────────────┐
 │ ▶ deck0  play      (—)  │ 12:03:41  CC  ch1 #7  = 64 │
-│    deck0  pause     (—)  │ 12:03:41  CC  ch1 #7  = 65 │
+│    deck0  play      (—)  │ 12:03:41  CC  ch1 #7  = 65 │
 │    deck0  fader.flow(✓) │ 12:03:42  NOTE ch1 #48 on  │
 │    deck0  eq.low    (✓)  │ 12:03:42  NOTE ch1 #48 off │
 │    …                     │  …滚动保留最近 N 条         │
@@ -274,7 +277,8 @@ action = "play"         # 按钮类:NoteOn 触发、NoteOff 视语义(toggle / m
   不是广播**,MIDI 线程再 clone 会从 TUI 打印线程嘴里抢消息。需先在前端做扇出层
   ——独立工程,midir 输出端口能力已预留;
 - **MIDI clock 同步**:牵动 `BeatGrid` / tempo 语义,独立大特性;
-- **CUE 点 / hot cue**:先在映射层用 `Jump` + `Play` 组合,不够用再补 `Command::Cue`;
+- **hot cue / CUE 点的存储管理**:v1 已有单一 cue 点(`cue`/`cue.play`/`cue.back`/`cue.set`,
+  MIDI `cue`/`cue.smart`),但多 hot cue 槽位、持久化仍不做;
 - **多映射文件热切换**:重启进程即可。
 
 ---

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::{AudioPipeline, Meters};
-use hypermixx_core::{Backend, BeatGrid, Command, CommandResponse, DeckState};
+use hypermixx_core::{Backend, BeatGrid, Command, CommandResponse, DeckState, KeylockMode, StemStatus};
 
 use crate::command::{Slots, UiEvent};
 use crate::notices::NoticeTx;
@@ -68,10 +68,6 @@ pub struct App {
     pub titles: Vec<Option<String>>,
     pub waveforms: Vec<Option<Arc<hypermixx_library::Waveform>>>,
     pub grids: Vec<Option<BeatGrid>>,
-    /// CLI-side tempo mirror; refreshed from every state answer so the header tracks the engine
-    /// (a lock or a fader on the other deck moves it without this front-end doing anything).
-    pub rates: Vec<f32>,
-    pub profiles: Vec<&'static str>,
 
     /// Shared zoom, in frames per braille dot. Both decks read this so they stay comparable.
     pub frames_per_dot: f64,
@@ -137,11 +133,14 @@ impl App {
                     playing: false,
                     total_frames: 0,
                     bpm: 0.0,
+                    bpm_at_frame: 0.0,
                     key: None,
                     virtual_frame: 0,
                     loop_range: None,
                     loop_in_armed: None,
                     tempo: 1.0,
+                    tempo_fader: 0.0,
+                    tempo_range: 0.1,
                     nudgerate: 0.0,
                     playing_rate: 1.0,
                     lock: false,
@@ -150,13 +149,15 @@ impl App {
                     sync_leader: None,
                     sync_mode: "free".to_owned(),
                     group_bpm: 0.0,
+                    cue_frame: 0,
+                    keylock: KeylockMode::On,
+                    key_shift: 0,
+                    stems: StemStatus::default(),
                 })
                 .collect(),
             titles: vec![None; decks],
             waveforms: vec![None; decks],
             grids: vec![None; decks],
-            rates: vec![1.0; decks],
-            profiles: vec!["tape"; decks],
             frames_per_dot: DEFAULT_FRAMES_PER_DOT,
             wave_width_dots: 200,
             log: VecDeque::new(),
@@ -289,9 +290,6 @@ impl App {
     fn set_state(&mut self, state: &DeckState) {
         if let Some(slot) = self.states.get_mut(state.deck_id as usize) {
             *slot = state.clone();
-        }
-        if let Some(rate) = self.rates.get_mut(state.deck_id as usize) {
-            *rate = state.tempo;
         }
     }
 

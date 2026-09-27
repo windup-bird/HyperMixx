@@ -1,0 +1,23 @@
+[package]
+name = "hypermixx-stems"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Offline stem separation: HTDemucs model management, a result cache, and the backend"
+
+[dependencies]
+hypermixx-core = { path = "../hypermixx-core" }
+hypermixx-media = { path = "../hypermixx-media" }
+sha2 = "0.10"
+# Only the real backend needs to fetch a model, so the HTTP client and the ML runtime ride the
+# same feature. `--no-default-features` gives the trait + mock + cache with no network and no
+# ONNX Runtime, which is what a build that never separates anything should pay.
+ureq = { version = "3", optional = true }
+charon-audio = { version = "0.1", default-features = false, features = [
+    "ort-backend",
+], optional = true }
+ndarray = { version = "0.15", optional = true }
+
+[features]
+default = ["onnx"]
+onnx = ["dep:ureq", "dep:charon-audio", "dep:ndarray"]

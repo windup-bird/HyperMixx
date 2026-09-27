@@ -358,6 +358,11 @@ fn route(
     match command {
         Load { deck_id, source, analysis } => {
             let total_frames = source.total_frames();
+            // The fader range is a controller setting, not a track property: read it before the
+            // channel borrow and carry it over, so loading a track does not reset the DJ's range.
+            let range = mixer
+                .deck(deck_id as usize)
+                .map(crate::deck::Deck::tempo_range);
             let Some(channel) = mixer.channel_mut(deck_id as usize) else {
                 return Some(error(unknown_deck(deck_id, mixer.channel_count())));
             };
@@ -365,7 +370,10 @@ fn route(
             // the other channels keep playing untouched. Faders and FX deliberately survive, because
             // reloading a track should not reset the mixer a user is standing at.
             // `set_analysis` takes `&self` (the grid swaps in lock-free), so no `mut` needed.
-            let deck = Deck::new(source);
+            let mut deck = Deck::new(source);
+            if let Some(range) = range {
+                deck.set_tempo_range(range);
+            }
             if let Some(analysis) = analysis {
                 deck.set_analysis(analysis);
             }
@@ -374,31 +382,39 @@ fn route(
         }
         Play { deck_id } => transport(mixer, deck_id, |deck| deck.play()),
         Pause { deck_id } => transport(mixer, deck_id, |deck| deck.pause()),
+        TogglePlay { deck_id } => transport(mixer, deck_id, |deck| deck.toggle_play()),
+        Cue { deck_id, op } => transport(mixer, deck_id, move |deck| deck.apply_cue(op)),
         Jump { deck_id, target_frame } => {
             transport(mixer, deck_id, move |deck| deck.jump(target_frame))
         }
         BeatJump { deck_id, beats } => transport(mixer, deck_id, move |deck| deck.beatjump(beats)),
-        SetRate { deck_id, rate } => answered(sync.set_tempo(mixer, deck_id, rate)),
+        SetTempo { deck_id, tempo } => answered(sync.set_tempo(mixer, deck_id, tempo)),
+        SetTempoFader { deck_id, position } => {
+            answered(sync.set_tempo_fader(mixer, deck_id, position))
+        }
+        SetTempoRange { deck_id, range } => answered(sync.set_tempo_range(mixer, deck_id, range)),
         Sync { deck_id, op } => answered(sync.handle_sync(mixer, deck_id, op)),
         Nudge { deck_id, op } => answered(sync.nudge(mixer, deck_id, op)),
         SetFader { target, value } => answered(mixer.set_fader(target, value)),
         Loop { deck_id, op } => {
             transport_result(mixer, deck_id, move |deck| deck.apply_loop(op))
         }
-        SetProfile { deck_id, profile } => {
-            let engine_profile = match profile.as_str() {
-                "tape" => Some(timestretch::engine::EngineProfile::Tape),
-                "keylock" => Some(timestretch::engine::EngineProfile::Keylock),
-                "wide" | "widekeylock" => Some(timestretch::engine::EngineProfile::WideKeylock),
-                _ => None,
-            };
-            match engine_profile {
-                Some(engine_profile) => {
-                    transport(mixer, deck_id, move |deck| deck.set_profile(engine_profile))
-                }
-                None => Some(error("unknown profile, use tape/keylock/wide".to_owned())),
-            }
+        SetKeylock { deck_id, mode } => {
+            transport(mixer, deck_id, move |deck| deck.set_keylock_mode(mode))
         }
+        // The pitch axis is a placeholder: the value is remembered and reported, nothing more.
+        SetKey {
+            deck_id,
+            semitones,
+        } => transport(mixer, deck_id, move |deck| deck.set_key_shift(semitones)),
+        SetStems { deck_id, stems } => Some(match mixer.set_stems(deck_id, stems) {
+            Ok(()) => CommandResponse::Ok,
+            Err(err) => error(err),
+        }),
+        Stem { deck_id, op } => Some(match mixer.apply_stem(deck_id, op) {
+            Ok(()) => CommandResponse::Ok,
+            Err(err) => error(err),
+        }),
         SetAnalysis { deck_id, analysis } => match mixer.deck_mut(deck_id as usize) {
             Some(deck) => {
                 deck.set_analysis(analysis);
@@ -406,8 +422,12 @@ fn route(
             }
             None => Some(error(unknown_deck(deck_id, mixer.channel_count()))),
         },
-        GetState { deck_id } => match mixer.deck(deck_id as usize) {
-            Some(deck) => Some(CommandResponse::State(state_of(deck_id, deck, sync))),
+        GetState { deck_id } => match mixer.channel(deck_id as usize) {
+            Some(channel) => Some(CommandResponse::State(state_of(deck_id, channel, sync))),
+            None => Some(error(unknown_deck(deck_id, mixer.channel_count()))),
+        },
+        GetStemState { deck_id } => match mixer.channel(deck_id as usize) {
+            Some(channel) => Some(CommandResponse::Stems(state_of(deck_id, channel, sync))),
             None => Some(error(unknown_deck(deck_id, mixer.channel_count()))),
         },
         GetAllStates => {
@@ -416,8 +436,8 @@ fn route(
             let states = (0..mixer.channel_count())
                 .filter_map(|index| {
                     mixer
-                        .deck(index)
-                        .map(|deck| state_of(index as DeckId, deck, sync))
+                        .channel(index)
+                        .map(|channel| state_of(index as DeckId, channel, sync))
                 })
                 .collect();
             Some(CommandResponse::States(states))
@@ -465,13 +485,18 @@ fn transport_result(
     }
 }
 
-fn state_of(deck_id: DeckId, deck: &Deck, sync: &SyncGroup) -> DeckState {
+/// The snapshot a front-end reads. Takes the whole channel rather than just its deck because the
+/// per-stem state (level, mute, solo) lives on the mixer side of the channel, while "are stems
+/// live yet" is the deck's answer.
+fn state_of(deck_id: DeckId, channel: &crate::mixer::Channel, sync: &SyncGroup) -> DeckState {
+    let deck = channel.deck();
     DeckState {
         deck_id,
         current_frame: deck.current_frame(),
         playing: deck.is_playing(),
         total_frames: deck.total_frames(),
         bpm: deck.bpm(),
+        bpm_at_frame: deck.bpm_at_frame() as f32,
         key: deck.key().map(|key| key.traditional()),
         virtual_frame: deck.virtual_frame(),
         loop_range: deck
@@ -479,6 +504,8 @@ fn state_of(deck_id: DeckId, deck: &Deck, sync: &SyncGroup) -> DeckState {
             .map(|range| (range.in_frame, range.out_frame)),
         loop_in_armed: deck.loop_in_armed(),
         tempo: deck.tempo() as f32,
+        tempo_fader: deck.tempo_fader() as f32,
+        tempo_range: deck.tempo_range() as f32,
         nudgerate: deck.nudgerate() as f32,
         playing_rate: deck.playing_rate() as f32,
         lock: deck.lock(),
@@ -489,6 +516,10 @@ fn state_of(deck_id: DeckId, deck: &Deck, sync: &SyncGroup) -> DeckState {
         sync_leader: sync.leader.filter(|&leader| leader != deck_id),
         sync_mode: sync.mode_label().to_owned(),
         group_bpm: sync.group_bpm as f32,
+        cue_frame: deck.cue_point(),
+        keylock: deck.keylock_mode(),
+        key_shift: deck.key_shift(),
+        stems: channel.stem_status(),
     }
 }
 

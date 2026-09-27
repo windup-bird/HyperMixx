@@ -9,14 +9,16 @@ pub mod command;
 pub mod deck;
 pub mod key;
 pub mod source;
+pub mod stem;
 
 pub use analysis::TrackAnalysis;
 pub use beatgrid::BeatGrid;
-pub use command::{Backend, Command, CommandResponse, FaderTarget, FxChainId, FxSlotRef,
-    FxSlotStatus, LoopEditOp, LoopOp, LoopQuantum, NudgeOp, PhaseMode, SyncOp};
+pub use command::{Backend, Command, CommandResponse, CueOp, FaderTarget, FxChainId, FxSlotRef,
+    FxSlotStatus, KeylockMode, LoopEditOp, LoopOp, LoopQuantum, NudgeOp, PhaseMode, SyncOp};
 pub use deck::{DeckId, DeckState};
 pub use key::{Key, KeyFormat, KeyMode};
 pub use source::{Shared, Source};
+pub use stem::{Stem, StemOp, StemPreset, StemSet, StemStatus};
 
 /// Engine-wide sample rate. The decoder resamples everything to it at load time.
 pub const SAMPLE_RATE: u32 = 44_100;

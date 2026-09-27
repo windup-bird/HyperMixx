@@ -5,6 +5,7 @@ members = [
     "crates/hypermixx-media",
     "crates/hypermixx-audio",
     "crates/hypermixx-library",
+    "crates/hypermixx-stems",
     "crates/hypermixx-midi",
     "crates/hypermixx-cli",
 ]

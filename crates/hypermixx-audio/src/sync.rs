@@ -25,7 +25,7 @@
 
 use hypermixx_core::{DeckId, NudgeOp, SyncOp};
 
-use crate::deck::{LeaderSample, PhaseAlign, SyncCtx, MAX_RATE, MIN_RATE};
+use crate::deck::{LeaderSample, PhaseAlign, SyncCtx, MAX_RATE, MAX_TEMPO_RANGE, MIN_RATE};
 use crate::mixer::Mixer;
 
 /// Why sync needs a grid the deck does not have.
@@ -458,6 +458,45 @@ impl SyncGroup {
         }
         if let Some(deck) = mixer.deck_mut(deck_id as usize) {
             deck.set_tempo(rate);
+        }
+        Ok(())
+    }
+
+    /// Applies a raw tempo **fader position** (`-1..=1`): the deck maps it to a rate under its own
+    /// range, and the result goes through the same sync branches as [`set_tempo`](Self::set_tempo).
+    pub fn set_tempo_fader(
+        &mut self,
+        mixer: &mut Mixer,
+        deck_id: DeckId,
+        position: f32,
+    ) -> Result<(), String> {
+        Self::require_track(mixer, deck_id)?;
+        if !position.is_finite() {
+            return Err(format!("tempo fader must be a number, got {position}"));
+        }
+        let deck = mixer
+            .deck(deck_id as usize)
+            .ok_or_else(|| format!("unknown deck {deck_id}"))?;
+        let rate = deck.tempo_from_fader(f64::from(position)) as f32;
+        self.set_tempo(mixer, deck_id, rate)
+    }
+
+    /// Sets the fader's range (`0 < range <= MAX_TEMPO_RANGE`). Only the mapping changes — the
+    /// running tempo is left alone, so the derived fader position simply shifts under it.
+    pub fn set_tempo_range(
+        &mut self,
+        mixer: &mut Mixer,
+        deck_id: DeckId,
+        range: f32,
+    ) -> Result<(), String> {
+        Self::require_track(mixer, deck_id)?;
+        if !range.is_finite() || range <= 0.0 || f64::from(range) > MAX_TEMPO_RANGE {
+            return Err(format!(
+                "tempo range must be in (0, {MAX_TEMPO_RANGE}], got {range}"
+            ));
+        }
+        if let Some(deck) = mixer.deck_mut(deck_id as usize) {
+            deck.set_tempo_range(f64::from(range));
         }
         Ok(())
     }

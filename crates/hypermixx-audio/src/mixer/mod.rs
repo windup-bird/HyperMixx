@@ -24,7 +24,7 @@ pub(crate) mod config;
 pub(crate) mod output;
 
 pub use bus::Bus;
-pub use channel::{ChainSlot, Channel, CueTap, CrossfaderCurve, DeckSide, SlotChain};
+pub use channel::{Channel, CueTap, CrossfaderCurve, DeckSide, SlotChain};
 pub use config::{
     build_chain, build_slot, build_slot_disabled, build_slots, defaults_for, reference_toml,
     simple_dj, silent_test_channel, ChainRef, ChannelConfig, MixerConfig, MixerError,
@@ -32,7 +32,7 @@ pub use config::{
 };
 pub use output::{Output, OutputError, OutputId, Outputs};
 
-use hypermixx_core::{CommandResponse, FxChainId, FxSlotStatus};
+use hypermixx_core::{CommandResponse, FxChainId, FxSlotStatus, StemOp, StemSet};
 
 use channel::Channel as ChannelInner;
 use crate::deck::Deck;
@@ -230,6 +230,9 @@ impl Mixer {
         use hypermixx_core::FaderTarget;
         match target {
             FaderTarget::Flow(deck_id) => self.fader_channel(deck_id)?.set_flow_fader(value),
+            FaderTarget::Stem { deck, stem } => {
+                self.fader_channel(deck)?.set_stem_level(stem, value)
+            }
             FaderTarget::Deck(deck_id) => self.fader_channel(deck_id)?.set_deck_fader(value),
             FaderTarget::CueSend(deck_id) => self.fader_channel(deck_id)?.set_cue_send(value),
             FaderTarget::Crossfader => {
@@ -382,11 +385,17 @@ impl Mixer {
 
     /// Reads one slot, addressing the deck's merged chain (flow slots first, then deck slots).
     pub fn resolve_fx(&self, target: &FxTarget) -> Option<&FxSlot> {
-        let channel = match target.chain {
-            FxChainId::Master => return self.master.fx.slot(target.index),
-            FxChainId::Deck(deck_id) => self.channels.get(deck_id as usize)?,
-        };
-        channel.slot(target.index)
+        match target.chain {
+            FxChainId::Master => self.master.fx.slot(target.index),
+            FxChainId::Deck(deck_id) => self
+                .channels
+                .get(deck_id as usize)?
+                .slot(SlotChain::Deck, target.index),
+            FxChainId::Stem { deck, stem } => self
+                .channels
+                .get(deck as usize)?
+                .slot(SlotChain::Flow(stem), target.index),
+        }
     }
 
     pub fn resolve_fx_mut(&mut self, target: &FxTarget) -> Option<&mut FxSlot> {
@@ -395,61 +404,105 @@ impl Mixer {
             FxChainId::Deck(deck_id) => self
                 .channels
                 .get_mut(deck_id as usize)?
-                .slot_mut(target.index),
+                .slot_mut(SlotChain::Deck, target.index),
+            FxChainId::Stem { deck, stem } => self
+                .channels
+                .get_mut(deck as usize)?
+                .slot_mut(SlotChain::Flow(stem), target.index),
         }
     }
 
-    /// Every slot in a chain, in the index space `resolve_fx` uses.
+    /// Every slot in one chain.
     pub fn list_fx(&self, chain: FxChainId) -> Option<Vec<FxSlotStatus>> {
         match chain {
             FxChainId::Master => Some(self.master.fx.statuses()),
-            FxChainId::Deck(deck_id) => self.channels.get(deck_id as usize).map(|c| c.slot_statuses()),
+            FxChainId::Deck(deck_id) => self
+                .channels
+                .get(deck_id as usize)?
+                .slot_statuses(SlotChain::Deck),
+            FxChainId::Stem { deck, stem } => self
+                .channels
+                .get(deck as usize)?
+                .slot_statuses(SlotChain::Flow(stem)),
         }
     }
 
     /// Appends an effect, returning its index in the addressed chain's own index space.
     ///
-    /// A deck is addressed through the *merged* chain (flow slots first, then deck slots), and an
-    /// append lands on the deck half — that is where a caller means a new insert to go. The flow
-    /// half is for per-stream effects and is reached through [`Mixer::add_flow_fx`].
+    /// `Deck` is the channel's shared chain; `Stem` is one stream's chain. There is no merged index
+    /// space any more — with a chain per stream, one index space could not mean anything.
     pub fn add_fx(&mut self, chain: FxChainId, slot: FxSlot) -> Result<usize, String> {
         match chain {
             FxChainId::Master => Ok(self.master.fx.push_slot(slot)),
             FxChainId::Deck(deck_id) => self
                 .channels
                 .get_mut(deck_id as usize)
-                .map(|channel| channel.add_slot(SlotChain::Deck, slot))
+                .and_then(|channel| channel.add_slot(SlotChain::Deck, slot))
                 .ok_or_else(|| unknown_deck(deck_id, self.channels.len())),
+            FxChainId::Stem { deck, stem } => self
+                .channels
+                .get_mut(deck as usize)
+                .and_then(|channel| channel.add_slot(SlotChain::Flow(stem), slot))
+                .ok_or_else(|| unknown_deck(deck, self.channels.len())),
         }
-    }
-
-    /// Appends to a deck's *flow* chain, returning the merged index.
-    pub fn add_flow_fx(&mut self, deck_id: u8, slot: FxSlot) -> Result<usize, String> {
-        let count = self.channels.len();
-        let channel = self
-            .channels
-            .get_mut(deck_id as usize)
-            .ok_or_else(|| unknown_deck(deck_id, count))?;
-        Ok(channel.add_slot(SlotChain::Flow, slot))
     }
 
     pub fn remove_fx(&mut self, target: &FxTarget) -> Result<FxSlot, String> {
         let count = self.channels.len();
-        match target.chain {
-            FxChainId::Master => self
-                .master
-                .fx
-                .remove(target.index)
-                .ok_or_else(|| "no effect at that index on master".to_owned()),
-            FxChainId::Deck(deck_id) => self
-                .channels
-                .get_mut(deck_id as usize)
-                .ok_or_else(|| unknown_deck(deck_id, count))?
-                .remove_slot(target.index)
-                .ok_or_else(|| {
-                    format!("deck {deck_id} has no effect at index {}", target.index)
-                }),
+        let (channel, place) = match target.chain {
+            FxChainId::Master => {
+                return self
+                    .master
+                    .fx
+                    .remove(target.index)
+                    .ok_or_else(|| "no effect at that index on master".to_owned())
+            }
+            FxChainId::Deck(deck_id) => (
+                self.channels
+                    .get_mut(deck_id as usize)
+                    .ok_or_else(|| unknown_deck(deck_id, count))?,
+                SlotChain::Deck,
+            ),
+            FxChainId::Stem { deck, stem } => (
+                self.channels
+                    .get_mut(deck as usize)
+                    .ok_or_else(|| unknown_deck(deck, count))?,
+                SlotChain::Flow(stem),
+            ),
+        };
+        channel.remove_slot(place, target.index).ok_or_else(|| {
+            format!(
+                "{} has no effect at index {}",
+                target.chain.label(),
+                target.index
+            )
+        })
+    }
+
+    /// Installs a separated track into one channel. The swap is seamless (a source change at the
+    /// current position) but lands a few blocks later; `DeckState::stems` reports when it has.
+    pub fn set_stems(&mut self, deck_id: u8, stems: StemSet) -> Result<(), String> {
+        let count = self.channels.len();
+        self.channels
+            .get_mut(deck_id as usize)
+            .map(|channel| channel.set_stems(stems))
+            .ok_or_else(|| unknown_deck(deck_id, count))
+    }
+
+    /// Applies a per-stem command, refusing it on a deck that has no stems — a `stem vocals mute`
+    /// that silently did nothing would be worse than an error.
+    pub fn apply_stem(&self, deck_id: u8, op: StemOp) -> Result<(), String> {
+        let count = self.channels.len();
+        let channel = self
+            .channels
+            .get(deck_id as usize)
+            .ok_or_else(|| unknown_deck(deck_id, count))?;
+        if !channel.has_stems() {
+            return Err(format!(
+                "deck {deck_id} has no stems — run `stem separate` first"
+            ));
         }
+        channel.apply_stem(op)
     }
 
     /// Applies one FX command, answering with the protocol's response.
@@ -522,6 +575,14 @@ impl Mixer {
             Command::ListFx { chain } => match self.list_fx(chain) {
                 Some(slots) => CommandResponse::FxListed { chain, slots },
                 None => CommandResponse::Error(unknown_chain(&chain)),
+            },
+            Command::SetStems { deck_id, stems } => match self.set_stems(deck_id, stems) {
+                Ok(()) => CommandResponse::Ok,
+                Err(err) => CommandResponse::Error(err),
+            },
+            Command::Stem { deck_id, op } => match self.apply_stem(deck_id, op) {
+                Ok(()) => CommandResponse::Ok,
+                Err(err) => CommandResponse::Error(err),
             },
             other => CommandResponse::Error(format!("not an FX command: {other:?}")),
         }
@@ -834,7 +895,12 @@ mod tests {
     fn fx_commands_round_trip_through_the_mixer() {
         use hypermixx_core::Command;
         let mut mixer = loaded(simple_dj(), 2);
-        let base = mixer.channel(0).unwrap().slot_statuses().len();
+        let base = mixer
+            .channel(0)
+            .unwrap()
+            .slot_statuses(SlotChain::Deck)
+            .unwrap()
+            .len();
         match mixer.handle_fx_command(Command::AddFx {
             chain: FxChainId::Deck(0),
             kind: "gain".into(),
@@ -872,7 +938,10 @@ mod tests {
             }),
             CommandResponse::Ok
         ));
-        assert_eq!(mixer.channel(0).unwrap().slot_statuses().len(), base);
+        assert_eq!(
+            mixer.channel(0).unwrap().slot_statuses(SlotChain::Deck).unwrap().len(),
+            base
+        );
     }
 
     #[test]
@@ -918,7 +987,13 @@ mod tests {
     fn a_pad_holds_a_slot_and_lets_go() {
         use hypermixx_core::Command;
         let mut mixer = loaded(simple_dj(), 1);
-        let index = mixer.channel(0).unwrap().slot_statuses().len() - 1;
+        let index = mixer
+            .channel(0)
+            .unwrap()
+            .slot_statuses(SlotChain::Deck)
+            .unwrap()
+            .len()
+            - 1;
         let slot = FxTarget { chain: FxChainId::Deck(0), index };
         mixer.handle_fx_command(Command::SetFxEnabled { slot, enabled: false });
         mixer.handle_fx_command(Command::PadPress { slot });

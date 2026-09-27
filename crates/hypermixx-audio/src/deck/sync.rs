@@ -40,6 +40,10 @@ pub const NUDGE_LIMIT: f64 = 0.10;
 /// Engine tempo bounds, mirroring timestretch's `EngineConfig` clamp.
 pub const MIN_RATE: f64 = 0.25;
 pub const MAX_RATE: f64 = 4.0;
+/// Default full-deflection range of the tempo fader (±10%).
+pub const DEFAULT_TEMPO_RANGE: f64 = 0.1;
+/// Largest fader range the engine accepts (±100%).
+pub const MAX_TEMPO_RANGE: f64 = 1.0;
 /// Seconds one processing block covers: the controller's `dt`.
 pub const BLOCK_SECONDS: f64 = crate::BLOCK_SIZE as f64 / crate::SAMPLE_RATE as f64;
 

@@ -271,6 +271,7 @@ impl Guide {
             max: None,
             curve: None,
             step: None,
+            seconds: None,
             beats: None,
             chain: None,
             fx: None,
@@ -286,6 +287,7 @@ impl Guide {
                 bind.chain = old.chain.clone();
                 bind.fx = old.fx.clone();
                 bind.param = old.param.clone();
+                bind.seconds = old.seconds;
                 self.map.binds[existing] = bind;
             }
             None if target.action.starts_with("fx.") => {

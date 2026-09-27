@@ -25,14 +25,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use hypermixx_core::{Key, LoopEditOp, LoopOp, LoopQuantum, Source, TrackAnalysis};
+use hypermixx_core::{CueOp, Key, KeylockMode, LoopEditOp, LoopOp, LoopQuantum, Source, TrackAnalysis};
 use timestretch::engine::EngineProfile;
 
 use super::jump::{resolve, Seek};
 use super::loop_::{
     beats_after, beat_shift, provisional_range, quantize_offset, quantize_to_beat, LoopRange,
 };
-use super::sync::{MAX_RATE, MIN_RATE, PhaseAlign, Playhead, SyncCtx};
+use super::sync::{MAX_RATE, MIN_RATE, PhaseAlign, Playhead, SyncCtx, DEFAULT_TEMPO_RANGE};
 use super::FlowShift;
 use crate::flow::{Flow, FlowState};
 use crate::fx::FxContext;
@@ -61,9 +61,15 @@ struct LoopArm {
 ///
 /// `flows` holds every flow the deck still cares about; v1 keeps exactly one active flow and
 /// replaces it on a jump, but the shape is already right for a future crossfade (two active flows
-/// plus a mixer).
+/// plus a mixer). A flow in turn carries **one engine over N streams** (see [`Flow`]), so "stream"
+/// is the axis stems live on and the deck is the thing every stream shares: one clock, one loop
+/// mapping, one tempo.
 pub struct Deck {
-    pool: Arc<dyn Source>,
+    /// The deck's streams, in order. One for a plain track; one per stem once they are installed.
+    /// The *active flow* is the authority on how many are audible right now — a swap is warmed on
+    /// the background thread and lands a few blocks later, so `sources.len()` alone would be ahead
+    /// of the audio. Use [`stream_count`](Self::stream_count).
+    sources: Vec<Arc<dyn Source>>,
     flows: Vec<Flow>,
     active_index: usize,
     flowshift: FlowShift,
@@ -99,17 +105,48 @@ pub struct Deck {
     /// then gets no group tempo and no phase correction — but still a ticking nudge.
     sync: Option<SyncCtx>,
     profile: EngineProfile,
+    /// The cue point in source frames; `cue play`/`cue back` land here. Defaults to the loaded
+    /// origin (0), reset whenever a fresh deck is built for a load.
+    cue_frame: u64,
+    /// Pitch shift in semitones. Stored and reported, but audibly inert until the streaming
+    /// engine grows a pitch axis (see [`Command::SetKey`](hypermixx_core::Command::SetKey)).
+    key_shift: i32,
+    /// Full-deflection range of the tempo fader (`0.1` = ±10%). A controller setting, not a track
+    /// property: `Load` carries it over to the fresh deck.
+    tempo_range: f64,
 }
 
 impl Deck {
-    /// Creates a deck over `pool`, cued at frame 0 and paused.
+    /// Creates a deck over `pool` as a single stream, cued at frame 0 and paused, with keylock on
+    /// (the DJ default).
     pub fn new(pool: Arc<dyn Source>) -> Self {
+        Self::with_sources(vec![pool])
+    }
+
+    /// Creates a deck over `sources.len()` streams — one for a plain track, up to
+    /// [`MAX_STREAMS`](crate::flow::MAX_STREAMS) for stems.
+    ///
+    /// Every stream shares the deck's transport (one clock, one loop range, one tempo) and is
+    /// rendered by one engine, so stems stay sample-aligned by construction. See
+    /// [`PitchShiftEngine`](crate::flow::PitchShiftEngine) for why they are not separate engines.
+    pub fn with_sources(sources: Vec<Arc<dyn Source>>) -> Self {
+        assert!(!sources.is_empty(), "a deck needs at least one stream");
         let flowshift = FlowShift::new();
-        let mut first = Flow::new(0, Arc::clone(&pool), 0, None, flowshift.ready_sender());
+        // The first flow has to be born with the profile: `Flow::new` hardcodes Tape, and a later
+        // `set_profile` would rebuild rather than start there.
+        let mut first = Flow::new_with(
+            0,
+            sources.clone(),
+            0,
+            None,
+            flowshift.ready_sender(),
+            1.0,
+            EngineProfile::Keylock,
+        );
         first.prepare();
         first.activate();
         Self {
-            pool,
+            sources,
             flows: vec![first],
             active_index: 0,
             flowshift,
@@ -124,7 +161,10 @@ impl Deck {
             playhead: Playhead::new(),
             applied_rate: 1.0,
             sync: None,
-            profile: EngineProfile::Tape,
+            profile: EngineProfile::Keylock,
+            cue_frame: 0,
+            key_shift: 0,
+            tempo_range: DEFAULT_TEMPO_RANGE,
         }
     }
 
@@ -142,18 +182,100 @@ impl Deck {
         self.playing.store(false, Ordering::Relaxed);
     }
 
+    /// Flips the transport; the bare `play` command and a MIDI play button both land here.
+    pub fn toggle_play(&self) {
+        self.playing.fetch_xor(true, Ordering::Relaxed);
+    }
+
+    /// The cue point in source frames.
+    pub fn cue_point(&self) -> u64 {
+        self.cue_frame
+    }
+
+    /// Runs one cue command. `Smart` resolves against the deck's own transport *here*, on the
+    /// producer thread, so the decision is atomic with the jump it causes.
+    pub fn apply_cue(&mut self, op: CueOp) {
+        match op {
+            CueOp::Play => {
+                self.jump(self.cue_frame);
+                self.play();
+            }
+            CueOp::Back => {
+                self.jump(self.cue_frame);
+                self.pause();
+            }
+            CueOp::Set => self.cue_frame = self.current_frame(),
+            CueOp::Smart => {
+                if self.is_playing() {
+                    self.jump(self.cue_frame);
+                    self.pause();
+                } else {
+                    self.cue_frame = self.current_frame();
+                }
+            }
+        }
+    }
+
+    /// Pitch shift in semitones (a placeholder; see [`Deck::key_shift`]).
+    pub fn key_shift(&self) -> i32 {
+        self.key_shift
+    }
+
+    pub fn set_key_shift(&mut self, semitones: i32) {
+        self.key_shift = semitones;
+    }
+
+    /// The keylock profile this deck runs.
+    pub fn keylock_mode(&self) -> KeylockMode {
+        match self.profile {
+            EngineProfile::Tape => KeylockMode::Off,
+            EngineProfile::Keylock => KeylockMode::On,
+            EngineProfile::WideKeylock => KeylockMode::Wide,
+        }
+    }
+
+    /// Switches the keylock profile (the engine's `Tape`/`Keylock`/`WideKeylock` chain).
+    pub fn set_keylock_mode(&mut self, mode: KeylockMode) {
+        let profile = match mode {
+            KeylockMode::Off => EngineProfile::Tape,
+            KeylockMode::On => EngineProfile::Keylock,
+            KeylockMode::Wide => EngineProfile::WideKeylock,
+        };
+        self.set_profile(profile);
+    }
+
     pub fn is_playing(&self) -> bool {
         self.playing.load(Ordering::Relaxed)
     }
 
-    /// Total frames of the loaded track.
+    /// Total frames of the loaded track (stream 0's length; a stem set is rendered frame-exactly
+    /// the same length — verified against the model, see the stem plan's P0 results).
     pub fn total_frames(&self) -> u64 {
-        self.pool.total_frames()
+        self.sources.first().map(|s| s.total_frames()).unwrap_or(0)
     }
 
-    /// The underlying PCM source, for out-of-band readers (e.g. the analysis layer).
+    /// Streams the deck is rendering right now: `1` for a plain track, one per stem once they are
+    /// installed.
+    ///
+    /// Read this **after** [`begin_block`](Self::begin_block): a `set_sources` swap lands there, so
+    /// before it the deck is still playing the old stream count. A mixer sizes its per-stream
+    /// chains from this, not from what it just asked to install.
+    pub fn stream_count(&self) -> usize {
+        self.flows
+            .get(self.active_index)
+            .map(Flow::stream_count)
+            .unwrap_or(1)
+    }
+
+    /// The first stream — the full mix while no stems are installed. For out-of-band readers (the
+    /// analysis layer) and for callers that only ever want "the track".
     pub fn source(&self) -> Arc<dyn Source> {
-        Arc::clone(&self.pool)
+        Arc::clone(&self.sources[0])
+    }
+
+    /// Every stream, in order.
+    pub fn sources(&self) -> Vec<Arc<dyn Source>> {
+        self.sources.clone()
     }
 
     /// Non-blocking jump: spawns a flow at `target_frame` and hands it to the warm-up thread.
@@ -284,6 +406,35 @@ impl Deck {
         self.push_rate();
     }
 
+    /// The tempo fader's full-deflection range (`0.1` = ±10%).
+    pub fn tempo_range(&self) -> f64 {
+        self.tempo_range
+    }
+
+    /// Sets the fader range. Purely a mapping change: the running tempo is **not** recomputed, it
+    /// stays exactly where the fader (or sync) left it.
+    pub fn set_tempo_range(&mut self, range: f64) {
+        if range.is_finite() && range > 0.0 {
+            self.tempo_range = range;
+        }
+    }
+
+    /// The tempo a fader at `position` (`-1..=1`) asks for under the current range.
+    pub fn tempo_from_fader(&self, position: f64) -> f64 {
+        1.0 + position.clamp(-1.0, 1.0) * self.tempo_range
+    }
+
+    /// Where the fader sits for the current tempo, derived (not stored) so a sync or a group
+    /// recompute can never leave a second, stale truth behind. Clamped to the travel.
+    pub fn tempo_fader(&self) -> f64 {
+        ((self.playhead.tempo - 1.0) / self.tempo_range).clamp(-1.0, 1.0)
+    }
+
+    /// Moves the fader: writes the tempo the position asks for under the current range.
+    pub fn set_tempo_fader(&mut self, position: f64) {
+        self.set_tempo(self.tempo_from_fader(position));
+    }
+
     /// Whether this deck derives its tempo from the group's shared BPM.
     pub fn set_lock(&mut self, lock: bool) {
         self.playhead.lock = lock;
@@ -381,50 +532,153 @@ impl Deck {
         }
     }
 
+    /// Runs the block's pre-render work: apply any completed switch, then the sync math.
+    ///
+    /// Split out of [`process_block`](Self::process_block) for the mixer, which needs to know this
+    /// block's stream count *before* it can build that many buses: read
+    /// [`stream_count`](Self::stream_count) between `begin_block` and
+    /// [`render_streams`](Self::render_streams), and a swap that landed this block is already
+    /// reflected. Sync runs first so the rate handed to the engine belongs to the same block as the
+    /// positions the leader was sampled at — a follower must never compare against last block.
+    pub fn begin_block(&mut self) {
+        self.poll_ready_flows();
+        self.apply_sync();
+    }
+
+    /// Renders this block into one [`Bus`] per stream — the path a mixer uses, so each stem can
+    /// take its own inserts and level before they are summed.
+    ///
+    /// A bus beyond the deck's stream count is cleared. Returns the frames of actual audio
+    /// (0 while paused or at the end).
+    pub fn render_streams(&mut self, outs: &mut [Bus]) -> usize {
+        if !self.is_playing() {
+            for bus in outs.iter_mut() {
+                bus.clear();
+            }
+            return 0;
+        }
+        let streams = self.stream_count().min(outs.len());
+        let (live, extra) = outs.split_at_mut(streams);
+        for bus in extra.iter_mut() {
+            bus.clear();
+        }
+        match self.flows.get_mut(self.active_index) {
+            Some(flow) => flow.process_streams(live),
+            None => {
+                for bus in live.iter_mut() {
+                    bus.clear();
+                }
+                0
+            }
+        }
+    }
+
+    /// Post-render bookkeeping: the armed LoopFlow is brought to exactly the clock the active flow
+    /// just reached (catching up its warm-up gap, then one block per block). Its render is thrown
+    /// away — the engine runs, the listener never hears it.
+    pub fn end_block(&mut self) {
+        self.drive_loop_flow();
+    }
+
     /// Processes one block, applying any completed jump first.
     ///
     /// `output` is always fully written (silence when paused or past the end); the return value is
-    /// the number of frames carrying actual audio.
+    /// the number of frames carrying actual audio. With stems the result is their **sum**: this is
+    /// the deck's single-stream view, for tests and for a ring buffer. A mixer wants
+    /// [`render_streams`](Self::render_streams) instead.
     pub fn process_block(&mut self, output: &mut [f32]) -> usize {
-        self.poll_ready_flows();
-        // Sync runs first so the rate handed to the engine belongs to the same block as the
-        // positions the leader was sampled at — a follower must never compare against last block.
-        self.apply_sync();
+        self.begin_block();
+        let written = self.render_sum(output);
+        self.end_block();
+        written
+    }
+
+    /// The interleaved, mixed render behind [`process_block`](Self::process_block) — without the
+    /// pre/post phases, so the three-phase callers share one implementation of the transport.
+    fn render_sum(&mut self, output: &mut [f32]) -> usize {
         let capacity = output.len() / CHANNELS;
         if !self.is_playing() {
             output[..capacity * CHANNELS].fill(0.0);
             return 0;
         }
-        let written = match self.flows.get_mut(self.active_index) {
+        match self.flows.get_mut(self.active_index) {
             Some(flow) => flow.process_block(output),
             None => {
                 output[..capacity * CHANNELS].fill(0.0);
                 0
             }
-        };
-        // Lockstep last: the armed LoopFlow is brought to exactly the clock the active flow just
-        // reached (catching up its warm-up gap, then one block per block). Its render lands in a
-        // scratch buffer and is thrown away — the engine runs, the listener never hears it.
-        self.drive_loop_flow();
+        }
+    }
+
+    /// One block of per-stream buses: `begin_block` → [`render_streams`](Self::render_streams) →
+    /// `end_block`.
+    ///
+    /// The mixer drives those three phases itself so it can size its per-stream chains in between;
+    /// this is the convenience form for tests and direct callers.
+    pub fn pull_streams_into(&mut self, outs: &mut [Bus]) -> usize {
+        self.begin_block();
+        let written = self.render_streams(outs);
+        self.end_block();
         written
+    }
+
+    /// Replaces the deck's streams — installing stems, or a fresh `load` on a deck that had them.
+    ///
+    /// The switch is a **source swap at the current position**, so it reuses the jump machinery
+    /// exactly: a new flow is warmed on the `FlowShift` thread and swapped in on a later block, with
+    /// `cued_from` compensation and the `reset_to` priming drain that make every flow change
+    /// seamless. The loop range is carried over, so installing stems mid-loop does not drop the
+    /// loop, and an armed loop-in is rebuilt against the new streams too (its engine would
+    /// otherwise keep reading the old track).
+    ///
+    /// Until the switch lands the deck keeps playing the *old* streams — one reason
+    /// [`stream_count`](Self::stream_count) and not this call's intent is what sizes a mixer.
+    pub fn set_sources(&mut self, sources: Vec<Arc<dyn Source>>) {
+        if sources.is_empty() {
+            return;
+        }
+        self.sources = sources;
+        let at = self.virtual_frame();
+        let range = self.loop_range();
+        let flow = self.make_flow(at, range);
+        self.cued_from = at;
+        self.flowshift.submit_prepare(flow);
+
+        if let Some(arm) = self.loop_arm.take() {
+            if arm.flow.is_none() {
+                // Still warming: abandon the old submission rather than leak it in the warm map.
+                self.loop_reap.push(arm.id);
+            }
+            let flow = self.make_flow(self.virtual_frame(), None);
+            let id = flow.id;
+            self.flowshift.submit_prepare_loop_flow(flow);
+            self.loop_arm = Some(LoopArm {
+                id,
+                p_in: arm.p_in,
+                flow: None,
+                profile: arm.profile,
+            });
+        }
     }
 
     /// Renders one block into a [`Bus`], de-interleaving the transport's output as it goes.
     ///
-    /// A thin wrapper on [`process_block`](Self::process_block) — the state machine, the jump
-    /// compensation and the silence rules are unchanged, so a mixer and a ring buffer can never see
-    /// two different decks. The tail of `bus` beyond the block length is zeroed, so a bus reused
-    /// across blocks cannot leak the previous block into a short one.
+    /// The single-stream form of [`pull_streams_into`](Self::pull_streams_into): the state machine,
+    /// the jump compensation and the silence rules are shared, so a direct caller and a mixer can
+    /// never see two different decks. With stems the bus carries their sum. The tail of `bus` beyond
+    /// the block length is zeroed, so a bus reused across blocks cannot leak the previous block into
+    /// a short one.
     ///
-    /// Returns the frames of actual audio (0 while paused or at the end), same contract as
-    /// [`process_block`](Self::process_block).
+    /// Returns the frames of actual audio (0 while paused or at the end).
     pub fn pull_into(&mut self, bus: &mut Bus, ctx: &FxContext) -> usize {
         let frames = ctx.block_frames.min(bus.frames());
         // Stack scratch for the interleaved block: no allocation on the audio path, and one
         // `BLOCK_SIZE` block is exactly what the transport produces.
         let mut block = [0.0f32; crate::BLOCK_SAMPLES];
         let want = frames.min(crate::BLOCK_SIZE) * CHANNELS;
-        let written = self.process_block(&mut block[..want]);
+        self.begin_block();
+        let written = self.render_sum(&mut block[..want]);
+        self.end_block();
         for (i, (left, right)) in bus.l[..frames].iter_mut().zip(&mut bus.r[..frames]).enumerate() {
             let base = i * CHANNELS;
             if base + 1 < want {
@@ -777,7 +1031,6 @@ impl Deck {
                 ));
             }
         };
-        let mut scratch = [0.0f32; crate::BLOCK_SAMPLES];
         let mut driven = 0usize;
         // Clock discontinuity: a flow switch re-anchored the deck behind this arm's back — a loop
         // exit resumes at `out`, which sits *behind* where the slipped clock had lapped (or ahead
@@ -793,7 +1046,9 @@ impl Deck {
             let next = (flow.virtual_frame() + crate::BLOCK_SIZE as u64).min(target);
             let chunk = (next - flow.virtual_frame()) as usize;
             store_provisional(flow, next);
-            flow.render(&mut scratch[..chunk * CHANNELS]);
+            // Discard the audio but drive every stream: they are one engine, so one render keeps
+            // them all converged and on the deck's clock.
+            flow.render_discard(chunk);
             driven += 1;
         }
     }
@@ -805,7 +1060,7 @@ impl Deck {
         self.next_flow_id = id.wrapping_add(1);
         let flow = Flow::new_with(
             id,
-            Arc::clone(&self.pool),
+            self.sources.clone(),
             start_frame,
             None,
             self.flowshift.ready_sender(),
@@ -911,6 +1166,15 @@ mod tests {
         }))
     }
 
+    /// A deck over the zero-latency Tape profile: at unity the output is a bit-exact read of the
+    /// source ramp, which is what the sample-exact transport/loop assertions below need. Keylock
+    /// (the production default) has its own coverage elsewhere.
+    fn tape_deck(source: Arc<dyn Source>) -> Deck {
+        let mut deck = Deck::new(source);
+        deck.set_keylock_mode(KeylockMode::Off);
+        deck
+    }
+
     /// Drives blocks until the deck reaches `target`; warm-up happens on another thread.
     fn settle_at(deck: &mut Deck, out: &mut [f32], target: u64) {
         for _ in 0..500 {
@@ -942,22 +1206,52 @@ mod tests {
     }
 
     #[test]
-    fn new_deck_is_cued_at_zero_and_paused() {
-        let deck = Deck::new(pool(10_000));
+    fn a_new_deck_keylocks_and_starts_paused_at_the_origin_cue() {
+        let mut deck = Deck::new(pool(10_000));
         assert!(!deck.is_playing());
         assert_eq!(deck.current_frame(), 0);
         assert_eq!(deck.total_frames(), 10_000);
+        assert_eq!(deck.keylock_mode(), KeylockMode::On, "keylock is the production default");
+        assert_eq!(deck.cue_point(), 0, "a fresh deck cues at the loaded origin");
+        assert_eq!(deck.key_shift(), 0);
+        deck.set_keylock_mode(KeylockMode::Wide);
+        assert_eq!(deck.keylock_mode(), KeylockMode::Wide);
+        deck.set_key_shift(2);
+        assert_eq!(deck.key_shift(), 2);
     }
 
     #[test]
-    fn an_empty_deck_is_silent_and_holds_no_audio() {
-        let mut deck = Deck::empty();
+    fn the_tempo_fader_maps_through_the_range_and_range_changes_leave_tempo_alone() {
+        let mut deck = tape_deck(pool(10_000));
+        assert!((deck.tempo_range() - 0.1).abs() < 1e-9, "default range is ±10%");
+        deck.set_tempo_fader(0.5);
+        assert!((deck.tempo() - 1.05).abs() < 1e-9, "tempo {}", deck.tempo());
+        assert!((deck.tempo_fader() - 0.5).abs() < 1e-9, "fader {}", deck.tempo_fader());
+        // Changing the range is a mapping change only: tempo stays, the derived fader shifts.
+        deck.set_tempo_range(0.2);
+        assert!((deck.tempo() - 1.05).abs() < 1e-9, "range change moved the tempo");
+        assert!((deck.tempo_fader() - 0.25).abs() < 1e-9, "fader {}", deck.tempo_fader());
+        // Full deflection, and anything past it, clamps to the travel.
+        deck.set_tempo_fader(5.0);
+        assert!((deck.tempo() - 1.2).abs() < 1e-9, "tempo {}", deck.tempo());
+    }
+
+    #[test]
+    fn cue_set_marks_the_position_and_smart_sets_while_paused() {
+        let mut deck = tape_deck(pool(10_000));
+        let mut out = vec![0.0f32; 256 * CHANNELS];
         deck.play();
-        let mut out = vec![1.0f32; 256 * CHANNELS];
-        assert_eq!(deck.process_block(&mut out), 256);
-        assert!(out.iter().all(|s| *s == 0.0));
-        assert_eq!(deck.total_frames(), 0);
-        assert!(deck.is_at_end());
+        for _ in 0..4 {
+            deck.process_block(&mut out);
+        }
+        deck.pause();
+        let here = deck.current_frame();
+        assert!(here > 0);
+        deck.apply_cue(CueOp::Set);
+        assert_eq!(deck.cue_point(), here);
+        // Smart while paused is `set`: it must not move the transport.
+        deck.apply_cue(CueOp::Smart);
+        assert_eq!(deck.current_frame(), here);
     }
 
     /// `pull_into` is a wrapper, not a second transport: it must agree with `process_block` exactly.
@@ -1033,7 +1327,7 @@ mod tests {
 
     #[test]
     fn playing_advances_the_playhead() {
-        let mut deck = Deck::new(pool(10_000));
+        let mut deck = tape_deck(pool(10_000));
         deck.play();
         let mut out = vec![0.0f32; 256 * CHANNELS];
         for _ in 0..3 {
@@ -1110,12 +1404,14 @@ mod tests {
 
     #[test]
     fn deck_over_empty_source_is_silent() {
-        let mut deck = Deck::new(Arc::new(PcmPool::empty()));
+        // `Deck::empty()` is the same construction; one silence test covers both spellings.
+        let mut deck = Deck::empty();
         deck.play();
         let mut out = vec![1.0f32; 256 * CHANNELS];
         // The engine always fills the buffer; empty source means the content is silence.
         assert_eq!(deck.process_block(&mut out), 256);
         assert!(out.iter().all(|s| *s == 0.0));
+        assert_eq!(deck.total_frames(), 0);
         assert!(deck.is_at_end());
     }
 
@@ -1173,7 +1469,7 @@ mod tests {
 
     #[test]
     fn beatjump_moves_by_beats_and_keeps_phase() {
-        let mut deck = Deck::new(pool(44_100 * 20));
+        let mut deck = tape_deck(pool(44_100 * 20));
         deck.set_analysis(grid_122bpm(48_000 * 20));
         deck.play();
         let mut out = vec![0.0f32; 256 * CHANNELS];
@@ -1209,7 +1505,7 @@ mod tests {
     }
 
     fn loop_deck(total: u64) -> Deck {
-        let deck = Deck::new(pool(total));
+        let deck = tape_deck(pool(total));
         deck.set_analysis(grid_122bpm(total));
         deck.play();
         deck
@@ -1691,5 +1987,151 @@ mod tests {
         let range = deck.loop_range().expect("engaged");
         assert!(range.out_frame <= total, "out clamped to the track end");
         assert!(range.out_frame > range.in_frame, "still a legal range");
+    }
+
+    /// A tagged ramp: the sample value encodes `(frame, stream)`, so a stream mix-up in the
+    /// interleave shows up as a value mismatch rather than as a level change.
+    fn tagged_pool(n_frames: u64, tag: f32) -> Arc<dyn Source> {
+        Arc::new(PcmPool::from_decoded(DecodedAudio {
+            pcm: (0..n_frames as usize)
+                .flat_map(|i| [i as f32 + tag, -(i as f32) - tag])
+                .collect(),
+            total_frames: n_frames,
+            sample_rate: crate::SAMPLE_RATE,
+            channels: CHANNELS,
+        }))
+    }
+
+    /// Installing stems is a **source swap at the current position**: the deck keeps playing, the
+    /// audible stream count grows to four, and each stream carries its own source.
+    #[test]
+    fn set_sources_swaps_to_four_streams_without_touching_the_clock() {
+        let mut deck = tape_deck(tagged_pool(200_000, 0.0));
+        deck.play();
+        let frames = crate::BLOCK_SIZE;
+        let mut out = vec![0.0f32; frames * CHANNELS];
+        settle_at(&mut deck, &mut out, (frames * 20) as u64);
+        assert_eq!(deck.stream_count(), 1, "a plain track is one stream");
+        let before = deck.current_frame();
+
+        let tags = [0.0f32, 1000.0, 2000.0, 3000.0];
+        deck.set_sources(
+            tags.iter().map(|tag| tagged_pool(200_000, *tag)).collect(),
+        );
+        // The swap warms on the background thread, so until it lands the deck is still one stream —
+        // which is exactly why `stream_count` (not the install call) is what sizes a mixer.
+        for _ in 0..500 {
+            deck.begin_block();
+            let streams = deck.stream_count();
+            deck.end_block();
+            if streams == 4 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(deck.stream_count(), 4, "the stem swap never landed");
+
+        let mut buses: Vec<Bus> = (0..4).map(|_| Bus::stereo(frames)).collect();
+        assert_eq!(deck.pull_streams_into(&mut buses), frames);
+        let start = deck.current_frame() - frames as u64;
+        for (stream, bus) in buses.iter().enumerate() {
+            let tag = tags[stream];
+            for i in 0..frames {
+                let expected = (start + i as u64) as f32 + tag;
+                assert!(
+                    (bus.l[i] - expected).abs() < 1e-2,
+                    "stream {stream} frame {i}: {} != {expected} (streams crossed?)",
+                    bus.l[i]
+                );
+                assert!(
+                    (bus.r[i] + expected).abs() < 1e-2,
+                    "stream {stream} right frame {i}: {} != {}",
+                    bus.r[i],
+                    -expected
+                );
+            }
+        }
+        // The clock ran through the swap instead of restarting.
+        assert!(deck.current_frame() > before);
+    }
+
+    /// The deck's mixed view (`process_block` / `pull_into`) sums its streams, so a caller that
+    /// only wants "the deck" keeps working after stems are installed.
+    #[test]
+    fn the_mixed_view_of_a_stem_deck_is_the_sum_of_its_streams() {
+        let tags = [0.0f32, 1000.0, 2000.0, 3000.0];
+        let mut deck = tape_deck(tagged_pool(200_000, 0.0));
+        deck.set_sources(tags.iter().map(|tag| tagged_pool(200_000, *tag)).collect());
+        for _ in 0..500 {
+            deck.begin_block();
+            let streams = deck.stream_count();
+            deck.end_block();
+            if streams == 4 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        deck.play();
+
+        let frames = crate::BLOCK_SIZE;
+        let mut out = vec![0.0f32; frames * CHANNELS];
+        deck.process_block(&mut out);
+        let tag_sum: f32 = tags.iter().sum();
+        for i in 0..frames {
+            let expected = i as f32 * 4.0 + tag_sum;
+            assert!(
+                (out[i * CHANNELS] - expected).abs() < 1e-2,
+                "frame {i}: {} != {expected}",
+                out[i * CHANNELS]
+            );
+        }
+    }
+
+    /// A source swap has to carry the loop with it: the range lives on the flow, and the replaced
+    /// flow takes it away, so `set_sources` re-stamps it. Without this, installing stems mid-loop
+    /// would silently drop the loop — and an armed loop-in would keep running on the old track.
+    #[test]
+    fn installing_stems_keeps_the_running_loop() {
+        let total = crate::SAMPLE_RATE as u64 * 60;
+        let mut deck = loop_deck(total);
+        let mut out = vec![0.0f32; 256 * CHANNELS];
+
+        deck.apply_loop(LoopOp::Beats(4)).expect("beat loop");
+        settle_loop(&mut deck, &mut out);
+        let range = deck.loop_range().expect("engaged");
+
+        let tags = [0.0f32, 1000.0, 2000.0, 3000.0];
+        deck.set_sources(tags.iter().map(|tag| tagged_pool(total, *tag)).collect());
+        for _ in 0..500 {
+            deck.begin_block();
+            let streams = deck.stream_count();
+            deck.end_block();
+            if streams == 4 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(deck.stream_count(), 4, "the stem swap never landed");
+        assert_eq!(
+            deck.loop_range(),
+            Some(range),
+            "the loop range must survive the source swap"
+        );
+
+        // …and it is still folding: drive a full lap and check that the audible clock never leaves
+        // the range while the slip clock runs past it. That is the whole loop state machine
+        // surviving the swap, not merely the range value.
+        for _ in 0..2_000 {
+            deck.process_block(&mut out);
+            let audible = deck.current_frame();
+            assert!(
+                audible >= range.in_frame && audible < range.out_frame,
+                "the loop stopped folding after the swap: {audible} outside {range:?}"
+            );
+            if deck.virtual_frame() > range.out_frame {
+                return;
+            }
+        }
+        panic!("the slip clock never ran past the loop after the swap");
     }
 }

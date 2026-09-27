@@ -1,13 +1,15 @@
 # Hypermixx 架构
 
-Rust workspace,六个 crate 单向分层:**core(类型) ← media(PCM) ← audio(引擎)**;
-library(分析)与 audio 零交叉依赖,只被 cli 调用。引擎域 **44.1 kHz 立体声**(与目标设备
-ALSA default 的原生时钟一致,cpal 回调直通,零转换)。
+Rust workspace,七个 crate 单向分层:**core(类型) ← media(PCM) ← audio(引擎)**;
+library(分析)与 audio 零交叉依赖,只被 cli 调用;stems(离线分离)同理,只是多一个 ML 依赖
+且可以关掉。引擎域 **44.1 kHz 立体声**(与目标设备 ALSA default 的原生时钟一致,cpal 回调直通,
+零转换)。
 
 ```
-cli ──→ core / media / audio / library / midi
+cli ──→ core / media / audio / library / stems / midi
 audio ──→ core, media          (+ timestretch, git 依赖 rev 锁定; serde + toml)
 library ──→ core, media        (+ stratum-dsp, git 依赖 rev 锁定)
+stems ───→ core, media         (+ charon-audio/ort, 特征开关;可关)
 midi ───→ core                 (+ midir, serde + toml)
 media ──→ core                 (+ symphonia)
 core ──→ serde
@@ -46,6 +48,14 @@ crates/
 │   │   ├── mixer/         # 混音拓扑(见下)
 │   │   └── fx/            # 效果子系统(见下)
 │   └── tests/            # engine / beatlock / loop / sync / decode / tone_faithful
+│
+├── hypermixx-stems/      # 离线 stem 分离(core + media + charon/ort, feature `onnx`)
+│   └── src/
+│       ├── lib.rs          # StemSeparator trait / Cancelled / read_source / separate_cached
+│       ├── mock.rs         # MockSeparator:无模型,CI 与开发用(两种精确可加的切法)
+│       ├── model.rs        # 模型表 + 镜像下载 + SHA-256 校验(不信任后端的下载器)
+│       ├── cache.rs        # 内容寻址缓存(~/.cache/hypermixx/stems/<key>/)
+│       └── onnx.rs         # CharonSeparator:进度/取消桥接 + 帧对齐契约检查
 │
 ├── hypermixx-library/    # 分析与曲库(core + media + stratum-dsp)
 │   └── src/
@@ -100,16 +110,22 @@ crates/
 
 ### `Command` / `CommandResponse`
 - `Load { deck_id, source, analysis }` — source 已解码,analysis 可选(常网格快路径)
-- `Play` / `Pause` / `Jump { target_frame }` / `BeatJump { beats }`
-- `SetRate` / `SetProfile` / `SetAnalysis` — 分析结果从这里进入 deck,**没有 `Analyse` 命令**
+- `Play` / `Pause` / `TogglePlay` / `Cue { deck_id, op }` / `Jump { target_frame }` / `BeatJump { beats }`;
+  `CueOp = Play | Back | Set | Smart`(`Smart` 由 deck 自己的 `is_playing()` 决定,前端不猜)
+- `SetTempo` / `SetTempoFader` / `SetTempoRange` / `SetKeylock { mode: KeylockMode }` / `SetKey { semitones }` / `SetAnalysis` —
+  分析结果从这里进入 deck,**没有 `Analyse` 命令**;`KeylockMode = Off | On | Wide`(默认 On),
+  `SetKey` 是占位(streaming 引擎无变调轴)。**推子是控制器输入**:`SetTempoFader{position}`
+  由 deck 按 `1 + position×tempo_range` 算 rate,再走 `SyncGroup::set_tempo` 的三分支
 - sync 族:`Sync { deck_id, op }`,op = `Tempo` / `Phase{mode,t}` / `TempoLock` /
   `PhaseLock{mode,t}` / `SetLeader` / `Unlock`;`PhaseMode = Instant | Linear | Pid`。
   **`phase` 包含 `tempo`,`phaselock` 包含 `tempolock`**;`SetLeader` 不带参数(target-first
   语法下 `deck0 sync set-leader` 即“deck0 是 leader”)
 - `Nudge { deck_id, op }`,`op = Start{delta, seconds} | Stop` — 临时速率弯折,
-  只动 `nudgerate`,结束时 `tempo` 原封不动
-- `DeckState` 除 transport 外还报 `tempo` / `nudgerate` / `playing_rate` / `lock` / `align` /
-  `nudge` / `sync_leader` / `sync_mode` / `group_bpm` —— TUI 徽标与 `sync_phase.sh` 的判据都读它
+  只动 `nudgerate`,结束时 `tempo` 原封不动(CLI 秒数必填,MIDI `seconds=None` 为按住)
+- `DeckState` 除 transport 外还报 `bpm` / `bpm_at_frame` / `tempo` / `tempo_fader` / `tempo_range` / `nudgerate` / `playing_rate` / `lock` / `align` /
+  `nudge` / `sync_leader` / `sync_mode` / `group_bpm` / `cue_frame` / `keylock` / `key_shift`
+  —— TUI 徽标与 `sync_phase.sh` 的判据都读它(deck 头行的 `keylock on|off|wide` 直接读 `DeckState`);
+  前端的“当前 BPM” = `bpm_at_frame × tempo`(`response::bpm_label`,不含 nudgerate)
 - `GetState` / `GetAllStates`(同块原子快照)/ `Quit`
 - FX 族:`AddFx { chain, kind }` / `RemoveFx { chain, index }` / `SetFxEnabled` /
   `SetFxParam { slot, name, value }` / `FxTrigger` / `PadPress` / `PadRelease` / `ListFx`;
@@ -178,17 +194,22 @@ mixer 只负责把 deck 变成采样;谁跟谁、共享 BPM 是什么,是**关�
 固定信号路径(`Channel::process`):
 
 ```
-deck.pull_into(bus)
-  → flow_fx        逐流插入(换流即重置滤波记忆)
-  → [cue tap]      PostFlowFx
-  → flow_fader     逐流电平
-  → [cue tap]      PostFlowFader
-  → deck_fx        逐 deck 音色(跨跳转持久)
+(逐 stream 循环:一个 deck 有 1 条,装了 stems 就有 4 条)
+    deck.render_stream(i)
+    → flow_fx[i]    逐流插入(换流即重置滤波记忆;**每 stream 一条,状态独立**)
+    → [cue tap]     PostFlowFx    = Σ 各路 flow_fx 之后
+    → flow_fader[i] 逐流电平(mute = -1 = bipolar_amp 的精确静音)
+    → Σ 到 channel bus
+  → [cue tap]      PostFlowFader  = Σ 各路 flow_fader 之后
+  → deck_fx        逐 deck 音色(跨跳转持久,整 deck 共用)
   → [cue tap]      PostDeckFx
-  → deck_fader     (stems 预留,现恒 unity)
+  → deck_fader
   → [cue tap]      PostDeckFader
   → crossfader     按侧别的 pan law(Left/Right/Center × EqualPower/Linear)
 ```
+
+单 stream 时上面这段与历史路径**逐位相同**(一个 stream 的循环就是原来那两步),这也是为什么
+加 stems 没有改变普通曲目的任何行为。
 
 `MasterBus::render`:`sum → master_fx → master_fader → limiter(安全级)`。
 四样东西**永远不可配置**:
@@ -205,8 +226,12 @@ fader 起始位、cue_send/cue_tap/side/curve、master fx/limiter/fader、输出
 (name/role(Main|Headphones)/channels/gain)。
 
 - `Bus` — 面内(L/R 分离)块单位,构造时分配,热路径零分配;效果器逐面迭代省去步长乘法
-- `Channel` — 拥有自己的 deck、两条链、四个 fader;**flow/deck 两链对外是一个合并索引
-  空间**(`slot(i)` 先 flow 后 deck,`AddFx` 落 deck 半边)
+- `Channel` — 拥有自己的 deck、**每 stream 一条 flow 链**(`Vec<FxChain>`,从 config 的
+  `flow_fx` 名单当模板重建)、一条共享 deck 链、每 stream 一个 fader;**没有合并索引空间**
+  (`FxChainId::Deck` 只指 deck 链,`FxChainId::Stem{deck,stem}` 指某条 stem 的链 —— 一条链
+  一个 stream 之后,"deck 的 slot 2" 可以指四个不同的效果)。逐 stem 的 level/mute/solo 存成
+  **三件独立事实**,由 `refresh_stem_faders` 一处合成,所以 solo 能压过 mute、取消静音能恢复
+  原电平(而不是回到 unity)
 - `Output`(`output.rs`,crate 里唯一出现 cpal 类型的地方)— 每输出独立 ring + stream;
   回调外预分配 scratch、partial push 永不阻塞、声道重映射安全钳制(单声道取和);
   `gain` 逐目的地 trim;**预填半 ring 静音**(~46ms)避免启动竞速;producer 侧 overrun
@@ -251,7 +276,10 @@ fader 起始位、cue_send/cue_tap/side/curve、master fx/limiter/fader、输出
   一个 variant + 一个 `build` arm + 一行 `ALL`,无插件面
 
 ### `deck/`
-- `Deck` — 单 source、单活跃流;`jump()` 记 `cued_from`(**virtual 时钟**),`switch_to()` 把新流
+- `Deck` — `sources: Vec<Shared>`(1 条 = 普通曲目,4 条 = stems)、单活跃 flow;
+  `set_sources()` 在当前 virtual 位置做**换源 jump**(带 loop range、重建 armed LoopFlow),
+  所以"播放中装 stems"是无缝的;`begin_block`/`render_streams`/`end_block` 三相位拆分,让 mixer
+  能在同一块内先让换源落地、再按 `stream_count()` 备好逐 stream 的链;`jump()` 记 `cued_from`(**virtual 时钟**),`switch_to()` 把新流
   落点前移预热期间已播放的帧量,保证跨 deck 相位锁定(`phase_probe.sh` 的 `err` 恒 +0);
   `pull_into(&mut Bus, &FxContext)` 是 `process_block` 的面内薄包装
 - **两个时钟**:`virtual_frame()` = 引擎播放头,只增不减、loop 不碰(slip);
@@ -286,8 +314,8 @@ fader 起始位、cue_send/cue_tap/side/curve、master fx/limiter/fader、输出
   持有自己的 `LoopRangeCell`,`render()` 无状态门(LoopFlow 的同速驱动用它),
   `prepare()` 与 `reset_to()` = seek 协议 + **排空 warm-start 锄热**——宣布 ready 与
   换流后的第一块都已是收敛音频(任何切换都不呼吸锄热间隙,换流无缝)
-- `PitchShiftEngine` — timestretch-rs 三 Profile:**Tape**(零延迟直通)/ **Keylock** /
-  **WideKeylock**(预热走 `reset → set_track_position → warm_start`);`feed()` 按
+- `PitchShiftEngine` — timestretch-rs 三 Profile 对应 `KeylockMode::Off/On/Wide`:**Tape**(零延迟直通,
+  默认**不再**用它)/ **Keylock**(生产默认)/ **WideKeylock**(预热走 `reset → set_track_position → warm_start`);`feed()` 按
   `demand_hint` **按需喂入**(超前量 32768→~1100 帧 ≈25ms,loop_range 变更影响窗口小到
   可被 overlap 淡化),按 LoopRange **分段读 + 每段 `set_track_position(实际位置)`**——
   wrap 只是喂入流内的 splice,引擎永不复位(Keylock 下无瞬态)
@@ -321,14 +349,14 @@ fader 起始位、cue_send/cue_tap/side/curve、master fx/limiter/fader、输出
 会话命令(target-first:行首 `deck0`/`0`/`master` 选目标,缺省用焦点 deck):
 - `load <path> [bpm]` — 后台解码;给 bpm 则建常网格跳过分析
 - `analyse` — 后台跑 `library::analyser::analyze`,完成后 `SetAnalysis`
-- `play / pause / jump <frame> / beatjump <beats> / rate / profile / state / quit`
+- `play / cue [play|back|set] / jump <frame> / beatjump <beats> / tempo / tempofader / temporange / keylock on|off|wide / key / state / quit`
 - `loop` 族:`loop in|out|<n>|exit|cancel|halve|double|edit <len|move|in|out> <beats>|quantum <q>`
   (手动 in/out 带量化与 LoopFlow 锄热,`<n>` 循环中 = 只调 out,halve/double = 当前长度
   ÷2/×2、域 1/32..64 拍,循环中编辑原地原子 store,exit 无缝续播越过 out)
 - `fx` 族:`fx add|remove|list|set|on|off|trigger|pad press|release`,chain 地址
   `master`/`m`/`deck0`/`d0`/`0`;`fx help` 从注册表生成 kind/参数清单(永不与引擎脱节)
 - `sync` 族:`sync tempo | phase <instant|linear [秒]|pid> | tempolock |
-  phaselock <mode> [秒] | set-leader | unlock`;`nudge <delta> [秒] | nudge off`。
+  phaselock <mode> [秒] | set-leader | unlock`;`nudge <delta> <秒> | nudge off`。
   解析错误(`linear 0`、非数字秒数)前端直接 `Failed`;引擎拒绝(无网格、反向同步)后到为 `Error`
 - TUI deck 头行多一枚黄色徽标:`sync phaselock 122.0 BPM ← deck0 phase pid locked`,
   与 CLI 的 `deck_line` 共用 `response::sync_badge`(所以测它就同时覆盖两边)
@@ -372,7 +400,8 @@ AudioPipeline ──producer thread───────────────
   │ 命令分发(块边界): transport → deck / FX → Mixer::handle_fx_command   │
   │ 查询: deck_source / channel_count(命令空队列时也 drain)             │
   │ 每 tick: SyncGroup::prepare → make_ctx → Mixer::process              │
-  │   ├ channel × N: deck.pull_into → flow_fx → fader → deck_fx → fader │
+  │   ├ channel × N: deck.render_streams[1..4] → flow_fx[i] → fader[i] → Σ │
+  │   │                     → deck_fx → deck_fader → crossfader           │
   │   │              → crossfader → master.sum;cue tap → cue.sum         │
   │   ├ master: fx → fader → limiter(安全级)                            │
   │   └ cue: fader                                                       │
