@@ -39,13 +39,14 @@ cli ─┬─► audio ───┐
 sudo apt install libasound2-dev   # Debian/Ubuntu
 
 git clone <repo> && cd HyperMixx
-cargo build --workspace           # 或 --release
+cargo build --release
+cargo build --release --features cuda  # use cuda to separate stems
 ```
 
 ## 示例操作
 
 ```bash
-cargo run -p hypermixx-cli - --tui
+cargo run -p hypermixx-cli --features cuda - --tui
 ```
 
 ```text
