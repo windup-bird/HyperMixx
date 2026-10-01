@@ -123,8 +123,8 @@ cargo build --release --workspace   # 两个脚本默认吃 target/release 的�
 1. loop sync
 2. midi control
 3. network streamming
-4. realtime stems（离线分离 + 逐 stem 播放已完成：`docs/stem-plan.md`、`docs/commands.md` §3.7；
-   未做的是短窗在线分离、per-stem 波形、MIDI stem 映射）
+4. realtime stems（离线分离 + 逐 stem 播放已完成，含 per-stem fx 配置与 MIDI：
+   `docs/stem-plan.md`、`docs/commands.md` §3.7；未做的是短窗在线分离与 per-stem 波形）
 5. slip loop(循环退出落 virtual/slip 位置;当前退出=落旧流停止处无缝续播、自然越过 out)
 6. 收敛超时检测(目前只有 PLL 输出 ±5% 限幅兑底,误差关不上时会一直以 5% 跑,不会自动清 align)
 7. TUI 按键式 nudge(需放行 `KeyEventKind::Release`,目前只支持定时/命令式)

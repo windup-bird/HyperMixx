@@ -174,6 +174,54 @@ fn empty_pool() -> Arc<dyn Source> {
     }))
 }
 
+/// Deletes all but the `keep` most recently written entries, returning `(removed, freed bytes)`.
+///
+/// A separated track is a few hundred megabytes, so an unbounded cache is a real problem rather than
+/// a tidiness one. Recency is the entry directory's mtime, which is when its last stem was written.
+pub fn prune_cache(keep: usize) -> Result<(usize, u64), StemError> {
+    let Ok(dir) = std::fs::read_dir(stems_root()) else {
+        return Ok((0, 0));
+    };
+    let mut entries: Vec<(std::time::SystemTime, PathBuf, u64)> = Vec::new();
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let written = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            // An unreadable timestamp sorts last, so it is a candidate for removal rather than a
+            // thing that is never removed.
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let bytes = std::fs::read_dir(&path)
+            .map(|inner| {
+                inner
+                    .flatten()
+                    .filter_map(|file| file.metadata().ok())
+                    .map(|meta| meta.len())
+                    .sum()
+            })
+            .unwrap_or(0);
+        entries.push((written, path, bytes));
+    }
+    // Newest first; `Reverse` keeps the ordering (and the `skip(keep)` below) readable.
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    let mut removed = 0usize;
+    let mut freed = 0u64;
+    for (_, path, bytes) in entries.into_iter().skip(keep) {
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                removed += 1;
+                freed += bytes;
+            }
+            // A cache that cannot be pruned is not a failed separation; report what did go.
+            Err(_) => continue,
+        }
+    }
+    Ok((removed, freed))
+}
+
 /// Total bytes the cache is holding, and how many entries — for a `stem cache` report.
 pub fn cache_usage() -> (u64, usize) {
     let mut bytes = 0u64;
@@ -278,6 +326,37 @@ mod tests {
         assert_eq!(cache_key("m", &a), cache_key("m", &b));
         assert_ne!(cache_key("m", &a), cache_key("m", &c), "content");
         assert_ne!(cache_key("m", &a), cache_key("other", &a), "separator id");
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_and_reports_what_it_freed() {
+        with_isolated_cache("prune", || {
+            let source = mix(100, 0.0);
+            let set = MockSeparator::default()
+                .separate(source.as_ref(), &crate::no_progress(), &crate::Cancelled::new())
+                .unwrap();
+            let mut keys = Vec::new();
+            for tag in 0..3 {
+                // Distinct keys, written in order; the mtime granularity on some filesystems is
+                // coarse, so the *set* is asserted rather than which exact one survived.
+                let key = format!("entry{tag}");
+                store_cached(&key, &set).unwrap();
+                keys.push(key);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert_eq!(cache_usage().1, 3);
+            let (removed, freed) = prune_cache(1).unwrap();
+            assert_eq!(removed, 2);
+            assert!(freed > 0);
+            let (bytes, entries) = cache_usage();
+            assert_eq!(entries, 1);
+            assert!(bytes > 0);
+            // The newest survives: it is the one written last.
+            assert!(load_cached(keys.last().unwrap()).is_some());
+            // Pruning to zero is how a user asks for "clear it".
+            assert_eq!(prune_cache(0).unwrap().0, 1);
+            assert_eq!(cache_usage(), (0, 0));
+        });
     }
 
     #[test]

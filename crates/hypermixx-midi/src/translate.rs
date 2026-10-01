@@ -6,7 +6,8 @@
 //! [`MergeBuffer`] coalesces the floods a fast fader sweep produces.
 
 use hypermixx_core::{
-    Command, CueOp, DeckId, FaderTarget, FxSlotRef, LoopEditOp, LoopOp, NudgeOp, PhaseMode, SyncOp,
+    Command, CueOp, DeckId, FaderTarget, FxSlotRef, LoopEditOp, LoopOp, NudgeOp, PhaseMode, StemOp,
+    SyncOp,
 };
 
 use crate::map::{
@@ -297,6 +298,15 @@ impl<'a> BindingOut<'a> {
                 deck_id: deck,
                 op: CueOp::Smart,
             }),
+            // Latching, so the engine flips its own state rather than the mapping holding one.
+            Action::StemMute { stem } => self.out.push(Command::Stem {
+                deck_id: deck,
+                op: StemOp::ToggleMute { stem },
+            }),
+            Action::StemSolo { stem } => self.out.push(Command::Stem {
+                deck_id: deck,
+                op: StemOp::ToggleSolo { stem },
+            }),
             Action::BeatJump { beats } => self.out.push(Command::BeatJump {
                 deck_id: deck,
                 beats,
@@ -538,6 +548,7 @@ impl MergeBuffer {
 mod tests {
     use super::*;
     use crate::map::Map;
+    use hypermixx_core::Stem;
 
     fn map(toml: &str) -> Map {
         Map::from_toml_str(toml).expect("test map should parse")
@@ -599,6 +610,74 @@ action = "play"
         // A different key or channel does nothing.
         assert!(translate(&map, &note(0, 49, true), &mut state).is_empty());
         assert!(translate(&map, &note(1, 48, true), &mut state).is_empty());
+    }
+
+    /// A stem button latches: the engine flips its own state, so the mapping never has to know it.
+    #[test]
+    fn a_stem_button_emits_a_toggle_and_nothing_on_release() {
+        let map = map(r#"
+[[bind]]
+type = "note"
+id = 20
+deck = 0
+action = "stem.vocals.mute"
+
+[[bind]]
+type = "note"
+id = 21
+deck = 1
+action = "stem.bass.solo"
+"#);
+        let mut state = TranslateState::new(&map);
+        let commands = translate(&map, &note(0, 20, true), &mut state);
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::Stem {
+                deck_id: 0,
+                op: StemOp::ToggleMute { stem: Stem::Vocals }
+            }]
+        ));
+        // Latching: the release edge must not fire a second toggle.
+        assert!(translate(&map, &note(0, 20, false), &mut state).is_empty());
+        // A second press is another toggle, not a state the mapping tracks.
+        let again = translate(&map, &note(0, 20, true), &mut state);
+        assert_eq!(again.len(), 1);
+        // The binding's deck goes with the action.
+        let commands = translate(&map, &note(0, 21, true), &mut state);
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::Stem {
+                deck_id: 1,
+                op: StemOp::ToggleSolo { stem: Stem::Bass }
+            }]
+        ));
+    }
+
+    /// A per-stem fader is an ordinary fader: same soft takeover, different target.
+    #[test]
+    fn a_stem_fader_takes_the_soft_takeover_path_to_the_stem_target() {
+        let map = map(r#"
+[[bind]]
+type = "cc"
+mode = "abs"
+id = 30
+deck = 1
+action = "fader.stem.other"
+"#);
+        let mut state = TranslateState::new(&map);
+        // A first value only registers a position; the takeover needs a crossing, so approach the
+        // mirror from above and then cross it (the same two-message shape as `fader.flow`).
+        assert!(translate(&map, &cc(0, 30, 127), &mut state).is_empty());
+        let commands = translate(&map, &cc(0, 30, 0), &mut state);
+        let (target, value) = fader(&commands[0]).expect("SetFader");
+        assert_eq!(
+            target,
+            FaderTarget::Stem {
+                deck: 1,
+                stem: Stem::Other
+            }
+        );
+        assert!(close(value, -1.0), "value {value}");
     }
 
     #[test]

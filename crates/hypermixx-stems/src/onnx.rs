@@ -44,10 +44,10 @@ impl CharonSeparator {
         }
     }
 
-    /// Random-shift averaging count (`0`..=10 in `charon`, kept here to `0`..=2 — past that the
-    /// separation time grows faster than the quality does for a DJ's purposes).
+    /// Random-shift averaging count, clamped to [`crate::MAX_SHIFTS`] (`charon` itself allows more;
+    /// see that constant for why this does not).
     pub fn with_shifts(mut self, shifts: usize) -> Self {
-        self.shifts = shifts.min(2);
+        self.shifts = shifts.min(crate::MAX_SHIFTS);
         self
     }
 
@@ -57,6 +57,8 @@ impl CharonSeparator {
 }
 
 impl StemSeparator for CharonSeparator {
+    /// The shift count is part of the id, which is part of the cache key: two shift counts produce
+    /// different audio, so they must not share a cache entry.
     fn id(&self) -> String {
         format!("charon-{}-s{}", HTDEMUCS.name, self.shifts)
     }

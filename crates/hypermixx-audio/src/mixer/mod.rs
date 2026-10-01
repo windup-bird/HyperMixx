@@ -94,13 +94,15 @@ impl Mixer {
         let block_frames = BLOCK_SIZE;
         let chains = cfg.build_chains()?;
         let mut channels = Vec::with_capacity(cfg.channels.len());
-        for (channel_cfg, (flow_slots, deck_slots)) in
+        for (channel_cfg, (flow_chains, deck_slots)) in
             cfg.channels.iter().zip(chains.into_iter())
         {
+            // `build_chains` already produced one chain per stem, so the per-stem overrides in the
+            // config are in effect from the first block — not only after a `SetStems`.
             channels.push(Channel::new(
                 Deck::empty(),
                 channel_cfg,
-                FxChain::from_slots(flow_slots),
+                flow_chains,
                 FxChain::from_slots(deck_slots),
             ));
         }

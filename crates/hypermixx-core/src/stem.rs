@@ -190,8 +190,14 @@ pub enum StemOp {
     Level { stem: Stem, position: f32 },
     /// Mute/unmute one stem. Solo, if any, still wins.
     Mute { stem: Stem, on: bool },
+    /// Flip one stem's mute. Resolved against the mixer's own state, the same way
+    /// [`CueOp::Smart`](crate::CueOp::Smart) is resolved by the deck: a MIDI button is a *toggle*,
+    /// and a front-end that guessed from a possibly-stale snapshot would fight the engine.
+    ToggleMute { stem: Stem },
     /// Add/remove one stem from the solo set.
     Solo { stem: Stem, on: bool },
+    /// Flip one stem's solo membership. See [`StemOp::ToggleMute`].
+    ToggleSolo { stem: Stem },
     /// All four audible at unity, no mute, no solo.
     Clear,
     /// A named arrangement (acapella, instrumental, …).

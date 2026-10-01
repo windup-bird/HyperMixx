@@ -65,6 +65,13 @@ struct LoopArm {
 /// is the axis stems live on and the deck is the thing every stream shares: one clock, one loop
 /// mapping, one tempo.
 pub struct Deck {
+    /// The **track** — the mix this deck was loaded with, kept even after stems replace it.
+    ///
+    /// `sources[0]` is what stream 0 is *playing*, which after [`set_sources`](Self::set_sources) is
+    /// a stem, not the track. Out-of-band readers want the track: analysing the drums stem gives a
+    /// wrong key, and re-separating a stem would produce garbage and a bogus cache entry. So the mix
+    /// is held separately and [`source`](Self::source) returns it.
+    original: Arc<dyn Source>,
     /// The deck's streams, in order. One for a plain track; one per stem once they are installed.
     /// The *active flow* is the authority on how many are audible right now — a swap is warmed on
     /// the background thread and lands a few blocks later, so `sources.len()` alone would be ahead
@@ -131,6 +138,9 @@ impl Deck {
     /// [`PitchShiftEngine`](crate::flow::PitchShiftEngine) for why they are not separate engines.
     pub fn with_sources(sources: Vec<Arc<dyn Source>>) -> Self {
         assert!(!sources.is_empty(), "a deck needs at least one stream");
+        // Stream 0 is the track here: this constructor is "load these streams", and a caller with
+        // four already-separated stems is describing a deck whose mix is unavailable.
+        let original = Arc::clone(&sources[0]);
         let flowshift = FlowShift::new();
         // The first flow has to be born with the profile: `Flow::new` hardcodes Tape, and a later
         // `set_profile` would rebuild rather than start there.
@@ -146,6 +156,7 @@ impl Deck {
         first.prepare();
         first.activate();
         Self {
+            original,
             sources,
             flows: vec![first],
             active_index: 0,
@@ -248,10 +259,11 @@ impl Deck {
         self.playing.load(Ordering::Relaxed)
     }
 
-    /// Total frames of the loaded track (stream 0's length; a stem set is rendered frame-exactly
-    /// the same length — verified against the model, see the stem plan's P0 results).
+    /// Total frames of the loaded track. A stem set is rendered frame-exactly the same length
+    /// (verified against the model — see the stem plan's P0 results), so the track's own length is
+    /// the honest answer whether or not stems are installed.
     pub fn total_frames(&self) -> u64 {
-        self.sources.first().map(|s| s.total_frames()).unwrap_or(0)
+        self.original.total_frames()
     }
 
     /// Streams the deck is rendering right now: `1` for a plain track, one per stem once they are
@@ -267,10 +279,11 @@ impl Deck {
             .unwrap_or(1)
     }
 
-    /// The first stream — the full mix while no stems are installed. For out-of-band readers (the
-    /// analysis layer) and for callers that only ever want "the track".
+    /// The **track** (the mix), not stream 0 — see [`Deck::original`]. This is what the analysis
+    /// layer analyses, what the waveform is built from, and what `stem separate` separates, all of
+    /// which must be the whole track rather than whichever stem happens to be first.
     pub fn source(&self) -> Arc<dyn Source> {
-        Arc::clone(&self.sources[0])
+        Arc::clone(&self.original)
     }
 
     /// Every stream, in order.
@@ -633,6 +646,10 @@ impl Deck {
     ///
     /// Until the switch lands the deck keeps playing the *old* streams — one reason
     /// [`stream_count`](Self::stream_count) and not this call's intent is what sizes a mixer.
+    ///
+    /// The deck's [`source`](Self::source) (the track) is deliberately **not** replaced: installing
+    /// stems must not change what the deck *is*, or analysing it afterwards would analyse a stem and
+    /// `stem separate` would separate one instead of the track.
     pub fn set_sources(&mut self, sources: Vec<Arc<dyn Source>>) {
         if sources.is_empty() {
             return;
@@ -2053,6 +2070,43 @@ mod tests {
         }
         // The clock ran through the swap instead of restarting.
         assert!(deck.current_frame() > before);
+    }
+
+    /// A deck with stems still knows what it is *playing* and what it *is*.
+    ///
+    /// `source()` must stay the track: `analyse` analyses it, the waveform is built from it, and
+    /// `stem separate` separates it. Returning stream 0 instead would make all three operate on
+    /// whichever stem was first — which is how a "separate" run once wrote a cache entry keyed on
+    /// the drums stem.
+    #[test]
+    fn installing_stems_keeps_the_track_as_the_deck_source() {
+        let mut deck = tape_deck(tagged_pool(200_000, 0.0));
+        let track = deck.source();
+        assert_eq!(deck.total_frames(), 200_000);
+
+        let tags = [0.0f32, 1000.0, 2000.0, 3000.0];
+        deck.set_sources(tags.iter().map(|tag| tagged_pool(200_000, *tag)).collect());
+        for _ in 0..500 {
+            deck.begin_block();
+            let streams = deck.stream_count();
+            deck.end_block();
+            if streams == 4 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(deck.stream_count(), 4);
+
+        // Same handle, same audio: the track, not the drums stem.
+        assert!(Arc::ptr_eq(&track, &deck.source()), "the track handle is unchanged");
+        let mut got = [0.0f32; CHANNELS];
+        deck.source().read_frames(5, &mut got);
+        assert_eq!(got[0], 5.0, "source() is still the untagged ramp");
+        // …while the streams really are the stems.
+        assert_eq!(deck.sources().len(), 4);
+        let mut stem = [0.0f32; CHANNELS];
+        deck.sources()[1].read_frames(5, &mut stem);
+        assert_eq!(stem[0], 1005.0);
     }
 
     /// The deck's mixed view (`process_block` / `pull_into`) sums its streams, so a caller that

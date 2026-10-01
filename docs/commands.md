@@ -200,7 +200,9 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 | `[deck] stem status` | 逐 stem 报告：电平、是否被静音/独奏、实际增益 |
 | `[deck] stem full \| acapella \| instrumental \| drums \| bass` | 命名编排（改的是静音位，**你的电平保留**） |
 | `[deck] stem clear` | 四条全开、unity、取消 solo |
+| `[deck] stem cancel` | 停掉正在跑的分离（在**当前模型窗口**结束时停，不是立刻） |
 | `[deck] stem cache` | 缓存目录与占用 |
+| `[deck] stem cache prune [--keep <n>] \| clear` | 只留最近 n 条（缺省 4）；`clear` = 全清 |
 | `[deck] <stem> level <-1..1>` | 该 stem 电平（0 = unity，-1 = 精确静音） |
 | `[deck] <stem> mute [on\|off]` | 静音该 stem（solo 仍然优先） |
 | `[deck] <stem> solo [on\|off] \| unsolo` | 加入/移出独奏集合（**集合语义**，可多个同时 solo） |
@@ -208,6 +210,23 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 
 `<stem>` = `drums` \| `bass` \| `other` \| `vocals`。行首目标因此可以带一层 stem：
 `deck0 vocals level -0.5`、`deck0 vocals fx add filter`。
+
+分离是**离线异步**的：换源在后台线程预热完才落地，期间 deck 一直在放原始混音；重复跑同一条曲目
+命中内容寻址缓存，成本是 0 s。缓存每曲约 300 MB，所以 `stem cache prune` 是需要的，不是装饰。
+
+**每 stem 的链也可以在配置文件里给**（`--config`）：
+
+```toml
+[[channel]]
+deck_fx = ["eq", "filter"]     # 共享：整 deck 一条链
+flow_fx = ["gain"]             # 模板：每条 stream 各建一条独立的链（4 stems = 4 条）
+[channel.stem_fx]              # 覆写：这里写了的 stem 用它，其余继承模板
+vocals = ["gain", "filter"]
+```
+
+`flow_fx` 是**模板而不是一条链**：`flow_fx = ["filter"]` 意味着四个独立的滤波器（各自状态，
+互不串味），不是一个滤波器加在求和之后。`[channel.stem_fx]` 里的名字和 `flow_fx` 一样在构造时
+校验，写错会在启动时失败而不是等到用的时候。
 
 三条容易混淆的语义，都是刻意的：
 

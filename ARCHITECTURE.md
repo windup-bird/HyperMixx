@@ -220,8 +220,10 @@ mixer 只负责把 deck 变成采样;谁跟谁、共享 BPM 是什么,是**关�
 3. crossfader 恒在最后(路由决策,不该因 fader 移动改音色)
 4. 阶段顺序本身
 
-其余由 `MixerConfig` 纯数据描述(`config.rs`):每通道的 flow_fx/deck_fx 名单
-(`Vec<String>`,经 `FxKind` 注册表解析,未知名 → `MixerError::UnknownFx` 构造失败)、
+其余由 `MixerConfig` 纯数据描述(`config.rs`):每通道的 flow_fx/**stem_fx**/deck_fx 名单
+(`Vec<String>`,经 `FxKind` 注册表解析,未知名 → `MixerError::UnknownFx` 构造失败)。
+`flow_fx` 是**模板**:每条 stream 各建一条独立的链(4 stems = 4 条,各自状态),`[channel.stem_fx]`
+按 stem 覆写模板 —— 所以"只给人声加 filter"可以写在配置里,不必只靠运行时命令、
 fader 起始位、cue_send/cue_tap/side/curve、master fx/limiter/fader、输出列表
 (name/role(Main|Headphones)/channels/gain)。
 

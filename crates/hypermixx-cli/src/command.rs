@@ -145,7 +145,15 @@ pub struct Dispatcher {
     pub notices: NoticeTx,
     pub events: Option<Sender<UiEvent>>,
     slots: Slots,
+    /// In-flight separations, by deck, so `stem cancel` can reach one. Separation is the only job
+    /// here long enough to be worth cancelling (~80 s), and the flag is observed between model
+    /// windows — so a cancel lands within one window, not instantly.
+    separations: Cancellations,
 }
+
+/// The separations a front-end has running. A plain `Mutex<HashMap>`: it is touched twice per job,
+/// never on the audio path.
+pub type Cancellations = Arc<Mutex<HashMap<u8, hypermixx_stems::Cancelled>>>;
 
 impl Dispatcher {
     pub fn new(command_tx: Sender<Command>, notices: NoticeTx) -> Self {
@@ -154,6 +162,7 @@ impl Dispatcher {
             notices,
             events: None,
             slots: Arc::new(SlotBook::default()),
+            separations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -766,39 +775,91 @@ fn stem_family<'a>(
     };
     match sub {
         "separate" | "split" => {
-            let mut model = None;
-            let mut shifts = 1;
+            let mut shifts = 1usize;
             while let Some(flag) = words.next() {
                 match flag {
                     "--shifts" => {
-                        shifts = match words.next().and_then(|v| v.parse::<usize>().ok()) {
-                            Some(value) => value,
-                            None => return Action::Failed("--shifts needs a number".into()),
+                        let Some(raw) = words.next() else {
+                            return Action::Failed("--shifts needs a number".into());
+                        };
+                        match raw.parse::<usize>() {
+                            // Refused rather than clamped: a silent clamp would make `--shifts 8`
+                            // look like it had done something it had not.
+                            Ok(value) if value <= hypermixx_stems::MAX_SHIFTS => shifts = value,
+                            Ok(value) => {
+                                return Action::Failed(format!(
+                                    "--shifts {value} is past the useful range (0..={}); higher \
+                                     only costs time",
+                                    hypermixx_stems::MAX_SHIFTS
+                                ))
+                            }
+                            Err(_) => {
+                                return Action::Failed(format!("--shifts needs a number, got `{raw}`"))
+                            }
                         }
                     }
-                    "--model" => model = words.next().map(str::to_owned),
                     other => {
                         return Action::Failed(format!(
-                            "unknown stem separate option `{other}` (--shifts <n>, --model <name>)"
+                            "unknown stem separate option `{other}` (only --shifts <n>)"
                         ))
                     }
                 }
             }
-            let _ = (model, shifts);
             let Some(source) = pipeline.deck_source(deck_id) else {
                 return Action::Failed(format!("deck {deck_id} holds no track to separate"));
             };
-            spawn_separate(deck_id, source, dispatcher);
+            spawn_separate(deck_id, source, shifts, dispatcher);
             Action::Continue
         }
         "status" => send(command_tx, Command::GetStemState { deck_id }),
         "cache" => {
-            let (bytes, entries) = hypermixx_stems::cache::cache_usage();
-            Action::Message(format!(
-                "stem cache: {entries} track(s), {:.1} MB in {}",
-                bytes as f64 / (1024.0 * 1024.0),
-                hypermixx_stems::cache::stems_root().display()
-            ))
+            // `stem cache prune [--keep <n>]` / `stem cache clear`; a bare `stem cache` reports.
+            match words.next() {
+                None => {
+                    let (bytes, entries) = hypermixx_stems::cache_usage();
+                    Action::Message(format!(
+                        "stem cache: {entries} track(s), {:.1} MB in {}",
+                        bytes as f64 / (1024.0 * 1024.0),
+                        hypermixx_stems::stems_root().display()
+                    ))
+                }
+                Some("clear") => cache_prune(0),
+                Some("prune") => {
+                    let mut keep = 4usize;
+                    if let Some(flag) = words.next() {
+                        if flag != "--keep" {
+                            return Action::Failed(format!(
+                                "usage: stem cache prune [--keep <n>], got `{flag}`"
+                            ));
+                        }
+                        match words.next().and_then(|v| v.parse::<usize>().ok()) {
+                            Some(value) => keep = value,
+                            None => return Action::Failed("--keep needs a number".into()),
+                        }
+                    }
+                    cache_prune(keep)
+                }
+                Some(other) => Action::Failed(format!(
+                    "unknown stem cache command `{other}` (prune [--keep <n>] | clear)"
+                )),
+            }
+        }
+        "cancel" => {
+            let running = dispatcher
+                .separations
+                .lock()
+                .ok()
+                .and_then(|running| running.get(&deck_id).cloned());
+            match running {
+                Some(cancelled) => {
+                    cancelled.cancel();
+                    Action::Message(format!(
+                        "deck{deck_id}: cancelling the separation (it stops at the end of the \
+                         current model window)"
+                    ))
+                }
+                None => Action::Message(format!("deck{deck_id}: no separation is running")),
+            }
         }
         "clear" => send(
             command_tx,
@@ -878,12 +939,14 @@ fn command_tx_of(dispatcher: &Dispatcher) -> Sender<Command> {
 
 /// Separates a deck's loaded track on a worker thread and installs the result.
 ///
-/// The pipeline needs the *mix* to separate, and `deck_source` is exactly that (the deck's first
-/// stream). The four streams come back through `Command::SetStems`, which is a seamless source swap
+/// The pipeline needs the *mix* to separate, and `deck_source` is exactly that (the deck's track,
+/// which it keeps even after stems replace stream 0). The four streams come back through
+/// `Command::SetStems`, which is a seamless source swap
 /// — so the user can keep playing, looping and beatmatching while this runs.
-pub(crate) fn spawn_separate(deck_id: u8, source: Shared, dispatcher: &Dispatcher) {
+pub(crate) fn spawn_separate(deck_id: u8, source: Shared, shifts: usize, dispatcher: &Dispatcher) {
     let command_tx = dispatcher.command_tx.clone();
     let notices_tx = dispatcher.notices.clone();
+    let cancellations = Arc::clone(&dispatcher.separations);
     std::thread::Builder::new()
         .name(format!("hypermixx-stem-{deck_id}"))
         .spawn(move || {
@@ -906,14 +969,21 @@ pub(crate) fn spawn_separate(deck_id: u8, source: Shared, dispatcher: &Dispatche
                 &notices_tx,
                 format!("[stem] deck{deck_id}: preparing the separator (may fetch a model)..."),
             );
-            let separator = match hypermixx_stems::default_separator(&progress) {
+            let separator = match hypermixx_stems::default_separator(shifts, &progress) {
                 Ok(separator) => separator,
                 Err(err) => {
                     notices::error(&notices_tx, format!("[stem] deck{deck_id}: {err}"));
                     return;
                 }
             };
+            notices::info(
+                &notices_tx,
+                format!("[stem] deck{deck_id}: separator {}", separator.id()),
+            );
             let cancelled = hypermixx_stems::Cancelled::new();
+            if let Ok(mut running) = cancellations.lock() {
+                running.insert(deck_id, cancelled.clone());
+            }
             let started = std::time::Instant::now();
             match hypermixx_stems::separate_cached(
                 separator.as_ref(),
@@ -933,11 +1003,34 @@ pub(crate) fn spawn_separate(deck_id: u8, source: Shared, dispatcher: &Dispatche
                     let _ = command_tx.send(Command::SetStems { deck_id, stems });
                 }
                 Err(err) => {
-                    notices::error(&notices_tx, format!("[stem] deck{deck_id}: {err}"));
+                    if err == hypermixx_stems::StemError::Cancelled {
+                        notices::info(&notices_tx, format!("[stem] deck{deck_id}: cancelled"));
+                    } else {
+                        notices::error(&notices_tx, format!("[stem] deck{deck_id}: {err}"));
+                    }
                 }
+            }
+            if let Ok(mut running) = cancellations.lock() {
+                running.remove(&deck_id);
             }
         })
         .ok();
+}
+
+/// Prunes the stem cache and reports what went, in the same shape as `stem cache`.
+fn cache_prune(keep: usize) -> Action {
+    match hypermixx_stems::prune_cache(keep) {
+        Ok((removed, freed)) => {
+            let (bytes, entries) = hypermixx_stems::cache_usage();
+            Action::Message(format!(
+                "stem cache: removed {removed} track(s), freed {:.1} MB; {entries} left, {:.1} MB in {}",
+                freed as f64 / (1024.0 * 1024.0),
+                bytes as f64 / (1024.0 * 1024.0),
+                hypermixx_stems::stems_root().display()
+            ))
+        }
+        Err(err) => Action::Failed(format!("stem cache: {err}")),
+    }
 }
 
 /// The reference to the always-available help text.

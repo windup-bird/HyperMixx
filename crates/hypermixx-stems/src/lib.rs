@@ -25,7 +25,10 @@ mod onnx;
 #[cfg(feature = "onnx")]
 pub use onnx::CharonSeparator;
 
-pub use cache::{cache_key, cache_root, load_cached, store_cached, CachedStems};
+pub use cache::{
+    cache_key, cache_root, cache_usage, load_cached, prune_cache, stems_root, store_cached,
+    CachedStems,
+};
 pub use mock::{MockMode, MockSeparator};
 pub use model::{ensure_model, model_path, models_root, ModelSpec, HTDEMUCS};
 
@@ -128,18 +131,34 @@ pub trait StemSeparator: Send + Sync {
     }
 }
 
+/// Most random shifts worth asking for.
+///
+/// A shift averages an extra run of the model over a randomly offset copy, which measurably improves
+/// separation for a linear cost in time — so this is a quality/time dial, not a quality cliff. Past
+/// two the separation time grows faster than the separation does for a DJ's purposes.
+pub const MAX_SHIFTS: usize = 2;
+
 /// The separator a front-end should use by default: HTDemucs on ONNX Runtime, with the model
 /// obtained (and verified) first. `progress` covers the model download when one is needed.
+///
+/// `shifts` is clamped to [`MAX_SHIFTS`]; it is part of the separator's [`id`](StemSeparator::id),
+/// so two shift counts never share a cache entry (they produce different audio).
 #[cfg(feature = "onnx")]
-pub fn default_separator(progress: &ProgressSink) -> Result<Box<dyn StemSeparator>, StemError> {
+pub fn default_separator(
+    shifts: usize,
+    progress: &ProgressSink,
+) -> Result<Box<dyn StemSeparator>, StemError> {
     let model = ensure_model(&HTDEMUCS, None, progress)?;
-    Ok(Box::new(CharonSeparator::new(model)))
+    Ok(Box::new(CharonSeparator::new(model).with_shifts(shifts)))
 }
 
 /// Without the `onnx` feature there is nothing to separate with; the mock is for tests, not for
 /// pretending a track was separated.
 #[cfg(not(feature = "onnx"))]
-pub fn default_separator(_progress: &ProgressSink) -> Result<Box<dyn StemSeparator>, StemError> {
+pub fn default_separator(
+    _shifts: usize,
+    _progress: &ProgressSink,
+) -> Result<Box<dyn StemSeparator>, StemError> {
     Err(StemError::NoBackend)
 }
 

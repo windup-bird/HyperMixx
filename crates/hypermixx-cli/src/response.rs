@@ -325,7 +325,9 @@ pub fn stem_help_text() -> String {
   stem full | acapella | instrumental | drums | bass
                                  a named arrangement (mute flags; your levels survive)
   stem clear                     all four audible at unity, nothing soloed
+  stem cancel                    stop a running separation (at its current model window)
   stem cache                     the cache directory and its size
+  stem cache prune [--keep <n>]  drop all but the n most recent (default 4); `clear` = all
 
 One stem at a time (target it directly):
   deck0 vocals level -0.5        that stem's level (0 = unity, -1 = exact silence)

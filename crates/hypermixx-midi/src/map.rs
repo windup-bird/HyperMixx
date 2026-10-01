@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use hypermixx_core::{DeckId, FaderTarget, FxChainId};
+use hypermixx_core::{DeckId, FaderTarget, FxChainId, Stem};
 use serde::{Deserialize, Serialize};
 
 /// A parse or validation failure. The message carries the TOML position when the error came from
@@ -199,6 +199,10 @@ pub enum Action {
     Loop(LoopAction),
     Sync(SyncAction),
     Fx(FxAction),
+    /// Latch one stem's mute (a button, so it flips rather than holding a value).
+    StemMute { stem: Stem },
+    /// Latch one stem's solo membership.
+    StemSolo { stem: Stem },
 }
 
 impl Action {
@@ -293,6 +297,11 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec { name: "beatjump+", deck: true, momentary: false },
     ActionSpec { name: "beatjump-", deck: true, momentary: false },
     ActionSpec { name: "fader.flow", deck: true, momentary: false },
+    // One stem's level, and the two latching buttons per stem. `<stem>` is drums | bass | other |
+    // vocals; the guide lists the vocals spelling and the parser accepts any stem name.
+    ActionSpec { name: "fader.stem.vocals", deck: true, momentary: false },
+    ActionSpec { name: "stem.vocals.mute", deck: true, momentary: false },
+    ActionSpec { name: "stem.vocals.solo", deck: true, momentary: false },
     ActionSpec { name: "fader.deck", deck: true, momentary: false },
     ActionSpec { name: "fader.cuesend", deck: true, momentary: false },
     ActionSpec { name: "fader.cross", deck: false, momentary: false },
@@ -438,6 +447,21 @@ fn compile(raw: &RawBinding) -> Result<BindingSpec, String> {
     Ok(spec)
 }
 
+/// Parses a stem out of an action name, naming the alternatives when it is wrong — the same
+/// treatment `deck` gets.
+fn stem_of(token: &str) -> Result<Stem, String> {
+    Stem::parse(token).ok_or_else(|| {
+        format!(
+            "unknown stem `{token}` (expected {})",
+            Stem::ALL
+                .iter()
+                .map(|stem| stem.name())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        )
+    })
+}
+
 /// Resolves an action name plus its optional parameters.
 fn parse_action(raw: &RawBinding) -> Result<Action, String> {
     let name = raw.action.as_str();
@@ -470,6 +494,31 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
             })
         }
         "fader.flow" => Ok(Action::Fader(FaderTarget::Flow(deck(name)?))),
+        // `fader.stem.vocals` — the deck comes from the binding's `deck`, the stem from the action
+        // name, mirroring how `fader.flow` takes its deck.
+        _ if name.starts_with("fader.stem.") => {
+            let stem = stem_of(&name["fader.stem.".len()..])?;
+            Ok(Action::Fader(FaderTarget::Stem {
+                deck: deck(name)?,
+                stem,
+            }))
+        }
+        // `stem.vocals.mute` / `stem.vocals.solo`: latching buttons.
+        _ if name.starts_with("stem.") => {
+            let rest = &name["stem.".len()..];
+            let (stem_name, what) = rest
+                .rsplit_once('.')
+                .ok_or_else(|| format!("`{name}` needs the form stem.<stem>.mute|solo"))?;
+            let stem = stem_of(stem_name)?;
+            deck(name)?;
+            match what {
+                "mute" => Ok(Action::StemMute { stem }),
+                "solo" => Ok(Action::StemSolo { stem }),
+                other => Err(format!(
+                    "unknown stem action `{other}` (mute | solo) in `{name}`"
+                )),
+            }
+        }
         "fader.deck" => Ok(Action::Fader(FaderTarget::Deck(deck(name)?))),
         "fader.cuesend" => Ok(Action::Fader(FaderTarget::CueSend(deck(name)?))),
         "fader.cross" => Ok(Action::Fader(FaderTarget::Crossfader)),
@@ -699,6 +748,78 @@ action = "fader.volume"
 "#;
         let err = Map::from_toml_str(bad_action).unwrap_err();
         assert!(err.message().contains("unknown action"), "{}", err.message());
+    }
+
+    /// The map the CLI loads by default must parse.
+    ///
+    /// Nothing else in the test suite reads it, and it is the file a user's first session uses — so
+    /// it is exactly the kind of thing that rots unnoticed.
+    #[test]
+    fn the_repositorys_default_map_parses() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../midi-map.toml");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            // A vendored build has no repository root to check; that is not a failure.
+            return;
+        };
+        let map = Map::from_toml_str(&text).expect("the shipped default map must parse");
+        assert!(!map.binds.is_empty());
+        // It should exercise the newer families, so changing one of them is noticed here.
+        assert!(map
+            .binds
+            .iter()
+            .any(|bind| matches!(bind.action, Action::StemMute { .. })));
+        assert!(map.binds.iter().any(|bind| matches!(
+            bind.action,
+            Action::Fader(FaderTarget::Stem { .. })
+        )));
+    }
+
+    /// The stem actions are spelled `<family>.<stem>.<verb>`, and a wrong stem names the valid ones
+    /// rather than failing as "unknown action".
+    #[test]
+    fn stem_actions_parse_and_name_their_stem() {
+        let map = |action: &str, deck: &str| -> Result<Action, String> {
+            let text = format!(
+                "[[bind]]\ntype = \"note\"\nid = 1\n{deck}action = \"{action}\"\n"
+            );
+            Map::from_toml_str(&text)
+                .map(|parsed| parsed.binds[0].action.clone())
+                // Keep the parser's `bind \`…\`: ` prefix: assertions use `contains`.
+                .map_err(|err| err.message().to_owned())
+        };
+        assert_eq!(
+            map("fader.stem.bass", "deck = 1\n").unwrap(),
+            Action::Fader(FaderTarget::Stem {
+                deck: 1,
+                stem: Stem::Bass
+            })
+        );
+        assert_eq!(
+            map("stem.vocals.mute", "deck = 0\n").unwrap(),
+            Action::StemMute {
+                stem: Stem::Vocals
+            }
+        );
+        assert_eq!(
+            map("stem.drums.solo", "deck = 0\n").unwrap(),
+            Action::StemSolo {
+                stem: Stem::Drums
+            }
+        );
+        // A stem action is deck-scoped like any other.
+        let err = map("stem.vocals.mute", "").unwrap_err();
+        assert!(err.contains("needs a `deck`"), "{err}");
+        // A bad stem lists what it could have been.
+        let err = map("stem.guitar.mute", "deck = 0\n").unwrap_err();
+        assert!(err.contains("vocals") && err.contains("unknown stem"), "{err}");
+        // A bad verb is not silently accepted.
+        let err = map("stem.vocals.solo_only", "deck = 0\n").unwrap_err();
+        assert!(err.contains("unknown stem action") || err.contains("unknown stem"), "{err}");
+        // Every stem name the engine has is addressable, on both families.
+        for stem in Stem::ALL {
+            assert!(map(&format!("fader.stem.{stem}"), "deck = 0\n").is_ok(), "{stem}");
+            assert!(map(&format!("stem.{stem}.mute"), "deck = 0\n").is_ok(), "{stem}");
+        }
     }
 
     #[test]

@@ -535,6 +535,42 @@ deck0 beatjump 64 / loop 8 / stem separate → 循环中换源，loop [1474820-1
   `FxChainId::Deck` 从此只指共享 deck 链，代价是 CLI 里 `deck0 vocals fx …` 必须写全（`fx help`
   与补全都跟着改了）。
 
+## 收尾（A–D：修漏 + 配置化 + 运维 + MIDI）
+
+P2/P3 之后按"先修自己的漏洞 → 配置化 → 运维 → 演出"做的一轮。
+
+**A. 修掉两个漏洞**
+- `stem separate --model/--shifts` 之前是**解析后丢弃**（`let _ = (model, shifts)`）：flag 承诺了
+  它没做的事。现在 `--shifts` 贯通到 `CharonSeparator::with_shifts`，并且**越界报错而不是静默钳制**
+  （`--shifts 5` → "--shifts 5 is past the useful range (0..=2); higher only costs time"）；
+  `--model` 删除（模型表只有一条，留着就是假选项）。
+- **`Deck::source()` 在装了 stems 之后返回的是 drums 那条流**，而三个调用方（`analyse`、TUI 波形、
+  `stem separate`）要的都是原始混音。后果很实在：`analyse` 去分析鼓轨（调性错），重复
+  `stem separate` 会去分离鼓轨、产生**一个垃圾缓存条目**（`stem cache` 显示 2 条而我只分离过一次，
+  就是这么来的）。修法：`Deck` 多持一个 `original`（混音），`source()` 返回它，`set_sources` 不碰它；
+  `total_frames()` 也改读 original。代价是每 deck 多驻留一份混音（3:39 曲目 77 MB），换来
+  `analyse`/重复分离/波形三处都正确。
+
+**B. 配置层能按 stem 给链**
+`ChannelConfig` 加 `stem_fx: HashMap<Stem, Vec<String>>`（TOML `[channel.stem_fx]`），
+`chain_names(stem)` = 覆写 else 模板；`MixerConfig::build_chains` 现在返回**每 channel 四条**
+flow 链（于是覆写里的错名在构造时就失败，而不是等那条链第一次被用到）。`Channel::new` 收
+`Vec<FxChain>`：调用方给的链优先（测试注入任意链的路径），名字只补空缺。
+
+**C. 运维**
+- `stem cancel`：`Cancelled` 早就贯通到模型窗口之间（进度回调里转发 `token.cancel()`），缺的只是
+  一个句柄 —— CLI 侧 `Mutex<HashMap<DeckId, Cancelled>>` 注册表，worker 起止时登记/注销。
+  取消不是"立刻停"，是"当前窗口结束时停"（消息里明说）。
+- `stem cache prune [--keep <n>] | clear`：`prune_cache` 按条目 mtime 保留最近 n 条。
+  之前只报占用不删，300 MB/曲无上限增长。
+
+**D. MIDI**
+- `fader.stem.<stem>`（软接管与 `fader.flow` 同路径）、`stem.<stem>.mute` / `stem.<stem>.solo`。
+- 按钮是 **latch**：新增 `StemOp::ToggleMute/ToggleSolo` 由**引擎**翻转自己的状态，而不是映射层
+  记一份可能过期的镜像 —— 与 `CueOp::Smart` "由 deck 自己决定"同一条设计原则。按住与按一下等价。
+- `midi-map.toml` 补了 6 条默认绑定（channel 6：4 个 mute + 1 个 solo + 1 个 per-stem fader），
+  并加了一条测试**解析仓库里那份默认 map** —— 之前没人读它，正是最容易烂掉的东西。
+
 ## 7. 成本与风险
 
 1. **stem 之间的相位一致性（最高风险，已由 §1 的结构解决）**：SOLA 的拼接点按全声道混合信号

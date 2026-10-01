@@ -265,3 +265,54 @@ channel = 1
 id = 1
 deck = 1
 action = "cue.smart"
+
+# --- stems ------------------------------------------------------------------------------------
+# Per-stem control. The mutes/solos are *latching buttons*: the engine flips its own state, so the
+# mapping never has to remember it, and holding a button does nothing more than pressing it.
+# Bindings work on a track with no stems too (the engine answers with an error, visible in the log)
+# — <stem> is drums | bass | other | vocals.
+
+[[bind]]
+type = "note"
+channel = 6
+id = 20
+deck = 0
+action = "stem.vocals.mute"
+
+[[bind]]
+type = "note"
+channel = 6
+id = 21
+deck = 0
+action = "stem.drums.mute"
+
+[[bind]]
+type = "note"
+channel = 6
+id = 22
+deck = 0
+action = "stem.bass.mute"
+
+[[bind]]
+type = "note"
+channel = 6
+id = 23
+deck = 0
+action = "stem.other.mute"
+
+[[bind]]
+type = "note"
+channel = 6
+id = 24
+deck = 0
+action = "stem.vocals.solo"
+
+# A per-stem fader. Soft takeover works exactly as it does for `fader.flow`: the binding starts at
+# unity and takes over when the physical control crosses that mirror.
+[[bind]]
+type = "cc"
+mode = "abs"
+channel = 6
+id = 40
+deck = 0
+action = "fader.stem.vocals"

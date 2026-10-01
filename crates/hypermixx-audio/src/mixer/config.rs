@@ -10,7 +10,7 @@
 //! a mixer that quietly dropped the limiter the user configured is worse than one that refuses to
 //! start.
 
-use hypermixx_core::FxChainId;
+use hypermixx_core::{FxChainId, Stem};
 
 use super::channel::{CueTap, CrossfaderCurve, DeckSide};
 use super::output::OutputId;
@@ -69,12 +69,24 @@ impl From<FxError> for MixerError {
     }
 }
 
+/// One channel's built chains: one flow chain per stream ([`Stem::ALL`] order), then the shared
+/// deck chain's slots. A named type because the tuple is otherwise unreadable at every use site.
+pub type BuiltChains = (Vec<FxChain>, Vec<FxSlot>);
+
 /// One mixer input.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ChannelConfig {
-    /// FX between the deck and the flow fader. Empty for "no per-stream inserts".
+    /// Per-stream inserts, as a **template**: every stream gets its own chain built from this list,
+    /// so four stems get four independent instances (separate filter state, not one filter shared).
+    ///
+    /// A stem that should differ is named in [`ChannelConfig::stem_fx`]; an empty list means "no
+    /// per-stream inserts", which is the default and costs nothing (the chains are never entered).
     pub flow_fx: Vec<String>,
+    /// Per-stem overrides of [`ChannelConfig::flow_fx`], for the stems that should differ. A stem
+    /// absent here uses the template.
+    #[serde(default)]
+    pub stem_fx: std::collections::HashMap<Stem, Vec<String>>,
     /// FX between the flow fader and the deck fader — the channel's tone controls.
     pub deck_fx: Vec<String>,
     /// Per-stream level, `-1.0 ..= 1.0` (centred = unity).
@@ -96,6 +108,7 @@ impl Default for ChannelConfig {
     fn default() -> Self {
         Self {
             flow_fx: Vec::new(),
+            stem_fx: std::collections::HashMap::new(),
             deck_fx: Vec::new(),
             flow_fader: 0.0,
             deck_fader: 0.0,
@@ -109,9 +122,18 @@ impl Default for ChannelConfig {
 }
 
 impl ChannelConfig {
-    /// Every FX name this channel names, flow chain first. Used for validation and `fx list`.
+    /// Every FX name this channel names — the template, every override, then the deck chain. Used
+    /// for validation and `fx list`, so an unknown name in an override cannot hide.
     pub fn all_fx(&self) -> impl Iterator<Item = &String> {
-        self.flow_fx.iter().chain(self.deck_fx.iter())
+        self.flow_fx
+            .iter()
+            .chain(self.stem_fx.values().flatten())
+            .chain(self.deck_fx.iter())
+    }
+
+    /// The names one stream's chain is built from: its own override, else the template.
+    pub fn chain_names(&self, stem: Stem) -> &[String] {
+        self.stem_fx.get(&stem).unwrap_or(&self.flow_fx)
     }
 
     /// A channel with `deck_fx` tone controls and no per-stream inserts.
@@ -236,16 +258,21 @@ pub struct MixerConfig {
 }
 
 impl MixerConfig {
-    /// Builds the chains this config names. Split out so a mixer can report a bad FX name without
-    /// having touched a device.
-    pub fn build_chains(&self) -> Result<Vec<(Vec<FxSlot>, Vec<FxSlot>)>, MixerError> {
+    /// Builds the chains this config names: **one per stream** (`Stem::COUNT` of them, from the
+    /// template and any per-stem overrides) plus the shared deck chain.
+    ///
+    /// Split out so a mixer can report a bad FX name without having touched a device — including a
+    /// bad name inside a `stem_fx` override, which would otherwise only surface when that stem's
+    /// chain was first built.
+    pub fn build_chains(&self) -> Result<Vec<BuiltChains>, MixerError> {
         self.channels
             .iter()
             .map(|channel| {
-                Ok((
-                    build_slots(&channel.flow_fx)?,
-                    build_slots(&channel.deck_fx)?,
-                ))
+                let flow = Stem::ALL
+                    .iter()
+                    .map(|stem| build_chain(channel.chain_names(*stem)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((flow, build_slots(&channel.deck_fx)?))
             })
             .collect()
     }
@@ -318,6 +345,9 @@ impl From<MixerFile> for MixerConfig {
 pub fn simple_dj() -> MixerConfig {
     let deck_channels = |side: DeckSide, crossfader: f32| ChannelConfig {
         flow_fx: vec![],
+        // The reference topology has no per-stem inserts: stems get the same (empty) template, and
+        // `[channel.stem_fx]` is how a user asks for one stem to differ.
+        stem_fx: std::collections::HashMap::new(),
         deck_fx: vec!["eq".into(), "filter".into()],
         flow_fader: 0.0,
         deck_fader: 0.0,
@@ -359,7 +389,9 @@ cue_send = 1.0                # linear 0..1 into the cue bus
 cue_tap = "post_deck_fx"      # post_flow_fx | post_flow_fader | post_deck_fx | post_deck_fader
 # crossfader_curve = "equal_power" # equal_power | linear
 deck_fx = ["eq", "filter"]    # per-deck inserts; names from `fx help`
-# flow_fx = []                # per-stream inserts
+# flow_fx = []                # per-stream inserts: ONE CHAIN PER STREAM (4 stems = 4 chains)
+# [channel.stem_fx]           # per-stem overrides of flow_fx, for the stems that differ
+# vocals = ["filter"]         # (stem names: drums | bass | other | vocals)
 
 [[channel]]
 side = "right"
@@ -394,6 +426,7 @@ pub fn silent_test_channel() -> MixerConfig {
     MixerConfig {
         channels: vec![ChannelConfig {
             flow_fx: vec![],
+            stem_fx: std::collections::HashMap::new(),
             deck_fx: vec![],
             flow_fader: 0.0,
             deck_fader: 0.0,
@@ -606,7 +639,69 @@ side = \"spinward\"".into()).unwrap_err();
         let chains = cfg.build_chains().unwrap();
         let kinds: Vec<_> = chains[0].1.iter().map(|slot| slot.kind()).collect();
         assert_eq!(kinds, vec!["gain", "eq"]);
-        assert!(chains[0].0.is_empty(), "no per-stream inserts configured");
+        assert_eq!(chains[0].0.len(), Stem::COUNT, "one stream chain per stem");
+        assert!(chains[0].0.iter().all(|chain| chain.is_empty()));
+    }
+
+    /// The template reaches every stem, and an override replaces it for exactly one.
+    #[test]
+    fn a_stem_override_replaces_the_template_for_that_stem_only() {
+        let mut cfg = simple_dj();
+        cfg.channels[0].flow_fx = vec!["gain".into()];
+        cfg.channels[0]
+            .stem_fx
+            .insert(Stem::Vocals, vec!["filter".into(), "gain".into()]);
+        let chains = cfg.build_chains().unwrap();
+        for stem in Stem::ALL {
+            let kinds: Vec<_> = chains[0].0[stem.index()]
+                .slots()
+                .iter()
+                .map(|slot| slot.kind())
+                .collect();
+            if stem == Stem::Vocals {
+                assert_eq!(kinds, vec!["filter", "gain"], "the override wins");
+            } else {
+                assert_eq!(kinds, vec!["gain"], "{stem} follows the template");
+            }
+        }
+        assert_eq!(cfg.channels[0].chain_names(Stem::Drums), ["gain".to_owned()]);
+        assert_eq!(
+            cfg.channels[0].chain_names(Stem::Vocals),
+            ["filter".to_owned(), "gain".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_unknown_fx_in_a_stem_override_is_a_construction_error() {
+        let mut cfg = simple_dj();
+        cfg.channels[0]
+            .stem_fx
+            .insert(Stem::Vocals, vec!["reverb".into()]);
+        let err = cfg.build_chains().unwrap_err();
+        assert!(matches!(err, MixerError::UnknownFx(_)), "{err:?}");
+        assert!(err.message().contains("reverb"));
+    }
+
+    /// The TOML spelling of a per-stem override, which is the point of the field.
+    #[test]
+    fn a_stem_override_parses_from_toml() {
+        let text = r#"
+            [[channel]]
+            side = "center"
+            deck_fx = ["eq"]
+            flow_fx = ["gain"]
+            [channel.stem_fx]
+            vocals = ["filter"]
+        "#;
+        let cfg = MixerConfig::from_toml_str(text).expect("parses");
+        assert_eq!(cfg.channels[0].chain_names(Stem::Vocals), ["filter".to_owned()]);
+        assert_eq!(cfg.channels[0].chain_names(Stem::Other), ["gain".to_owned()]);
+        assert!(cfg.build_chains().is_ok());
+        // An unknown stem name is a parse error, not a silently ignored key.
+        assert!(MixerConfig::from_toml_str(
+            "[[channel]]\n[channel.stem_fx]\nguitar = [\"eq\"]\n"
+        )
+        .is_err());
     }
 
     #[test]

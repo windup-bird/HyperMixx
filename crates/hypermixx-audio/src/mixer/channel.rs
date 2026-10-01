@@ -112,9 +112,10 @@ pub struct Channel {
     /// more streams — an [`FxChain`] is not `Clone` (its slots own `Box<dyn Fx>`), so growth rebuilds
     /// from names rather than copying a chain.
     flow_fx: Vec<FxChain>,
-    /// The names every stream's chain is built from. The config describes *a* flow chain, not four;
-    /// applying it to each stream is what makes it a template.
-    flow_fx_names: Vec<String>,
+    /// Per-stream name lists, index = `Stem::index()`. Only a fallback: the mixer builds all
+    /// `Stem::COUNT` chains up front, so growth never happens in practice. It is kept so a
+    /// hand-built `Channel` (a test) that passes one chain still behaves.
+    flow_fx_names: [Vec<String>; Stem::COUNT],
     /// The channel's shared inserts — the tone controls that survive a jump, and the only chain a
     /// track without stems ever has.
     deck_fx: FxChain,
@@ -150,13 +151,29 @@ pub struct Channel {
 impl Channel {
     /// Builds a channel over `deck`. The chains come from the config layer, which is what decides
     /// that a `simple_dj()` channel has an EQ and a filter.
-    pub fn new(deck: Deck, cfg: &ChannelConfig, flow_fx: FxChain, deck_fx: FxChain) -> Self {
+    /// `flow_fx` is what the mixer built: one chain per stem, from the config's template and its
+    /// per-stem overrides. A caller may pass fewer (a test passing one); the rest are then built
+    /// from `cfg`'s names on first use.
+    pub fn new(
+        deck: Deck,
+        cfg: &ChannelConfig,
+        flow_fx: Vec<FxChain>,
+        deck_fx: FxChain,
+    ) -> Self {
         let frames = BLOCK_SIZE;
         let level = clamp_pos(cfg.flow_fader);
+        if flow_fx.is_empty() {
+            // Never happens from the mixer, but a `Channel` with no chain at all would index out of
+            // bounds in `process`; an empty chain is the honest stand-in.
+            debug_assert!(false, "a channel needs at least one stream chain");
+        }
         let mut channel = Self {
             deck,
-            flow_fx: vec![flow_fx],
-            flow_fx_names: cfg.flow_fx.clone(),
+            flow_fx,
+            flow_fx_names: std::array::from_fn(|i| {
+                cfg.chain_names(Stem::from_index(i).expect("index < Stem::COUNT in range"))
+                    .to_vec()
+            }),
             deck_fx,
             bus: Bus::stereo(frames),
             stream_buses: vec![Bus::stereo(frames)],
@@ -311,6 +328,16 @@ impl Channel {
             }
             StemOp::Mute { stem, on } => {
                 self.stem_mute[stem.index()].store(on, Ordering::Relaxed);
+            }
+            StemOp::ToggleMute { stem } => {
+                let slot = &self.stem_mute[stem.index()];
+                let now = slot.load(Ordering::Relaxed);
+                slot.store(!now, Ordering::Relaxed);
+            }
+            StemOp::ToggleSolo { stem } => {
+                let bit = 1u8 << stem.index();
+                let current = self.stem_solo.load(Ordering::Relaxed);
+                self.stem_solo.store(current ^ bit, Ordering::Relaxed);
             }
             StemOp::Solo { stem, on } => {
                 let bit = 1u8 << stem.index();
@@ -472,7 +499,8 @@ impl Channel {
     /// built, so a failure here is impossible.
     fn sync_streams(&mut self, streams: usize) {
         while self.flow_fx.len() < streams {
-            let slots = super::config::build_slots(&self.flow_fx_names)
+            let names = &self.flow_fx_names[self.flow_fx.len().min(Stem::COUNT - 1)];
+            let slots = super::config::build_slots(names)
                 .expect("flow_fx names were validated at mixer construction");
             self.flow_fx.push(FxChain::from_slots(slots));
             self.flow_fader.push(Fader::new(0.0, FADER_TAU));
@@ -625,7 +653,9 @@ mod tests {
         Deck::new(tone_source((BLOCK * 2_000) as u64))
     }
 
-    fn channel_with(cfg: ChannelConfig, flow: FxChain, deck_chain: FxChain) -> Channel {
+    /// A channel over the zero-ramp deck. `flow` is the per-stream chain list the mixer would have
+    /// built; tests that pass one chain get three empty ones built from an empty config template.
+    fn channel_with(cfg: ChannelConfig, flow: Vec<FxChain>, deck_chain: FxChain) -> Channel {
         Channel::new(deck_at_zero(), &cfg, flow, deck_chain)
     }
 
@@ -651,7 +681,7 @@ mod tests {
         let mut channel = Channel::new(
             deck_at_zero(),
             &ChannelConfig { side: DeckSide::Center, cue_send: 1.0, ..Default::default() },
-            FxChain::new(),
+            vec![FxChain::new()],
             FxChain::new(),
         );
         channel.deck_mut().play();
@@ -679,11 +709,11 @@ mod tests {
     fn flow_fader_scales_the_block() {
         let mut half = channel_with(
             ChannelConfig { flow_fader: -0.5, cue_send: 1.0, ..Default::default() },
-            FxChain::new(),
+            vec![FxChain::new()],
             FxChain::new(),
         );
         half.deck_mut().play();
-        let mut unity = channel_with(unity(), FxChain::new(), FxChain::new());
+        let mut unity = channel_with(unity(), vec![FxChain::new()], FxChain::new());
         unity.deck_mut().play();
         let mut moved = 0.0f32;
         let mut full = 0.0f32;
@@ -699,7 +729,7 @@ mod tests {
         let mut channel = Channel::new(
             tone_deck(),
             &ChannelConfig { flow_fader: -1.0, cue_send: 1.0, ..Default::default() },
-            FxChain::new(),
+            vec![FxChain::new()],
             FxChain::new(),
         );
         channel.deck_mut().play();
@@ -750,7 +780,7 @@ mod tests {
                 cue_send: 1.0,
                 ..Default::default()
             },
-            FxChain::new(),
+            vec![FxChain::new()],
             FxChain::new(),
         );
         channel.deck_mut().play();
@@ -773,7 +803,7 @@ mod tests {
             let mut channel = Channel::new(
                 tone_deck(),
                 &ChannelConfig { cue_send: 1.0, cue_tap: CueTap::PostDeckFx, ..Default::default() },
-                FxChain::new(),
+                vec![FxChain::new()],
                 FxChain::from_parts([("eq", Box::new(Eq::new()) as Box<dyn Fx>)]),
             );
             channel.deck_mut().play();
@@ -793,7 +823,7 @@ mod tests {
             let mut channel = Channel::new(
                 tone_deck(),
                 &ChannelConfig { cue_send: 1.0, cue_tap: tap, ..Default::default() },
-                FxChain::new(),
+                vec![FxChain::new()],
                 FxChain::from_parts([("eq", Box::new(all_the_way_down()) as Box<dyn Fx>)]),
             );
             channel.deck_mut().play();
@@ -823,7 +853,7 @@ mod tests {
         let mut channel = Channel::new(
             tone_deck(),
             &ChannelConfig { cue_send: -1.0, ..Default::default() },
-            FxChain::new(),
+            vec![FxChain::new()],
             FxChain::new(),
         );
         channel.deck_mut().play();
@@ -841,7 +871,7 @@ mod tests {
     fn each_chain_has_its_own_index_space() {
         let mut channel = channel_with(
             unity(),
-            FxChain::from_parts([("filter", Box::new(Filter::new()) as Box<dyn Fx>)]),
+            vec![FxChain::from_parts([("filter", Box::new(Filter::new()) as Box<dyn Fx>)])],
             FxChain::from_parts([
                 ("gain", Box::new(Gain::new(1.0)) as Box<dyn Fx>),
                 ("limiter", Box::new(Limiter::new()) as Box<dyn Fx>),
@@ -871,7 +901,7 @@ mod tests {
 
     #[test]
     fn adding_a_slot_returns_its_index_within_that_chain() {
-        let mut channel = channel_with(unity(), FxChain::new(), FxChain::new());
+        let mut channel = channel_with(unity(), vec![FxChain::new()], FxChain::new());
         let stream = SlotChain::Flow(Stem::Bass);
         assert_eq!(
             channel
@@ -913,7 +943,7 @@ mod tests {
                 cue_send: 0.0,
                 ..Default::default()
             },
-            FxChain::new(),
+            vec![FxChain::new()],
             FxChain::new(),
         )
     }
@@ -1035,6 +1065,45 @@ mod tests {
         assert!((settled_left(&mut channel) - TAGS[3] * 0.25).abs() < 1e-2);
     }
 
+    /// The channel end of `MixerConfig::build_chains`: the config's template reaches every stream
+    /// and its `stem_fx` override reaches exactly one.
+    ///
+    /// The chains a caller *passes* are authoritative — that is how a test injects an arbitrary
+    /// chain — and the config's names only fill the gaps, so a hand-built channel that passes one
+    /// chain still ends up with `Stem::COUNT` of them. The mixer passes all four, so production
+    /// never depends on the precedence.
+    #[test]
+    fn a_channel_names_a_chain_per_stem_from_the_config() {
+        let cfg = ChannelConfig {
+            flow_fx: vec!["gain".into()],
+            stem_fx: [(Stem::Vocals, vec!["filter".into()])].into_iter().collect(),
+            ..Default::default()
+        };
+        let passed = FxChain::from_parts([("eq", Box::new(Eq::new()) as Box<dyn Fx>)]);
+        let mut channel = Channel::new(deck_at_zero(), &cfg, vec![passed], FxChain::new());
+        channel.sync_streams(Stem::COUNT);
+        let kinds = |stem| -> Vec<&'static str> {
+            channel
+                .stem_fx(stem)
+                .expect("every stem has a chain")
+                .slots()
+                .iter()
+                .map(|slot| slot.kind())
+                .collect()
+        };
+        assert_eq!(kinds(Stem::Drums), ["eq"], "what the caller passed wins");
+        assert_eq!(kinds(Stem::Bass), ["gain"], "the template");
+        assert_eq!(kinds(Stem::Other), ["gain"], "the template");
+        assert_eq!(kinds(Stem::Vocals), ["filter"], "the override");
+        // Each is its own instance, not one shared chain: a filter's state must never be shared
+        // between stems.
+        let (bass, other) = (
+            channel.stem_fx(Stem::Bass).unwrap(),
+            channel.stem_fx(Stem::Other).unwrap(),
+        );
+        assert!(!std::ptr::eq(bass, other));
+    }
+
     /// The point of a chain per stream: an insert on one stem must not touch the others.
     #[test]
     fn a_stem_chain_only_processes_its_own_stream() {
@@ -1072,7 +1141,7 @@ mod tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let mut channel = channel_with(
             unity(),
-            FxChain::from_parts([("counter", Box::new(Counter(hits.clone())) as Box<dyn Fx>)]),
+            vec![FxChain::from_parts([("counter", Box::new(Counter(hits.clone())) as Box<dyn Fx>)])],
             FxChain::new(),
         );
         channel.deck_mut().play();
@@ -1096,7 +1165,7 @@ mod tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let mut channel = channel_with(
             unity(),
-            FxChain::from_parts([("counter", Box::new(Counter(hits.clone())) as Box<dyn Fx>)]),
+            vec![FxChain::from_parts([("counter", Box::new(Counter(hits.clone())) as Box<dyn Fx>)])],
             FxChain::new(),
         );
         channel.deck_mut().play();
@@ -1108,7 +1177,7 @@ mod tests {
 
     #[test]
     fn loading_a_new_deck_keeps_the_mixer_controls() {
-        let mut channel = channel_with(unity(), FxChain::new(), FxChain::from_parts([("eq", Box::new(Eq::new()) as Box<dyn Fx>)]));
+        let mut channel = channel_with(unity(), vec![FxChain::new()], FxChain::from_parts([("eq", Box::new(Eq::new()) as Box<dyn Fx>)]));
         channel.set_flow_fader(-0.25);
         channel.deck_fx().slot(0).unwrap().set_param("low", 0.5).unwrap();
         channel.replace_deck(Deck::new(ramp_source(1_000)));
@@ -1123,7 +1192,7 @@ mod tests {
 
     #[test]
     fn analysis_reaches_the_deck_through_the_channel() {
-        let mut channel = channel_with(unity(), FxChain::new(), FxChain::new());
+        let mut channel = channel_with(unity(), vec![FxChain::new()], FxChain::new());
         channel.deck_mut().set_analysis(crate::core::TrackAnalysis::from_grid(
             BeatGrid::from_constant_bpm(122.0, 0, 44_100 * 10, SAMPLE_RATE),
             122.0,
@@ -1133,7 +1202,7 @@ mod tests {
 
     #[test]
     fn a_bad_fader_value_cannot_break_the_law() {
-        let mut channel = channel_with(unity(), FxChain::new(), FxChain::new());
+        let mut channel = channel_with(unity(), vec![FxChain::new()], FxChain::new());
         channel.set_flow_fader(f32::NAN);
         channel.set_crossfader(99.0);
         channel.set_deck_fader(-99.0);

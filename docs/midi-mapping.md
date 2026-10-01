@@ -139,6 +139,10 @@ action = "play"         # 按钮类:NoteOn 触发、NoteOff 视语义(toggle / m
   - transport:`play`(toggle)/ `cue`(momentary:按下 `Cue::Play`、松开 `Cue::Back`)/ 
     `cue.smart`(单边沿,引擎按走带决定 back 或 set)/ `beatjump±`(相对按钮步长可配)
   - fader 族:`fader.flow` `fader.deck` `fader.cuesend` `fader.cross` `fader.master` `fader.cue`
+  - stem 族:`fader.stem.<stem>`(某条 stem 的电平,软接管与 `fader.flow` 一致)、
+    `stem.<stem>.mute` / `stem.<stem>.solo`(**latch 按钮** —— 引擎自己翻转状态,映射层不记状态,
+    所以按住与按一下等价;`<stem>` = `drums|bass|other|vocals`)。装了 stems 才有意义,
+    没装时引擎返回错误并显示在日志里
   - tempo:`tempofader`(CC → `SetTempoFader`,只发推子位置 -1..1;量程由 deck 的
     `temporange` 管,映射层不再做量程换算)
   - nudge:`nudge` — NoteOn → `Nudge::Start{delta, seconds}`;省略 `seconds` 时是 momentary
