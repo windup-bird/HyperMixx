@@ -9,7 +9,7 @@ library(分析)与 audio 零交叉依赖,只被 cli 调用;stems(离线分离)�
 cli ──→ core / media / audio / library / stems / midi
 audio ──→ core, media          (+ timestretch, git 依赖 rev 锁定; serde + toml)
 library ──→ core, media        (+ stratum-dsp, git 依赖 rev 锁定)
-stems ───→ core, media         (+ charon-audio/ort, 特征开关;可关)
+stems ───→ core, media         (+ charon-audio/ort, `onnx` 默认开, `cuda` 可选)
 midi ───→ core                 (+ midir, serde + toml)
 media ──→ core                 (+ symphonia)
 core ──→ serde
@@ -55,7 +55,9 @@ crates/
 │       ├── mock.rs         # MockSeparator:无模型,CI 与开发用(两种精确可加的切法)
 │       ├── model.rs        # 模型表 + 镜像下载 + SHA-256 校验(不信任后端的下载器)
 │       ├── cache.rs        # 内容寻址缓存(~/.cache/hypermixx/stems/<key>/)
-│       └── onnx.rs         # CharonSeparator:进度/取消桥接 + 帧对齐契约检查
+│       ├── onnx.rs         # CharonSeparator:进度/取消桥接 + 帧对齐契约检查 + EP 选择
+│       └── onnx_options.rs # Provider(cpu|cuda)/SeparateOptions:改音频的旋钮,也就是缓存 key
+├── vendor/charon-audio/  # 上游 0.1.2 + 15 行补丁(CUDA EP);见其中的 PATCH.md
 │
 ├── hypermixx-library/    # 分析与曲库(core + media + stratum-dsp)
 │   └── src/

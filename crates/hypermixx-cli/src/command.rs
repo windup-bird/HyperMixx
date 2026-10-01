@@ -775,40 +775,68 @@ fn stem_family<'a>(
     };
     match sub {
         "separate" | "split" => {
-            let mut shifts = 1usize;
+            let mut options = hypermixx_stems::SeparateOptions::default();
             while let Some(flag) = words.next() {
                 match flag {
-                    "--shifts" => {
-                        let Some(raw) = words.next() else {
-                            return Action::Failed("--shifts needs a number".into());
-                        };
-                        match raw.parse::<usize>() {
-                            // Refused rather than clamped: a silent clamp would make `--shifts 8`
-                            // look like it had done something it had not.
-                            Ok(value) if value <= hypermixx_stems::MAX_SHIFTS => shifts = value,
-                            Ok(value) => {
-                                return Action::Failed(format!(
-                                    "--shifts {value} is past the useful range (0..={}); higher \
-                                     only costs time",
-                                    hypermixx_stems::MAX_SHIFTS
-                                ))
-                            }
-                            Err(_) => {
-                                return Action::Failed(format!("--shifts needs a number, got `{raw}`"))
-                            }
+                    // Every option is refused rather than clamped: a silent clamp makes `--shifts 8`
+                    // look like it did something it did not.
+                    "--shifts" => match words.next().and_then(|v| v.parse::<usize>().ok()) {
+                        Some(value) if value <= hypermixx_stems::MAX_SHIFTS => {
+                            options.shifts = value
                         }
-                    }
+                        Some(value) => {
+                            return Action::Failed(format!(
+                                "--shifts {value} is past the useful range (0..={}); 0 and 1 are the \
+                                 same single pass, 2 averages a second run for ~2× the time",
+                                hypermixx_stems::MAX_SHIFTS
+                            ))
+                        }
+                        None => return Action::Failed("--shifts needs a number".into()),
+                    },
+                    "--overlap" => match words.next().and_then(|v| v.parse::<f32>().ok()) {
+                        Some(value)
+                            if value.is_finite() && (0.0..=hypermixx_stems::MAX_OVERLAP).contains(&value) =>
+                        {
+                            options.overlap = value
+                        }
+                        Some(value) => {
+                            return Action::Failed(format!(
+                                "--overlap {value} is outside 0.0..={}; 0.0 is 24% faster than the \
+                                 0.25 default and weights window edges more",
+                                hypermixx_stems::MAX_OVERLAP
+                            ))
+                        }
+                        None => return Action::Failed("--overlap needs a number".into()),
+                    },
+                    "--gpu" => options.provider = hypermixx_stems::Provider::Cuda,
+                    "--provider" => match words.next().and_then(hypermixx_stems::Provider::parse) {
+                        Some(provider) => options.provider = provider,
+                        None => {
+                            return Action::Failed(
+                                "--provider needs cpu or cuda (--gpu is short for the latter)".into(),
+                            )
+                        }
+                    },
                     other => {
                         return Action::Failed(format!(
-                            "unknown stem separate option `{other}` (only --shifts <n>)"
+                            "unknown stem separate option `{other}` \
+                             (--shifts <n> | --overlap <x> | --gpu)"
                         ))
                     }
                 }
             }
+            // A build without the feature must say so *before* fetching a model and starting an
+            // 80-second job, not after.
+            if !hypermixx_stems::provider_available(options.provider) {
+                return Action::Failed(format!(
+                    "this build has no {} support (rebuild with --features cuda)",
+                    options.provider.label()
+                ));
+            }
             let Some(source) = pipeline.deck_source(deck_id) else {
                 return Action::Failed(format!("deck {deck_id} holds no track to separate"));
             };
-            spawn_separate(deck_id, source, shifts, dispatcher);
+            spawn_separate(deck_id, source, options, dispatcher);
             Action::Continue
         }
         "status" => send(command_tx, Command::GetStemState { deck_id }),
@@ -943,7 +971,12 @@ fn command_tx_of(dispatcher: &Dispatcher) -> Sender<Command> {
 /// which it keeps even after stems replace stream 0). The four streams come back through
 /// `Command::SetStems`, which is a seamless source swap
 /// — so the user can keep playing, looping and beatmatching while this runs.
-pub(crate) fn spawn_separate(deck_id: u8, source: Shared, shifts: usize, dispatcher: &Dispatcher) {
+pub(crate) fn spawn_separate(
+    deck_id: u8,
+    source: Shared,
+    options: hypermixx_stems::SeparateOptions,
+    dispatcher: &Dispatcher,
+) {
     let command_tx = dispatcher.command_tx.clone();
     let notices_tx = dispatcher.notices.clone();
     let cancellations = Arc::clone(&dispatcher.separations);
@@ -969,16 +1002,24 @@ pub(crate) fn spawn_separate(deck_id: u8, source: Shared, shifts: usize, dispatc
                 &notices_tx,
                 format!("[stem] deck{deck_id}: preparing the separator (may fetch a model)..."),
             );
-            let separator = match hypermixx_stems::default_separator(shifts, &progress) {
+            let separator = match hypermixx_stems::default_separator(options, &progress) {
                 Ok(separator) => separator,
                 Err(err) => {
                     notices::error(&notices_tx, format!("[stem] deck{deck_id}: {err}"));
                     return;
                 }
             };
+            // The id names the model, shifts, overlap and provider — the four things that decide
+            // which audio this is, and which cache entry it will land in.
             notices::info(
                 &notices_tx,
-                format!("[stem] deck{deck_id}: separator {}", separator.id()),
+                format!(
+                    "[stem] deck{deck_id}: {} (shifts {}, overlap {}, {})",
+                    separator.id(),
+                    options.shifts,
+                    options.overlap,
+                    options.provider.label()
+                ),
             );
             let cancelled = hypermixx_stems::Cancelled::new();
             if let Ok(mut running) = cancellations.lock() {

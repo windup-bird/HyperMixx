@@ -19,3 +19,8 @@ hypermixx-midi = { path = "../hypermixx-midi" }
 crossbeam-channel = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+
+[features]
+# GPU stem separation. Off by default: the CPU path is complete without it, and this pulls the
+# CUDA-enabled ONNX Runtime prebuilt (~183 MB) and needs CUDA 13 + cuDNN 9 on the host.
+cuda = ["hypermixx-stems/cuda"]

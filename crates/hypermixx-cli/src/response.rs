@@ -320,7 +320,10 @@ startup flags: --config <file> (custom topology), --print-config (reference TOML
 /// The `stem` family's own help, for the `stem` verb with no subcommand.
 pub fn stem_help_text() -> String {
     "stem commands (the deck is the line's target, focused by default):
-  stem separate [--shifts <n>]   separate the loaded track into 4 stems, install them when ready
+  stem separate [options]        separate the loaded track into 4 stems, install them when ready
+                                 --shifts <0..=2>  0/1 = one pass (default 1), 2 = ~2x time
+                                 --overlap <x>     0.0..=0.5, default 0.25; 0.0 is 24% faster
+                                 --gpu             run on CUDA (needs a --features cuda build)
   stem status                    show the per-stem level / mute / solo
   stem full | acapella | instrumental | drums | bass
                                  a named arrangement (mute flags; your levels survive)

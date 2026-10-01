@@ -19,6 +19,7 @@
 pub mod cache;
 pub mod mock;
 pub mod model;
+mod onnx_options;
 
 #[cfg(feature = "onnx")]
 mod onnx;
@@ -29,6 +30,7 @@ pub use cache::{
     cache_key, cache_root, cache_usage, load_cached, prune_cache, stems_root, store_cached,
     CachedStems,
 };
+pub use onnx_options::{Provider, SeparateOptions, DEFAULT_OVERLAP, MAX_OVERLAP};
 pub use mock::{MockMode, MockSeparator};
 pub use model::{ensure_model, model_path, models_root, ModelSpec, HTDEMUCS};
 
@@ -138,28 +140,40 @@ pub trait StemSeparator: Send + Sync {
 /// two the separation time grows faster than the separation does for a DJ's purposes.
 pub const MAX_SHIFTS: usize = 2;
 
-/// The separator a front-end should use by default: HTDemucs on ONNX Runtime, with the model
-/// obtained (and verified) first. `progress` covers the model download when one is needed.
+/// The separator a front-end should use: HTDemucs on ONNX Runtime, with the model obtained (and
+/// verified) first. `progress` covers the model download when one is needed.
 ///
-/// `shifts` is clamped to [`MAX_SHIFTS`]; it is part of the separator's [`id`](StemSeparator::id),
-/// so two shift counts never share a cache entry (they produce different audio).
+/// `options` are canonicalised here, so every caller's request reaches the backend in range. Each
+/// option is part of the separator's [`id`](StemSeparator::id), and so of the cache key: they all
+/// produce different samples, and none may share an entry with another setting.
 #[cfg(feature = "onnx")]
 pub fn default_separator(
-    shifts: usize,
+    options: SeparateOptions,
     progress: &ProgressSink,
 ) -> Result<Box<dyn StemSeparator>, StemError> {
     let model = ensure_model(&HTDEMUCS, None, progress)?;
-    Ok(Box::new(CharonSeparator::new(model).with_shifts(shifts)))
+    Ok(Box::new(CharonSeparator::from_options(model, options)))
 }
 
 /// Without the `onnx` feature there is nothing to separate with; the mock is for tests, not for
 /// pretending a track was separated.
 #[cfg(not(feature = "onnx"))]
 pub fn default_separator(
-    _shifts: usize,
+    _options: SeparateOptions,
     _progress: &ProgressSink,
 ) -> Result<Box<dyn StemSeparator>, StemError> {
     Err(StemError::NoBackend)
+}
+
+/// Whether this build can ask for `provider`.
+///
+/// Lets a front-end reject `--gpu` with "this build has no CUDA support" instead of failing the job
+/// after the model has been fetched.
+pub fn provider_available(provider: Provider) -> bool {
+    match provider {
+        Provider::Cpu => cfg!(feature = "onnx"),
+        Provider::Cuda => cfg!(all(feature = "onnx", feature = "cuda")),
+    }
 }
 
 /// Separates `mix`, with the on-disk cache in front of the model.

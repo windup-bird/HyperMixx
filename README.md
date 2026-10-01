@@ -20,12 +20,13 @@ cli ─┬─► audio ───┐
 | `hypermixx-media` | 解码与内存池：`decode_file`（symphonia → 44.1k 立体声）、`PcmPool` | core |
 | `hypermixx-audio` | 实时引擎：producer 线程 + cpal 输出、mixer/通道/FX 链、时间拉伸 | core, media |
 | `hypermixx-library` | 离线分析：beat 网格编译、stratum-dsp 适配、波形峰值 | core, media |
-| `hypermixx-stems` | 离线 stem 分离：HTDemucs 模型获取/校验、内容寻址缓存、ONNX 后端（feature `onnx`，可关） | core, media, ort |
+| `hypermixx-stems` | 离线 stem 分离：HTDemucs 模型获取/校验、内容寻址缓存、ONNX 后端（CPU 默认；`cuda` 可选） | core, media, ort |
 | `hypermixx-midi` | MIDI 输入：字节解析、TOML 映射表、`Event → Command` 翻译（纯逻辑，可无硬件单测） | core, midir |
 | `hypermixx-cli` | 前端：行 REPL、`--tui` 终端界面、命令解析与补全 | 全部 |
 
 外部依赖：`stratum-dsp`、`timestretch`、`midir`、`charon-audio`/`ort`（仅 `hypermixx-stems` 的
-`onnx` feature，默认开）。
+`onnx` feature，默认开）。`vendor/charon-audio` 是带了 15 行补丁的副本 —— 上游 0.1.2 的
+`ExecutionProvider` 只有 CPU/CoreML，补丁加上 CUDA 一档，见 `vendor/charon-audio/PATCH.md`。
 
 
 ## 安装
@@ -66,7 +67,9 @@ hypermixx> fx set filter value  0.5
 hypermixx> master fx list
 
 # stems：离线分离 4 条轨，然后逐条控制（分离在后台跑，期间照常 play/loop/jump/sync）
-hypermixx> deck0 stem separate         # 首次 ~80s（3:39 曲目）+ ~1.9GB 内存；之后命中缓存 0s
+hypermixx> deck0 stem separate         # CPU：首次 ~87s（3:39 曲目）+ ~2GB 内存；之后命中缓存 0s
+hypermixx> deck0 stem separate --gpu   # CUDA：13s（同曲目，RTX 4050）；需 --features cuda 构建
+hypermixx> deck0 stem separate --overlap 0.0   # 0.25→0.0：少 24% 时间，窗口边缘权重更大
 hypermixx> deck0 stem acapella         # 只要人声（instrumental | drums | bass | full）
 hypermixx> deck0 vocals level -0.5     # 单条 stem 电平（-1 = 精确静音）
 hypermixx> deck0 vocals mute           # solo 仍然优先

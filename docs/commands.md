@@ -196,7 +196,7 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 
 | 命令 | 说明 |
 |---|---|
-| `[deck] stem separate [--shifts <n>]` | 分离并安装（`--shifts` 提高质量、成倍耗时） |
+| `[deck] stem separate [--shifts <n>] [--overlap <x>] [--gpu]` | 分离并安装；见下表 |
 | `[deck] stem status` | 逐 stem 报告：电平、是否被静音/独奏、实际增益 |
 | `[deck] stem full \| acapella \| instrumental \| drums \| bass` | 命名编排（改的是静音位，**你的电平保留**） |
 | `[deck] stem clear` | 四条全开、unity、取消 solo |
@@ -211,8 +211,20 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 `<stem>` = `drums` \| `bass` \| `other` \| `vocals`。行首目标因此可以带一层 stem：
 `deck0 vocals level -0.5`、`deck0 vocals fx add filter`。
 
+分离参数（三个都会改变产出的音频，所以**都进缓存 key**）：
+
+| 参数 | 缺省 | 效果（`stem-test.mp3`, 3:39, 实测） |
+|---|---|---|
+| `--shifts <0..=2>` | 1 | `0` 与 `1` 等价（单趟）；`2` 多跑一次带偏移的平均，**+98% 时间**（81→161 s）、+360 MB |
+| `--overlap <0..=0.5>` | 0.25 | `0.0` **−24% 时间**（81→62 s，窗口数 38→29）；代价是窗口边缘的模型估计权重更大，需要耳朵判断 |
+| `--gpu` | 关 | CUDA：**13 s**（vs CPU 87 s，RTX 4050），显存 ~3.2 GB。需要 `--features cuda` 构建 + 宿主 CUDA 13 / cuDNN 9 |
+
+`--gpu` 是**要求而不是建议**：CUDA 不能接管整张图时会直接报错，而不是悄悄在 CPU 上跑（那样只是慢 9 倍，
+看起来却像成功了）。窗口长度不可调 —— 导出把它钉在 343,980 采样（7.8 s）。
+
 分离是**离线异步**的：换源在后台线程预热完才落地，期间 deck 一直在放原始混音；重复跑同一条曲目
 命中内容寻址缓存，成本是 0 s。缓存每曲约 300 MB，所以 `stem cache prune` 是需要的，不是装饰。
+CPU 与 CUDA 的结果 Σ 残差一致（实测都是 −32.9 dB 量级），但两者存在不同的缓存条目里（key 含 provider）。
 
 **每 stem 的链也可以在配置文件里给**（`--config`）：
 

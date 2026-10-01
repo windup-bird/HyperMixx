@@ -10,6 +10,12 @@ members = [
     "crates/hypermixx-cli",
 ]
 
+# Hypermixx carries a minimal patch to `charon-audio` (a CUDA execution provider alongside the
+# upstream CPU/CoreML ones), vendored under `vendor/`: see `vendor/charon-audio/PATCH.md` for the
+# exact diff and how to re-apply it to a newer upstream release.
+[patch.crates-io]
+charon-audio = { path = "vendor/charon-audio" }
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

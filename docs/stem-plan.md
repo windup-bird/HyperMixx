@@ -571,6 +571,43 @@ flow 链（于是覆写里的错名在构造时就失败，而不是等那条链
 - `midi-map.toml` 补了 6 条默认绑定（channel 6：4 个 mute + 1 个 solo + 1 个 per-stem fader），
   并加了一条测试**解析仓库里那份默认 map** —— 之前没人读它，正是最容易烂掉的东西。
 
+## GPU（实测 9.6×，默认仍走 CPU）
+
+**先纠正一个我之前的错误结论。** 我曾在方案里写"这个导出把 STFT 放在图内,只能跑 CPU;要 GPU 得用上游
+没托管的 split 导出"。这是错的,而且错得有两层:
+
+1. `charon` 的 `ExecutionProvider` 只有 `Cpu`/`CoreMl`/`Auto` —— **它根本没有"请求 CUDA"这一档**。
+   "不能 GPU"是上游 API 缺一档,不是模型/硬件不行。
+2. 更关键:真凶是 **`OnnxOptions::low_memory()`**(`ModelConfig::htdemucs()` 继承它)里的
+   `disabled_optimizers: ["ConstantFolding"]`。**一关掉 ConstantFolding,ORT 的 CUDA EP 一个节点都不接**
+   —— 整张 1201 节点的图全落到 CPU EP。charon 踩到了这个,把它归因成"导出只能在 CPU 上跑"。
+
+实测(RTX 4050 Laptop 6 GB,CUDA 13.4 + cuDNN 9.26 + ORT 1.28 cuda13 预编译):
+
+| 会话 | 每 7.8 s 窗口 | 全曲 219 s(38 窗) | 显存 |
+|---|---|---|---|
+| CPU | 2055 ms | **87 s**(端到端实测) | 1.98 GB RSS |
+| CUDA + `disabled_optimizers=[]` | **214 ms** | **13 s**(端到端实测) | 3.2 GB |
+| CUDA + `memory_pattern=false` | 214 ms | — | — |
+| CUDA + `disabled_optimizers=["ConstantFolding"]` | **0 节点被接管**(开 `disable_cpu_ep_fallback` 则硬失败) | — | — |
+
+**集成方式**(`vendor/charon-audio`,见其 `PATCH.md`):`cuda` feature → `ort/cuda`;`ExecutionProvider::Cuda`
++ `build_session` 按 EP 分支;Cuda 路径设 `session.disable_cpu_ep_fallback=1` 并**保留 ConstantFolding**。
+
+**"不静默降级"是硬要求**,而且是这次踩坑的直接教训:provider 库加载失败、或它拒接节点,ORT 都只是
+*悄悄*跑在 CPU 上 —— 慢 9 倍,看起来却完全成功。所以:
+
+- 会话用 `disable_cpu_ep_fallback=1`,任何节点落不到 CUDA 就**报错**;
+- 建完会话再核对 `separator.provider()`,不一致就报错(双保险);
+- `session_error` 把失败翻译成"需要 CUDA 13 / cuDNN 9 / `--features cuda` / provider 库在二进制旁"。
+
+**CPU 保持完整**:`--gpu` 是可选 feature,默认构建不含任何 CUDA 依赖,CPU 路径行为与之前逐位一致
+(`low_memory()` 的过滤只在 CUDA 路径生效)。实测两条路 Σ 残差相同(−32.9 dB 量级),但 key 里带
+provider,所以是两条独立缓存条目。
+
+**新增旋钮**:`--overlap`(0.25→0.0 = −24% 时间,实测 81→62 s;OLA 是按权重归一化的,所以零重叠不会在
+窗口边界塌陷,代价是边缘估计权重更大)、`--shifts`(0 与 1 等价、2 = +98% 时间)、`--provider cpu|cuda`。
+
 ## 7. 成本与风险
 
 1. **stem 之间的相位一致性（最高风险，已由 §1 的结构解决）**：SOLA 的拼接点按全声道混合信号

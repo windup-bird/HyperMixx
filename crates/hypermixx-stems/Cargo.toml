@@ -21,3 +21,6 @@ ndarray = { version = "0.15", optional = true }
 [features]
 default = ["onnx"]
 onnx = ["dep:ureq", "dep:charon-audio", "dep:ndarray"]
+# GPU inference, off by default: it needs CUDA 13 + cuDNN 9 on the host and makes `ort` fetch a
+# larger prebuilt (183 MB vs 101 MB). With it off, the CPU path is unchanged and complete.
+cuda = ["onnx", "charon-audio/cuda"]
