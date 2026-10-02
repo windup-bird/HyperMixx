@@ -222,7 +222,8 @@ pub enum NudgeOp {
 /// front-end never has to guess the deck's transport from a possibly-stale state snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CueOp {
-    /// Jump to the cue point, then play (the press edge of a held cue button).
+    /// Jump to the cue point, then play. Unconditional: it neither moves the cue point nor asks the
+    /// transport anything, which is what `cue play` means.
     Play,
     /// Jump to the cue point and pause (the release edge of a held cue button).
     Back,
@@ -230,6 +231,13 @@ pub enum CueOp {
     Set,
     /// `Back` while playing, `Set` while paused — resolved by the deck itself.
     Smart,
+    /// The **press edge** of a held cue button: [`CueOp::Smart`] first, then play from the cue point.
+    ///
+    /// So a paused deck takes the playhead as its cue point before playing it (finding a spot and
+    /// cueing it is one gesture, not two), and a playing deck restarts from the cue. One op rather
+    /// than `Smart` + `Play` because the decision must be atomic with the jump it causes: two
+    /// commands could be split by another one arriving in between.
+    SmartPlay,
 }
 
 /// The keylock profile a deck runs: whether the time-stretch corrects pitch while the tempo moves.

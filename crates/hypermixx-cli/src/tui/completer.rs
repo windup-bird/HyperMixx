@@ -41,7 +41,7 @@ const VERBS: &[(&str, &str)] = &[
     ("load", "decode a file"),
     ("analyse", "run the analyser"),
     ("play", "toggle play/pause"),
-    ("cue", "play from / return to / set the cue point"),
+    ("cue", "play from / return to / set the cue point (hold = cue button press)"),
     ("jump", "seek to frame"),
     ("beatjump", "seek by beats"),
     ("tempo", "set the tempo"),
@@ -203,6 +203,7 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
                         ("play", "play from the cue point"),
                         ("back", "return to cue and pause"),
                         ("set", "set the cue point here"),
+                        ("hold", "cue button press: cue here, then play"),
                     ],
                     partial,
                 )

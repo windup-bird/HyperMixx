@@ -181,7 +181,8 @@ impl BindingSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Play,
-    /// Momentary cue button: press plays from the cue point, release returns to it and pauses.
+    /// Momentary cue button: the press edge cues the playhead (paused) or restarts from the cue
+    /// point (playing) and plays; the release edge returns to the cue point and pauses.
     Cue,
     /// One-shot cue: the deck decides between "back to cue" and "set cue here".
     CueSmart,

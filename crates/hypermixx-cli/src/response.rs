@@ -266,7 +266,10 @@ pub fn help_text(decks: usize) -> String {
   [deck] load <path> [bpm]     decode a file (deck defaults to the focused one)
   [deck] analyse               run the analyser and publish its grid
   [deck] play                  toggle play/pause
-  [deck] cue [play|back|set]   play from / return to / set the cue point (bare `cue` = smart)
+  [deck] cue [play|back|set|hold]
+                               play from / return to / set the cue point (bare `cue` = smart);
+                               `hold` = the press edge of a held cue button: cue the playhead when
+                               paused, then play from the cue point
   [deck] jump <frame>          seek to a frame (1 second = {SAMPLE_RATE} frames)
   [deck] beatjump <beats>      seek by whole beats, keeping the phase
   [deck] tempo <ratio>         set the tempo (1.0 = unity, 0.5 = half speed)

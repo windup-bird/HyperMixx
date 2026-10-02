@@ -33,7 +33,7 @@ AudioPipeline producer:块边界 route → Mixer / Deck
 | **混音推子/交叉推子无命令** | `set_flow_fader` / `set_crossfader` / `set_cue_send` / master `set_fader` 只能靠 TOML 启动配置 | core 新增 `Command::SetFader`,`pipeline::route` 加 arm(mixer 侧 setter 均为 `&self`,无需 `&mut`) |
 | 推子位置无回读 | `Channel::levels()` 存在但无 query 暴露 | v1 **不需要**:soft-takeover 只比对映射层自己的镜像(初始值取自 `MixerConfig`),零协议成本 |
 | FX 参数按 index 寻址 | `SetFxParam { slot: FxSlotRef{index} }`,index 随 `RemoveFx` 漂移 | 映射文件按**名字**写(`chain/ fx / param`),启动时经 `ListFx` 解析成 index 注入 map,复用 cli 的 `Slots` 簿记 |
-| 单一 cue 点 | 只有 `Jump` + `Play` | 已补 `Command::Cue`(`play`/`back`/`set`/`smart`);多 hot cue 槽位仍不做 |
+| 单一 cue 点 | 只有 `Jump` + `Play` | 已补 `Command::Cue`(`play`/`back`/`set`/`smart`/`smartplay`);多 hot cue 槽位仍不做 |
 
 ---
 
@@ -136,7 +136,8 @@ action = "play"         # 按钮类:NoteOn 触发、NoteOff 视语义(toggle / m
   同一张表(`TargetManifest::standard(decks)`),永不脱节——对齐 `fx help` 从注册表
   生成的做法;
 - `action` v1 集:
-  - transport:`play`(toggle)/ `cue`(momentary:按下 `Cue::Play`、松开 `Cue::Back`)/ 
+  - transport:`play`(toggle)/ `cue`(momentary:按下 `Cue::SmartPlay`——暂停时 cue 点落到
+    播放头,播放中从 cue 重开,两者都开始播放;松开 `Cue::Back`)/ 
     `cue.smart`(单边沿,引擎按走带决定 back 或 set)/ `beatjump±`(相对按钮步长可配)
   - fader 族:`fader.flow` `fader.deck` `fader.cuesend` `fader.cross` `fader.master` `fader.cue`
   - stem 族:`fader.stem.<stem>`(某条 stem 的电平,软接管与 `fader.flow` 一致)、

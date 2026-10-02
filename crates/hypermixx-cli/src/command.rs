@@ -440,9 +440,12 @@ fn cue_command<'a>(
         Some("play") => CueOp::Play,
         Some("back") => CueOp::Back,
         Some("set") => CueOp::Set,
+        // The press edge of a held cue button (a MIDI button's note-on): cue the playhead if the
+        // deck is paused, then play from the cue point.
+        Some("hold") => CueOp::SmartPlay,
         Some(other) => {
             return Action::Failed(format!(
-                "unknown cue subcommand `{other}` — play|back|set (or bare `cue`)"
+                "unknown cue subcommand `{other}` — play|back|set|hold (or bare `cue`)"
             ));
         }
     };

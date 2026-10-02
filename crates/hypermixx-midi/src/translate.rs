@@ -292,7 +292,7 @@ impl<'a> BindingOut<'a> {
             Action::Play => self.out.push(Command::TogglePlay { deck_id: deck }),
             Action::Cue => self.out.push(Command::Cue {
                 deck_id: deck,
-                op: CueOp::Play,
+                op: CueOp::SmartPlay,
             }),
             Action::CueSmart => self.out.push(Command::Cue {
                 deck_id: deck,
@@ -835,10 +835,11 @@ action = "cue.smart"
             [Command::Nudge { op: NudgeOp::Start { seconds: Some(s), .. }, .. }] if close(*s as f32, 0.5)
         ));
         assert!(edge(&mut state, 61, false).is_empty());
-        // The cue button is a held pair: down plays from the cue, up returns to it.
+        // The cue button is a held pair: down cues the playhead (or restarts from the cue point)
+        // and plays; up returns to the cue point and pauses.
         assert!(matches!(
             edge(&mut state, 62, true).as_slice(),
-            [Command::Cue { op: CueOp::Play, .. }]
+            [Command::Cue { op: CueOp::SmartPlay, .. }]
         ));
         assert!(matches!(
             edge(&mut state, 62, false).as_slice(),

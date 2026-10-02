@@ -224,6 +224,12 @@ impl Deck {
                     self.cue_frame = self.current_frame();
                 }
             }
+            // `Smart` resolves the transport (and moves the cue point when it is paused), then the
+            // deck plays from wherever that left the playhead — which is the cue point by then.
+            CueOp::SmartPlay => {
+                self.apply_cue(CueOp::Smart);
+                self.play();
+            }
         }
     }
 
@@ -1251,6 +1257,53 @@ mod tests {
         // Full deflection, and anything past it, clamps to the travel.
         deck.set_tempo_fader(5.0);
         assert!((deck.tempo() - 1.2).abs() < 1e-9, "tempo {}", deck.tempo());
+    }
+
+    /// The held cue button's press edge, in both transports: paused takes the playhead as the cue
+    /// point and plays it, playing restarts from the cue point that was already there.
+    #[test]
+    fn cue_smartplay_cues_the_playhead_when_paused_and_restarts_when_playing() {
+        let mut deck = tape_deck(pool(10_000));
+        let mut out = vec![0.0f32; 256 * CHANNELS];
+        // Park the playhead somewhere that is not the cue point (frame 0 by default).
+        deck.play();
+        for _ in 0..4 {
+            deck.process_block(&mut out);
+        }
+        deck.pause();
+        let parked = deck.current_frame();
+        assert!(parked > 0 && deck.cue_point() == 0);
+        assert!(!deck.is_playing());
+
+        // Paused: the cue point moves to the playhead, and the hold plays from there — no jump, so
+        // this half needs no settling.
+        deck.apply_cue(CueOp::SmartPlay);
+        assert_eq!(deck.cue_point(), parked, "the playhead became the cue point");
+        assert!(deck.is_playing(), "and the hold started playing");
+        assert_eq!(deck.current_frame(), parked, "without moving");
+
+        // Playing: the same op restarts from the cue point (a jump, so the deck settles onto it)
+        // and keeps playing.
+        for _ in 0..4 {
+            deck.process_block(&mut out);
+        }
+        let before = deck.current_frame();
+        assert!(before > parked);
+        deck.apply_cue(CueOp::SmartPlay);
+        assert_eq!(deck.cue_point(), parked, "the cue point was not moved");
+        assert!(deck.is_playing(), "still playing");
+        settle_below(&mut deck, &mut out, before);
+        let landed = deck.current_frame();
+        assert!(
+            (parked..before).contains(&landed),
+            "should have restarted from the cue: landed at {landed}, cue {parked}, was {before}"
+        );
+
+        // The release edge is the existing `Back`: back to the cue point, paused.
+        deck.apply_cue(CueOp::Back);
+        assert!(!deck.is_playing());
+        settle_below(&mut deck, &mut out, landed + 1);
+        assert!(deck.current_frame() >= parked);
     }
 
     #[test]

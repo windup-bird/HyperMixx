@@ -79,9 +79,12 @@ cargo run -p hypermixx-cli -- [flags]
 
 ```
 [deck] play                  切换播放/暂停（toggle；`pause` 已移除）
-[deck] cue [play|back|set]   cue 点：`play` 从 cue 播放，`back` 回 cue 并暂停，
+[deck] cue [play|back|set|hold]
+                             cue 点：`play` 从 cue 播放，`back` 回 cue 并暂停，
                              `set` 把当前帧记为 cue 点；**bare `cue` = smart**：
-                             播放中→back，暂停中→set
+                             播放中→back，暂停中→set；
+                             `hold` = 按住式 cue 按钮的**按下边沿**：先按 smart 定位
+                             （暂停中 → cue 点落到当前播放头），再从 cue 播放
 [deck] jump <frame>         按帧 seek（1 秒 = 44100 帧）
 [deck] beatjump <beats>     按整拍 seek，保持相位（i64，负数回跳）
 [deck] tempo <ratio>        设 tempo 绝对值（1.0 = 原速，0.25..4.0）
@@ -92,8 +95,11 @@ cargo run -p hypermixx-cli -- [flags]
 state                       打印全部 deck 的状态行
 ```
 
-- `cue` 点默认在装载原点（帧 0）；`Load` 换 deck 时回到 0。`back`/`play` 走非阻塞 jump，
-  落地可能滞后一个块 + 预热时间。
+- `cue` 点默认在装载原点（帧 0）；`Load` 换 deck 时回到 0。`back`/`play`/`hold` 走非阻塞
+  jump，落地可能滞后一个块 + 预热时间（`hold` 在**暂停**那一路不跳，所以是即时的）。
+- **按住式 cue 按钮**（MIDI note）是一对边沿：按下 `hold`、松开 `back`。所以暂停时"找到位置 →
+  按下 cue"是一个动作（cue 点先落到播放头，再出声），播放中按住 = 从 cue 点重开。
+  一个 op 而不是 `smart`+`play` 两条命令，因为判定必须与它引发的跳转原子。
 - **tempo / tempofader / temporange**：`tempo` 是绝对值（sync、脚本用）；`tempofader` 是物理推子
   位置（MIDI 用），引擎按 `1 + pos×range` 换算并走同一套 sync 分支。`temporange` **只改映射**，
   当前 tempo 不动（推子的反推位置随之变化）；范围 `(0, 1.0]`，缺省 0.1。
