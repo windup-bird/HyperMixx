@@ -522,6 +522,15 @@ impl SyncGroup {
                 }
                 Ok(())
             }
+            NudgeOp::Bend { delta, seconds } => {
+                if !delta.is_finite() {
+                    return Err(format!("nudge must be a number, got {delta}"));
+                }
+                if let Some(deck) = mixer.deck_mut(deck_id as usize) {
+                    deck.bend_nudge(f64::from(delta), seconds.clamp(0.01, 5.0));
+                }
+                Ok(())
+            }
             NudgeOp::Stop => {
                 if let Some(deck) = mixer.deck_mut(deck_id as usize) {
                     deck.stop_nudge();

@@ -181,10 +181,14 @@ impl BindingSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Play,
-    /// Momentary cue button: the press edge cues the playhead (paused) or restarts from the cue
-    /// point (playing) and plays; the release edge returns to the cue point and pauses.
+    /// Momentary cue button. The press edge is [`CueOp::Hold`](hypermixx_core::CueOp::Hold): while
+    /// playing it is a back cue, while paused it cues the playhead and plays it. The release edge is
+    /// `Back`. This is the only cue row the guide lists.
     Cue,
-    /// One-shot cue: the deck decides between "back to cue" and "set cue here".
+    /// One-shot cue: the deck decides between "back to cue" and "set cue here", and never plays.
+    ///
+    /// Kept — and kept out of [`ACTIONS`], so the guide offers one cue row instead of two — for a
+    /// button that should only *place* the cue point. `cue.smart` is the name a map uses for it.
     CueSmart,
     BeatJump { beats: i64 },
     Fader(FaderTarget),
@@ -196,6 +200,19 @@ pub enum Action {
     Nudge {
         delta: f32,
         seconds: Option<f64>,
+    },
+    /// A DJ wheel, which is two controls in one message stream and is therefore bound **twice** on a
+    /// real controller:
+    ///
+    /// * a **note** (the platter sensor) → the touch and its release;
+    /// * a **relative CC** (the wheel itself) → turns, `step` frames of audio per tick.
+    ///
+    /// What a turn *means* — move the playhead or bend the tempo — is the deck's decision, because
+    /// only the deck knows whether the platter is held. That is why both bindings carry the same
+    /// action name.
+    Vinyl {
+        /// Frames of audio per wheel tick (the `step` field), applied only while the platter is held.
+        frames_per_tick: f32,
     },
     Loop(LoopAction),
     Sync(SyncAction),
@@ -219,7 +236,10 @@ impl Action {
     pub fn is_momentary(&self) -> bool {
         matches!(
             self,
-            Action::Cue | Action::Fx(FxAction::Pad { .. }) | Action::Nudge { seconds: None, .. }
+            Action::Cue
+                | Action::Vinyl { .. }
+                | Action::Fx(FxAction::Pad { .. })
+                | Action::Nudge { seconds: None, .. }
         )
     }
 
@@ -290,11 +310,46 @@ pub struct ActionSpec {
     pub momentary: bool,
 }
 
+/// The baseline nudge, as a rate: one wheel message bends by this much (`0.15` = 15 % fast), and a
+/// binding that omits `step` gets it.
+///
+/// Deliberately large, because most controller encoders report ±1 per message however fast you turn:
+/// the message *rate* is the only speed information there is, so one message has to be worth
+/// something on its own. With [`Nudge::bend`] accumulating up to `NUDGE_LIMIT`, two messages reach a
+/// wheel-sized bend.
+pub const DEFAULT_NUDGE_STEP: f32 = 0.15;
+
+/// How long a bend started by a **relative encoder tick** lasts when the binding omits `seconds`.
+///
+/// Short on purpose: each message bends, then gets out of the way, so turning feels like nudging the
+/// platter rather than gradually changing the tempo. The release is re-armed by every message, so a
+/// turn that keeps going keeps bending.
+///
+/// An encoder has no release edge — one tick is one message — so a bend with no end would never be
+/// released. (A *note* has both edges, so `seconds` omitted there still means "hold while the button
+/// is down", which is why this default is applied by the translator rather than at parse time.)
+pub const DEFAULT_NUDGE_SECONDS: f64 = 0.06;
+
+/// Frames of audio one wheel tick moves the playhead while the platter is held, when a `vinyl`
+/// binding omits `step`.
+///
+/// Tune it with the physics: a record at 33⅓ RPM carries **1.8 s per revolution**, so
+///
+/// ```text
+/// frames_per_tick = 79380 / (ticks your wheel sends per revolution)
+/// ```
+///
+/// A slow encoder that reports ±1 a few times a second needs a big number to feel like a platter at
+/// all; 1323 is that formula for a 60-detent wheel (and 441 = ⅓ of it, for deliberately fine
+/// placement). To measure yours: open the guide's raw monitor, turn the wheel exactly one revolution,
+/// and count the messages.
+pub const DEFAULT_VINYL_FRAMES_PER_TICK: f32 = 1323.0;
+
 /// Every action the mapping layer knows, in the order a guide should list them.
 pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec { name: "play", deck: true, momentary: false },
     ActionSpec { name: "cue", deck: true, momentary: true },
-    ActionSpec { name: "cue.smart", deck: true, momentary: false },
+    ActionSpec { name: "vinyl", deck: true, momentary: true },
     ActionSpec { name: "beatjump+", deck: true, momentary: false },
     ActionSpec { name: "beatjump-", deck: true, momentary: false },
     ActionSpec { name: "fader.flow", deck: true, momentary: false },
@@ -479,6 +534,14 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
             deck("cue")?;
             Ok(Action::Cue)
         }
+        "vinyl" => {
+            deck(name)?;
+            let step = raw.step.unwrap_or(DEFAULT_VINYL_FRAMES_PER_TICK);
+            if !step.is_finite() || step <= 0.0 {
+                return Err("`step` (vinyl frames per tick) must be a positive number".to_owned());
+            }
+            Ok(Action::Vinyl { frames_per_tick: step })
+        }
         "cue.smart" => {
             deck("cue.smart")?;
             Ok(Action::CueSmart)
@@ -531,7 +594,7 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
         }
         "nudge" => {
             deck(name)?;
-            let delta = raw.step.unwrap_or(0.04);
+            let delta = raw.step.unwrap_or(DEFAULT_NUDGE_STEP);
             if !delta.is_finite() || delta == 0.0 {
                 return Err("`step` (nudge delta) must be non-zero".to_owned());
             }
@@ -880,6 +943,23 @@ action = "play"
         assert_eq!(map.fx_slot(FxChainId::Deck(1), "filter"), None);
         map.resolve_fx(FxChainId::Deck(1), "filter", 3);
         assert_eq!(map.fx_slot(FxChainId::Deck(1), "filter"), Some(3));
+    }
+
+    /// The guide offers one cue row; `cue.smart` stays a name a map can use for the one-shot
+    /// behaviour (placing the cue point without ever playing it).
+    #[test]
+    fn the_guide_lists_one_cue_row_and_the_one_shot_stays_reachable_by_name() {
+        let names: Vec<&str> = ACTIONS.iter().map(|spec| spec.name).collect();
+        assert!(names.contains(&"cue"));
+        assert!(!names.contains(&"cue.smart"), "one cue row, not two");
+        let map = Map::from_toml_str(
+            "[[bind]]\ntype = \"note\"\nid = 1\ndeck = 0\naction = \"cue.smart\"\n",
+        )
+        .expect("an existing map still loads");
+        assert_eq!(map.binds[0].action, Action::CueSmart);
+        // And the momentary one is the pair of edges.
+        assert!(Action::Cue.is_momentary());
+        assert!(!Action::CueSmart.is_momentary());
     }
 
     #[test]

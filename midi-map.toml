@@ -11,7 +11,7 @@ action = "play"
 [[bind]]
 type = "note"
 channel = 0
-id = 49
+id = 1
 deck = 0
 action = "cue"
 
@@ -159,21 +159,48 @@ id = 41
 deck = 1
 action = "tempofader"
 
+# The jog wheel. `vinyl` is two controls in one action: without a hand on the platter it is a
+# pitch bend (`step` is unused then), and with one it *scrubs* — `step` frames of audio per tick,
+# 1323 by default. That number is the vinyl physics: one revolution at 33⅓ RPM is 1.8 s, so
+# `frames_per_tick = 79380 / messages per revolution` (1323 for a 60-detent wheel; 441 to place
+# things finely). Turn the wheel one revolution in the guide's raw monitor to count yours.
+#
+# `mode = "rel2"` because this controller sends **1 / 127** for the two directions (sign in the
+# value's high bit, magnitude in the low bits). `rel1` would be the other convention — centred on 64,
+# so 65 = one step forward and 1 = sixty-three steps *back* — which reads as a wild, one-directional
+# jump rather than a turn. Check yours in the guide's raw monitor: values near 63/64/65 = `rel1`,
+# values like 1,2,3 / 127,126 = `rel2` (or `rel3` for direction only).
 [[bind]]
 type = "cc"
-mode = "rel1"
+mode = "rel2"
 channel = 0
 id = 6
 deck = 0
-action = "nudge"
+action = "vinyl"
 
 [[bind]]
 type = "cc"
-mode = "rel1"
+mode = "rel2"
 channel = 1
 id = 6
 deck = 1
-action = "nudge"
+action = "vinyl"
+
+# The platter sensor: a note that is down while a hand is on the wheel. It pauses the deck, so the
+# wheel turns into a scrub until you let go.
+[[bind]]
+type = "note"
+channel = 0
+id = 80
+deck = 0
+action = "vinyl"
+
+[[bind]]
+type = "note"
+channel = 1
+id = 80
+deck = 1
+action = "vinyl"
 
 [[bind]]
 type = "note"
@@ -254,26 +281,6 @@ action = "sync.phase"
 
 [[bind]]
 type = "note"
-channel = 0
-id = 1
-deck = 0
-action = "cue.smart"
-
-[[bind]]
-type = "note"
-channel = 1
-id = 1
-deck = 1
-action = "cue.smart"
-
-# --- stems ------------------------------------------------------------------------------------
-# Per-stem control. The mutes/solos are *latching buttons*: the engine flips its own state, so the
-# mapping never has to remember it, and holding a button does nothing more than pressing it.
-# Bindings work on a track with no stems too (the engine answers with an error, visible in the log)
-# — <stem> is drums | bass | other | vocals.
-
-[[bind]]
-type = "note"
 channel = 6
 id = 20
 deck = 0
@@ -307,8 +314,6 @@ id = 24
 deck = 0
 action = "stem.vocals.solo"
 
-# A per-stem fader. Soft takeover works exactly as it does for `fader.flow`: the binding starts at
-# unity and takes over when the physical control crosses that mirror.
 [[bind]]
 type = "cc"
 mode = "abs"
@@ -316,3 +321,10 @@ channel = 6
 id = 40
 deck = 0
 action = "fader.stem.vocals"
+
+[[bind]]
+type = "note"
+channel = 1
+id = 1
+deck = 1
+action = "cue"

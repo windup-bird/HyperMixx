@@ -25,7 +25,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use hypermixx_core::{CueOp, Key, KeylockMode, LoopEditOp, LoopOp, LoopQuantum, Source, TrackAnalysis};
+use hypermixx_core::{
+    CueOp, Key, KeylockMode, LoopEditOp, LoopOp, LoopQuantum, Source, TrackAnalysis, VinylOp,
+};
 use timestretch::engine::EngineProfile;
 
 use super::jump::{resolve, Seek};
@@ -115,6 +117,20 @@ pub struct Deck {
     /// The cue point in source frames; `cue play`/`cue back` land here. Defaults to the loaded
     /// origin (0), reset whenever a fresh deck is built for a load.
     cue_frame: u64,
+    /// Whether a `Button` cue gesture is between its press and its release edges. Owned by the deck
+    /// so a front-end with no release edge (a typed command) can still perform the whole gesture —
+    /// and so it cannot drift from the transport it belongs to.
+    cue_held: bool,
+    /// A hand on the platter (`vinyl touch`), and whether that touch is what paused the deck.
+    vinyl_held: bool,
+    vinyl_resume: bool,
+    /// Where the hand has scrubbed *to*, tracked by the deck rather than read back from the flow: the
+    /// flow keeps advancing on its own between seeks, so its position would drift forward at tempo
+    /// and a backward turn would only cancel that out.
+    vinyl_frame: u64,
+    /// Whether the wheel moved during the block just begun. A held platter that is *not* being turned
+    /// is silent (a stationary groove carries no signal, and a frozen grain would just buzz).
+    vinyl_moved: bool,
     /// Pitch shift in semitones. Stored and reported, but audibly inert until the streaming
     /// engine grows a pitch axis (see [`Command::SetKey`](hypermixx_core::Command::SetKey)).
     key_shift: i32,
@@ -174,6 +190,11 @@ impl Deck {
             sync: None,
             profile: EngineProfile::Keylock,
             cue_frame: 0,
+            cue_held: false,
+            vinyl_held: false,
+            vinyl_resume: false,
+            vinyl_frame: 0,
+            vinyl_moved: false,
             key_shift: 0,
             tempo_range: DEFAULT_TEMPO_RANGE,
         }
@@ -203,34 +224,162 @@ impl Deck {
         self.cue_frame
     }
 
-    /// Runs one cue command. `Smart` resolves against the deck's own transport *here*, on the
-    /// producer thread, so the decision is atomic with the jump it causes.
+    /// Runs one cue command. `Smart`, `Hold` and `Button` resolve against the deck's own transport
+    /// *here*, on the producer thread, so the decision is atomic with the jump it causes.
     pub fn apply_cue(&mut self, op: CueOp) {
         match op {
             CueOp::Play => {
                 self.jump(self.cue_frame);
                 self.play();
+                self.cue_held = false;
             }
             CueOp::Back => {
-                self.jump(self.cue_frame);
-                self.pause();
+                self.cue_back();
+                self.cue_held = false;
             }
-            CueOp::Set => self.cue_frame = self.current_frame(),
+            CueOp::Set => {
+                self.cue_frame = self.current_frame();
+                self.cue_held = false;
+            }
             CueOp::Smart => {
                 if self.is_playing() {
-                    self.jump(self.cue_frame);
-                    self.pause();
+                    self.cue_back();
                 } else {
                     self.cue_frame = self.current_frame();
                 }
+                self.cue_held = false;
             }
-            // `Smart` resolves the transport (and moves the cue point when it is paused), then the
-            // deck plays from wherever that left the playhead — which is the cue point by then.
-            CueOp::SmartPlay => {
-                self.apply_cue(CueOp::Smart);
-                self.play();
+            CueOp::Hold => {
+                self.cue_press();
+                self.cue_held = true;
+            }
+            CueOp::Button => {
+                if self.cue_held {
+                    self.cue_back();
+                    self.cue_held = false;
+                } else {
+                    self.cue_press();
+                    self.cue_held = true;
+                }
             }
         }
+    }
+
+    /// A wheel turn while nobody is on the platter is a pitch bend. The shape matches a default
+    /// `nudge` binding ([`DEFAULT_NUDGE_STEP`]/[`DEFAULT_NUDGE_SECONDS`] in `hypermixx-midi`) because
+    /// it *is* the same gesture — a short, strong kick per message rather than a slow squeeze; the
+    /// numbers live here because the wheel's meaning is the deck's decision (it is the only thing that
+    /// knows whether the platter is held).
+    const VINYL_BEND: f64 = 0.15;
+    /// See [`Deck::VINYL_BEND`].
+    const VINYL_BEND_SECONDS: f64 = 0.06;
+
+    /// Runs one `vinyl` command: the platter sensor, the release, and the wheel.
+    pub fn apply_vinyl(&mut self, op: VinylOp) {
+        match op {
+            VinylOp::Touch => {
+                if !self.vinyl_held {
+                    // Remember the transport the touch interrupted, so the release restores *it*
+                    // rather than guessing. A second touch without a release changes nothing.
+                    self.vinyl_resume = self.is_playing();
+                    self.pause();
+                    self.vinyl_held = true;
+                    self.vinyl_frame = self.current_frame();
+                    self.vinyl_moved = false;
+                }
+            }
+            VinylOp::Release => {
+                if self.vinyl_held {
+                    self.vinyl_held = false;
+                    self.vinyl_moved = false;
+                    // The flow may be a block ahead of the last seek; put it exactly where the hand
+                    // left it before the transport takes over again.
+                    self.scrub_to(self.vinyl_frame);
+                    if self.vinyl_resume {
+                        self.play();
+                    }
+                    self.vinyl_resume = false;
+                }
+            }
+            VinylOp::Turn {
+                ticks,
+                frames_per_tick,
+            } => {
+                if self.vinyl_held {
+                    // Accumulate in the deck's own frame, not in the flow's: the flow advances at
+                    // tempo between seeks, so reading its position back would bias every scratch
+                    // forward by a block.
+                    let frames = f64::from(ticks) * f64::from(frames_per_tick);
+                    self.vinyl_frame = self.shift_position(self.vinyl_frame, frames as i64);
+                    self.vinyl_moved = true;
+                } else {
+                    // Nobody is on the platter: the wheel is a pitch bend, and turning harder bends
+                    // harder (the bend accumulates, clamped by the engine) rather than longer.
+                    self.bend_nudge(Self::VINYL_BEND * f64::from(ticks), Self::VINYL_BEND_SECONDS);
+                }
+            }
+        }
+    }
+
+    /// `frame` moved by `frames`, clamped to the track. Negative is back.
+    fn shift_position(&self, frame: u64, frames: i64) -> u64 {
+        let last = self.total_frames().saturating_sub(1) as i64;
+        (frame as i64 + frames).clamp(0, last.max(0)) as u64
+    }
+
+    /// Repositions the active flow **in place**, without a flow switch: a switch is warmed on another
+    /// thread and crossfaded in, which is neither immediate enough for a scratch nor what a scratch
+    /// sounds like.
+    fn scrub_to(&mut self, target: u64) {
+        if self.flows.get(self.active_index).is_none() {
+            return;
+        }
+        if let Some(flow) = self.flows.get_mut(self.active_index) {
+            // The flow's clock is both the audible position and the slip/virtual clock, so a
+            // reposition here keeps the loop and compensation math consistent with what is heard.
+            flow.reset_to(target);
+        }
+    }
+
+    /// True while a hand is on the platter.
+    pub fn vinyl_held(&self) -> bool {
+        self.vinyl_held
+    }
+
+    /// Lets go of the platter without restoring anything.
+    ///
+    /// An explicit `play`/`pause` means the hand is not on the record any more — and since a missed
+    /// note-off (a controller that drops one, a cable pulled mid-touch) would otherwise leave a deck
+    /// that can never resume, every transport command calls this first.
+    pub fn release_vinyl(&mut self) {
+        self.vinyl_held = false;
+        self.vinyl_moved = false;
+        self.vinyl_resume = false;
+    }
+
+    /// True when this block has audio to render: playing, or a hand is *moving* the record. A
+    /// stationary held platter is silent — the groove is not moving, and a frozen grain would only
+    /// buzz.
+    fn renders_audio(&self) -> bool {
+        self.is_playing() || (self.vinyl_held && self.vinyl_moved)
+    }
+
+    /// The press edge of a held cue button: while playing it is a back cue (the transport was
+    /// already running, so nothing is started); while paused the playhead becomes the cue point and
+    /// the deck plays it.
+    fn cue_press(&mut self) {
+        if self.is_playing() {
+            self.cue_back();
+        } else {
+            self.cue_frame = self.current_frame();
+            self.play();
+        }
+    }
+
+    /// Jump to the cue point and pause: the release edge, and the plain `cue back`.
+    fn cue_back(&mut self) {
+        self.jump(self.cue_frame);
+        self.pause();
     }
 
     /// Pitch shift in semitones (a placeholder; see [`Deck::key_shift`]).
@@ -473,6 +622,12 @@ impl Deck {
         self.push_rate();
     }
 
+    /// Adds to the running bend (a wheel tick); see [`Nudge::bend`](crate::deck::sync::Nudge).
+    pub fn bend_nudge(&mut self, delta: f64, seconds: f64) {
+        self.playhead.bend_nudge(delta, seconds);
+        self.push_rate();
+    }
+
     /// Releases a running bend; it ramps back to zero rather than snapping.
     pub fn stop_nudge(&mut self) {
         self.playhead.stop_nudge();
@@ -562,6 +717,13 @@ impl Deck {
     pub fn begin_block(&mut self) {
         self.poll_ready_flows();
         self.apply_sync();
+        // A hand on the platter: pin the flow to where the hand has scrubbed to, every block. The
+        // flow still advances at tempo *within* the block (that is the grain you hear while moving)
+        // and this pulls it back, so the position follows the wheel exactly — including backwards,
+        // which a tempo-only engine could not do at all.
+        if self.vinyl_held {
+            self.scrub_to(self.vinyl_frame);
+        }
     }
 
     /// Renders this block into one [`Bus`] per stream — the path a mixer uses, so each stem can
@@ -570,7 +732,7 @@ impl Deck {
     /// A bus beyond the deck's stream count is cleared. Returns the frames of actual audio
     /// (0 while paused or at the end).
     pub fn render_streams(&mut self, outs: &mut [Bus]) -> usize {
-        if !self.is_playing() {
+        if !self.renders_audio() {
             for bus in outs.iter_mut() {
                 bus.clear();
             }
@@ -597,6 +759,9 @@ impl Deck {
     /// away — the engine runs, the listener never hears it.
     pub fn end_block(&mut self) {
         self.drive_loop_flow();
+        // Cleared *after* the render, because whether the wheel moved this block is what decides
+        // whether there was any audio to hear in it.
+        self.vinyl_moved = false;
     }
 
     /// Processes one block, applying any completed jump first.
@@ -616,7 +781,7 @@ impl Deck {
     /// pre/post phases, so the three-phase callers share one implementation of the transport.
     fn render_sum(&mut self, output: &mut [f32]) -> usize {
         let capacity = output.len() / CHANNELS;
-        if !self.is_playing() {
+        if !self.renders_audio() {
             output[..capacity * CHANNELS].fill(0.0);
             return 0;
         }
@@ -1259,51 +1424,310 @@ mod tests {
         assert!((deck.tempo() - 1.2).abs() < 1e-9, "tempo {}", deck.tempo());
     }
 
-    /// The held cue button's press edge, in both transports: paused takes the playhead as the cue
-    /// point and plays it, playing restarts from the cue point that was already there.
+    /// Vinyl: a hand on the platter pauses, the wheel **moves the playhead audibly** (both ways,
+    /// clamped to the track), holding still is silent, and letting go restores the transport.
     #[test]
-    fn cue_smartplay_cues_the_playhead_when_paused_and_restarts_when_playing() {
+    fn vinyl_scrubs_audibly_both_ways_and_restores_the_transport() {
         let mut deck = tape_deck(pool(10_000));
         let mut out = vec![0.0f32; 256 * CHANNELS];
-        // Park the playhead somewhere that is not the cue point (frame 0 by default).
         deck.play();
         for _ in 0..4 {
             deck.process_block(&mut out);
         }
+        assert!(deck.current_frame() > 0);
+
+        // A hand goes on: it pauses, and the deck remembers it was playing.
+        deck.apply_vinyl(VinylOp::Touch);
+        assert!(deck.vinyl_held());
+        assert!(!deck.is_playing(), "the platter is held, so the deck is paused");
+        // Holding still is silent: the groove is not moving. (A frozen grain would just buzz.)
+        assert_eq!(deck.process_block(&mut out), 0, "a stationary platter is silent");
+        assert!(out.iter().all(|sample| *sample == 0.0));
+        // A second touch without a release is not a second pause.
+        deck.apply_vinyl(VinylOp::Touch);
+        assert!(deck.vinyl_held());
+
+        // Turning *is* audible, and it moves the playhead by the ticks. The block also renders its
+        // own grain, so the position lands within one block of the tick count.
+        let before = deck.current_frame() as i64;
+        deck.apply_vinyl(VinylOp::Turn {
+            ticks: 2,
+            frames_per_tick: 441.0,
+        });
+        assert!(
+            deck.process_block(&mut out) > 0,
+            "turning the wheel is audible"
+        );
+        let forward = deck.current_frame() as i64 - before;
+        assert!(
+            (882..882 + 257).contains(&forward),
+            "two ticks forward: {forward}"
+        );
+
+        // Backwards goes behind where it was.
+        deck.apply_vinyl(VinylOp::Turn {
+            ticks: -4,
+            frames_per_tick: 441.0,
+        });
+        deck.process_block(&mut out);
+        assert!(
+            (deck.current_frame() as i64) < before,
+            "four ticks back: {} vs {before}",
+            deck.current_frame()
+        );
+
+        // Clamped at both ends of the track.
+        deck.apply_vinyl(VinylOp::Turn {
+            ticks: -10_000,
+            frames_per_tick: 441.0,
+        });
+        deck.process_block(&mut out);
+        assert!(deck.current_frame() <= 256, "{}", deck.current_frame());
+        deck.apply_vinyl(VinylOp::Turn {
+            ticks: 1_000_000,
+            frames_per_tick: 441.0,
+        });
+        deck.process_block(&mut out);
+        assert!(deck.current_frame() >= 10_000 - 257, "{}", deck.current_frame());
+
+        // Letting go resumes, because that is what the touch interrupted.
+        deck.apply_vinyl(VinylOp::Release);
+        assert!(!deck.vinyl_held());
+        assert!(deck.is_playing(), "the touch is what paused it");
+    }
+
+    /// The shape of one wheel message: a strong, short kick. The phase really moves, and the bend is
+    /// over by itself before the next message arrives — "nudge the platter", not "change the tempo".
+    ///
+    /// The assertion is the formula rather than a magic number: **phase = rate × duration**, which is
+    /// the one thing to reason about when tuning `step`/`seconds` for feel.
+    #[test]
+    fn a_bend_moves_the_phase_and_releases_itself() {
+        let mut deck = tape_deck(pool(1_000_000));
+        let mut out = vec![0.0f32; 256 * CHANNELS];
+        deck.play();
+        let advance = |deck: &mut Deck, out: &mut Vec<f32>| {
+            let start = deck.current_frame();
+            for _ in 0..40 {
+                deck.process_block(out);
+            }
+            deck.current_frame() - start
+        };
+        // Baseline: forty blocks at 1×.
+        let plain = advance(&mut deck, &mut out);
+
+        // One message: the same forty blocks, with the kick in them.
+        let (delta, seconds) = (0.15_f64, 0.06_f64);
+        deck.bend_nudge(delta, seconds);
+        let bent = advance(&mut deck, &mut out);
+        let gain = bent as f64 - plain as f64;
+        let expected = delta * seconds * f64::from(crate::SAMPLE_RATE);
+        assert!(
+            (gain - expected).abs() < 0.25 * expected,
+            "phase gain {gain} frames, expected ~{expected:.0} (rate × duration)"
+        );
+
+        // It let go on its own, and the deck is back to plain playback.
+        assert_eq!(deck.nudge_rate(), 0.0, "the kick released itself");
+        assert_eq!(advance(&mut deck, &mut out), plain, "back to 1×");
+    }
+
+    /// A deck that was already paused can be scratched too (and stays paused afterwards); an
+    /// explicit transport command always lets go of the platter, so a missed note-off cannot leave a
+    /// deck that never resumes; and a turn with nobody on the plate is a bend that *accumulates*.
+    #[test]
+    fn vinyl_works_while_paused_and_cannot_lock_the_deck() {
+        let mut deck = tape_deck(pool(10_000));
+        let mut out = vec![0.0f32; 256 * CHANNELS];
+        let park = |deck: &mut Deck, out: &mut Vec<f32>| {
+            deck.play();
+            for _ in 0..4 {
+                deck.process_block(out);
+            }
+            deck.pause();
+        };
+        park(&mut deck, &mut out);
+
+        // Scratched while paused: audible, and still paused afterwards.
+        let before = deck.current_frame();
+        deck.apply_vinyl(VinylOp::Touch);
+        deck.apply_vinyl(VinylOp::Turn {
+            ticks: -1,
+            frames_per_tick: 100.0,
+        });
+        assert!(
+            deck.process_block(&mut out) > 0,
+            "scratching a paused deck is audible"
+        );
+        // Back by the tick, plus at most the block's own grain.
+        let moved = deck.current_frame() as i64 - before as i64;
+        assert!((-100..=-100 + 256).contains(&moved), "one tick back: {moved}");
+        deck.apply_vinyl(VinylOp::Release);
+        assert!(!deck.is_playing(), "a paused deck stays paused");
+        assert!(!deck.vinyl_held());
+
+        // A missed release note, then an explicit play: the platter is let go and the deck plays.
+        deck.apply_vinyl(VinylOp::Touch);
+        assert!(deck.vinyl_held());
+        deck.release_vinyl();
+        assert!(!deck.vinyl_held());
+        deck.play();
+        assert!(deck.is_playing(), "the deck is not stuck");
+
+        // Nobody on the platter: the wheel bends, and turning harder bends harder (the accumulation)
+        // rather than longer. The waits are short on purpose — a bend now releases itself 60 ms after
+        // the last message, so sampling after ~120 ms would read a bend that has already let go.
+        let before = deck.current_frame();
+        deck.apply_vinyl(VinylOp::Turn {
+            ticks: 1,
+            frames_per_tick: 441.0,
+        });
+        for _ in 0..4 {
+            deck.process_block(&mut out);
+        }
+        let first = deck.nudge_rate();
+        assert!(first > 0.0, "it bent forward");
+        assert!(deck.current_frame() > before, "and the deck kept playing");
+        // Two ticks the other way cancel the one that was added.
+        deck.apply_vinyl(VinylOp::Turn {
+            ticks: -1,
+            frames_per_tick: 441.0,
+        });
+        for _ in 0..4 {
+            deck.process_block(&mut out);
+        }
+        assert!(
+            deck.nudge_rate().abs() < 0.01,
+            "opposite turns cancel: {}",
+            deck.nudge_rate()
+        );
+        // Two messages the same way: stronger, and the engine's clamp is what stops it.
+        deck.apply_vinyl(VinylOp::Turn {
+            ticks: 1,
+            frames_per_tick: 441.0,
+        });
+        deck.apply_vinyl(VinylOp::Turn {
+            ticks: 1,
+            frames_per_tick: 441.0,
+        });
+        for _ in 0..4 {
+            deck.process_block(&mut out);
+        }
+        assert!(
+            deck.nudge_rate() > first + 0.01,
+            "a second turn is stronger, not longer: {first} then {}",
+            deck.nudge_rate()
+        );
+        assert!(
+            deck.nudge_rate() <= crate::deck::sync::NUDGE_LIMIT + 1e-3,
+            "and clamped"
+        );
+        let _ = park;
+    }
+
+    /// What one scrub actually costs, because it repositions the *live* flow (the seek protocol
+    /// drains its priming synchronously) rather than swapping a warmed flow in. Printed, not
+    /// asserted: the number depends on the machine, and it is the one thing that decides how many
+    /// wheel ticks per second a scrub can carry.
+    #[test]
+    #[ignore]
+    fn scrub_cost_probe() {
+        // Both profiles, because that is the whole question for scratch quality: `Keylock` runs a
+        // band-split corrector with ~12.7 ms of pipeline delay and a warm-start preroll on *every*
+        // seek, `Tape` is bare varispeed (a sinc resampler) with no preroll at all.
+        for profile in [EngineProfile::Keylock, EngineProfile::Tape] {
+            let mut deck = tape_deck(pool(1_000_000));
+            deck.set_keylock_mode(match profile {
+                EngineProfile::Tape => KeylockMode::Off,
+                _ => KeylockMode::On,
+            });
+            let mut out = vec![0.0f32; 256 * CHANNELS];
+            deck.play();
+            deck.process_block(&mut out);
+            let ticks = 1_000;
+            let started = std::time::Instant::now();
+            for index in 0..ticks {
+                deck.apply_vinyl(VinylOp::Turn {
+                    ticks: 1,
+                    frames_per_tick: 441.0,
+                });
+                deck.process_block(&mut out);
+                if index % 2 == 1 {
+                    deck.apply_vinyl(VinylOp::Turn {
+                        ticks: -1,
+                        frames_per_tick: 441.0,
+                    });
+                }
+            }
+            let per_block = started.elapsed() / ticks as u32;
+            println!(
+                "scrub {profile:?}: {per_block:?} per block (seek + render) — {} blocks/s of headroom",
+                (std::time::Duration::from_secs(1).as_nanos() / per_block.as_nanos().max(1)) as u64
+            );
+        }
+    }
+
+    /// The held cue button, in both transports, and the press/release toggle a front-end with no
+    /// release edge uses.
+    #[test]
+    fn cue_hold_and_button_follow_the_transport() {
+        let mut deck = tape_deck(pool(10_000));
+        let mut out = vec![0.0f32; 256 * CHANNELS];
+        let advance = |deck: &mut Deck, out: &mut Vec<f32>, blocks: usize| {
+            for _ in 0..blocks {
+                deck.process_block(out);
+            }
+        };
+        // Park the playhead somewhere that is not the cue point (frame 0 by default).
+        deck.play();
+        advance(&mut deck, &mut out, 4);
         deck.pause();
         let parked = deck.current_frame();
         assert!(parked > 0 && deck.cue_point() == 0);
-        assert!(!deck.is_playing());
 
-        // Paused: the cue point moves to the playhead, and the hold plays from there — no jump, so
-        // this half needs no settling.
-        deck.apply_cue(CueOp::SmartPlay);
+        // Paused: the press takes the playhead as the cue point and plays it — no jump, so this half
+        // needs no settling.
+        deck.apply_cue(CueOp::Hold);
         assert_eq!(deck.cue_point(), parked, "the playhead became the cue point");
         assert!(deck.is_playing(), "and the hold started playing");
         assert_eq!(deck.current_frame(), parked, "without moving");
 
-        // Playing: the same op restarts from the cue point (a jump, so the deck settles onto it)
-        // and keeps playing.
-        for _ in 0..4 {
-            deck.process_block(&mut out);
-        }
+        // Playing: the *same* press is a back cue (jump and pause). The transport was already
+        // running, so nothing is started — that is the "no overlap with cue play" rule.
+        advance(&mut deck, &mut out, 4);
         let before = deck.current_frame();
         assert!(before > parked);
-        deck.apply_cue(CueOp::SmartPlay);
+        deck.apply_cue(CueOp::Hold);
         assert_eq!(deck.cue_point(), parked, "the cue point was not moved");
-        assert!(deck.is_playing(), "still playing");
+        assert!(!deck.is_playing(), "a held press while playing pauses");
         settle_below(&mut deck, &mut out, before);
         let landed = deck.current_frame();
         assert!(
             (parked..before).contains(&landed),
-            "should have restarted from the cue: landed at {landed}, cue {parked}, was {before}"
+            "should have gone back to the cue: landed at {landed}, cue {parked}, was {before}"
         );
 
-        // The release edge is the existing `Back`: back to the cue point, paused.
+        // The release edge is `Back`, and it is a no-op from there (already at the cue, paused).
         deck.apply_cue(CueOp::Back);
         assert!(!deck.is_playing());
-        settle_below(&mut deck, &mut out, landed + 1);
         assert!(deck.current_frame() >= parked);
+
+        // `Button` is the same two edges from one input: the first press plays from the cue (paused
+        // here), the next returns to it and pauses.
+        deck.apply_cue(CueOp::Button);
+        assert!(deck.is_playing(), "the first Button is the press edge");
+        advance(&mut deck, &mut out, 4);
+        assert!(deck.current_frame() > parked);
+        deck.apply_cue(CueOp::Button);
+        assert!(!deck.is_playing(), "the second is the release edge");
+        let now = deck.current_frame();
+        settle_below(&mut deck, &mut out, now + 1);
+        assert!(deck.current_frame() >= parked);
+        // An explicit op leaves the button up, so the next `Button` is a press again rather than a
+        // release nobody asked for.
+        deck.apply_cue(CueOp::Back);
+        deck.apply_cue(CueOp::Button);
+        assert!(deck.is_playing(), "explicit ops reset the toggle");
     }
 
     #[test]
@@ -1551,8 +1975,12 @@ mod tests {
         deck.beatjump(4);
         settle_at(&mut deck, &mut out, before + 4 * 21_000);
         let forward = deck.current_frame();
+        // The bounds are the *warm-up race*, not the math: the landing is `target + however far the old
+        // flow ran while the new one was prepared`, and this test's 2 ms polling lets extra blocks slip
+        // whenever the machine is loaded (it showed up as 3 blocks under a full-workspace run). A
+        // beatjump that computed the wrong beat would be off by a whole 21 689-sample beat.
         assert!(
-            (forward as i64 - (before as i64 + 4 * 21_689)).abs() <= 2 * 256,
+            (forward as i64 - (before as i64 + 4 * 21_689)).abs() <= 4 * 256,
             "four beats ahead should be ~86754 frames on: {before} -> {forward}"
         );
 
@@ -1560,7 +1988,7 @@ mod tests {
         let back = deck.beat_target_frame(-4).expect("grid");
         settle_below(&mut deck, &mut out, forward);
         assert!(
-            (deck.current_frame() as i64 - back as i64).abs() <= 2 * 256,
+            (deck.current_frame() as i64 - back as i64).abs() <= 4 * 256,
             "back to the original phase: expected ~{back}, got {}",
             deck.current_frame()
         );

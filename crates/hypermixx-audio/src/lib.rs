@@ -37,7 +37,7 @@ pub use {hypermixx_core as core, hypermixx_media as media};
 
 pub use hypermixx_core::{
     Backend, BeatGrid, Command, CommandResponse, DeckId, DeckState, FxChainId, Key, KeyFormat,
-    KeyMode, NudgeOp, PhaseMode, Source, SyncOp, TrackAnalysis, CHANNELS, SAMPLE_RATE,
+    KeyMode, NudgeOp, PhaseMode, Source, SyncOp, TrackAnalysis, VinylOp, CHANNELS, SAMPLE_RATE,
 };
 
 /// Frames per processing block: one deck tick, and the mixer's block length.

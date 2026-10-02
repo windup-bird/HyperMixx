@@ -234,6 +234,11 @@ pub fn stem_report(state: &DeckState) -> Vec<String> {
 /// running phase correction and any bend. `None` for a deck with nothing to report, so an idle
 /// `state` line stays exactly as short as it always was (and `phase_probe.sh`'s parsing is unchanged).
 pub fn sync_badge(state: &DeckState) -> Option<String> {
+    // A hand on the platter belongs with the transport, and it is the one state where "paused" is
+    // not the whole story — so it shows even on an otherwise badge-free deck.
+    if state.vinyl {
+        return Some("vinyl".to_owned());
+    }
     if state.group_bpm <= 0.0 && state.nudgerate.abs() < 1e-4 && state.sync_leader.is_none() {
         return None;
     }
@@ -390,6 +395,7 @@ mod tests {
     /// A fully idle deck: nothing to report, so no badge.
     fn idle() -> DeckState {
         DeckState {
+            vinyl: false,
             deck_id: 1,
             current_frame: 0,
             playing: true,

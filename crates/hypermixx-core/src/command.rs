@@ -212,9 +212,34 @@ pub enum SyncOp {
 pub enum NudgeOp {
     /// Start bending by `delta` (a rate, `0.04` = 4% fast). `seconds` releases it on its own;
     /// `None` holds until [`NudgeOp::Stop`].
+    ///
+    /// Absolute: the bend becomes `delta`, whatever it was. What a *button* wants.
     Start { delta: f32, seconds: Option<f64> },
+    /// Add `delta` to the running bend (clamped to the engine's limit) and release it `seconds`
+    /// after the last message. What a **wheel** wants: turning faster bends harder instead of
+    /// bending for longer, and the two directions subtract from each other.
+    Bend { delta: f32, seconds: f64 },
     /// Release the bend (ramps back to zero, it is not cut off).
     Stop,
+}
+
+/// One `vinyl` command: a DJ wheel, which is two things at once (a platter sensor and a jog wheel)
+/// and therefore resolved by the deck, which is the only thing that knows whether the platter is
+/// held right now.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VinylOp {
+    /// A hand went on the platter: pause, remembering whether the deck was playing. Pressing twice
+    /// without a release is ignored, so a repeat sensor cannot stack pauses.
+    Touch,
+    /// The hand came off: resume if the touch is what paused it.
+    Release,
+    /// The wheel turned by `ticks` (signed — negative is anticlockwise). **Held** (a hand on the
+    /// platter): the playhead moves by `ticks × frames_per_tick`. **Not held**: it is a pitch bend,
+    /// which is what a wheel does on a deck when nobody is touching the record.
+    ///
+    /// `frames_per_tick` comes from the binding, so the sensitivity is per controller: a wheel with
+    /// 60 detents per revolution wants a very different number from one that only reports ±1 slowly.
+    Turn { ticks: i32, frames_per_tick: f32 },
 }
 
 /// One `cue` command. The cue point defaults to frame 0 (the loaded origin) and `Set` can move
@@ -231,13 +256,23 @@ pub enum CueOp {
     Set,
     /// `Back` while playing, `Set` while paused — resolved by the deck itself.
     Smart,
-    /// The **press edge** of a held cue button: [`CueOp::Smart`] first, then play from the cue point.
+    /// The **press edge** of a held cue button, resolved by the deck against its own transport:
     ///
-    /// So a paused deck takes the playhead as its cue point before playing it (finding a spot and
-    /// cueing it is one gesture, not two), and a playing deck restarts from the cue. One op rather
-    /// than `Smart` + `Play` because the decision must be atomic with the jump it causes: two
-    /// commands could be split by another one arriving in between.
-    SmartPlay,
+    /// * playing → a back cue: jump to the cue point and pause. The transport was already running, so
+    ///   there is nothing to start — no preview overlapping the back cue.
+    /// * paused → the playhead becomes the cue point, and the deck plays it. Finding a spot and
+    ///   cueing it is one gesture, and holding the button is what makes it audible.
+    ///
+    /// One op rather than a pair of commands because the decision must be atomic with the jump it
+    /// causes: two commands could be split by another one arriving in between.
+    Hold,
+    /// The whole gesture of a cue **button**, for a front-end that has no release edge (a typed
+    /// command, a clicking UI): each `Button` is the next edge of that button — the first is the
+    /// press ([`CueOp::Hold`]), the next is the release ([`CueOp::Back`]), and so on.
+    ///
+    /// The deck holds the state, for the same reason it resolves `Smart` and `Hold` itself: a
+    /// front-end that tracked it would be guessing at a transport it can only see stale snapshots of.
+    Button,
 }
 
 /// The keylock profile a deck runs: whether the time-stretch corrects pitch while the tempo moves.
@@ -337,6 +372,11 @@ pub enum Command {
     Cue {
         deck_id: DeckId,
         op: CueOp,
+    },
+    /// A DJ wheel: platter touch, release, or a turn.
+    Vinyl {
+        deck_id: DeckId,
+        op: VinylOp,
     },
     /// Sample-accurate seek, in frames.
     Jump {
@@ -525,6 +565,11 @@ impl std::fmt::Debug for Command {
             Command::Cue { deck_id, op } => {
                 f.debug_struct("Cue").field("deck_id", deck_id).field("op", op).finish()
             }
+            Command::Vinyl { deck_id, op } => f
+                .debug_struct("Vinyl")
+                .field("deck_id", deck_id)
+                .field("op", op)
+                .finish(),
             Command::Jump {
                 deck_id,
                 target_frame,

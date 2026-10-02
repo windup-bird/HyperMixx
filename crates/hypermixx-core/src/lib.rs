@@ -13,8 +13,10 @@ pub mod stem;
 
 pub use analysis::TrackAnalysis;
 pub use beatgrid::BeatGrid;
-pub use command::{Backend, Command, CommandResponse, CueOp, FaderTarget, FxChainId, FxSlotRef,
-    FxSlotStatus, KeylockMode, LoopEditOp, LoopOp, LoopQuantum, NudgeOp, PhaseMode, SyncOp};
+pub use command::{
+    Backend, Command, CommandResponse, CueOp, FaderTarget, FxChainId, FxSlotRef, FxSlotStatus,
+    KeylockMode, LoopEditOp, LoopOp, LoopQuantum, NudgeOp, PhaseMode, SyncOp, VinylOp,
+};
 pub use deck::{DeckId, DeckState};
 pub use key::{Key, KeyFormat, KeyMode};
 pub use source::{Shared, Source};

@@ -2,3 +2,5 @@
 .commandcode/
 audition/
 /mp3
+midi-map.toml
+midi.toml

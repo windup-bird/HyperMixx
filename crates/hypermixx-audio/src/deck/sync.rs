@@ -36,7 +36,11 @@ pub const NUDGERATE_LIMIT: f64 = 0.15;
 /// Ceiling on the phase controller alone — the ±5% convergence backstop.
 pub const PLL_LIMIT: f64 = 0.05;
 /// Ceiling on a single nudge bend.
-pub const NUDGE_LIMIT: f64 = 0.10;
+/// How hard a bend may get, as a rate. The ceiling is what decides how *far* one wheel flick can move
+/// the phase — a per-message step that already sits near the limit makes every extra message useless,
+/// which reads as "not responsive" no matter how short the bend is. ±30 % is a wheel-sized bend and
+/// still well inside [`MIN_RATE`]/[`MAX_RATE`], so a bend can never push playback out of range.
+pub const NUDGE_LIMIT: f64 = 0.30;
 /// Engine tempo bounds, mirroring timestretch's `EngineConfig` clamp.
 pub const MIN_RATE: f64 = 0.25;
 pub const MAX_RATE: f64 = 4.0;
@@ -178,13 +182,30 @@ pub struct Nudge {
 }
 
 impl Nudge {
-    /// Time constant of the bend's ramp: slow enough to be inaudible as a transient, short enough
-    /// that a short timed nudge still reaches its target while it lasts.
-    const TAU_SECONDS: f64 = 0.015;
+    /// Time constant of the bend's ramp: how fast the applied rate catches the target. Short, so a
+    /// wheel tick is *felt* immediately (≈0.7 of a block, i.e. it arrives within the block it was asked
+    /// in) — but not zero: an instant step in playback rate is a click, and 4 ms is ~176 samples of
+    /// ramp, which is inaudible as a transient and still snappy under the hand.
+    const TAU_SECONDS: f64 = 0.004;
 
     /// Starts bending by `delta` (clamped), optionally releasing itself after `seconds`.
     pub fn start(&mut self, delta: f64, seconds: Option<f64>) {
         self.target = delta.clamp(-NUDGE_LIMIT, NUDGE_LIMIT);
+        self.arm_release(seconds);
+    }
+
+    /// **Adds** `delta` to the running bend, clamped to the limit, and re-arms the release.
+    ///
+    /// This is what a wheel does: each tick makes the bend stronger (up to the clamp), a tick the
+    /// other way weakens it, and the bend lets go `seconds` after the messages stop. Re-arming
+    /// matters — a turn that keeps going must not release mid-turn — but the *strength* is what
+    /// accumulates, not the duration.
+    pub fn bend(&mut self, delta: f64, seconds: f64) {
+        self.target = (self.target + delta).clamp(-NUDGE_LIMIT, NUDGE_LIMIT);
+        self.arm_release(Some(seconds));
+    }
+
+    fn arm_release(&mut self, seconds: Option<f64>) {
         self.remaining_blocks = seconds
             .filter(|s| s.is_finite() && *s > 0.0)
             .map(|s| (s / BLOCK_SECONDS).ceil().max(1.0) as u32);
@@ -303,6 +324,11 @@ impl Playhead {
     /// [`stop_nudge`](Self::stop_nudge). Only `nudgerate` moves — the tempo stays put.
     pub fn start_nudge(&mut self, delta: f64, seconds: Option<f64>) {
         self.nudge.start(delta, seconds);
+    }
+
+    /// Adds to the running bend; see [`Nudge::bend`].
+    pub fn bend_nudge(&mut self, delta: f64, seconds: f64) {
+        self.nudge.bend(delta, seconds);
     }
 
     /// Releases a running bend; it ramps back to zero rather than snapping.

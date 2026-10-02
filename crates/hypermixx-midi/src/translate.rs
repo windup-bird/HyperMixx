@@ -7,11 +7,12 @@
 
 use hypermixx_core::{
     Command, CueOp, DeckId, FaderTarget, FxSlotRef, LoopEditOp, LoopOp, NudgeOp, PhaseMode, StemOp,
-    SyncOp,
+    SyncOp, VinylOp,
 };
 
 use crate::map::{
     Action, BindingSpec, Curve, EventKind, FxAction, LoopAction, Map, RelMode, SyncAction,
+    DEFAULT_NUDGE_SECONDS,
 };
 use crate::msg::Event;
 
@@ -210,6 +211,42 @@ impl<'a> BindingOut<'a> {
             // A relative encoder is endless: there is nothing to pick up.
             self.state.engaged = true;
             self.state.mirror = norm;
+            // A wheel is a *direction*, not a position: one tick forward bends one way, one tick back
+            // the other way. It also has no release edge, so the bend has to end on its own — hence
+            // the duration default (`seconds` in the map still wins). Turning faster sends more
+            // ticks, and each one re-arms that timer, so the bend lasts as long as the wheel moves.
+            // A `vinyl` wheel sends the same shape, but the *deck* decides whether a tick scrubs
+            // (platter held) or bends (nobody on it) — the mapping cannot know, and must not guess.
+            if let Action::Vinyl { frames_per_tick } = self.spec.action.clone() {
+                if delta != 0 {
+                    let Some(deck_id) = self.spec.deck else { return };
+                    self.out.push(Command::Vinyl {
+                        deck_id,
+                        op: VinylOp::Turn {
+                            ticks: i32::from(delta.signum()),
+                            frames_per_tick,
+                        },
+                    });
+                }
+                return;
+            }
+            if let Action::Nudge { delta: step, seconds } = self.spec.action.clone() {
+                if delta != 0 {
+                    let Some(deck_id) = self.spec.deck else { return };
+                    // `Bend`, not `Start`: each message *adds* to the bend (so turning faster bends
+                    // harder, up to the engine's clamp) instead of re-stating it (which would only
+                    // make it last longer). The magnitude is the tick count, so an encoder that
+                    // reports ±3 per detent counts three times.
+                    self.out.push(Command::Nudge {
+                        deck_id,
+                        op: NudgeOp::Bend {
+                            delta: step * f32::from(delta),
+                            seconds: seconds.unwrap_or(DEFAULT_NUDGE_SECONDS),
+                        },
+                    });
+                }
+                return;
+            }
             self.emit_continuous(norm);
             return;
         }
@@ -292,7 +329,12 @@ impl<'a> BindingOut<'a> {
             Action::Play => self.out.push(Command::TogglePlay { deck_id: deck }),
             Action::Cue => self.out.push(Command::Cue {
                 deck_id: deck,
-                op: CueOp::SmartPlay,
+                op: CueOp::Hold,
+            }),
+            // The platter sensor is a note: pressing it is a hand on the record.
+            Action::Vinyl { .. } => self.out.push(Command::Vinyl {
+                deck_id: deck,
+                op: VinylOp::Touch,
             }),
             Action::CueSmart => self.out.push(Command::Cue {
                 deck_id: deck,
@@ -387,6 +429,10 @@ impl<'a> BindingOut<'a> {
             Action::Cue => self.out.push(Command::Cue {
                 deck_id: deck,
                 op: CueOp::Back,
+            }),
+            Action::Vinyl { .. } => self.out.push(Command::Vinyl {
+                deck_id: deck,
+                op: VinylOp::Release,
             }),
             _ => self.release_deckless(),
         }
@@ -547,6 +593,7 @@ impl MergeBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::map::{DEFAULT_NUDGE_STEP, DEFAULT_VINYL_FRAMES_PER_TICK};
     use crate::map::Map;
     use hypermixx_core::Stem;
 
@@ -785,6 +832,135 @@ action = "tempofader"
         assert_eq!(relative_delta(RelMode::Rel3, 64), 0);
     }
 
+    /// A wheel is a *direction*, not a position: one tick clockwise bends forward, one tick the
+    /// other way bends back. It also has no release edge, so each tick starts a bend that ends on its
+    /// own — the `seconds` default is what makes that possible.
+    #[test]
+    fn a_relative_wheel_nudges_both_ways_and_releases_itself() {
+        let map = map(r#"
+[[bind]]
+type = "cc"
+mode = "rel1"
+id = 20
+deck = 0
+action = "nudge"
+
+[[bind]]
+type = "cc"
+mode = "rel1"
+id = 21
+deck = 0
+action = "nudge"
+step = 0.10
+seconds = 0.5
+
+[[bind]]
+type = "cc"
+id = 22
+deck = 0
+action = "nudge"
+step = 0.05
+"#);
+        let mut state = TranslateState::new(&map);
+        // Rel1 is centred on 64, so 65 and 63 are one tick each way. The defaults are the speed and
+        // the self-release.
+        assert!(matches!(
+            translate(&map, &cc(0, 20, 65), &mut state).as_slice(),
+            [Command::Nudge { op: NudgeOp::Bend { delta, seconds }, .. }]
+                if close(*delta, DEFAULT_NUDGE_STEP)
+                    && close(*seconds as f32, DEFAULT_NUDGE_SECONDS as f32)
+        ));
+        assert!(matches!(
+            translate(&map, &cc(0, 20, 63), &mut state).as_slice(),
+            [Command::Nudge { op: NudgeOp::Bend { delta, .. }, .. }]
+                if close(*delta, -DEFAULT_NUDGE_STEP)
+        ));
+        // A message that reports several ticks counts several times: 67 is three ticks forward.
+        assert!(matches!(
+            translate(&map, &cc(0, 20, 67), &mut state).as_slice(),
+            [Command::Nudge { op: NudgeOp::Bend { delta, seconds }, .. }]
+                if close(*delta, 3.0 * DEFAULT_NUDGE_STEP)
+                    && close(*seconds as f32, DEFAULT_NUDGE_SECONDS as f32)
+        ));
+        // Sitting on the centre value is not a tick at all.
+        assert!(translate(&map, &cc(0, 20, 64), &mut state).is_empty());
+        // A binding that names its own speed and time keeps both.
+        assert!(matches!(
+            translate(&map, &cc(0, 21, 65), &mut state).as_slice(),
+            [Command::Nudge { op: NudgeOp::Bend { delta, seconds }, .. }]
+                if close(*delta, 0.10) && close(*seconds as f32, 0.5)
+        ));
+        // An *absolute* control has no direction and does have edges, so it stays a held bend.
+        assert!(matches!(
+            translate(&map, &cc(0, 22, 64), &mut state).as_slice(),
+            [Command::Nudge { op: NudgeOp::Start { delta, seconds: None }, .. }]
+                if close(*delta, 0.05)
+        ));
+        assert!(matches!(
+            translate(&map, &cc(0, 22, 0), &mut state).as_slice(),
+            [Command::Nudge { op: NudgeOp::Stop, .. }]
+        ));
+    }
+
+    /// A vinyl wheel is bound twice on a real controller: a note for the platter sensor and a
+    /// relative CC for the wheel. Both carry the same action, and the *deck* decides what a turn
+    /// means.
+    #[test]
+    fn a_vinyl_wheel_sends_platter_edges_and_signed_turns() {
+        let map = map(r#"
+[[bind]]
+type = "note"
+id = 80
+deck = 0
+action = "vinyl"
+
+[[bind]]
+type = "cc"
+mode = "rel1"
+id = 6
+deck = 0
+action = "vinyl"
+
+[[bind]]
+type = "cc"
+mode = "rel1"
+id = 7
+deck = 0
+action = "vinyl"
+step = 1323
+"#);
+        let mut state = TranslateState::new(&map);
+        // The platter sensor: press = a hand on the record, release = letting go.
+        assert!(matches!(
+            translate(&map, &note(0, 80, true), &mut state).as_slice(),
+            [Command::Vinyl { op: VinylOp::Touch, .. }]
+        ));
+        assert!(matches!(
+            translate(&map, &note(0, 80, false), &mut state).as_slice(),
+            [Command::Vinyl { op: VinylOp::Release, .. }]
+        ));
+        // The wheel: one tick each way, in ticks (the deck converts, because only the deck knows
+        // whether the platter is held).
+        assert!(matches!(
+            translate(&map, &cc(0, 6, 65), &mut state).as_slice(),
+            [Command::Vinyl { op: VinylOp::Turn { ticks, frames_per_tick }, .. }]
+                if *ticks == 1 && close(*frames_per_tick, DEFAULT_VINYL_FRAMES_PER_TICK)
+        ));
+        assert!(matches!(
+            translate(&map, &cc(0, 6, 63), &mut state).as_slice(),
+            [Command::Vinyl { op: VinylOp::Turn { ticks, .. }, .. }] if *ticks == -1
+        ));
+        // A wheel with more detents per revolution says so with `step`.
+        assert!(matches!(
+            translate(&map, &cc(0, 7, 65), &mut state).as_slice(),
+            [Command::Vinyl { op: VinylOp::Turn { frames_per_tick, .. }, .. }]
+                if close(*frames_per_tick, 1323.0)
+        ));
+        // The centre value is not a turn, and a note release on a *note* binding is not a turn
+        // either: what a binding sends follows the event kind it was declared for.
+        assert!(translate(&map, &cc(0, 6, 64), &mut state).is_empty());
+    }
+
     /// Every button edge in one place: a momentary hold pairs press/release, a smart cue fires
     /// once, and a timed nudge ignores its release.
     #[test]
@@ -839,7 +1015,7 @@ action = "cue.smart"
         // and plays; up returns to the cue point and pauses.
         assert!(matches!(
             edge(&mut state, 62, true).as_slice(),
-            [Command::Cue { op: CueOp::SmartPlay, .. }]
+            [Command::Cue { op: CueOp::Hold, .. }]
         ));
         assert!(matches!(
             edge(&mut state, 62, false).as_slice(),

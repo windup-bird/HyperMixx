@@ -380,9 +380,20 @@ fn route(
             channel.replace_deck(deck);
             Some(CommandResponse::Loaded { deck_id, total_frames })
         }
-        Play { deck_id } => transport(mixer, deck_id, |deck| deck.play()),
-        Pause { deck_id } => transport(mixer, deck_id, |deck| deck.pause()),
-        TogglePlay { deck_id } => transport(mixer, deck_id, |deck| deck.toggle_play()),
+        // An explicit transport command takes the record out of the hand's control: see
+        // `Deck::release_vinyl`.
+        Play { deck_id } => transport(mixer, deck_id, |deck| {
+            deck.release_vinyl();
+            deck.play()
+        }),
+        Pause { deck_id } => transport(mixer, deck_id, |deck| {
+            deck.release_vinyl();
+            deck.pause()
+        }),
+        TogglePlay { deck_id } => transport(mixer, deck_id, |deck| {
+            deck.release_vinyl();
+            deck.toggle_play()
+        }),
         Cue { deck_id, op } => transport(mixer, deck_id, move |deck| deck.apply_cue(op)),
         Jump { deck_id, target_frame } => {
             transport(mixer, deck_id, move |deck| deck.jump(target_frame))
@@ -395,6 +406,7 @@ fn route(
         SetTempoRange { deck_id, range } => answered(sync.set_tempo_range(mixer, deck_id, range)),
         Sync { deck_id, op } => answered(sync.handle_sync(mixer, deck_id, op)),
         Nudge { deck_id, op } => answered(sync.nudge(mixer, deck_id, op)),
+        Vinyl { deck_id, op } => transport(mixer, deck_id, move |deck| deck.apply_vinyl(op)),
         SetFader { target, value } => answered(mixer.set_fader(target, value)),
         Loop { deck_id, op } => {
             transport_result(mixer, deck_id, move |deck| deck.apply_loop(op))
@@ -517,6 +529,7 @@ fn state_of(deck_id: DeckId, channel: &crate::mixer::Channel, sync: &SyncGroup) 
         sync_mode: sync.mode_label().to_owned(),
         group_bpm: sync.group_bpm as f32,
         cue_frame: deck.cue_point(),
+        vinyl: deck.vinyl_held(),
         keylock: deck.keylock_mode(),
         key_shift: deck.key_shift(),
         stems: channel.stem_status(),

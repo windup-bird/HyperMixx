@@ -18,6 +18,7 @@ use hypermixx_audio::{AudioPipeline, Command, SAMPLE_RATE};
 use hypermixx_core::{
     Backend, CommandResponse, CueOp, FxChainId, FxSlotRef, KeylockMode, LoopEditOp, LoopOp,
     LoopQuantum, NudgeOp, PhaseMode, Shared, Stem, StemOp, StemPreset, SyncOp, TrackAnalysis,
+    VinylOp,
 };
 
 use crate::notices::{self, NoticeTx};
@@ -319,6 +320,27 @@ pub fn dispatch(
         "loop" => with_deck(target, "loop", |deck_id| {
             loop_command(&mut words, deck_id, command_tx)
         }),
+        // The platter: touch pauses and is remembered, the wheel moves the playhead while held and
+        // bends the tempo while not, release restores what the touch interrupted.
+        "vinyl" => with_deck(target, "vinyl", |deck_id| {
+            let op = match words.next() {
+                None | Some("touch") => VinylOp::Touch,
+                Some("release") => VinylOp::Release,
+                Some("turn") => match words.next().and_then(|value| value.parse::<i32>().ok()) {
+                    Some(ticks) => VinylOp::Turn {
+                        ticks,
+                        frames_per_tick: hypermixx_midi::map::DEFAULT_VINYL_FRAMES_PER_TICK,
+                    },
+                    None => return Action::Failed("usage: [deck] vinyl turn <ticks>".into()),
+                },
+                Some(other) => {
+                    return Action::Failed(format!(
+                        "unknown vinyl subcommand `{other}` — touch|release|turn <ticks>"
+                    ))
+                }
+            };
+            send(command_tx, Command::Vinyl { deck_id, op })
+        }),
         "sync" => with_deck(target, "sync", |deck_id| {
             sync_command(&mut words, deck_id, command_tx)
         }),
@@ -436,16 +458,18 @@ fn cue_command<'a>(
     command_tx: &Sender<Command>,
 ) -> Action {
     let op = match words.next() {
-        None => CueOp::Smart,
+        // Bare `cue` is the *button*, not one edge of it: the first press is the press edge (cue the
+        // playhead and play, or back-cue while playing), the next is the release (return to the cue
+        // and pause). The deck owns that state.
+        None => CueOp::Button,
         Some("play") => CueOp::Play,
         Some("back") => CueOp::Back,
         Some("set") => CueOp::Set,
-        // The press edge of a held cue button (a MIDI button's note-on): cue the playhead if the
-        // deck is paused, then play from the cue point.
-        Some("hold") => CueOp::SmartPlay,
+        // The decision without the preview: back-cue while playing, place the cue point while paused.
+        Some("smart") => CueOp::Smart,
         Some(other) => {
             return Action::Failed(format!(
-                "unknown cue subcommand `{other}` — play|back|set|hold (or bare `cue`)"
+                "unknown cue subcommand `{other}` — play|back|set|smart (or bare `cue`)"
             ));
         }
     };

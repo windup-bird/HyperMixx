@@ -58,6 +58,9 @@ pub struct DeckState {
     pub group_bpm: f32,
     /// The cue point in source frames. Defaults to the loaded origin (0); `cue set` moves it.
     pub cue_frame: u64,
+    /// Whether a hand is on the platter (`vinyl` touch). While it is, the deck is paused and a wheel
+    /// turn moves the playhead instead of bending the tempo.
+    pub vinyl: bool,
     /// The active keylock profile.
     pub keylock: KeylockMode,
     /// Pitch shift in semitones. Always 0 today — the streaming engine has no pitch axis.

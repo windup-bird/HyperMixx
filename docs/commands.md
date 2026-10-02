@@ -79,12 +79,15 @@ cargo run -p hypermixx-cli -- [flags]
 
 ```
 [deck] play                  切换播放/暂停（toggle；`pause` 已移除）
-[deck] cue [play|back|set|hold]
-                             cue 点：`play` 从 cue 播放，`back` 回 cue 并暂停，
-                             `set` 把当前帧记为 cue 点；**bare `cue` = smart**：
-                             播放中→back，暂停中→set；
-                             `hold` = 按住式 cue 按钮的**按下边沿**：先按 smart 定位
-                             （暂停中 → cue 点落到当前播放头），再从 cue 播放
+[deck] cue [play|back|set|smart]
+                             cue 点：`play` 从 cue 播放，`back` 回 cue 并暂停，`set` 把当前帧
+                             记为 cue 点，`smart` = 引擎按走带决定（播放中→back，暂停中→set）
+                             **bare `cue` = 整颗 cue 键**：第一次是按下、再一次是松开
+                             （状态在引擎里，所以前端不需要自己记走带）
+[deck] vinyl [touch|release|turn <ticks>]
+                             唱盘：`touch` = 手放上去（暂停并记住走带），`turn` = 转轮（手持时
+                             按 tick 移动播放头，空手时是 pitch bend），`release` = 松手（恢复
+                             被 touch 打断的走带）。bare = touch
 [deck] jump <frame>         按帧 seek（1 秒 = 44100 帧）
 [deck] beatjump <beats>     按整拍 seek，保持相位（i64，负数回跳）
 [deck] tempo <ratio>        设 tempo 绝对值（1.0 = 原速，0.25..4.0）
@@ -97,9 +100,26 @@ state                       打印全部 deck 的状态行
 
 - `cue` 点默认在装载原点（帧 0）；`Load` 换 deck 时回到 0。`back`/`play`/`hold` 走非阻塞
   jump，落地可能滞后一个块 + 预热时间（`hold` 在**暂停**那一路不跳，所以是即时的）。
-- **按住式 cue 按钮**（MIDI note）是一对边沿：按下 `hold`、松开 `back`。所以暂停时"找到位置 →
-  按下 cue"是一个动作（cue 点先落到播放头，再出声），播放中按住 = 从 cue 点重开。
-  一个 op 而不是 `smart`+`play` 两条命令，因为判定必须与它引发的跳转原子。
+- **`vinyl`（唱盘）**：一颗转盘在真实设备上是两个控件 —— 一个 note（贴盘传感器）+ 一个相对
+  CC（轮子本身）。两个绑定都写 `action = "vinyl"`，**转一下到底什么意思由引擎判定**（只有它
+  知道此刻手在不在盘上）：
+  - **手在盘上** → 暂停 + 每块把播放头**钉到**手搓到的位置（每 tick `step` 帧，缺省 441 =
+    10 ms）。**只有轮子动的那一块出声**：移动可闻、静止静音 —— 真唱盘静止时也没有信号（而不是
+    把同一个颗粒反复播成嗡嗡声）。**暂停中的 deck 一样能搓**（照样出声），松手后仍是暂停。
+    反向能搓（引擎只前进，位置由 deck 自己记账，所以后退不会被"格内前进"抵消）。
+  - **手不在盘上** → pitch bend，**累加**：每条消息按 tick 数加减速度（上限 ±10%），不是延长
+    时间。
+  - 松手恢复"被 touch 打断的那条走带"（本来在放 → 继续放，本来暂停 → 保持暂停）。
+  - **保险**：任何显式 `play`/`pause`/`toggle` 都会先**松盘**，丢一个 note-off（拔线、控制器
+    丢包）不会让 deck 永远卡在暂停里。
+- **按住式 cue 按钮**（MIDI note）是一对边沿：按下 `Hold`、松开 `Back`。`Hold` 由引擎按走带
+  自己判定：
+  - **播放中** → back cue（跳回 cue 点并暂停）。走带本来就在跑，所以不叠加"从 cue 播放"
+  - **暂停中** → 当前播放头成为 cue 点，并**开始播放**（找位置和试听是一个动作）
+  - 松开 → 无论哪种情况都回到 cue 点并暂停
+- **bare `cue`（CLI/TUI）就是同一颗键**：引擎记着它是否处于"按下"，所以敲一次是按下、再敲一次
+  是松开 —— 键盘也能做出"按住试听、松开归位"的手势。任何显式 op（`play`/`back`/`set`/`smart`）
+  都会把该状态清回"松开"。
 - **tempo / tempofader / temporange**：`tempo` 是绝对值（sync、脚本用）；`tempofader` 是物理推子
   位置（MIDI 用），引擎按 `1 + pos×range` 换算并走同一套 sync 分支。`temporange` **只改映射**，
   当前 tempo 不动（推子的反推位置随之变化）；范围 `(0, 1.0]`，缺省 0.1。

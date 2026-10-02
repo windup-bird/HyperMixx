@@ -150,6 +150,7 @@ impl App {
                     sync_mode: "free".to_owned(),
                     group_bpm: 0.0,
                     cue_frame: 0,
+                    vinyl: false,
                     keylock: KeylockMode::On,
                     key_shift: 0,
                     stems: StemStatus::default(),

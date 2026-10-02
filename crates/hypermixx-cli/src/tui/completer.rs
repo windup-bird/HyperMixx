@@ -41,7 +41,8 @@ const VERBS: &[(&str, &str)] = &[
     ("load", "decode a file"),
     ("analyse", "run the analyser"),
     ("play", "toggle play/pause"),
-    ("cue", "play from / return to / set the cue point (hold = cue button press)"),
+    ("cue", "cue button: press plays from the cue, press again returns to it"),
+    ("vinyl", "platter: touch pauses, turn scrubs, release resumes"),
     ("jump", "seek to frame"),
     ("beatjump", "seek by beats"),
     ("tempo", "set the tempo"),
@@ -196,6 +197,20 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
                 Vec::new()
             }
         }
+        "vinyl" => {
+            if rest.len() == 1 {
+                pairs(
+                    &[
+                        ("touch", "hand on the platter (pauses)"),
+                        ("release", "let go (resumes if the touch paused it)"),
+                        ("turn", "turn the wheel by N ticks"),
+                    ],
+                    partial,
+                )
+            } else {
+                Vec::new()
+            }
+        }
         "cue" => {
             if rest.len() == 1 {
                 pairs(
@@ -203,7 +218,7 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
                         ("play", "play from the cue point"),
                         ("back", "return to cue and pause"),
                         ("set", "set the cue point here"),
-                        ("hold", "cue button press: cue here, then play"),
+                        ("smart", "back while playing / cue here while paused"),
                     ],
                     partial,
                 )
