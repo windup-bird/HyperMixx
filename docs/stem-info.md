@@ -40,7 +40,7 @@
 
 需要 `--features cuda` 构建 + 宿主 CUDA 13 / cuDNN 9。`--gpu` 是**要求而不是建议**：CUDA 接管不了
 整张图时直接报错，而不是悄悄在 CPU 上跑（慢 9 倍却看起来成功，正是这次踩过的坑 —— 见
-[`vendor/charon-audio/PATCH.md`](vendor/charon-audio/PATCH.md)）。CPU 与 CUDA 的 Σ 残差一致，
+[fork 的 `FORK.md`](https://github.com/windup-bird/charon-audio-cuda/blob/feat/cuda-ep/FORK.md)）。CPU 与 CUDA 的 Σ 残差一致，
 但两者存在不同的缓存条目里。
 
 ### 三个旋钮都进缓存 key

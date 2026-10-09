@@ -57,7 +57,9 @@ crates/
 │       ├── cache.rs        # 内容寻址缓存(~/.cache/hypermixx/stems/<key>/)
 │       ├── onnx.rs         # CharonSeparator:进度/取消桥接 + 帧对齐契约检查 + EP 选择
 │       └── onnx_options.rs # Provider(cpu|cuda)/SeparateOptions:改音频的旋钮,也就是缓存 key
-├── vendor/charon-audio/  # 上游 0.1.2 + 15 行补丁(CUDA EP);见其中的 PATCH.md
+│
+│   # charon-audio(CUDA EP)不在此树内:它是 fork windup-bird/charon-audio-cuda,
+│   # 由根 Cargo.toml 的 [patch.crates-io] 接管;见该 fork 的 FORK.md
 │
 ├── hypermixx-library/    # 分析与曲库(core + media + stratum-dsp)
 │   └── src/

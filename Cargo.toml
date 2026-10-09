@@ -10,11 +10,13 @@ members = [
     "crates/hypermixx-cli",
 ]
 
-# Hypermixx carries a minimal patch to `charon-audio` (a CUDA execution provider alongside the
-# upstream CPU/CoreML ones), vendored under `vendor/`: see `vendor/charon-audio/PATCH.md` for the
-# exact diff and how to re-apply it to a newer upstream release.
+# Hypermixx needs one change to `charon-audio` that upstream 0.1.2 does not have: a CUDA
+# execution provider alongside its CPU/CoreML ones. It lives in our fork,
+# `windup-bird/charon-audio-cuda`, branch `feat/cuda-ep`, which is upstream `v0.1.2` plus
+# that provider. See `docs/stem.md` §4 for why a fork and not a patch, and the fork's
+# `FORK.md` for the diff and the measurements.
 [patch.crates-io]
-charon-audio = { path = "vendor/charon-audio" }
+charon-audio = { git = "https://github.com/windup-bird/charon-audio-cuda", branch = "feat/cuda-ep" }
 
 [workspace.package]
 version = "0.1.0"

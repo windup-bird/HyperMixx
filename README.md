@@ -25,8 +25,10 @@ cli ─┬─► audio ───┐
 | `hypermixx-cli` | 前端：行 REPL、`--tui` 终端界面、命令解析与补全 | 全部 |
 
 外部依赖：`stratum-dsp`、`timestretch`、`midir`、`charon-audio`/`ort`（仅 `hypermixx-stems` 的
-`onnx` feature，默认开）。`vendor/charon-audio` 是带了 15 行补丁的副本 —— 上游 0.1.2 的
-`ExecutionProvider` 只有 CPU/CoreML，补丁加上 CUDA 一档，见 `vendor/charon-audio/PATCH.md`。
+`onnx` feature，默认开）。上游 `charon-audio` 0.1.2 的 `ExecutionProvider` 只有 CPU/CoreML，
+hypermixx 用的 CUDA 一档在 **fork** [`windup-bird/charon-audio-cuda`](https://github.com/windup-bird/charon-audio-cuda)
+（分支 `feat/cuda-ep`，即上游 `v0.1.2` + 该 provider），由根 `Cargo.toml` 的 `[patch.crates-io]`
+接管；fork 的 `FORK.md` 有 diff 与实测。
 
 
 ## 安装

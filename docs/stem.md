@@ -4,7 +4,7 @@
 
 - 旋钮的完整语义与命令族：[`commands.md`](commands.md) §3.7、README「stem 分离」一节；
 - 模型来源、许可、下载与校验：[`stem-info.md`](stem-info.md)；
-- CUDA 补丁的全文说明与可重放 diff：[`../vendor/charon-audio/PATCH.md`](../vendor/charon-audio/PATCH.md)。
+- CUDA 补丁的全文说明与可重放 diff：[fork 的 `FORK.md`](https://github.com/windup-bird/charon-audio-cuda/blob/feat/cuda-ep/FORK.md)。
 
 ## 1. 现在能做什么
 
@@ -50,7 +50,7 @@ out stems :: Float32 [1, 4, 2, 343980]
 `overlap 0.0` 上略高（1.63× vs 1.15×，被音乐淹没，说明低重叠的代价**不是咔哒**而是更微妙的边界音色
 不一致）。所以默认值留在原处，调它们值得自己听一遍。
 
-## 4. GPU：为什么必须 fork（`vendor/charon-audio`）
+## 4. GPU：为什么必须 fork（`charon-audio-cuda`）
 
 **上游 charon-audio 0.1.2 根本没有"请求 CUDA"这一档**：`ExecutionProvider` 只有
 `Cpu`/`CoreMl`/`Auto`。我最初以为"这个导出把 STFT 放在图内、只能跑 CPU"——**那个结论是错的**，
@@ -64,7 +64,8 @@ out stems :: Float32 [1, 4, 2, 343980]
    `copy-dylibs`/`tracing`，provider 库没拷到二进制旁、注册失败又被静默吞掉——"建了会话但一样慢"
    和"跑了但没收益"看起来完全一样。）
 
-**补丁（`vendor/charon-audio`，236 K，`[patch.crates-io]` 指向它）**：
+**补丁（fork [`windup-bird/charon-audio-cuda`](https://github.com/windup-bird/charon-audio-cuda) 的
+`feat/cuda-ep` 分支 = 上游 `v0.1.2` + 下面 4 条，`[patch.crates-io]` 指向它）**：
 
 | 改动 | 作用 |
 |---|---|
@@ -73,8 +74,10 @@ out stems :: Float32 [1, 4, 2, 343980]
 | Cuda 路径**保留 ConstantFolding**（过滤掉 `low_memory()` 的禁用项） | 这是"节点全落 CPU"的解药；只在 CUDA 生效 |
 | Cuda 路径设 `session.disable_cpu_ep_fallback = 1` | 见下：不静默降级 |
 
-`charon-audio-hypermixx.patch` 共 618 行，其中**功能性改动约 40 行**，其余是剥掉上游的
-`bin`/`example`/`bench`/`test` 目标（上游把 1.6 MB 测试音频也打进包里）。
+功能性改动约 40 行，其余是注释与文档；`src/models.rs` 的 diff 不到 100 行。
+
+fork 按上游会接受的样子写（`build_session` 按 EP 分支、不重复会话构造），所以下一步是给
+`Valkyra-Labs/charon-audio` 开 PR，而不是永久带着这份 fork。
 
 **实测（RTX 4050 Laptop 6 GB / CUDA 13.4 / cuDNN 9.26 / ORT 1.28 cuda13）**：
 
@@ -125,5 +128,6 @@ cargo test --release -p hypermixx-stems --features cuda -- --ignored real_model 
 - **stem 源 mmap**：能省那约 600 MB 常驻，但要在 media 层做内存映射；
 - **其它模型**：`htdemucs_fp16weights.onnx`（166 MB，下载减半）、单源专家（karaoke，算力约 1/4）
   ——`ModelSpec` 表已经预留，加模型 = 加一条数据 + `--model` 变真；
-- **上游 PR**：这份补丁是按上游能接受的样子写的（`build_session` 按 EP 分支、不重复会话构造），
-  提交给 `charon-audio` 是下一步。
+- **上游 PR**：补丁已经按上游能接受的样子写好了，现在就在 fork 的 `feat/cuda-ep` 分支上
+  （不再以 patch 文件 + vendor 目录的形式携带）——提交给 `Valkyra-Labs/charon-audio` 是下一步。
+  合并后删掉根 `Cargo.toml` 的 `[patch.crates-io]` 即可，仓库里已经没有要清的东西。
