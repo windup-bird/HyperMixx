@@ -24,12 +24,7 @@ cli ─┬─► audio ───┐
 | `hypermixx-midi` | MIDI 输入：字节解析、TOML 映射表、`Event → Command` 翻译（纯逻辑，可无硬件单测） | core, midir |
 | `hypermixx-cli` | 前端：行 REPL、`--tui` 终端界面、命令解析与补全 | 全部 |
 
-外部依赖：`stratum-dsp`、`timestretch`、`midir`、`charon-audio`/`ort`（仅 `hypermixx-stems` 的
-`onnx` feature，默认开）。上游 `charon-audio` 0.1.2 的 `ExecutionProvider` 只有 CPU/CoreML，
-hypermixx 用的 CUDA 一档在 **fork** [`windup-bird/charon-audio-cuda`](https://github.com/windup-bird/charon-audio-cuda)
-（分支 `feat/cuda-ep`，即上游 `v0.1.2` + 该 provider），由根 `Cargo.toml` 的 `[patch.crates-io]`
-接管；fork 的 `FORK.md` 有 diff 与实测。
-
+外部依赖：`stratum-dsp`、`timestretch`、`midir`、`charon-audio-cuda`(forked from `charon-audio`)
 
 ## 安装
 
@@ -112,7 +107,7 @@ TUI 内尽量不用启动参数:`--tui` 下按 `F2` 选 MIDI 端口、`F3` 选�
 
 ## Stem Separate
 
-`stem separate` 把当前曲目离线分离成[drums/bass/other/vocals]并**热装**进 deck，pcm缓存在`~/.config/hypermixx/stems/...`。
+`stem separate` 把当前曲目离线分离成[drums/bass/other/vocals]，pcm缓存在`~/.config/hypermixx/stems/...`。
 
 使用`--features cuda`构建并在cli使用`stem separate --gpu`可以用cudnn加速。
 
