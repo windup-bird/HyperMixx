@@ -259,6 +259,7 @@ impl Guide {
             } else {
                 None
             },
+            reverse: None,
             channel: Some(candidate.channel),
             id: if candidate.kind == EventKind::Bend {
                 None

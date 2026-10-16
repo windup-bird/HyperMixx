@@ -1,21 +1,19 @@
 //! [`MixerConfig`]: what a mixer is built from — channels, master/cue chains, outputs.
 //!
-//! Hard-coded for now, deliberately: [`simple_dj`] is the shape a TOML file will describe later, and
-//! keeping the two apart means the config layer can gain a parser without the mixer learning about
-//! files. Everything here is plain data (`String` effect names, `f32` fader positions), so it can
-//! come from a crate, a socket or a test helper.
+//! Everything here is plain data (`String` effect names, `f32` fader positions): a TOML file, a
+//! crate or a test helper can all produce the same thing. The file schema is [`MixerFile`] at the
+//! bottom of this module; [`simple_dj`] is the built-in reference and [`reference_toml`] its text.
 //!
 //! FX are named by string and resolved through [`FxKind`](crate::fx::FxKind) at build time. A name
 //! that is not in the registry is a [`MixerError::UnknownFx`] at construction, not a silent skip:
 //! a mixer that quietly dropped the limiter the user configured is worse than one that refuses to
 //! start.
 
-use hypermixx_core::{FxChainId, Stem};
+use hypermixx_core::Stem;
 
-use super::channel::{CueTap, CrossfaderCurve, DeckSide};
+use super::channel::{CrossfaderCurve, CrossfaderPlace, CueTap, DeckSide};
 use super::output::OutputId;
 use crate::fx::{FxChain, FxError, FxKind, FxSlot};
-
 /// Why a mixer could not be built from a config.
 #[derive(Clone, Debug, PartialEq)]
 pub enum MixerError {
@@ -89,17 +87,17 @@ pub struct ChannelConfig {
     pub stem_fx: std::collections::HashMap<Stem, Vec<String>>,
     /// FX between the flow fader and the deck fader — the channel's tone controls.
     pub deck_fx: Vec<String>,
-    /// Per-stream level, `-1.0 ..= 1.0` (centred = unity).
+    /// Per-stream level, `-1.0 ..= 1.0` (centred = unity, the top of the travel is 0 dB).
     pub flow_fader: f32,
     /// Deck level; stays at unity until a track exposes stems.
     pub deck_fader: f32,
-    /// Starting crossfade position.
-    pub crossfader: f32,
+    /// Channel trim, `-1.0 ..= 1.0`: `0.0` is 0 dB, `1.0` is +6 dB (the only stage that boosts),
+    /// `-1.0` is silence. The last stage before the sum.
+    pub gain: f32,
     /// How much of this channel reaches the cue bus: **linear, 0.0 (off) ..= 1.0 (full)**.
     pub cue_send: f32,
     pub cue_tap: CueTap,
     pub side: DeckSide,
-    pub crossfader_curve: CrossfaderCurve,
 }
 
 impl Default for ChannelConfig {
@@ -112,11 +110,10 @@ impl Default for ChannelConfig {
             deck_fx: Vec::new(),
             flow_fader: 0.0,
             deck_fader: 0.0,
-            crossfader: 0.0,
+            gain: 0.0,
             cue_send: 0.0,
             cue_tap: CueTap::default(),
             side: DeckSide::default(),
-            crossfader_curve: CrossfaderCurve::default(),
         }
     }
 }
@@ -143,21 +140,6 @@ impl ChannelConfig {
             ..Default::default()
         }
     }
-
-    /// Which chain a command addresses for this channel.
-    pub fn chain(&self, chain: SlotPlace) -> &[String] {
-        match chain {
-            SlotPlace::Flow => &self.flow_fx,
-            SlotPlace::Deck => &self.deck_fx,
-        }
-    }
-}
-
-/// Which of a channel's two chains a config entry means.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SlotPlace {
-    Flow,
-    Deck,
 }
 
 /// One destination.
@@ -189,13 +171,68 @@ fn default_gain() -> f32 {
     1.0
 }
 
+/// The crossfader's shape, shared by every channel: one physical control has one position, one
+/// curve and one cut width. Configured by the `[crossfader]` table.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CrossfaderConfig {
+    /// Where in the channel path the gain acts.
+    pub place: CrossfaderPlace,
+    pub curve: CrossfaderCurve,
+    /// Fraction of the travel the `cut` curve drops over, at each end.
+    pub cut_width: f32,
+    /// Starting position, `-1.0` hard left .. `1.0` hard right.
+    pub start: f32,
+}
+
+impl Default for CrossfaderConfig {
+    fn default() -> Self {
+        Self {
+            place: CrossfaderPlace::Deck,
+            curve: CrossfaderCurve::Classic,
+            cut_width: super::DEFAULT_CUT_WIDTH,
+            start: 0.0,
+        }
+    }
+}
+
+/// The cue bus's shape: what a `cue` output carries. Configured by the `[cue]` table.
+///
+/// A DJ's headphone output is a **blend** of the cue sends and the master mix, so the cue bus mixes
+/// the two with a crossfader-like control. `blend = -1.0` is the default and the historical
+/// behaviour: headphones carry the cue and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CueMixConfig {
+    /// Cue trim.
+    pub fader: f32,
+    /// `-1.0` = cue only, `0.0` = both at the curve's centre, `1.0` = master only.
+    pub blend: f32,
+    pub curve: CrossfaderCurve,
+    /// Fraction of the blend the `cut` curve drops over, at each end.
+    pub cut_width: f32,
+}
+
+impl Default for CueMixConfig {
+    fn default() -> Self {
+        Self {
+            fader: 0.0,
+            blend: -1.0,
+            curve: CrossfaderCurve::Classic,
+            cut_width: super::DEFAULT_CUT_WIDTH,
+        }
+    }
+}
+
 /// Whether an output carries the mix or the cue.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputRole {
+    /// The summed mix.
     #[default]
-    Main,
-    Headphones,
+    Master,
+    /// The cue bus (the headphone destination).
+    Cue,
 }
 
 impl Default for OutputConfig {
@@ -206,27 +243,29 @@ impl Default for OutputConfig {
             id: 0,
             name: String::new(),
             channels: (0, 1),
-            role: OutputRole::Main,
+            role: OutputRole::Master,
             gain: 1.0,
         }
     }
 }
 
 impl OutputConfig {
-    pub fn main(id: OutputId, name: impl Into<String>) -> Self {
+    /// A stereo master destination.
+    pub fn master(id: OutputId, name: impl Into<String>) -> Self {
         Self {
             id,
             name: name.into(),
             channels: (0, 1),
-            role: OutputRole::Main,
+            role: OutputRole::Master,
             gain: 1.0,
         }
     }
 
-    pub fn headphones(id: OutputId, name: impl Into<String>) -> Self {
+    /// A cue (headphone) destination.
+    pub fn cue(id: OutputId, name: impl Into<String>) -> Self {
         Self {
-            role: OutputRole::Headphones,
-            ..Self::main(id, name)
+            role: OutputRole::Cue,
+            ..Self::master(id, name)
         }
     }
 
@@ -246,14 +285,18 @@ impl OutputConfig {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MixerConfig {
     pub channels: Vec<ChannelConfig>,
+    /// The shared crossfader (one physical control, every channel applies it on its own side).
+    pub crossfader: CrossfaderConfig,
     /// FX on the summed mix, before the safety limiter.
     pub master_fx: Vec<String>,
     /// Always-on safety limiter, wired separately so it cannot be configured away by a bad list.
     pub master_limiter: bool,
-    /// Master trim, `-1.0 ..= 1.0`.
+    /// Master trim, `-1.0 ..= 1.0` (0 dB at the top).
     pub master_fader: f32,
-    /// Cue trim.
+    /// Cue trim, `-1.0 ..= 1.0`.
     pub cue_fader: f32,
+    /// How a `cue` output blends the cue sends with the master mix.
+    pub cue: CueMixConfig,
     pub outputs: Vec<OutputConfig>,
 }
 
@@ -277,14 +320,6 @@ impl MixerConfig {
             .collect()
     }
 
-    pub fn master_slots(&self) -> Result<Vec<FxSlot>, MixerError> {
-        build_slots(&self.master_fx)
-    }
-
-    pub fn output_for(&self, index: usize) -> Option<&OutputConfig> {
-        self.outputs.get(index)
-    }
-
     /// Parses a mixer topology from TOML text.
     ///
     /// This is the parser half of the "config is plain data" rule: the file schema is spelled out
@@ -302,17 +337,20 @@ impl MixerConfig {
     }
 }
 
-/// The TOML schema for a whole mixer: one `[[channel]]` per deck, one `[master]` table, any number
-/// of `[[output]]`s. Every field defaults, so the smallest legal file is a single `[[channel]]`.
+/// The TOML schema for a whole mixer: one `[[channel]]` per deck, a `[crossfader]`, a `[master]`,
+/// a `[cue]` and any number of `[[output]]`s. Every field defaults, so the smallest legal file is a
+/// single `[[channel]]`.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct MixerFile {
     channel: Vec<ChannelConfig>,
+    crossfader: CrossfaderConfig,
     master: MasterFile,
+    cue: CueMixConfig,
     output: Vec<OutputConfig>,
 }
 
-/// The `[master]` table: `fx`, `limiter`, `fader`, `cue_fader`.
+/// The `[master]` table: `fx`, `limiter`, `fader`.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct MasterFile {
@@ -321,29 +359,31 @@ struct MasterFile {
     /// config that omits it gets exactly what it asked for, and the mixer docs say so).
     limiter: bool,
     fader: f32,
-    cue_fader: f32,
 }
 
 impl From<MixerFile> for MixerConfig {
     fn from(file: MixerFile) -> Self {
+        let cue = file.cue;
         Self {
             channels: file.channel,
+            crossfader: file.crossfader,
             master_fx: file.master.fx,
             master_limiter: file.master.limiter,
             master_fader: file.master.fader,
-            cue_fader: file.master.cue_fader,
+            cue_fader: cue.fader,
+            cue,
             outputs: file.output,
         }
     }
 }
 
-/// The reference topology: two decks, each with an EQ and a sweep, a limiting master, and main plus
-/// headphones.
+/// The reference topology: two decks, each with an EQ and a sweep, a limiting master, and master plus
+/// cue (headphone) destinations.
 ///
 /// This is the function every test and the CLI starts from. If it changes, the acceptance question
 /// ("does a cue still work, does the crossfader still isolate a deck?") has a new answer.
 pub fn simple_dj() -> MixerConfig {
-    let deck_channels = |side: DeckSide, crossfader: f32| ChannelConfig {
+    let deck_channels = |side: DeckSide| ChannelConfig {
         flow_fx: vec![],
         // The reference topology has no per-stem inserts: stems get the same (empty) template, and
         // `[channel.stem_fx]` is how a user asks for one stem to differ.
@@ -351,24 +391,25 @@ pub fn simple_dj() -> MixerConfig {
         deck_fx: vec!["eq".into(), "filter".into()],
         flow_fader: 0.0,
         deck_fader: 0.0,
-        crossfader,
+        gain: 0.0,
         cue_send: 1.0,
-        cue_tap: CueTap::PostDeckFx,
+        cue_tap: CueTap::PostDeckFader,
         side,
-        crossfader_curve: CrossfaderCurve::EqualPower,
     };
     MixerConfig {
         channels: vec![
-            deck_channels(DeckSide::Left, 0.0),
-            deck_channels(DeckSide::Right, 0.0),
+            deck_channels(DeckSide::Left),
+            deck_channels(DeckSide::Right),
         ],
+        crossfader: CrossfaderConfig::default(),
         master_fx: vec![],
         master_limiter: true,
         master_fader: 0.0,
         cue_fader: 0.0,
+        cue: CueMixConfig::default(),
         outputs: vec![
-            OutputConfig::main(0, "main"),
-            OutputConfig::headphones(1, "headphones"),
+            OutputConfig::master(0, "main"),
+            OutputConfig::cue(1, "headphones"),
         ],
     }
 }
@@ -377,47 +418,9 @@ pub fn simple_dj() -> MixerConfig {
 /// emits it). Parsing this text must yield exactly [`simple_dj`], which is the test that keeps the
 /// schema and the constructor honest with each other.
 pub fn reference_toml() -> &'static str {
-    r#"# Hypermixx mixer topology. `--print-config` prints this; edit and pass back via --config.
-
-# One [[channel]] per deck. Omitted keys take the defaults shown in comments.
-[[channel]]
-side = "left"                 # left | right | center
-# crossfader = 0.0            # starting position, -1 hard left .. 1 hard right
-# flow_fader = 0.0            # per-stream level (0 = unity)
-# deck_fader = 0.0            # deck level (0 = unity)
-cue_send = 1.0                # linear 0..1 into the cue bus
-cue_tap = "post_deck_fx"      # post_flow_fx | post_flow_fader | post_deck_fx | post_deck_fader
-# crossfader_curve = "equal_power" # equal_power | linear
-deck_fx = ["eq", "filter"]    # per-deck inserts; names from `fx help`
-# flow_fx = []                # per-stream inserts: ONE CHAIN PER STREAM (4 stems = 4 chains)
-# [channel.stem_fx]           # per-stem overrides of flow_fx, for the stems that differ
-# vocals = ["filter"]         # (stem names: drums | bass | other | vocals)
-
-[[channel]]
-side = "right"
-cue_send = 1.0
-cue_tap = "post_deck_fx"
-deck_fx = ["eq", "filter"]
-
-[master]
-# fx = []                     # inserts on the summed mix
-limiter = true                # the safety stage; strongly recommended
-# fader = 0.0                 # master trim (0 = unity)
-# cue_fader = 0.0             # cue bus trim (0 = unity)
-
-# One [[output]] per destination. `name` and `role` are required; the rest has defaults.
-# NOTE: every output opens on the system default device, and the mixer keeps only one stream
-# per physical device — a second output on the same device is dropped (see mixer docs).
-[[output]]
-name = "main"
-role = "main"                  # main | headphones
-# channels = [0, 1]           # device channel pair
-# gain = 1.0                  # per-destination trim
-
-[[output]]
-name = "headphones"
-role = "headphones"
-"#
+    // The reference topology ships as a file so there is exactly one source of truth: this text,
+    // `--print-config` and `config/mixer.toml` are the same bytes.
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/mixer.toml"))
 }
 
 /// A single-channel config with no outputs at all: the mixer computes and writes nothing, which is
@@ -430,16 +433,19 @@ pub fn silent_test_channel() -> MixerConfig {
             deck_fx: vec![],
             flow_fader: 0.0,
             deck_fader: 0.0,
-            crossfader: 0.0,
+            gain: 0.0,
             cue_send: 1.0,
             cue_tap: CueTap::PostDeckFader,
             side: DeckSide::Center,
-            crossfader_curve: CrossfaderCurve::Linear,
         }],
+        // `Center` on the side already takes the crossfader out of the path, so the curve is
+        // irrelevant here — the default keeps the test config minimal.
+        crossfader: CrossfaderConfig::default(),
         master_fx: vec![],
         master_limiter: false,
         master_fader: 0.0,
         cue_fader: 0.0,
+        cue: CueMixConfig::default(),
         outputs: vec![],
     }
 }
@@ -455,48 +461,11 @@ pub fn build_slot(name: &str) -> Result<FxSlot, MixerError> {
     Ok(FxSlot::new(kind.build(), kind.name()))
 }
 
-/// As [`build_slot`], but bypassed — how a safety limiter is armed.
-pub fn build_slot_disabled(name: &str) -> Result<FxSlot, MixerError> {
-    let kind = FxKind::parse(name).map_err(|_| MixerError::UnknownFx(name.to_owned()))?;
-    Ok(FxSlot::disabled(kind.build(), kind.name()))
-}
-
 /// Builds a chain from names.
 pub fn build_chain(names: &[String]) -> Result<FxChain, MixerError> {
     Ok(FxChain::from_slots(build_slots(names)?))
 }
 
-/// The default parameter a caller can read off a fresh instance, for validation in tests.
-pub fn defaults_for(name: &str) -> Option<Vec<(String, f32)>> {
-    let kind = FxKind::parse(name).ok()?;
-    let fx = kind.build();
-    Some(
-        fx.param_names()
-            .iter()
-            .map(|n| ((*n).to_owned(), fx.get_param(n).unwrap_or(0.0)))
-            .collect(),
-    )
-}
-
-/// Which chain a command names, resolved against the mixer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChainRef {
-    Master,
-    Cue,
-    Channel(usize),
-}
-
-impl From<FxChainId> for ChainRef {
-    fn from(chain: FxChainId) -> Self {
-        match chain {
-            FxChainId::Master => ChainRef::Master,
-            FxChainId::Deck(deck_id) => ChainRef::Channel(deck_id as usize),
-            // A stream's chain belongs to the same channel; `ChainRef` is a *config* notion of
-            // "which list of names", and a stem has no separate list yet.
-            FxChainId::Stem { deck, .. } => ChainRef::Channel(deck as usize),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -508,13 +477,14 @@ mod tests {
         let cfg = simple_dj();
         assert_eq!(cfg.channels.len(), 2);
         assert_eq!(cfg.outputs.len(), 2);
-        assert_eq!(cfg.outputs[0].role, OutputRole::Main);
-        assert_eq!(cfg.outputs[1].role, OutputRole::Headphones);
+        assert_eq!(cfg.outputs[0].role, OutputRole::Master);
+        assert_eq!(cfg.outputs[1].role, OutputRole::Cue);
         for channel in &cfg.channels {
             assert_eq!(channel.deck_fx, vec!["eq".to_owned(), "filter".to_owned()]);
             // A cue that only sounds when you send to it is not a cue.
             assert!(channel.cue_send > -1.0, "channels must reach the headphones");
             assert_eq!(channel.flow_fader, 0.0, "both decks start at unity");
+            assert_eq!(channel.gain, 0.0, "no channel starts with a trim");
         }
         assert_ne!(
             cfg.channels[0].side, cfg.channels[1].side,
@@ -565,7 +535,7 @@ mod tests {
             side = "center"
             [[output]]
             name = "only"
-            role = "main"
+            role = "master"
             "#,
         )
         .unwrap();
@@ -574,10 +544,16 @@ mod tests {
         assert_eq!(channel.deck_fader, 0.0);
         assert_eq!(channel.cue_send, 0.0, "a default channel does not spam the cue");
         assert_eq!(channel.cue_tap, CueTap::PostDeckFader);
-        assert_eq!(channel.crossfader_curve, CrossfaderCurve::EqualPower);
+        assert_eq!(channel.gain, 0.0, "the trim starts at 0 dB");
+        assert_eq!(cfg.crossfader.place, CrossfaderPlace::Deck, "the crossfader is last by default");
+        assert_eq!(cfg.crossfader.curve, CrossfaderCurve::Classic);
+        assert_eq!(cfg.crossfader.start, 0.0);
+        assert_eq!(cfg.crossfader.cut_width, crate::mixer::DEFAULT_CUT_WIDTH);
+        assert_eq!(cfg.cue.blend, -1.0, "a default cue carries the cue and nothing else");
         assert!(channel.flow_fx.is_empty() && channel.deck_fx.is_empty());
         assert_eq!(cfg.outputs[0].channels, (0, 1));
         assert_eq!(cfg.outputs[0].gain, 1.0);
+        assert_eq!(cfg.cue_fader, 0.0);
         assert!(!cfg.master_limiter, "the safety stage is opt-in from a file");
         assert_eq!(cfg.master_fader, 0.0);
         // The struct default and the `dj` helper agree with the parsed channel above.
@@ -594,12 +570,12 @@ mod tests {
     fn toml_errors_name_their_location_and_refuse_unknown_keys() {
         // A syntax error carries the line; a typo'd key is refused rather than ignored.
         let err = MixerConfig::from_toml_str("[[channel]]
-side = \"spinward\"".into()).unwrap_err();
+side = \"spinward\"").unwrap_err();
         assert!(matches!(err, MixerError::Parse(_)));
         assert!(err.message().contains("spinward"), "got: {}", err.message());
 
         let err = MixerConfig::from_toml_str(
-            "[[channel]]\nside = \"left\"\nbass_boost = 12.0\n".into(),
+            "[[channel]]\nside = \"left\"\nbass_boost = 12.0\n",
         )
         .unwrap_err();
         assert!(
@@ -609,7 +585,7 @@ side = \"spinward\"".into()).unwrap_err();
         );
 
         // An output without a name has nothing to log against.
-        assert!(MixerConfig::from_toml_str("[[output]]\nrole = \"main\"".into()).is_err());
+        assert!(MixerConfig::from_toml_str("[[output]]\nrole = \"main\"").is_err());
         // Every error variant is displayable.
         for err in [
             MixerError::UnknownFx("x".into()),
@@ -705,16 +681,6 @@ side = \"spinward\"".into()).unwrap_err();
     }
 
     #[test]
-    fn defaults_are_readable_for_validation() {
-        for kind in FxKind::ALL {
-            let params = defaults_for(kind.name()).unwrap();
-            assert_eq!(params.len(), kind.param_names().len(), "{kind}");
-            assert!(params.iter().all(|(_, v)| v.is_finite()), "{kind} default");
-        }
-        assert!(defaults_for("nope").is_none());
-    }
-
-    #[test]
     fn silent_test_config_never_touches_a_device() {
         let cfg = silent_test_channel();
         assert!(cfg.outputs.is_empty());
@@ -723,22 +689,13 @@ side = \"spinward\"".into()).unwrap_err();
     }
 
     #[test]
-    fn chain_refs_match_the_protocol() {
-        assert_eq!(ChainRef::from(FxChainId::Master), ChainRef::Master);
-        assert_eq!(
-            ChainRef::from(FxChainId::Deck(1)),
-            ChainRef::Channel(1)
-        );
-    }
-
-    #[test]
     fn channel_pair_falls_back_rather_than_going_out_of_range() {
         let cfg = OutputConfig {
             channels: (4, 5),
-            ..OutputConfig::main(0, "x")
+            ..OutputConfig::master(0, "x")
         };
         assert_eq!(cfg.channel_pair(2), (0, 1), "a 2ch device clamps rather than indexing out");
         assert_eq!(cfg.channel_pair(8), (4, 5));
-        assert_eq!(OutputConfig::main(0, "m").channel_pair(1), (0, 1), "1ch writes the sum to ch0");
+        assert_eq!(OutputConfig::master(0, "m").channel_pair(1), (0, 1), "1ch writes the sum to ch0");
     }
 }

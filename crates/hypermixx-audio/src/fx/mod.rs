@@ -17,10 +17,10 @@
 
 pub(crate) mod dsp;
 
-// The bipolar fader law, re-exported: a front-end that shows a level in dB has to agree with what
+// The fader/trim laws, re-exported: a front-end that shows a level in dB has to agree with what
 // the mixer actually applies, and the interesting part of the law is that -1.0 is *silence* rather
 // than -80 dB. Keeping one implementation is the only way that stays true.
-pub use dsp::bipolar_amp;
+pub use dsp::{fader_amp, trim_amp};
 mod chain;
 mod param;
 mod registry;

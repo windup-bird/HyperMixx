@@ -164,7 +164,7 @@ fn approach_factor(tau_seconds: f32, frames: usize, sr: u32) -> f32 {
     if tau_seconds <= 0.0 || frames == 0 || sr == 0 {
         return 1.0;
     }
-    let elapsed = frames as f64 / f64::from(sr) as f64;
+    let elapsed = frames as f64 / f64::from(sr);
     let alpha = 1.0 - (-elapsed / f64::from(tau_seconds)).exp();
     (alpha as f32).clamp(0.0, 1.0)
 }

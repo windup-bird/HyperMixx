@@ -15,7 +15,7 @@ cargo run -p hypermixx-cli -- [flags]
 | 参数 | 说明 |
 |---|---|
 | `--tui` | 终端界面（默认是行式 REPL） |
-| `--config <file>` | 自定义混音拓扑 TOML（通道/效果链/输出）；缺省用内置 `simple_dj()` 参考拓扑 |
+| `--config <file>` | 自定义混音拓扑 TOML（通道/效果链/输出）；不给则读 `./config/mixer.toml`（缺文件/坏文件回落内置参考拓扑） |
 | `--print-config` | 打印参考拓扑 TOML 后退出（不启动引擎） |
 | `--backend auto\|stratum\|timestretch` | 离线分析后端，缺省 `auto`（stratum 优先，失败回落） |
 | `--midi <port>` | 启动时打开 MIDI 输入端口（端口号或名字，`midi ports` 可列） |
@@ -95,6 +95,9 @@ cargo run -p hypermixx-cli -- [flags]
 [deck] temporange <0..1>    推子满量程（缺省 0.1 = ±10%）；只改映射，不动当前 tempo
 [deck] keylock on|off|wide  变调引擎（缺省 on；off = tape 零延迟直通，wide = widekeylock）
 [deck] key <semitones>      变调（**占位**：只记录并回读，暂不发声）
+[deck] fader <stage> <pos>  电平：`flow`/`deck`/`gain`/`cuesend` 作用在目标 deck，
+                            `cross`/`master`/`cue` 是共用控制（忽略目标）
+                            pos 为 `-1..1`（0 = unity），`cuesend` 是线性的 `0..1`
 state                       打印全部 deck 的状态行
 ```
 
@@ -103,8 +106,8 @@ state                       打印全部 deck 的状态行
 - **`vinyl`（唱盘）**：一颗转盘在真实设备上是两个控件 —— 一个 note（贴盘传感器）+ 一个相对
   CC（轮子本身）。两个绑定都写 `action = "vinyl"`，**转一下到底什么意思由引擎判定**（只有它
   知道此刻手在不在盘上）：
-  - **手在盘上** → 暂停 + 每块把播放头**钉到**手搓到的位置（每 tick `step` 帧，缺省 441 =
-    10 ms）。**只有轮子动的那一块出声**：移动可闻、静止静音 —— 真唱盘静止时也没有信号（而不是
+  - **手在盘上** → 暂停 + 每块把播放头**钉到**手搓到的位置（每 tick `frames_per_tick` 帧，缺省 1323
+    ＝ 一张 33⅓ 唱片转一圈 1.8 s ÷ 60 格）。**只有轮子动的那一块出声**：移动可闻、静止静音 —— 真唱盘静止时也没有信号（而不是
     把同一个颗粒反复播成嗡嗡声）。**暂停中的 deck 一样能搓**（照样出声），松手后仍是暂停。
     反向能搓（引擎只前进，位置由 deck 自己记账，所以后退不会被"格内前进"抵消）。
   - **手不在盘上** → pitch bend，**累加**：每条消息按 tick 数加减速度（上限 ±10%），不是延长
@@ -268,11 +271,33 @@ vocals = ["gain", "filter"]
 
 三条容易混淆的语义，都是刻意的：
 
-- **mute 与 level 是两件独立的事**：取消静音恢复的是你设过的电平，不是 unity。
+- **mute 与 level 是两件独立的事**，而且分在两个串联的阶段上：**mute/solo 是 source fader**
+  （每条流最前面的一颗门，正好是 `1.0` 或 `0.0`），**level 是 flow fader**。所以取消静音恢复的
+  是你设过的电平，不是 unity；而被静音的 stem 交给它自己的效果链的是**真正的静音**，不是带着
+  尾巴的衰减信号。
 - **solo 优先于 mute**，而且 solo 是集合：`deck0 vocals solo on` 再 `deck0 drums solo on`
   会同时听到两条，而不是后者顶掉前者。
-- **level/mute/solo 走的是逐 stream 的 flow fader**，`deck0 fader <x>`（不带 stem）一次写全部
-  四条，所以单个硬件推子仍然可用。
+- **`deck0 fader flow <x>`（不带 stem）一次写全部四条**，所以单个硬件推子仍然可用；
+  `deck0 vocals fader <x>` 只写一条。
+
+### 3.7.1 电平与信号路径
+
+```
+每条流:  source fader(门) → flow_fx → flow_fader ─┐
+                                                  Σ → deck_fx → deck_fader → gain(trim) → 求和
+                        共享 crossfader 的增益坐在这三颗 fader 之一的位置（[crossfader] place）
+```
+
+- **所有 fader 只衰减**：行程顶端是 0 dB。要 headroom 用 `gain`（trim，0 dB…+6 dB，`0.0` = 0 dB、
+  `1.0` = +6 dB），它是设定而不是演出控制。
+- **crossfader 的位置可配**（`[crossfader] place = "source" | "flow" | "deck"`），三种曲线
+  `classic`（缺省：中间两轨同时 0 dB，两头线性到单轨）/ `constant_power` / `cut`
+  （两端陡降，`cut_width` 缺省 0.05 = 各占 5% 行程）。
+- **cue 从三颗 fader 之一分叉**（`[channel] cue_tap = post_source_fader | post_flow_fader |
+  post_deck_fader`）。分叉点与 crossfader 位置相同时，cue **不受** crossfader 影响（历史上的
+  保证）；分叉点在 crossfader 之后时，cue 会跟着它（把 crossfader 放早的代价，文档写明）。
+- **cue 总线与 master 混合**（`[cue] blend`：`-1` = 只听 cue（缺省）/ `0` = 两者 / `+1` =
+  只听 master，`curve`/`cut_width` 同上），这就是耳机上那颗 cue-mix 旋钮。
 
 ### 3.8 MIDI
 

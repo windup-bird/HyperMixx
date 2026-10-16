@@ -11,8 +11,6 @@
 //! Either way neither side ever waits on the other, which is the whole reason a scratch buffer is
 //! pre-allocated outside the callback: real-time code may not call `malloc`.
 
-use std::sync::Arc;
-
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer};
 
@@ -193,7 +191,7 @@ impl Output {
 
     /// A named sink with the default mapping, for tests and for "no output configured".
     pub fn null(id: OutputId, block_frames: usize) -> Self {
-        Self::sink(&OutputConfig::main(id, "null"), block_frames)
+        Self::sink(&OutputConfig::master(id, "null"), block_frames)
     }
 
     pub fn is_sink(&self) -> bool {
@@ -446,18 +444,11 @@ impl Clone for Output {
                 id: self.id,
                 name: self.name.clone(),
                 channels: self.channels,
-                role: super::config::OutputRole::Main,
+                role: super::config::OutputRole::Master,
                 gain: self.gain,
             },
             self.block_frames,
         )
-    }
-}
-
-// A shared handle so a future UI can read meters without borrowing the mixer.
-impl Output {
-    pub fn arc_sink(id: OutputId, block_frames: usize) -> Arc<Output> {
-        Arc::new(Output::null(id, block_frames))
     }
 }
 
@@ -507,7 +498,7 @@ mod tests {
     /// must never hand back an output that silently produces nothing while claiming to be live.
     #[test]
     fn open_either_succeeds_or_reports_a_real_failure() {
-        let cfg = OutputConfig::main(0, "probe");
+        let cfg = OutputConfig::master(0, "probe");
         match Output::open(&cfg, crate::SAMPLE_RATE, BLOCK_SIZE) {
             Ok(out) => {
                 // A sink means "no device"; anything else means a started stream.

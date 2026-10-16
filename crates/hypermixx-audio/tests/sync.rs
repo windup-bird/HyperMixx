@@ -5,9 +5,9 @@
 
 mod common;
 
-use std::time::Duration;
-
-use common::{ack, answer, ask, constant_grid, decode_wav, load_both, session, state, states};
+use common::{
+    ack, ask, constant_grid, decode_wav, expect_error, load_both, session, sleep, state, states,
+};
 use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::deck::wrap_phase;
 use hypermixx_audio::{
@@ -35,20 +35,9 @@ fn seed(
     ack(rx);
 }
 
-fn expect_error(rx: &Receiver<CommandResponse>) -> String {
-    match answer(rx) {
-        CommandResponse::Error(message) => message,
-        other => panic!("expected an error, got {other:?}"),
-    }
-}
-
 /// leader phase − follower phase, folded into `[-0.5, 0.5]`.
 fn phase_gap(grid: &BeatGrid, leader: u64, follower: u64) -> f64 {
     wrap_phase(f64::from(grid.phase(leader)) - f64::from(grid.phase(follower)))
-}
-
-fn sleep(ms: u64) {
-    std::thread::sleep(Duration::from_millis(ms));
 }
 
 // ---------------------------------------------------------------- sync tempo
@@ -536,7 +525,7 @@ fn sync_refuses_a_deck_that_cannot_be_compared() {
             op: SyncOp::Tempo,
         },
     );
-    let message = expect_error(&rx);
+    let message = expect_error(&rx, "sync_refuses_a_deck_that_cannot_be_compared");
     assert!(message.contains("beat grid"), "unhelpful refusal: {message}");
 
     // A leader without a grid is its own failure: matching to a silent zero would be worse.
@@ -548,7 +537,7 @@ fn sync_refuses_a_deck_that_cannot_be_compared() {
             op: SyncOp::Tempo,
         },
     );
-    let message = expect_error(&rx);
+    let message = expect_error(&rx, "sync_refuses_a_deck_that_cannot_be_compared");
     assert!(
         message.contains("leader deck0") && message.contains("grid"),
         "unhelpful refusal: {message}"
@@ -591,7 +580,7 @@ fn two_decks_may_not_sync_to_each_other() {
             op: SyncOp::Tempo,
         },
     );
-    let message = expect_error(&rx);
+    let message = expect_error(&rx, "two_decks_may_not_sync_to_each_other");
     assert!(message.contains("follow each other"), "unhelpful refusal: {message}");
 
     // An explicitly named leader also refuses to sync to itself.
@@ -610,7 +599,7 @@ fn two_decks_may_not_sync_to_each_other() {
             op: SyncOp::Tempo,
         },
     );
-    let message = expect_error(&rx);
+    let message = expect_error(&rx, "two_decks_may_not_sync_to_each_other");
     assert!(message.contains("is the leader"), "unhelpful refusal: {message}");
 
     ask(&tx, Command::Quit);
@@ -634,7 +623,7 @@ fn a_one_shot_tempo_match_is_refused_once_the_pair_is_locked() {
     // Under a lock the one-shot match would be overwritten by the group recompute on the next
     // block — answering `Ok` while doing nothing is worse than refusing.
     ask(&tx, Command::Sync { deck_id: 1, op: SyncOp::Tempo });
-    let message = expect_error(&rx);
+    let message = expect_error(&rx, "a_one_shot_tempo_match_is_refused_once_the_pair_is_locked");
     assert!(message.contains("already locked"), "{message}");
 
     sleep(250);
@@ -691,7 +680,7 @@ fn a_linear_phase_sync_rejects_a_nonsense_duration() {
             },
         },
     );
-    let message = expect_error(&rx);
+    let message = expect_error(&rx, "a_linear_phase_sync_rejects_a_nonsense_duration");
     assert!(message.contains("positive duration"), "unhelpful refusal: {message}");
 
     // …and a good one applies: tempo matched, controller installed, still free of any lock.

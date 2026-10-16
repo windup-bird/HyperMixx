@@ -53,6 +53,7 @@ const VERBS: &[(&str, &str)] = &[
     ("loop", "loop family"),
     ("sync", "beat-sync against the other deck"),
     ("nudge", "temporary rate bend"),
+    ("fader", "channel/master/cue levels (flow|deck|gain|cuesend|cross|master|cue)"),
     ("fx", "effect chain commands"),
     ("stem", "stem separation and per-stem control"),
     ("state", "show decks"),

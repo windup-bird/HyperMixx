@@ -344,6 +344,7 @@ pub fn dispatch(
         "sync" => with_deck(target, "sync", |deck_id| {
             sync_command(&mut words, deck_id, command_tx)
         }),
+        "fader" => fader_command(&mut words, target, command_tx),
         "nudge" => with_deck(target, "nudge", |deck_id| {
             nudge_command(&mut words, deck_id, command_tx)
         }),
@@ -354,6 +355,55 @@ pub fn dispatch(
         "quit" | "exit" => Action::Quit,
         other => Action::Failed(format!("unknown command `{other}` — `help` lists them")),
     }
+}
+
+/// The `fader` family: one verb for every level, so the CLI and the MIDI map name the same stages.
+///
+/// `flow | deck | gain | cuesend` address the target deck; `cross | master | cue` are the shared
+/// controls and ignore the target. Positions are `-1.0 ..= 1.0` (0.0 = unity), except `cuesend`,
+/// which is a linear `0..=1` send level.
+fn fader_command<'a>(
+    words: &mut impl Iterator<Item = &'a str>,
+    target: Target,
+    command_tx: &Sender<Command>,
+) -> Action {
+    use hypermixx_core::FaderTarget;
+    let usage = "usage: [deck] fader <flow|deck|gain|cuesend> <position> \
+                 | fader <cross|master|cue> <position>";
+    let Some(stage) = words.next() else {
+        return Action::Message(usage.into());
+    };
+    let Some(raw) = words.next() else {
+        return Action::Failed(usage.into());
+    };
+    let value = match raw.parse::<f32>() {
+        Ok(value) if value.is_finite() => value,
+        _ => return Action::Failed(format!("the position must be a number, got `{raw}`")),
+    };
+    let target_fader = match stage {
+        "cross" | "crossfader" => FaderTarget::Crossfader,
+        "master" => FaderTarget::Master,
+        "cue" => FaderTarget::Cue,
+        // Everything else names a stage inside the target channel.
+        deck_stage => {
+            let deck_id = match deck_only(target) {
+                Ok(deck_id) => deck_id,
+                Err(_) => return Action::Failed(format!("`fader {deck_stage}` needs a deck")),
+            };
+            match deck_stage {
+                "flow" => FaderTarget::Flow(deck_id),
+                "deck" => FaderTarget::Deck(deck_id),
+                "gain" | "trim" => FaderTarget::Gain(deck_id),
+                "cuesend" | "cue_send" => FaderTarget::CueSend(deck_id),
+                other => {
+                    return Action::Failed(format!(
+                        "unknown fader `{other}` (flow|deck|gain|cuesend|cross|master|cue)"
+                    ))
+                }
+            }
+        }
+    };
+    send(command_tx, Command::SetFader { target: target_fader, value })
 }
 
 /// The `midi` family. Only port listing lands here: opening an input happens at launch
@@ -1183,4 +1233,54 @@ fn spawn_analyse(deck_id: u8, source: Shared, backend: Backend, dispatcher: &Dis
             }
         })
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::unbounded;
+    use hypermixx_core::FaderTarget;
+
+    /// The `fader` verb is a pure parse into `Command::SetFader`, so it can be tested without an
+    /// engine: every stage must resolve, and a bad line must fail before it reaches the engine.
+    #[test]
+    fn the_fader_verb_addresses_every_stage() {
+        let (tx, rx) = unbounded();
+        let parse = |line: &str, target: Target| {
+            let mut words = line.split_whitespace();
+            fader_command(&mut words, target, &tx)
+        };
+        let expect = |expected: FaderTarget, value: f32| match rx.recv().unwrap() {
+            Command::SetFader { target, value: got } => {
+                assert_eq!(target, expected);
+                assert_eq!(got, value);
+            }
+            other => panic!("expected SetFader, got {other:?}"),
+        };
+
+        assert!(matches!(parse("flow -0.5", Target::Deck(1)), Action::Continue));
+        expect(FaderTarget::Flow(1), -0.5);
+        assert!(matches!(parse("deck 0.25", Target::Deck(1)), Action::Continue));
+        expect(FaderTarget::Deck(1), 0.25);
+        assert!(matches!(parse("gain 1.0", Target::Deck(0)), Action::Continue));
+        expect(FaderTarget::Gain(0), 1.0);
+        assert!(matches!(parse("cuesend 0.9", Target::Deck(0)), Action::Continue));
+        expect(FaderTarget::CueSend(0), 0.9);
+        // The shared stages ignore the target: they are one physical control.
+        for (line, expected) in [
+            ("cross -1.0", FaderTarget::Crossfader),
+            ("master 0.1", FaderTarget::Master),
+            ("cue -0.2", FaderTarget::Cue),
+        ] {
+            assert!(matches!(parse(line, Target::Master), Action::Continue), "{line}");
+            expect(expected, line.split_whitespace().nth(1).unwrap().parse().unwrap());
+        }
+
+        // A stage that needs a channel refuses `master` rather than silently addressing deck 0.
+        assert!(matches!(parse("flow 0.1", Target::Master), Action::Failed(_)));
+        // A mistyped stage or value is the user's mistake, reported before the engine sees it.
+        assert!(matches!(parse("volume 0.1", Target::Deck(0)), Action::Failed(_)));
+        assert!(matches!(parse("gain loud", Target::Deck(0)), Action::Failed(_)));
+        assert!(matches!(parse("gain", Target::Deck(0)), Action::Failed(_)));
+    }
 }

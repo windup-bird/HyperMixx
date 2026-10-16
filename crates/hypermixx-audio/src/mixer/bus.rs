@@ -149,7 +149,12 @@ impl Bus {
     /// a short block leaves the tail of the bus exactly as it found it.
     pub fn write_interleaved(&mut self, interleaved: &[f32]) -> usize {
         let frames = self.frames().min(interleaved.len() / CHANNELS);
-        for (i, frame) in interleaved[..frames * CHANNELS].chunks_exact(CHANNELS).enumerate() {
+        for (i, frame) in interleaved[..frames * CHANNELS]
+            .as_chunks::<CHANNELS>()
+            .0
+            .iter()
+            .enumerate()
+        {
             self.l[i] = frame[0];
             self.r[i] = frame[1];
         }
@@ -160,7 +165,9 @@ impl Bus {
     pub fn read_interleaved(&self, output: &mut [f32]) -> usize {
         let frames = self.frames().min(output.len() / CHANNELS);
         for (i, out) in output[..frames * CHANNELS]
-            .chunks_exact_mut(CHANNELS)
+            .as_chunks_mut::<CHANNELS>()
+            .0
+            .iter_mut()
             .enumerate()
         {
             out[0] = self.l[i];

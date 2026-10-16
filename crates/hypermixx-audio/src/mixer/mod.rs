@@ -24,11 +24,13 @@ pub(crate) mod config;
 pub(crate) mod output;
 
 pub use bus::Bus;
-pub use channel::{Channel, CueTap, CrossfaderCurve, DeckSide, SlotChain};
+pub use channel::{
+    Channel, CrossfaderCurve, CrossfaderPlace, CueTap, DeckSide, SlotChain, DEFAULT_CUT_WIDTH,
+};
 pub use config::{
-    build_chain, build_slot, build_slot_disabled, build_slots, defaults_for, reference_toml,
-    simple_dj, silent_test_channel, ChainRef, ChannelConfig, MixerConfig, MixerError,
-    OutputConfig, OutputRole, SlotPlace,
+    build_chain, build_slot, build_slots, reference_toml, simple_dj, silent_test_channel,
+    ChannelConfig, CrossfaderConfig, CueMixConfig, MixerConfig, MixerError, OutputConfig,
+    OutputRole,
 };
 pub use output::{Output, OutputError, OutputId, Outputs};
 
@@ -56,10 +58,15 @@ pub struct MasterBus {
     peak: f32,
 }
 
-/// The monitor destination: a sum of cue sends, no FX, its own outputs.
+/// The monitor destination: a sum of cue sends, its own outputs, and a blend with the master mix.
 pub struct CueBus {
     pub sum: Bus,
+    /// What the cue outputs actually receive: [`CueBus::sum`] blended with the master's mix.
+    pub mix: Bus,
     pub fader: Fader,
+    pub blend: f32,
+    pub curve: CrossfaderCurve,
+    pub cut_width: f32,
     pub outputs: Vec<usize>,
     peak: f32,
 }
@@ -95,13 +102,14 @@ impl Mixer {
         let chains = cfg.build_chains()?;
         let mut channels = Vec::with_capacity(cfg.channels.len());
         for (channel_cfg, (flow_chains, deck_slots)) in
-            cfg.channels.iter().zip(chains.into_iter())
+            cfg.channels.iter().zip(chains)
         {
             // `build_chains` already produced one chain per stem, so the per-stem overrides in the
             // config are in effect from the first block — not only after a `SetStems`.
             channels.push(Channel::new(
                 Deck::empty(),
                 channel_cfg,
+                cfg.crossfader,
                 flow_chains,
                 FxChain::from_slots(deck_slots),
             ));
@@ -158,8 +166,8 @@ impl Mixer {
         for (index, output) in outputs.items_mut().enumerate() {
             output.id = index as OutputId;
         }
-        // Route by role, skipping the duplicates: whoever configures `Headphones` gets the cue
-        // bus, everything else the mix.
+        // Route by role, skipping the duplicates: a `Cue` output gets the cue bus, everything else
+        // the mix.
         let mut master_outputs = Vec::new();
         let mut cue_outputs = Vec::new();
         for (index, output_cfg) in cfg.outputs.iter().enumerate() {
@@ -167,23 +175,20 @@ impl Mixer {
                 continue;
             }
             match output_cfg.role {
-                OutputRole::Main => master_outputs.push(index),
-                OutputRole::Headphones => cue_outputs.push(index),
+                OutputRole::Master => master_outputs.push(index),
+                OutputRole::Cue => cue_outputs.push(index),
             }
         }
         let any_live = outputs.iter().any(|output| !output.is_sink());
         if master_outputs.is_empty() && any_live {
-            // A config that named only headphones (or whose mains all failed to open) still needs
-            // to be audible somewhere.
+            // A config that named only a cue (or whose masters all failed to open) still needs to be
+            // audible somewhere.
             master_outputs.extend(0..outputs.len());
             cue_outputs.clear();
         }
 
-        let limiter = cfg
-            .master_limiter
-            .then(|| build_slot("limiter"))
-            .transpose()?
-            .unwrap_or_else(|| build_slot_disabled("limiter").expect("limiter is a known kind"));
+        let limiter = build_slot("limiter")?;
+        limiter.set_enabled(cfg.master_limiter);
 
         Ok(Self {
             channels,
@@ -197,7 +202,11 @@ impl Mixer {
             },
             cue: CueBus {
                 sum: Bus::stereo(block_frames),
+                mix: Bus::stereo(block_frames),
                 fader: Fader::new(cfg.cue_fader, MASTER_TAU),
+                blend: cfg.cue.blend,
+                curve: cfg.cue.curve,
+                cut_width: cfg.cue.cut_width,
                 outputs: cue_outputs,
                 peak: 0.0,
             },
@@ -236,6 +245,7 @@ impl Mixer {
                 self.fader_channel(deck)?.set_stem_level(stem, value)
             }
             FaderTarget::Deck(deck_id) => self.fader_channel(deck_id)?.set_deck_fader(value),
+            FaderTarget::Gain(deck_id) => self.fader_channel(deck_id)?.set_gain(value),
             FaderTarget::CueSend(deck_id) => self.fader_channel(deck_id)?.set_cue_send(value),
             FaderTarget::Crossfader => {
                 // One physical fader: every channel is written the same position; the pan law is
@@ -270,10 +280,6 @@ impl Mixer {
 
     pub fn outputs(&self) -> &Outputs {
         &self.outputs
-    }
-
-    pub fn outputs_mut(&mut self) -> &mut Outputs {
-        &mut self.outputs
     }
 
     pub fn master(&self) -> &MasterBus {
@@ -349,6 +355,10 @@ impl Mixer {
 
         master.render(ctx);
         cue.render(ctx);
+        // The monitor is a blend of the cue sends and what the room hears. `blend = -1` (the
+        // default) leaves the cue untouched, which is the historical behaviour: headphones carry the
+        // cue and nothing else.
+        cue.blend_with(&master.sum);
 
         // Borrowed one field at a time: the route lists are read while the buses are still borrowed,
         // so no `clone()` of a `Vec` happens on this path.
@@ -361,7 +371,7 @@ impl Mixer {
         // A cue is private: it reaches only the outputs its route names, never the main mix.
         for index in &cue.outputs {
             if let Some(output) = outputs.get_mut(*index) {
-                output.write(&cue.sum);
+                output.write(&cue.mix);
             }
         }
     }
@@ -641,6 +651,19 @@ impl CueBus {
         self.peak = self.sum.peak();
     }
 
+    /// Fills [`CueBus::mix`] from the cue sum and the master's mix, using the configured blend and
+    /// curve. A gain of exactly zero skips the add outright, so "cue only" costs nothing.
+    fn blend_with(&mut self, master: &Bus) {
+        let t = (self.blend.clamp(-1.0, 1.0) + 1.0) * 0.5;
+        let (cue_gain, master_gain) = self.curve.gains(t, self.cut_width);
+        self.mix.ensure_frames(self.sum.frames());
+        self.mix.clear();
+        self.mix.add_scaled(&self.sum, cue_gain);
+        if master_gain > 0.0 {
+            self.mix.add_scaled(master, master_gain);
+        }
+    }
+
     pub fn set_fader(&self, position: f32) {
         self.fader.set(position.clamp(-1.0, 1.0));
     }
@@ -722,6 +745,13 @@ mod tests {
         // Deck fader is its own target, not an alias of flow.
         mixer.set_fader(FaderTarget::Deck(1), -0.25).unwrap();
         assert_eq!(mixer.channel(1).unwrap().levels().1, -0.25);
+
+        // The trim is its own target too, and clamps like the rest.
+        mixer.set_fader(FaderTarget::Gain(1), 1.0).unwrap();
+        assert_eq!(mixer.channel(1).unwrap().levels().4, 1.0, "the trim reaches +6 dB");
+        mixer.set_fader(FaderTarget::Gain(1), -9.0).unwrap();
+        assert_eq!(mixer.channel(1).unwrap().levels().4, -1.0);
+        mixer.set_fader(FaderTarget::Gain(1), 0.0).unwrap();
 
         // Cue send is a linear level: a negative value clamps to 0, not -1.
         mixer.set_fader(FaderTarget::CueSend(1), -3.0).unwrap();
@@ -1033,8 +1063,8 @@ mod tests {
     fn master_and_cue_routes_follow_the_configured_roles() {
         let cfg = MixerConfig {
             outputs: vec![
-                OutputConfig::main(0, "main"),
-                OutputConfig::headphones(1, "phones"),
+                OutputConfig::master(0, "main"),
+                OutputConfig::cue(1, "phones"),
             ],
             ..silent_test_channel()
         };
@@ -1058,6 +1088,51 @@ mod tests {
         mixer.channel_mut(0).unwrap().replace_deck(deck);
         tick(&mut mixer, 2);
         assert_eq!(mixer.outputs().writes(), 0);
+    }
+
+    /// The cue outputs carry a blend of the cue sends and the master mix; the default is cue only.
+    #[test]
+    fn the_cue_blend_decides_what_the_headphones_carry() {
+        let with_blend = |blend: f32| MixerConfig {
+            cue: CueMixConfig { blend, ..Default::default() },
+            ..simple_dj()
+        };
+        let playing = |cfg: MixerConfig| {
+            let mut mixer = headless(cfg);
+            let deck = Deck::new(tone(10));
+            deck.play();
+            mixer.channel_mut(0).unwrap().replace_deck(deck);
+            tick(&mut mixer, 30);
+            mixer
+        };
+
+        // The default: the cue sends reach the headphones and the master does not, so a mix you are
+        // not monitoring cannot leak into a preview.
+        let mixer = playing(with_blend(-1.0));
+        assert!(mixer.cue_peak() > 0.5, "the cue send must reach the cue bus");
+        assert!(mixer.master_peak() > 0.0, "the other deck is playing");
+        assert!(
+            (mixer.cue().mix.peak() - mixer.cue_peak()).abs() < 1e-6,
+            "blend -1 must be cue only, got {}",
+            mixer.cue().mix.peak()
+        );
+
+        // Master only: what the room hears is what you hear.
+        let mixer = playing(with_blend(1.0));
+        assert!(
+            (mixer.cue().mix.peak() - mixer.master().sum.peak()).abs() < 1e-6,
+            "blend +1 must be the master alone, got {} vs {}",
+            mixer.cue().mix.peak(),
+            mixer.master().sum.peak()
+        );
+
+        // Both, at the curve's centre: neither side disappears.
+        let mixer = playing(with_blend(0.0));
+        assert!(
+            mixer.cue().mix.peak() >= mixer.cue_peak() && mixer.cue().mix.peak() >= mixer.master().sum.peak(),
+            "blend 0 must carry both, got {}",
+            mixer.cue().mix.peak()
+        );
     }
 
     #[test]

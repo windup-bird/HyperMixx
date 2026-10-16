@@ -205,7 +205,7 @@ impl<'a> BindingOut<'a> {
     /// actions as an edge.
     fn on_control(&mut self, value: u8) {
         if self.spec.mode != RelMode::Abs {
-            let delta = relative_delta(self.spec.mode, value);
+            let delta = relative_delta(self.spec.mode, value, self.spec.reverse);
             let norm = (self.state.norm + delta as f32 * REL_SCALE).clamp(0.0, 1.0);
             self.state.norm = norm;
             // A relative encoder is endless: there is nothing to pick up.
@@ -473,8 +473,11 @@ fn command_value(spec: &BindingSpec, norm: f32) -> f32 {
 /// - `Rel1`: offset binary around 64 (`value - 64`, so 64 is no movement);
 /// - `Rel2`: two's-complement around 64 (1..63 up, 65..127 down);
 /// - `Rel3`: direction only, magnitude ignored (1..63 up, 65..127 down).
-fn relative_delta(mode: RelMode, value: u8) -> i16 {
-    match mode {
+///
+/// `reverse` flips the sign: a controller that numbers its detents the other way round is one
+/// boolean away from working, and the guide cannot tell which way a wheel turns.
+fn relative_delta(mode: RelMode, value: u8, reverse: bool) -> i16 {
+    let delta = match mode {
         RelMode::Abs => 0,
         RelMode::Rel1 => i16::from(value) - 64,
         RelMode::Rel2 => {
@@ -489,6 +492,11 @@ fn relative_delta(mode: RelMode, value: u8) -> i16 {
             std::cmp::Ordering::Greater => -1,
             std::cmp::Ordering::Equal => 0,
         },
+    };
+    if reverse {
+        -delta
+    } else {
+        delta
     }
 }
 
@@ -822,14 +830,24 @@ action = "tempofader"
 
     #[test]
     fn relative_modes_decode_the_documented_wraparounds() {
-        assert_eq!(relative_delta(RelMode::Rel1, 64), 0);
-        assert_eq!(relative_delta(RelMode::Rel1, 65), 1);
-        assert_eq!(relative_delta(RelMode::Rel1, 63), -1);
-        assert_eq!(relative_delta(RelMode::Rel2, 1), 1);
-        assert_eq!(relative_delta(RelMode::Rel2, 127), -1);
-        assert_eq!(relative_delta(RelMode::Rel3, 1), 1);
-        assert_eq!(relative_delta(RelMode::Rel3, 127), -1);
-        assert_eq!(relative_delta(RelMode::Rel3, 64), 0);
+        assert_eq!(relative_delta(RelMode::Rel1, 64, false), 0);
+        assert_eq!(relative_delta(RelMode::Rel1, 65, false), 1);
+        assert_eq!(relative_delta(RelMode::Rel1, 63, false), -1);
+        assert_eq!(relative_delta(RelMode::Rel2, 1, false), 1);
+        assert_eq!(relative_delta(RelMode::Rel2, 127, false), -1);
+        assert_eq!(relative_delta(RelMode::Rel3, 1, false), 1);
+        assert_eq!(relative_delta(RelMode::Rel3, 127, false), -1);
+        assert_eq!(relative_delta(RelMode::Rel3, 64, false), 0);
+        // `reverse` flips every mode's sign and nothing else, so a differently-numbered controller
+        // is one boolean away from working.
+        for (mode, value, plain) in [
+            (RelMode::Rel1, 65, 1),
+            (RelMode::Rel2, 1, 1),
+            (RelMode::Rel3, 127, -1),
+        ] {
+            assert_eq!(relative_delta(mode, value, true), -plain, "{mode:?} {value}");
+        }
+        assert_eq!(relative_delta(RelMode::Rel1, 64, true), 0, "zero stays zero");
     }
 
     /// A wheel is a *direction*, not a position: one tick clockwise bends forward, one tick the

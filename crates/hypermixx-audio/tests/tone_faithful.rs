@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use hypermixx_audio::{Deck, DECK_MIX_GAIN};
+use hypermixx_audio::Deck;
 use hypermixx_core::{KeylockMode, Source, CHANNELS, SAMPLE_RATE};
 use hypermixx_media::{DecodedAudio, PcmPool};
 
@@ -79,7 +79,7 @@ fn deck_is_faithful_at_ratio_one() {
         .fold(0.0f32, |m, s| m.max(s.abs()));
     assert!(
         (peak - 1.0).abs() < 0.15,
-        "输出峰值 {peak:.2} 偏离 1.0 — 有意外衰减/增益(DECK_MIX_GAIN={DECK_MIX_GAIN} 属 pipeline 层)"
+        "输出峰值 {peak:.2} 偏离 1.0 — 有意外衰减/增益"
     );
 }
 

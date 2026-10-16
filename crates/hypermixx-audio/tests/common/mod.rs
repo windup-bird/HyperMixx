@@ -214,3 +214,49 @@ pub fn seed_grids(
         ack(rx);
     }
 }
+
+// ---------------------------------------------------------------- waiting
+
+/// Sleeps for `ms` milliseconds. Integration tests pace themselves on the wall clock because the
+/// producer thread does too — there is no device to drive the ring here.
+pub fn sleep(ms: u64) {
+    std::thread::sleep(Duration::from_millis(ms));
+}
+
+/// Sleeps for `frames` worth of real time at the engine rate.
+pub fn sleep_frames(frames: f64) {
+    let millis = frames * 1000.0 / f64::from(hypermixx_audio::SAMPLE_RATE);
+    sleep(millis.max(0.0) as u64);
+}
+
+/// Polls a deck's state until `pred` holds (or ~3 s of warm-up slack, then panic with `label`).
+///
+/// A flow switch and a stem install both land on the producer thread a few blocks after the command
+/// is acknowledged, so the tests that depend on them must poll the protocol's own observability
+/// (`DeckState`) rather than assume a timing.
+pub fn wait_for(
+    tx: &Sender<Command>,
+    rx: &Receiver<CommandResponse>,
+    deck_id: DeckId,
+    label: &str,
+    pred: impl Fn(&DeckState) -> bool,
+) -> DeckState {
+    for _ in 0..600 {
+        let snapshot = state(tx, rx, deck_id);
+        if pred(&snapshot) {
+            return snapshot;
+        }
+        sleep(5);
+    }
+    panic!("timed out waiting for {label}");
+}
+
+/// The message of an engine refusal. A command that should be refused must come back as an
+/// `Error`, not a silent ack; `label` names the expectation in the panic.
+pub fn expect_error(rx: &Receiver<CommandResponse>, label: &str) -> String {
+    match answer(rx) {
+        CommandResponse::Error(message) => message,
+        CommandResponse::Ok => panic!("{label}: the engine accepted a command it should refuse"),
+        other => panic!("{label}: expected an error, got {other:?}"),
+    }
+}

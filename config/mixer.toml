@@ -1,0 +1,61 @@
+# Hypermixx mixer topology. `--print-config` prints this; edit and pass back via --config (or edit
+# this file in place — it is what a run without `--config` reads).
+#
+# Signal path, per channel:
+#
+#   per stream:  source fader (stem mute/solo gate) → flow_fx → flow_fader ─┐
+#                                                                         Σ → deck_fx → deck_fader → gain
+#   the shared crossfader's gain sits at one of those three faders ([crossfader] place).
+#
+# Every fader is attenuation only: the top of its travel is 0 dB. Headroom is `gain` (up to +6 dB),
+# which is a setting rather than a performance control.
+
+# One [[channel]] per deck. Omitted keys take the defaults shown in comments.
+[[channel]]
+side = "left"                 # left | right | center
+# flow_fader = 0.0            # per-stream level; top of travel = 0 dB
+# deck_fader = 0.0            # deck level; top of travel = 0 dB
+# gain = 0.0                  # channel trim: 0 = 0 dB, +1 = +6 dB, -1 = silence
+cue_send = 1.0                # linear 0..1 into the cue bus
+cue_tap = "post_deck_fader"   # post_source_fader | post_flow_fader | post_deck_fader
+deck_fx = ["eq", "filter"]    # per-deck inserts; names from `fx help`
+# flow_fx = []                # per-stream inserts: ONE CHAIN PER STREAM (4 stems = 4 chains)
+# [channel.stem_fx]           # per-stem overrides of flow_fx, for the stems that differ
+# vocals = ["filter"]         # (stem names: drums | bass | other | vocals)
+
+[[channel]]
+side = "right"
+cue_send = 1.0
+cue_tap = "post_deck_fader"
+deck_fx = ["eq", "filter"]
+
+# The shared crossfader: one physical control, applied on each channel by its `side`.
+[crossfader]
+place = "deck"                # source | flow | deck — where in the channel path its gain acts
+curve = "classic"             # classic | constant_power | cut
+# start = 0.0                 # starting position, -1 hard left .. 1 hard right
+# cut_width = 0.05            # `cut`: fraction of the travel the drop takes, at each end
+
+[master]
+# fx = []                     # inserts on the summed mix
+limiter = true                # the safety stage; strongly recommended
+# fader = 0.0                 # master trim (0 = unity)
+
+[cue]
+# fader = 0.0                 # cue bus trim (0 = unity)
+# blend = -1.0                # -1 = cue only (default), 0 = both, +1 = master only
+# curve = "classic"           # classic | constant_power | cut
+# cut_width = 0.05
+
+# One [[output]] per destination. `name` and `role` are required; the rest has defaults.
+# NOTE: every output opens on the system default device, and the mixer keeps only one stream
+# per physical device — a second output on the same device is dropped (see mixer docs).
+[[output]]
+name = "main"
+role = "master"               # master | cue
+# channels = [0, 1]           # device channel pair
+# gain = 1.0                  # per-destination trim
+
+[[output]]
+name = "headphones"
+role = "cue"

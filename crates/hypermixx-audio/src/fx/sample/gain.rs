@@ -22,12 +22,6 @@ impl Gain {
         }
     }
 
-    /// A gain stage that follows a fader position of `-1.0 ..= 1.0` (centred = unity), the law the
-    /// channel faders use.
-    pub fn from_bipolar(position: f32) -> Self {
-        Self::new(crate::fx::dsp::bipolar_amp(position))
-    }
-
     /// The value the audio thread is currently applying.
     pub fn current(&self) -> f32 {
         self.gain.get()
@@ -144,7 +138,7 @@ impl Fader {
         let position = self.position.next_block(ctx.block_frames, ctx.sample_rate);
         self.moving
             .store(!self.position.is_settled(), Ordering::Relaxed);
-        crate::fx::dsp::bipolar_amp(position)
+        crate::fx::dsp::fader_amp(position)
     }
 
     pub fn is_moving(&self) -> bool {
@@ -241,19 +235,6 @@ mod tests {
     }
 
     #[test]
-    fn bipolar_law_drives_a_fader_from_position() {
-        let mut kill = Gain::from_bipolar(-1.0);
-        let mut b = bus_with(1.0, 4);
-        kill.process(&mut b, &ctx(4));
-        assert!(b.peak() < 1e-3, "full CC must be silence, got {}", b.peak());
-
-        let mut full = Gain::from_bipolar(1.0);
-        let mut b = bus_with(1.0, 4);
-        full.process(&mut b, &ctx(4));
-        assert!(b.peak() > 4.0, "full CW must boost, got {}", b.peak());
-    }
-
-    #[test]
     fn fader_reports_its_own_movement() {
         let fader = Fader::new(0.0, 0.02);
         assert!(!fader.is_moving());
@@ -265,7 +246,7 @@ mod tests {
             fader.next_amp(&ctx);
         }
         assert!(!fader.is_moving());
-        assert!(fader.next_amp(&ctx) > 5.0, "top of travel boosts");
+        assert_eq!(fader.next_amp(&ctx), 1.0, "the top of the travel is 0 dB");
         fader.snap(-1.0);
         assert!(fader.is_closed());
         assert!(fader.next_amp(&ctx) < 1e-3);

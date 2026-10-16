@@ -4,7 +4,7 @@
 //! said. These functions return data rather than printing: the REPL writes it to stdout/stderr and
 //! the TUI pushes it into its scrollback.
 
-use hypermixx_audio::fx::bipolar_amp;
+use hypermixx_audio::fx::fader_amp;
 use hypermixx_core::{CommandResponse, DeckState, Stem, StemStatus, SAMPLE_RATE};
 
 /// How a line should be presented. `Error` lines already carry the `error: ` prefix.
@@ -88,7 +88,7 @@ pub fn format_response(response: &CommandResponse) -> Vec<LogLine> {
 /// `None` without a grid. Deliberately excludes `playing_rate`'s nudge and phase correction —
 /// those are transient, not the tempo.
 pub fn current_bpm(state: &DeckState) -> Option<f32> {
-    (state.bpm_at_frame > 0.0).then(|| state.bpm_at_frame * state.tempo)
+    (state.bpm_at_frame > 0.0).then_some(state.bpm_at_frame * state.tempo)
 }
 
 /// The deck's BPM readout: the local grid BPM, with the tempo-scaled "now" BPM appended once it
@@ -213,9 +213,9 @@ pub fn stem_report(state: &DeckState) -> Vec<String> {
         } else {
             "audible"
         };
-        // `bipolar_amp` is the law the fader applies, so the dB figure is what is heard, not a
+        // `fader_amp` is the law the fader applies, so the dB figure is what is heard, not a
         // re-derivation: -1.0 is silence rather than -80 dB, and that is worth showing as such.
-        let gain = bipolar_amp(effective);
+        let gain = fader_amp(effective);
         let gain_text = if gain <= 0.0 {
             "silent".to_owned()
         } else {
@@ -287,6 +287,7 @@ pub fn help_text(decks: usize) -> String {
   [deck] sync phaselock <mode> follower tracks the leader exactly (its own fader is ignored)
   [deck] sync set-leader       name *this* deck as the one the others follow
   [deck] sync unlock           drop the lock and the correction, keeping the tempo
+  [deck] fader <stage> <pos>   levels: flow|deck|gain|cuesend on a deck, cross|master|cue shared
   [deck] nudge <delta> <sec>   temporary rate bend to hand-align phase (0.04 = 4% fast)
   [deck] nudge off             release the bend (it ramps back, no click)
   [deck] keylock on|off|wide   keylock profile (default: on)

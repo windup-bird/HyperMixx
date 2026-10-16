@@ -322,6 +322,10 @@ pub enum FaderTarget {
     Stem { deck: DeckId, stem: Stem },
     /// One channel's deck fader (unity until a track exposes stems).
     Deck(DeckId),
+    /// One channel's **trim**: `0.0` is 0 dB, `1.0` is +6 dB, `-1.0` is silence. The only level a
+    /// channel has that can boost, and therefore the only one that is a setting rather than a
+    /// performance control.
+    Gain(DeckId),
     /// One channel's cue send, linear `0.0..=1.0` (a send level, not a bipolar fader).
     CueSend(DeckId),
     /// The single crossfader, broadcast to every channel (`-1.0` hard left .. `1.0` hard right).
@@ -341,6 +345,7 @@ impl FaderTarget {
             FaderTarget::Flow(..)
             | FaderTarget::Stem { .. }
             | FaderTarget::Deck(..)
+            | FaderTarget::Gain(..)
             | FaderTarget::Crossfader
             | FaderTarget::Master
             | FaderTarget::Cue => true,

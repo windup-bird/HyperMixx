@@ -49,9 +49,6 @@ pub const OUTPUT_RING_CAPACITY: usize = 4096;
 pub const PREFILL_FRAMES: usize = 2048;
 /// Number of decks the default topology owns: 0 and 1.
 pub const DECK_COUNT: usize = 2;
-/// Per-deck gain when summing two decks by hand. The mixer owns level now (a master fader and a
-/// limiter replace a fixed constant), so this survives only for the pre-mixer integration tests.
-pub const DECK_MIX_GAIN: f32 = 0.5;
 
 /// Samples (f32) per processing block.
 pub const BLOCK_SAMPLES: usize = BLOCK_SIZE * CHANNELS;

@@ -337,11 +337,10 @@ fn drain_queries(mixer: &mut Mixer, rx: &Receiver<(Query, Sender<QueryResponse>)
 
 /// Paces one iteration so the loop's period is `pace` rather than `pace` + a block's work.
 fn sleep_until_next(started: Instant, pace: Duration) {
-    match pace.checked_sub(started.elapsed()) {
-        Some(remaining) => std::thread::sleep(remaining),
-        // Fell behind: skip the sleep, not the block. If that keeps happening the rings fill and
-        // `Output::overruns` starts counting dropped samples; better than backing the pipeline up.
-        None => {}
+    // Fell behind: skip the sleep, not the block. If that keeps happening the rings fill and
+    // `Output::overruns` starts counting dropped samples; better than backing the pipeline up.
+    if let Some(remaining) = pace.checked_sub(started.elapsed()) {
+        std::thread::sleep(remaining);
     }
 }
 

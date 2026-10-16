@@ -72,11 +72,12 @@ pub enum EventKind {
 pub enum RelMode {
     #[default]
     Abs,
-    /// 1..63 = +, 65..127 = − (64 is "no movement").
+    /// Offset binary around 64: `value - 64`, so 64 is "no movement", 65..127 = +, 1..63 = −.
     Rel1,
-    /// 65..127 = +, 1..63 = −.
+    /// Two's complement around 64: 1..63 = +, 65..127 = − (127 = −1).
     Rel2,
-    /// Two's-complement around 64.
+    /// Direction only (1..63 = +, 65..127 = −); the magnitude is ignored, so a fast turn is worth
+    /// the same as a slow one. For a device that reports only the sign of each step.
     Rel3,
 }
 
@@ -99,6 +100,10 @@ pub struct RawBinding {
     pub kind: EventKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<RelMode>,
+    /// Flip the sign of a relative encoder's delta. Some controllers number their detents the other
+    /// way round; the guide cannot tell, so it is a per-binding choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,6 +161,8 @@ impl MapFile {
 pub struct BindingSpec {
     pub kind: EventKind,
     pub mode: RelMode,
+    /// Sign flip for relative encoders ([`RawBinding::reverse`]).
+    pub reverse: bool,
     /// `None` matches any channel.
     pub channel: Option<u8>,
     /// CC controller / note key. Ignored for bend.
@@ -359,6 +366,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec { name: "stem.vocals.mute", deck: true, momentary: false },
     ActionSpec { name: "stem.vocals.solo", deck: true, momentary: false },
     ActionSpec { name: "fader.deck", deck: true, momentary: false },
+    ActionSpec { name: "fader.gain", deck: true, momentary: false },
     ActionSpec { name: "fader.cuesend", deck: true, momentary: false },
     ActionSpec { name: "fader.cross", deck: false, momentary: false },
     ActionSpec { name: "fader.master", deck: false, momentary: false },
@@ -476,6 +484,10 @@ fn compile(raw: &RawBinding) -> Result<BindingSpec, String> {
         // Bend is always absolute.
         EventKind::Note | EventKind::Bend => RelMode::Abs,
     };
+    if raw.reverse == Some(true) && mode == RelMode::Abs {
+        return Err("`reverse` is only meaningful for a relative `mode` (rel1 | rel2 | rel3)"
+            .to_owned());
+    }
     let bipolar = action.is_bipolar();
     // FX params default to the effect's own 0..1 domain; faders use their target's domain.
     let (def_min, def_max) = if bipolar { (-1.0, 1.0) } else { (0.0, 1.0) };
@@ -487,6 +499,7 @@ fn compile(raw: &RawBinding) -> Result<BindingSpec, String> {
     let spec = BindingSpec {
         kind: raw.kind,
         mode,
+        reverse: raw.reverse.unwrap_or(false),
         channel: raw.channel,
         id: raw.id.unwrap_or(0),
         deck: raw.deck,
@@ -584,6 +597,7 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
             }
         }
         "fader.deck" => Ok(Action::Fader(FaderTarget::Deck(deck(name)?))),
+        "fader.gain" => Ok(Action::Fader(FaderTarget::Gain(deck(name)?))),
         "fader.cuesend" => Ok(Action::Fader(FaderTarget::CueSend(deck(name)?))),
         "fader.cross" => Ok(Action::Fader(FaderTarget::Crossfader)),
         "fader.master" => Ok(Action::Fader(FaderTarget::Master)),
@@ -792,6 +806,16 @@ param = "value"
         assert_eq!((map.binds[3].min, map.binds[3].max), (0.0, 1.0));
     }
 
+    /// The channel trim is reachable by name, like every other level.
+    #[test]
+    fn the_channel_trim_is_addressable_by_name() {
+        let map = Map::from_toml_str(
+            "[[bind]]\ntype = \"cc\"\nmode = \"abs\"\nid = 7\ndeck = 1\naction = \"fader.gain\"\n",
+        )
+        .unwrap();
+        assert_eq!(map.binds[0].action, Action::Fader(FaderTarget::Gain(1)));
+    }
+
     #[test]
     fn unknown_keys_and_actions_are_errors() {
         let bad_key = r#"
@@ -812,6 +836,48 @@ action = "fader.volume"
 "#;
         let err = Map::from_toml_str(bad_action).unwrap_err();
         assert!(err.message().contains("unknown action"), "{}", err.message());
+    }
+
+    /// `reverse` flips a relative encoder and is refused where it would mean nothing.
+    #[test]
+    fn reverse_is_a_relative_only_switch() {
+        let map = Map::from_toml_str(
+            r#"
+[[bind]]
+type = "cc"
+mode = "rel2"
+reverse = true
+id = 6
+deck = 0
+action = "vinyl"
+
+[[bind]]
+type = "cc"
+mode = "rel1"
+id = 7
+deck = 0
+action = "vinyl"
+"#,
+        )
+        .unwrap();
+        assert!(map.binds[0].reverse, "the flag reaches the binding");
+        assert!(!map.binds[1].reverse, "and defaults to off");
+
+        // On an absolute control it can only be a mistake, so it is an error rather than a
+        // silently ignored key.
+        let err = Map::from_toml_str(
+            r#"
+[[bind]]
+type = "cc"
+mode = "abs"
+reverse = true
+id = 6
+deck = 0
+action = "fader.flow"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.message().contains("reverse"), "{}", err.message());
     }
 
     /// The map the CLI loads by default must parse.

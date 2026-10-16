@@ -48,7 +48,7 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        None => simple_dj(),
+        None => default_config(),
     };
     // `start` builds the mixer on the producer thread (cpal streams are !Send) and reports a bad
     // config back synchronously, so a failure here is a clean exit, not a half-alive engine.
@@ -215,4 +215,21 @@ impl CliArgs {
 fn read_config(path: &str) -> Result<MixerConfig, String> {
     let text = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
     MixerConfig::from_toml_str(&text).map_err(|err| err.message())
+}
+
+/// The topology to run with when `--config` is absent: `config/mixer.toml` when the working
+/// directory has one (the shipped default, and the file a user edits), otherwise the built-in
+/// reference. The shipped file parses to exactly [`simple_dj`], so the two paths describe one mixer.
+fn default_config() -> MixerConfig {
+    const PATH: &str = "config/mixer.toml";
+    match std::fs::read_to_string(PATH) {
+        Ok(text) => match MixerConfig::from_toml_str(&text) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                eprintln!("warning: {PATH}: {}; using the built-in topology", err.message());
+                simple_dj()
+            }
+        },
+        Err(_) => simple_dj(),
+    }
 }

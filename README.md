@@ -54,6 +54,9 @@ deck0> play                        # 切换播放/暂停（toggle）
 deck0> cue                         # smart：播放中回 cue 并暂停；暂停时把当前帧记为 cue 点
 deck0> cue set                     # 显式记 cue 点
 deck0> tempo 1.04                  # 设 tempo（1.0 = 原速）
+deck0> fader flow -0.2             # 通道/逐流电平（只衰减，顶端 0 dB）
+deck0> fader gain 1.0              # 通道 trim：0 = 0 dB，1 = +6 dB
+deck0> fader cross -1.0            # crossfader（共用；位置与曲线见 [crossfader]）
 deck0> tempofader 0.5              # 推子位置（tempo = 1 + pos × temporange）
 deck0> temporange 0.16             # 推子满量程 ±16%（缺省 0.1）
 deck0> keylock wide                # 变调引擎：on（默认）| off | wide
@@ -88,7 +91,7 @@ deck0> quit
 ```bash
 cargo run -p hypermixx-cli -- --backend auto        # 分析后端 auto | stratum | timestretch
 cargo run -p hypermixx-cli -- --config topo.toml    # 自定义拓扑
-cargo run -p hypermixx-cli -- --print-config        # 打印参考 TOML
+cargo run -p hypermixx-cli -- --print-config        # 打印参考 TOML（= config/mixer.toml）
 cargo run -p hypermixx-cli -- --midi 0              # 打开 0 号 MIDI 输入，用默认 midi-map.toml
 cargo run -p hypermixx-cli -- --midi 0 --midi-map my.toml   # 指定映射文件
 cargo run -p hypermixx-cli -- --midi-guide          # learn 模式编辑映射（不启动引擎，端口/文件在 TUI 里选）

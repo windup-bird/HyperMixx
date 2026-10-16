@@ -314,20 +314,45 @@ impl BiquadChain {
     }
 }
 
-/// Maps a bipolar `-1.0 ..= 1.0` control onto an amplitude multiplier with a musical law:
-/// counterclockwise reaches (near) silence, clockwise tops out at [`MAX_BOOST_DB`].
+/// The **fader law**: a bipolar `-1.0 ..= 1.0` control mapped onto an attenuation.
 ///
-/// The floor is −80 dB rather than true zero because the shelf formulas degenerate at `A = 0`;
-/// eight decimal places below a full-scale signal is inaudible either way.
-pub fn bipolar_amp(value: f32) -> f32 {
-    const MAX_BOOST_DB: f32 = 16.0;
-    const KILL_DB: f32 = -80.0;
+/// A fader only ever attenuates — the top of the travel is 0 dB (unity), never a boost. Headroom is
+/// a *trim* ([`trim_amp`]) or a gain insert, deliberately kept off the controls a performance rides:
+/// a fader that can boost is a fader that can clip the mix by accident.
+///
+/// Counterclockwise is a squared ramp, so half-way down is already −12 dB and the bottom is exact
+/// silence (a "−80 dB" floor leaks audibly on a hot recording). Clockwise is flat: unity from centre
+/// to the top.
+pub fn fader_amp(value: f32) -> f32 {
     if !value.is_finite() {
         return 1.0;
     }
     let v = value.clamp(-1.0, 1.0);
+    attenuation(v)
+}
+
+/// The **trim law**: same bottom half as [`fader_amp`], but clockwise climbs to
+/// [`TRIM_MAX_DB`]. Used by the channel `gain` stage, which is a static setting rather than a
+/// performance control.
+pub fn trim_amp(value: f32) -> f32 {
+    const TRIM_MAX_DB: f32 = 6.0;
+    if !value.is_finite() {
+        return 1.0;
+    }
+    let v = value.clamp(-1.0, 1.0);
+    if v > 0.0 {
+        10f32.powf(v * TRIM_MAX_DB / 20.0)
+    } else {
+        attenuation(v)
+    }
+}
+
+/// The shared bottom half of both laws: unity at `v >= 0`, a squared ramp below, exact zero at −1.
+#[inline]
+fn attenuation(v: f32) -> f32 {
+    const KILL_DB: f32 = -80.0;
     if v >= 0.0 {
-        10f32.powf(v * MAX_BOOST_DB / 20.0)
+        1.0
     } else if v <= -1.0 {
         // The bottom of the travel is silence, exactly. A fader that bottoms out at −80 dB instead
         // of 0 leaves a closed channel audibly leaking on a hot recording (−80 dB of a peak of 255
@@ -537,21 +562,41 @@ mod tests {
     }
 
     #[test]
-    fn bipolar_law_spans_kill_to_boost() {
-        assert!((bipolar_amp(0.0) - 1.0).abs() < 1e-6, "centred is unity");
-        assert!(bipolar_amp(1.0) > 5.0, "full clockwise boosts");
-        assert_eq!(bipolar_amp(-1.0), 0.0, "full counterclockwise must be exactly silent");
-        assert!(bipolar_amp(-0.99) > 0.0, "the kill must be a point, not a region");
-        assert!(bipolar_amp(-0.5) < 0.3 && bipolar_amp(-0.5) > 0.1, "halfway");
+    fn the_fader_law_is_attenuation_only() {
+        assert!((fader_amp(0.0) - 1.0).abs() < 1e-6, "centred is unity");
+        assert_eq!(fader_amp(1.0), 1.0, "the top of the travel is 0 dB, not a boost");
+        assert_eq!(fader_amp(0.5), 1.0, "the whole upper half is flat");
+        assert_eq!(fader_amp(-1.0), 0.0, "full counterclockwise must be exactly silent");
+        assert!(fader_amp(-0.99) > 0.0, "the kill must be a point, not a region");
+        assert!(fader_amp(-0.5) < 0.3 && fader_amp(-0.5) > 0.1, "halfway");
         // Monotonic across the whole travel, and NaN-proof.
         let mut prev = f32::MIN;
         for i in -100..=100 {
             let v = i as f32 / 100.0;
-            let amp = bipolar_amp(v);
+            let amp = fader_amp(v);
             assert!(amp >= prev, "not monotonic at {v}");
+            assert!(amp <= 1.0 + 1e-6, "a fader boosted at {v}: {amp}");
             prev = amp;
         }
-        assert!((bipolar_amp(f32::NAN) - 1.0).abs() < 1e-6);
-        assert!(bipolar_amp(-99.0) < 1e-3, "clamped at the kill floor");
+        assert!((fader_amp(f32::NAN) - 1.0).abs() < 1e-6);
+        assert!(fader_amp(-99.0) < 1e-3, "clamped at the kill floor");
+    }
+
+    #[test]
+    fn the_trim_law_tops_out_six_db_above_unity() {
+        assert!((trim_amp(0.0) - 1.0).abs() < 1e-6, "centred is unity");
+        let top = trim_amp(1.0);
+        assert!(
+            (top - 10f32.powf(6.0 / 20.0)).abs() < 1e-5,
+            "the trim must top out at +6 dB, got {top}"
+        );
+        assert_eq!(trim_amp(-1.0), 0.0, "and share the fader's kill");
+        assert!((trim_amp(-0.5) - fader_amp(-0.5)).abs() < 1e-6, "same bottom half");
+        // Never more than +6 dB, whatever comes in.
+        for i in -100..=100 {
+            let v = i as f32 / 100.0;
+            assert!(trim_amp(v) <= top + 1e-6, "trim exceeded +6 dB at {v}");
+        }
+        assert_eq!(trim_amp(f32::NAN), 1.0);
     }
 }

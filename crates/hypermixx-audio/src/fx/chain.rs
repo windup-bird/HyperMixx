@@ -372,9 +372,8 @@ mod tests {
         slot.set_enabled(false); // a UI toggle while held
         assert!(slot.is_enabled(), "a held pad stays audible however the toggle moves");
         slot.release_pad();
-        assert_eq!(
-            slot.is_enabled(),
-            false,
+        assert!(
+            !slot.is_enabled(),
             "release must restore the state the toggle last asked for"
         );
     }

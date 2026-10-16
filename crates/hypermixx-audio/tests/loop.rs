@@ -15,44 +15,19 @@ mod common;
 
 use std::time::Duration;
 
-use common::{ack, answer, ask, decode_wav, load, load_both, seed_grids, session, state, states};
-use crossbeam_channel::{Receiver, Sender};
-use hypermixx_audio::{Command, CommandResponse, SAMPLE_RATE};
-use hypermixx_core::{DeckState, LoopEditOp, LoopOp, LoopQuantum};
+use common::{
+    ack, ask, decode_wav, expect_error, load, load_both, seed_grids, session, state, states, wait_for,
+};
+use crossbeam_channel::Sender;
+use hypermixx_audio::{Command, SAMPLE_RATE};
+use hypermixx_core::{LoopEditOp, LoopOp, LoopQuantum};
 
 const BPM: f32 = 122.0;
 /// One beat at the engine rate, as the grid lays it out (float — per-beat rounding stays honest).
 const BEAT: f64 = SAMPLE_RATE as f64 * 60.0 / BPM as f64;
 
-/// Polls a deck's state until `label` holds, or panics after ~3 s of warm-up slack.
-fn wait_for(
-    tx: &Sender<Command>,
-    rx: &Receiver<CommandResponse>,
-    deck_id: u8,
-    label: &str,
-    pred: impl Fn(&DeckState) -> bool,
-) -> DeckState {
-    for _ in 0..600 {
-        let snapshot = state(tx, rx, deck_id);
-        if pred(&snapshot) {
-            return snapshot;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    panic!("timed out waiting for {label}");
-}
-
 fn ask_loop(tx: &Sender<Command>, deck_id: u8, op: LoopOp) {
     ask(tx, Command::Loop { deck_id, op });
-}
-
-/// A refused loop command must come back as an engine `Error`, not a silent ack.
-fn expect_error(rx: &Receiver<CommandResponse>, label: &str) {
-    match answer(rx) {
-        CommandResponse::Error(_) => {}
-        CommandResponse::Ok => panic!("{label}: the engine accepted a command it should refuse"),
-        other => panic!("{label}: expected an error, got {other:?}"),
-    }
 }
 
 #[test]

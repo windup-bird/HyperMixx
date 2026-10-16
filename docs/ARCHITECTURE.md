@@ -200,55 +200,64 @@ mixer 只负责把 deck 变成采样;谁跟谁、共享 BPM 是什么,是**关�
 ```
 (逐 stream 循环:一个 deck 有 1 条,装了 stems 就有 4 条)
     deck.render_stream(i)
-    → flow_fx[i]    逐流插入(换流即重置滤波记忆;**每 stream 一条,状态独立**)
-    → [cue tap]     PostFlowFx    = Σ 各路 flow_fx 之后
-    → flow_fader[i] 逐流电平(mute = -1 = bipolar_amp 的精确静音)
+    → source_fader[i] 逐流**门**:stem 的 mute/solo 决策,恰好 1.0 或 0.0(GATE_TAU 平滑)
+    → [cue tap]       PostSourceFader = 门之后、插入之前(听得到"裸声")
+    → flow_fx[i]      逐流插入(换流即重置滤波记忆;**每 stream 一条,状态独立**)
+    → flow_fader[i]   逐流电平(只衰减,行程顶端 0 dB)
     → Σ 到 channel bus
-  → [cue tap]      PostFlowFader  = Σ 各路 flow_fader 之后
-  → deck_fx        逐 deck 音色(跨跳转持久,整 deck 共用)
-  → [cue tap]      PostDeckFx
-  → deck_fader
-  → [cue tap]      PostDeckFader
-  → crossfader     按侧别的 pan law(Left/Right/Center × EqualPower/Linear)
+  → [cue tap]         PostFlowFader  = Σ 各路 flow_fader 之后
+  → deck_fx           逐 deck 音色(跨跳转持久,整 deck 共用)
+  → deck_fader        逐 deck 电平(只衰减)
+  → [cue tap]         PostDeckFader
+  → gain              channel trim:0 dB .. +6 dB(唯一能 boost 的一级)
+  → 求和
 ```
 
-单 stream 时上面这段与历史路径**逐位相同**(一个 stream 的循环就是原来那两步),这也是为什么
-加 stems 没有改变普通曲目的任何行为。
+共享 crossfader 的按侧增益坐在三颗 fader 之一的位置(`[crossfader] place = source|flow|deck`,
+缺省 `deck` = 历史位置),**恒在与其同名 cue tap 之后**,所以分叉点与它是同一点时 cue 不受
+crossfader 影响;分叉在它之后则跟着它(把 crossfader 放早的代价,文档写明)。
+
+单 stream、且 crossfader 在 `deck` 位置时,上面这段与历史路径**逐位相同**。
 
 `MasterBus::render`:`sum → master_fx → master_fader → limiter(安全级)`。
+`CueBus`:`sum → cue_fader → blend_with(master.sum)` —— 耳机是 cue 与 master 的混合,
+`[cue] blend` `-1`(缺省,= 只听 cue)/`0`/`+1`,三条曲线与 crossfader 共用。
+
 四样东西**永远不可配置**:
 
 1. limiter 是 `MasterBus` 的字段而非槽位——配置忘写 `"limiter"` 也不可能把全尺度音频
    送到 DAC(且不走链跳过优化,engaged 即执行)
-2. cue tap 的四个位置是枚举,不是自由路由
-3. crossfader 恒在最后(路由决策,不该因 fader 移动改音色)
+2. cue tap 的三个位置是枚举,不是自由路由
+3. **fader 只衰减**:`fader_amp` 的上半段恒为 1.0;headroom 只在 `gain`(`trim_amp`,+6 dB 封顶)
 4. 阶段顺序本身
 
 其余由 `MixerConfig` 纯数据描述(`config.rs`):每通道的 flow_fx/**stem_fx**/deck_fx 名单
-(`Vec<String>`,经 `FxKind` 注册表解析,未知名 → `MixerError::UnknownFx` 构造失败)。
+(`Vec<String>`,经 `FxKind` 注册表解析,未知名 → `MixerError::UnknownFx` 构造失败),
+`[crossfader]`(place/curve/cut_width/start)、`[cue]`(fader/blend/curve/cut_width)、
+以及 fader 起始位、cue_send/cue_tap/side、master fx/limiter/fader、输出列表
+(name/role(`master`|`cue`)/channels/gain)。
 `flow_fx` 是**模板**:每条 stream 各建一条独立的链(4 stems = 4 条,各自状态),`[channel.stem_fx]`
-按 stem 覆写模板 —— 所以"只给人声加 filter"可以写在配置里,不必只靠运行时命令、
-fader 起始位、cue_send/cue_tap/side/curve、master fx/limiter/fader、输出列表
-(name/role(Main|Headphones)/channels/gain)。
+按 stem 覆写模板 —— 所以"只给人声加 filter"可以写在配置里,不必只靠运行时命令。
 
 - `Bus` — 面内(L/R 分离)块单位,构造时分配,热路径零分配;效果器逐面迭代省去步长乘法
 - `Channel` — 拥有自己的 deck、**每 stream 一条 flow 链**(`Vec<FxChain>`,从 config 的
   `flow_fx` 名单当模板重建)、一条共享 deck 链、每 stream 一个 fader;**没有合并索引空间**
   (`FxChainId::Deck` 只指 deck 链,`FxChainId::Stem{deck,stem}` 指某条 stem 的链 —— 一条链
   一个 stream 之后,"deck 的 slot 2" 可以指四个不同的效果)。逐 stem 的 level/mute/solo 存成
-  **三件独立事实**,由 `refresh_stem_faders` 一处合成,所以 solo 能压过 mute、取消静音能恢复
-  原电平(而不是回到 unity)
+  **三件独立事实**,由 `refresh_stem_faders` 一处合成成**两颗门 + 四颗 fader**:solo 能压过 mute、
+  取消静音能恢复原电平(而不是回到 unity),而被静音的 stem 交给自己的插入链的是真静音
 - `Output`(`output.rs`,crate 里唯一出现 cpal 类型的地方)— 每输出独立 ring + stream;
   回调外预分配 scratch、partial push 永不阻塞、声道重映射安全钳制(单声道取和);
   `gain` 逐目的地 trim;**预填半 ring 静音**(~46ms)避免启动竞速;producer 侧 overrun
   有计数(callback 侧 underrun 与真实静音不可区分,故不数)
-- **同一物理设备只保留一条流**:main+headphones 都落在 default device 时,PipeWire 会在
+- **同一物理设备只保留一条流**:master+cue 都落在 default device 时,PipeWire 会在
   graph 里把两条流直接相加——main 有 limiter(≤−1 dBFS)但 cue 总线没有(cue_send 1.0
   时电平可达 2.0),DAC 实收 ~2.9 → 硬削波。Mixer 检测设备名重复,第二条降级 sink 不路由
   (设备选择 `[[output]] device` 字段是后续工作)
-- `simple_dj()` — 参考拓扑:2 通道(各 eq+filter,cue_send 1.0,tap PostDeckFx)+
-  master limiter + main/headphones 输出;`reference_toml()` 是它的 TOML 文本
-  (`--print-config` 输出,测试钉死解析回 `simple_dj()`)
+- `simple_dj()` — 参考拓扑:2 通道(各 eq+filter,cue_send 1.0,tap PostDeckFader)+
+  master limiter + master/cue 输出;`reference_toml()` 是它的 TOML 文本 —— 直接
+  `include_str!("config/mixer.toml")`,所以文件、`--print-config` 与内置构造只有一个真源
+  (测试钉死解析回 `simple_dj()`)
 
 **TOML 配置**(`MixerConfig::from_toml_str`):文件 schema 由 `MixerFile`/`MasterFile`
 镜像结构定义(`deny_unknown_fields`,坏键报行号),Rust 类型与文件格式各自保有适合的
@@ -267,7 +276,8 @@ fader 起始位、cue_send/cue_tap/side/curve、master fx/limiter/fader、输出
 - `FxChain` — `Vec<FxSlot>` 有序表,槽位增删在 producer 线程块边界(move,无锁热交换)
 - `dsp.rs` — RBJ biquad(LPF/HPF/BPF/bell/shelf):bell 用 `10^(dB/20)`、shelf 用
   `10^(dB/40)`(各自正确的 A 幂次);原地重设计保留状态(连续扫频收敛)、退化输入
-  钳制、发散自愈 + 计数;`bipolar_amp` 双极性 fader 律(−1 恰好静音)
+  钳制、发散自愈 + 计数;`fader_amp`(只衰减,−1 恰好静音、0 dB 封顶)与 `trim_amp`
+  (下半个行程同律,上半段到 +6 dB)
 - `sample/` 四个内置效果:
   - `Eq` — 三段 ISO:low shelf 320Hz / bell 1.2kHz / high shelf 3.6kHz,±26 dB 线性 dB
     律;系数仅在控制移动时重算,平坦时整段跳过
@@ -407,8 +417,8 @@ AudioPipeline ──producer thread───────────────
   │ 查询: deck_source / channel_count(命令空队列时也 drain)             │
   │ 每 tick: SyncGroup::prepare → make_ctx → Mixer::process              │
   │   ├ channel × N: deck.render_streams[1..4] → flow_fx[i] → fader[i] → Σ │
-  │   │                     → deck_fx → deck_fader → crossfader           │
-  │   │              → crossfader → master.sum;cue tap → cue.sum         │
+  │   │                     → deck_fx → deck_fader → gain                 │
+  │   │              → master.sum;cue tap → cue.sum → blend(master)       │
   │   ├ master: fx → fader → limiter(安全级)                            │
   │   └ cue: fader                                                       │
   └─ Bus → Output.write(重映射+trim)→ ring → cpal 回调(44.1k 直通)→ 声卡
