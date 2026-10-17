@@ -48,14 +48,17 @@ limiter = true                # the safety stage; strongly recommended
 # cut_width = 0.05
 
 # One [[output]] per destination. `name` and `role` are required; the rest has defaults.
-# NOTE: every output opens on the system default device, and the mixer keeps only one stream
-# per physical device — a second output on the same device is dropped (see mixer docs).
+# `device` omitted = the system default device. Two outputs landing on one physical device: the
+# second is dropped (the server would sum both buses outside the limiter) — give it its own device.
 [[output]]
 name = "main"
 role = "master"               # master | cue
+# device = "USB Headset"      # name substring (case-insensitive) or a device index; omit = default
+# sample_rates = [44100]      # rates this destination may run at (default: the engine's own)
 # channels = [0, 1]           # device channel pair
 # gain = 1.0                  # per-destination trim
 
 [[output]]
 name = "headphones"
 role = "cue"
+# device = "Headphones"

@@ -30,9 +30,9 @@ pub use channel::{
 pub use config::{
     build_chain, build_slot, build_slots, reference_toml, simple_dj, silent_test_channel,
     ChannelConfig, CrossfaderConfig, CueMixConfig, MixerConfig, MixerError, OutputConfig,
-    OutputRole,
 };
-pub use output::{Output, OutputError, OutputId, Outputs};
+pub use hypermixx_core::{OutputRole, OutputState, OutputStatus};
+pub use output::{Output, OutputError, OutputId, OutputTuning, Outputs};
 
 use hypermixx_core::{CommandResponse, FxChainId, FxSlotStatus, StemOp, StemSet};
 
@@ -82,6 +82,13 @@ pub struct Mixer {
     cue: CueBus,
     outputs: Outputs,
     block_frames: usize,
+    /// The topology this mixer was built from. Kept so `output refresh` (and, later, a config
+    /// reload) can re-derive the parts that are not live state, without the front-end having to
+    /// remember the file it passed in.
+    config: MixerConfig,
+    sample_rate: u32,
+    /// Buffer sizes, kept so a reload/refresh opens the same kind of ring.
+    tuning: OutputTuning,
 }
 
 impl Mixer {
@@ -95,6 +102,16 @@ impl Mixer {
     /// simply goes unrouted — otherwise "main + headphones on the default device" plays both buses
     /// on top of each other and clips the DAC even though the master meter reads −1 dBFS.
     pub fn new(cfg: MixerConfig, sample_rate: u32) -> Result<Self, MixerError> {
+        Self::with_tuning(cfg, sample_rate, OutputTuning::default())
+    }
+
+    /// As [`Mixer::new`], with the per-output buffer sizes spelled out (they come from the live
+    /// config).
+    pub fn with_tuning(
+        cfg: MixerConfig,
+        sample_rate: u32,
+        tuning: OutputTuning,
+    ) -> Result<Self, MixerError> {
         if cfg.channels.is_empty() {
             return Err(MixerError::Empty);
         }
@@ -115,77 +132,7 @@ impl Mixer {
             ));
         }
 
-        let mut opened: Vec<Output> = Vec::with_capacity(cfg.outputs.len());
-        for output_cfg in &cfg.outputs {
-            match Output::open(output_cfg, sample_rate, block_frames) {
-                Ok(output) => opened.push(output),
-                Err(err) => {
-                    eprintln!("[audio] {}: {err}; continuing without it", output_cfg.name);
-                    opened.push(Output::sink(output_cfg, block_frames));
-                }
-            }
-        }
-        // One stream per physical device. The first output on a device wins; later ones are
-        // downgraded to sinks and left unrouted, which is also the honest state: without device
-        // selection a second *logical* output cannot be made audible separately anyway.
-        let mut duplicate = vec![false; opened.len()];
-        {
-            let mut first_on_device = std::collections::HashMap::<String, usize>::new();
-            for (index, output) in opened.iter().enumerate() {
-                if let Some(device) = output.device() {
-                    match first_on_device.get(device) {
-                        Some(&first) => {
-                            eprintln!(
-                                "[audio] {}: `{}` is already on {device}; dropping this stream \
-                                 so the server does not sum two buses outside the limiter \
-                                 (device selection is future work)",
-                                cfg.outputs[index].name, cfg.outputs[first].name
-                            );
-                            duplicate[index] = true;
-                        }
-                        None => {
-                            first_on_device.insert(device.to_owned(), index);
-                        }
-                    }
-                }
-            }
-        }
-        for (index, taken) in duplicate.iter().enumerate() {
-            if *taken {
-                // Replacing the element drops the cpal stream on the spot, freeing the device
-                // slot the duplicate needlessly held.
-                opened[index] = Output::sink(&cfg.outputs[index], block_frames);
-            }
-        }
-        let mut outputs = Outputs::new();
-        for output in opened {
-            outputs.push(output);
-        }
-        // Ids are positional: a config (or a TOML file that omitted them) cannot make two outputs
-        // share an id, and a dropped duplicate does not leave a hole in the numbering.
-        for (index, output) in outputs.items_mut().enumerate() {
-            output.id = index as OutputId;
-        }
-        // Route by role, skipping the duplicates: a `Cue` output gets the cue bus, everything else
-        // the mix.
-        let mut master_outputs = Vec::new();
-        let mut cue_outputs = Vec::new();
-        for (index, output_cfg) in cfg.outputs.iter().enumerate() {
-            if duplicate[index] {
-                continue;
-            }
-            match output_cfg.role {
-                OutputRole::Master => master_outputs.push(index),
-                OutputRole::Cue => cue_outputs.push(index),
-            }
-        }
-        let any_live = outputs.iter().any(|output| !output.is_sink());
-        if master_outputs.is_empty() && any_live {
-            // A config that named only a cue (or whose masters all failed to open) still needs to be
-            // audible somewhere.
-            master_outputs.extend(0..outputs.len());
-            cue_outputs.clear();
-        }
+        let routed = build_outputs(&cfg, sample_rate, block_frames, tuning);
 
         let limiter = build_slot("limiter")?;
         limiter.set_enabled(cfg.master_limiter);
@@ -197,7 +144,7 @@ impl Mixer {
                 fx: build_chain(&cfg.master_fx)?,
                 fader: Fader::new(cfg.master_fader, MASTER_TAU),
                 limiter,
-                outputs: master_outputs,
+                outputs: routed.master_outputs,
                 peak: 0.0,
             },
             cue: CueBus {
@@ -207,12 +154,101 @@ impl Mixer {
                 blend: cfg.cue.blend,
                 curve: cfg.cue.curve,
                 cut_width: cfg.cue.cut_width,
-                outputs: cue_outputs,
+                outputs: routed.cue_outputs,
                 peak: 0.0,
             },
-            outputs,
+            outputs: routed.outputs,
             block_frames,
+            config: cfg,
+            sample_rate,
+            tuning,
         })
+    }
+
+    /// Re-binds every destination to its device and swaps the streams in.
+    ///
+    /// Every output is reopened, not just the unavailable ones: that is what makes a *changed*
+    /// device take effect (a different card now matching the same pattern, a rate the device started
+    /// reporting). The old streams are dropped first, before the new ones open, because two streams
+    /// on one device is exactly what the duplicate rule below exists to prevent — opening the
+    /// replacement while the old one still holds the device would fail on ALSA.
+    pub fn refresh_outputs(&mut self) -> Vec<OutputStatus> {
+        self.outputs = Outputs::new();
+        let routed = build_outputs(&self.config, self.sample_rate, self.block_frames, self.tuning);
+        self.outputs = routed.outputs;
+        self.master.outputs = routed.master_outputs;
+        self.cue.outputs = routed.cue_outputs;
+        self.outputs.statuses()
+    }
+
+    /// Every destination's binding, for `output list`.
+    pub fn output_statuses(&self) -> Vec<OutputStatus> {
+        self.outputs.statuses()
+    }
+
+    /// The topology this mixer was built from.
+    pub fn config(&self) -> &MixerConfig {
+        &self.config
+    }
+
+    /// Rebuilds the topology from `text`, which is parsed exactly as `--config` parses a file:
+    /// **undefined keys take their defaults**, they do not keep the running value.
+    ///
+    /// What survives is everything that is *not* a config value: each channel's deck and its
+    /// transport (a reload must not stop the music), and the meters. A channel the file no longer
+    /// names is dropped — with its track, which is why the message says so.
+    ///
+    /// Refused wholesale on any error (no channels, an unknown FX name): a half-applied topology
+    /// would leave the engine in a state no config file describes. The old chains keep working
+    /// until validation has passed.
+    pub fn reload(&mut self, text: &str) -> Result<Vec<OutputStatus>, MixerError> {
+        let cfg = MixerConfig::from_toml_str(text)?;
+        if cfg.channels.is_empty() {
+            return Err(MixerError::Empty);
+        }
+        // Validate everything that can be validated before touching live state.
+        let chains = cfg.build_chains()?;
+        let master_fx = build_chain(&cfg.master_fx)?;
+
+        let mut old = std::mem::take(&mut self.channels);
+        let mut channels = Vec::with_capacity(cfg.channels.len());
+        for (channel_cfg, (flow_chains, deck_slots)) in cfg.channels.iter().zip(chains) {
+            let mut channel = Channel::new(
+                Deck::empty(),
+                channel_cfg,
+                cfg.crossfader,
+                flow_chains,
+                FxChain::from_slots(deck_slots),
+            );
+            // Whatever was playing on this index keeps playing: a deck is not a config value.
+            if let Some(previous) = old.get_mut(channels.len()) {
+                channel.replace_deck(previous.take_deck());
+            }
+            channels.push(channel);
+        }
+        let dropped = old.len().saturating_sub(channels.len());
+        if dropped > 0 {
+            eprintln!("[audio] reload: {dropped} channel(s) dropped, with their tracks");
+        }
+
+        self.channels = channels;
+        self.master.fx = master_fx;
+        self.master.fader = Fader::new(cfg.master_fader, MASTER_TAU);
+        self.master.limiter.set_enabled(cfg.master_limiter);
+        self.cue.fader = Fader::new(cfg.cue_fader, MASTER_TAU);
+        self.cue.blend = cfg.cue.blend;
+        self.cue.curve = cfg.cue.curve;
+        self.cue.cut_width = cfg.cue.cut_width;
+        self.config = cfg;
+        // Destinations are the part that most often *needs* a reload (a device that appeared), so
+        // they are rebuilt last and reported.
+        Ok(self.refresh_outputs())
+    }
+
+    /// The rate the engine renders at (a destination refusing it is what `OutputState::Disabled`
+    /// means).
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 
     /// Channels this mixer mixes.
@@ -545,6 +581,13 @@ impl Mixer {
                     Err(err) => CommandResponse::Error(err),
                 }
             }
+            Command::ToggleFx { slot } => match self.resolve_fx(&slot) {
+                Some(found) => {
+                    found.toggle();
+                    CommandResponse::Ok
+                }
+                None => CommandResponse::Error(slot_error(&slot)),
+            },
             Command::SetFxEnabled { slot, enabled } => match self.resolve_fx(&slot) {
                 Some(found) => {
                     found.set_enabled(enabled);
@@ -598,6 +641,105 @@ impl Mixer {
             },
             other => CommandResponse::Error(format!("not an FX command: {other:?}")),
         }
+    }
+}
+
+/// The outputs a config names, with the routes that feed them.
+struct RoutedOutputs {
+    outputs: Outputs,
+    master_outputs: Vec<usize>,
+    cue_outputs: Vec<usize>,
+}
+
+/// Opens every destination a config names and works out which bus feeds which.
+///
+/// Split out of `Mixer::new` because `output refresh` needs exactly this again, without touching the
+/// channels: the destinations are the part of a topology that can change under the engine's feet
+/// (a device that is not plugged in yet, a rate a card refuses), while the signal path is not.
+fn build_outputs(
+    cfg: &MixerConfig,
+    sample_rate: u32,
+    block_frames: usize,
+    tuning: OutputTuning,
+) -> RoutedOutputs {
+    let mut opened: Vec<Output> = Vec::with_capacity(cfg.outputs.len());
+    for output_cfg in &cfg.outputs {
+        // `Output::open` only fails when a device claimed to work and then would not build a stream;
+        // everything else (no device, a device that is not there, a rate it refuses) comes back as a
+        // placeholder with a state, and the engine keeps running.
+        match Output::open_with(output_cfg, sample_rate, block_frames, tuning) {
+            Ok(output) => opened.push(output),
+            Err(err) => {
+                eprintln!("[audio] {}: {err}; continuing without it", output_cfg.name);
+                opened.push(Output::sink(output_cfg, block_frames));
+            }
+        }
+    }
+    // One stream per physical device. The first output on a device wins; later ones are downgraded
+    // to sinks and left unrouted, which is also the honest state: two *logical* outputs on one
+    // device would be summed by the server outside the limiter.
+    let mut duplicate = vec![false; opened.len()];
+    {
+        let mut first_on_device = std::collections::HashMap::<String, usize>::new();
+        for (index, output) in opened.iter().enumerate() {
+            if let Some(device) = output.device() {
+                match first_on_device.get(device) {
+                    Some(&first) => {
+                        eprintln!(
+                            "[audio] {}: `{}` is already on {device}; dropping this stream \
+                             so the server does not sum two buses outside the limiter \
+                             (give this output its own `device`)",
+                            cfg.outputs[index].name, cfg.outputs[first].name
+                        );
+                        duplicate[index] = true;
+                    }
+                    None => {
+                        first_on_device.insert(device.to_owned(), index);
+                    }
+                }
+            }
+        }
+    }
+    for (index, taken) in duplicate.iter().enumerate() {
+        if *taken {
+            // Replacing the element drops the cpal stream on the spot, freeing the device slot the
+            // duplicate needlessly held.
+            opened[index] = Output::sink(&cfg.outputs[index], block_frames);
+        }
+    }
+    let mut outputs = Outputs::new();
+    for output in opened {
+        outputs.push(output);
+    }
+    // Ids are positional: a config (or a TOML file that omitted them) cannot make two outputs share
+    // an id, and a dropped duplicate does not leave a hole in the numbering.
+    for (index, output) in outputs.items_mut().enumerate() {
+        output.id = index as OutputId;
+    }
+    // Route by role, skipping the duplicates: a `cue` output gets the cue bus, everything else the
+    // mix.
+    let mut master_outputs = Vec::new();
+    let mut cue_outputs = Vec::new();
+    for (index, output_cfg) in cfg.outputs.iter().enumerate() {
+        if duplicate[index] {
+            continue;
+        }
+        match output_cfg.role {
+            OutputRole::Master => master_outputs.push(index),
+            OutputRole::Cue => cue_outputs.push(index),
+        }
+    }
+    let any_live = outputs.iter().any(Output::is_live);
+    if master_outputs.is_empty() && any_live {
+        // A config that named only a cue (or whose masters all failed to open) still needs to be
+        // audible somewhere.
+        master_outputs.extend(0..outputs.len());
+        cue_outputs.clear();
+    }
+    RoutedOutputs {
+        outputs,
+        master_outputs,
+        cue_outputs,
     }
 }
 
@@ -774,7 +916,7 @@ mod tests {
     #[test]
     fn process_needs_no_device_and_writes_nothing_when_unrouted() {
         let mut mixer = loaded(simple_dj(), 2);
-        assert!(mixer.outputs().is_empty() || mixer.outputs().iter().all(Output::is_sink));
+        assert!(mixer.outputs().is_empty() || !mixer.outputs().iter().any(Output::is_live));
         tick(&mut mixer, 4);
         assert!(mixer.master_peak() > 0.0, "the master bus should carry audio");
     }
@@ -1132,6 +1274,109 @@ mod tests {
             mixer.cue().mix.peak() >= mixer.cue_peak() && mixer.cue().mix.peak() >= mixer.master().sum.peak(),
             "blend 0 must carry both, got {}",
             mixer.cue().mix.peak()
+        );
+    }
+
+    /// Every destination is reported, refresh never panics and never loses a destination, and a
+    /// device that is not there keeps the engine alive.
+    #[test]
+    fn output_bindings_are_reportable_and_refreshable() {
+        let mut mixer = Mixer::new(simple_dj(), SAMPLE_RATE).expect("the reference topology builds");
+        let listed = mixer.output_statuses();
+        assert_eq!(listed.len(), 2, "one status per configured destination");
+        assert_eq!(listed[0].role, OutputRole::Master);
+        assert_eq!(listed[1].role, OutputRole::Cue);
+        // Headless (CI) they are sinks; with devices they are live. Either way a *state* is reported.
+        for status in &listed {
+            assert!(
+                matches!(
+                    status.state,
+                    OutputState::Live | OutputState::Sink | OutputState::Missing | OutputState::Disabled
+                ),
+                "{status:?}"
+            );
+        }
+        // A refresh re-binds all of them and reports the same destinations.
+        let refreshed = mixer.refresh_outputs();
+        assert_eq!(refreshed.len(), 2);
+        assert_eq!(refreshed[0].role, OutputRole::Master);
+
+        // A configured device that is not there is reported, not fatal: the mixer builds, the deck
+        // still plays, and the destination is listed as missing until a refresh finds it.
+        let cfg = MixerConfig {
+            outputs: vec![OutputConfig {
+                device: Some("hypermixx-no-such-device".into()),
+                ..OutputConfig::master(0, "ghost")
+            }],
+            ..silent_test_channel()
+        };
+        let mut mixer = Mixer::new(cfg, SAMPLE_RATE).expect("a missing device must not fail the build");
+        assert_eq!(mixer.output_statuses()[0].state, OutputState::Missing);
+        assert_eq!(mixer.refresh_outputs()[0].state, OutputState::Missing);
+        let deck = Deck::new(tone(10));
+        deck.play();
+        mixer.channel_mut(0).unwrap().replace_deck(deck);
+        tick(&mut mixer, 4);
+        assert!(mixer.master_peak() > 0.0, "the mix runs with no live output");
+    }
+
+    /// A reload rebuilds every config value from `defaults + file`, keeps the transports, and
+    /// refuses a bad file wholesale.
+    #[test]
+    fn a_reload_keeps_the_music_and_replaces_the_config() {
+        let mut mixer = loaded(simple_dj(), 2);
+        // Move a fader and start a deck, so both "kept" and "reset" are observable.
+        mixer.set_fader(FaderTarget::Flow(0), -0.75).unwrap();
+        tick(&mut mixer, 3);
+        let playing = mixer.deck(0).unwrap().current_frame();
+        assert!(playing > 0, "the deck should be running");
+
+        // A file that names one channel, gives it a different chain and a different trim, and no
+        // outputs.
+        let statuses = mixer
+            .reload(
+                r#"
+                [[channel]]
+                side = "center"
+                deck_fx = ["gain"]
+                gain = 1.0
+                [[output]]
+                name = "only"
+                role = "master"
+                device = "hypermixx-no-such-device"
+                "#,
+            )
+            .expect("a valid file reloads");
+        assert_eq!(mixer.channel_count(), 1, "the file's channel list replaces the old one");
+        assert_eq!(statuses.len(), 1, "the destinations come from the file too");
+        assert_eq!(statuses[0].state, OutputState::Missing, "and are reported as unavailable");
+
+        // The transport survived; the trim did not (it is a config value, and the file says +6 dB).
+        assert!(mixer.deck(0).unwrap().current_frame() >= playing, "a reload must not stop the deck");
+        assert_eq!(mixer.channel(0).unwrap().levels().4, 1.0, "the trim comes from the file");
+        assert_eq!(
+            mixer.channel(0).unwrap().levels().0, 0.0,
+            "an undefined fader takes its default, not the running value"
+        );
+        assert_eq!(
+            mixer.channel(0).unwrap().slot_statuses(SlotChain::Deck).unwrap()[0].kind,
+            "gain",
+            "the chain came from the file"
+        );
+
+        // A bad file changes nothing: an unknown effect is refused before any live state is touched.
+        let err = mixer.reload("[[channel]]\ndeck_fx = [\"reverb\"]\n").unwrap_err();
+        assert!(matches!(err, MixerError::UnknownFx(_)), "{err:?}");
+        assert_eq!(mixer.channel_count(), 1);
+        assert_eq!(
+            mixer.channel(0).unwrap().slot_statuses(SlotChain::Deck).unwrap()[0].kind,
+            "gain",
+            "the old chain is still in place"
+        );
+        // An empty file has no channels to mix, which is a refusal rather than silence.
+        assert_eq!(
+            mixer.reload("[master]\nlimiter = true\n").unwrap_err(),
+            MixerError::Empty
         );
     }
 

@@ -18,7 +18,7 @@ pub struct DecodedAudio {
     /// Interleaved stereo PCM at `sample_rate`.
     pub pcm: Vec<f32>,
     pub total_frames: u64,
-    /// Always [`SAMPLE_RATE`] (`decode_file` resamples if the source differs).
+    /// Always the rate the decoder was asked for ([`decode_file`] resamples if the source differs).
     pub sample_rate: u32,
     /// Always [`CHANNELS`].
     pub channels: usize,
@@ -28,6 +28,15 @@ pub struct DecodedAudio {
 ///
 /// CPU and IO heavy: call from a background thread, never from the audio path.
 pub fn decode_file(path: &str) -> Result<DecodedAudio, Box<dyn Error>> {
+    decode_file_at(path, SAMPLE_RATE)
+}
+
+/// As [`decode_file`], resampling to `target_rate` instead of the engine's default.
+///
+/// The engine's rate is a live setting (a 48k-only device is a fact about the machine), so the
+/// decoder takes it as an argument: everything downstream of this call has no sample-rate concept
+/// left, which is what makes the engine's own code rate-agnostic.
+pub fn decode_file_at(path: &str, target_rate: u32) -> Result<DecodedAudio, Box<dyn Error>> {
     let file = File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
 
@@ -61,7 +70,7 @@ pub fn decode_file(path: &str) -> Result<DecodedAudio, Box<dyn Error>> {
 
     // Decode everything into a scratch buffer at the native rate/channel count.
     let mut raw: Vec<f32> = Vec::new();
-    let mut src_rate = params.sample_rate.unwrap_or(SAMPLE_RATE);
+    let mut src_rate = params.sample_rate.unwrap_or(target_rate);
     let mut src_channels = params.channels.map(|c| c.count()).unwrap_or(CHANNELS);
 
     loop {
@@ -97,13 +106,13 @@ pub fn decode_file(path: &str) -> Result<DecodedAudio, Box<dyn Error>> {
     }
 
     let stereo = into_stereo(raw, src_channels);
-    let pcm = resample(stereo, src_rate, SAMPLE_RATE);
+    let pcm = resample(stereo, src_rate, target_rate);
     let total_frames = (pcm.len() / CHANNELS) as u64;
 
     Ok(DecodedAudio {
         pcm,
         total_frames,
-        sample_rate: SAMPLE_RATE,
+        sample_rate: target_rate,
         channels: CHANNELS,
     })
 }

@@ -3,14 +3,18 @@
 //! Dependency rule: this crate depends only on `serde`. Nothing here knows about cpal,
 //! symphonia, stratum-dsp or timestretch.
 
+pub mod action;
 pub mod analysis;
 pub mod beatgrid;
 pub mod command;
 pub mod deck;
 pub mod key;
+pub mod live;
+pub mod output;
 pub mod source;
 pub mod stem;
 
+pub use action::{ActionSpec, ArgSpec, ACTIONS};
 pub use analysis::TrackAnalysis;
 pub use beatgrid::BeatGrid;
 pub use command::{
@@ -19,6 +23,8 @@ pub use command::{
 };
 pub use deck::{DeckId, DeckState};
 pub use key::{Key, KeyFormat, KeyMode};
+pub use live::{AudioSettings, LiveConfig, StemSettings};
+pub use output::{OutputOp, OutputRole, OutputState, OutputStatus};
 pub use source::{Shared, Source};
 pub use stem::{Stem, StemOp, StemPreset, StemSet, StemStatus};
 

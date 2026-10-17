@@ -26,10 +26,12 @@ pub use deck::{Deck, FlowShift, LoopRange, Seek};
 pub use flow::{Flow, FlowState, PitchShiftEngine};
 pub use fx::{Fx, FxChain, FxContext, FxError, FxKind, FxSlot, FxTarget, Param};
 pub use mixer::{
-    reference_toml, simple_dj, Bus, Channel, ChannelConfig, CueTap, MasterBus, Mixer, MixerConfig,
-    MixerError, Output, OutputConfig, OutputError, OutputId, Outputs,
+    reference_toml, silent_test_channel, simple_dj, Bus, Channel, ChannelConfig,
+    CrossfaderConfig, CrossfaderCurve, CrossfaderPlace, CueMixConfig, CueTap, MasterBus, Mixer,
+    MixerConfig, MixerError, Output, OutputConfig, OutputError, OutputId, OutputRole, OutputState,
+    OutputStatus, Outputs,
 };
-pub use pipeline::{AudioPipeline, Meters, PipelineError};
+pub use pipeline::{AudioPipeline, AudioTuning, Meters, PipelineError};
 pub use ringbuf::AudioRingBuffer;
 pub use sync::{SyncGroup, SyncMode};
 
@@ -41,6 +43,10 @@ pub use hypermixx_core::{
 };
 
 /// Frames per processing block: one deck tick, and the mixer's block length.
+///
+/// A **contract**, not a setting: the time-stretch engine is fed to a `BLOCK_SIZE` demand, and the
+/// deck's catch-up and loop arithmetic are expressed in it. The live config deliberately does not
+/// offer it; the ring and the engine rate are what a machine's performance actually needs to vary.
 pub const BLOCK_SIZE: usize = 256;
 /// Output ring buffer capacity, in frames.
 pub const OUTPUT_RING_CAPACITY: usize = 4096;

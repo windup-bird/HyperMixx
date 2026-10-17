@@ -17,6 +17,7 @@ hypermixx-library = { path = "../hypermixx-library" }
 hypermixx-stems = { path = "../hypermixx-stems" }
 hypermixx-midi = { path = "../hypermixx-midi" }
 crossbeam-channel = { workspace = true }
+toml = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 

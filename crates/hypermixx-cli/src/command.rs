@@ -16,15 +16,16 @@ use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::fx::FxKind;
 use hypermixx_audio::{AudioPipeline, Command, SAMPLE_RATE};
 use hypermixx_core::{
-    Backend, CommandResponse, CueOp, FxChainId, FxSlotRef, KeylockMode, LoopEditOp, LoopOp,
-    LoopQuantum, NudgeOp, PhaseMode, Shared, Stem, StemOp, StemPreset, SyncOp, TrackAnalysis,
-    VinylOp,
+    Backend, CommandResponse, CueOp, FxChainId, FxSlotRef, KeylockMode, LiveConfig, LoopEditOp,
+    LoopOp, LoopQuantum, NudgeOp, OutputOp, PhaseMode, Shared, Stem, StemOp, StemPreset, SyncOp,
+    TrackAnalysis, VinylOp,
 };
 
 use crate::notices::{self, NoticeTx};
 use crate::response::{fx_help_text, help_text};
 
 /// Result of interpreting one input line.
+#[derive(Debug)]
 pub enum Action {
     Continue,
     Quit,
@@ -145,6 +146,13 @@ pub struct Dispatcher {
     pub command_tx: Sender<Command>,
     pub notices: NoticeTx,
     pub events: Option<Sender<UiEvent>>,
+    /// Where `mixer reload` reads from when no path is given: `--config`'s file, or the shipped
+    /// default under `./config/`. The front-end owns file IO, so the engine only ever sees text.
+    topology: Arc<Mutex<Option<String>>>,
+    /// Where `live reload` reads from: `--live`'s file, or the shipped default.
+    live_path: Arc<Mutex<Option<String>>>,
+    /// The machine's settings: the engine rate, the ring sizes, and the stem defaults.
+    live: Arc<Mutex<LiveConfig>>,
     slots: Slots,
     /// In-flight separations, by deck, so `stem cancel` can reach one. Separation is the only job
     /// here long enough to be worth cancelling (~80 s), and the flag is observed between model
@@ -162,6 +170,9 @@ impl Dispatcher {
             command_tx,
             notices,
             events: None,
+            topology: Arc::new(Mutex::new(None)),
+            live_path: Arc::new(Mutex::new(None)),
+            live: Arc::new(Mutex::new(LiveConfig::default())),
             slots: Arc::new(SlotBook::default()),
             separations: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -171,6 +182,51 @@ impl Dispatcher {
     pub fn tap_events(mut self, events: Sender<UiEvent>) -> Self {
         self.events = Some(events);
         self
+    }
+
+    /// Installs the live settings and remembers where they came from, so `live reload` can re-read
+    /// the same file.
+    pub fn with_live(&self, live: LiveConfig, path: Option<String>) {
+        if let Ok(mut slot) = self.live.lock() {
+            *slot = live;
+        }
+        if let Ok(mut slot) = self.live_path.lock() {
+            *slot = path;
+        }
+    }
+
+    /// The live settings, as the workers read them (decode rate, stem defaults).
+    pub fn live(&self) -> LiveConfig {
+        self.live
+            .lock()
+            .map(|live| live.clone())
+            .unwrap_or_default()
+    }
+
+    /// The live settings file: `--live`'s path, else the shipped default.
+    fn live_path(&self) -> String {
+        self.live_path
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|| DEFAULT_LIVE.to_owned())
+    }
+
+    /// Remembers which topology file `mixer reload` should fall back to (`--config`).
+    pub fn with_topology(self, path: Option<String>) -> Self {
+        if let Ok(mut slot) = self.topology.lock() {
+            *slot = path;
+        }
+        self
+    }
+
+    /// The topology file to reload: the one from `--config`, else the shipped default.
+    fn topology_path(&self) -> String {
+        self.topology
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|| DEFAULT_TOPOLOGY.to_owned())
     }
 
     /// The shared slot book (the TUI holds a clone to update/read it).
@@ -350,6 +406,9 @@ pub fn dispatch(
         }),
         "fx" => fx(&mut words, dispatcher, target),
         "state" => send(command_tx, Command::GetAllStates),
+        "output" | "outputs" => output_command(&mut words, command_tx),
+        "mixer" => mixer_command(&mut words, dispatcher),
+        "live" => live_command(&mut words, dispatcher),
         "midi" => midi_command(&mut words),
         "help" | "h" | "?" => Action::Message(help_text(decks)),
         "quit" | "exit" => Action::Quit,
@@ -404,6 +463,132 @@ fn fader_command<'a>(
         }
     };
     send(command_tx, Command::SetFader { target: target_fader, value })
+}
+
+/// The shipped default topology, under `./profile/`. Also what a run without `--config` reads.
+pub const DEFAULT_TOPOLOGY: &str = crate::profile::DEFAULT_MIXER;
+
+/// The shipped live settings, under `./profile/`. Also what a run without `--live` reads.
+pub const DEFAULT_LIVE: &str = crate::profile::DEFAULT_LIVE;
+
+/// Reads a live-settings file: TOML, then made sane. Returns the settings and whatever had to be
+/// substituted, so the caller can say so once rather than silently changing a user's machine.
+pub fn read_live_config(path: &str) -> Result<(LiveConfig, Vec<String>), String> {
+    let text = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let parsed: LiveConfig = toml::from_str(&text).map_err(|err| err.to_string())?;
+    let live = parsed.clone().sanitised();
+    let mut notes = Vec::new();
+    if live != parsed {
+        notes.push(format!(
+            "{path}: some values were out of range and were clamped"
+        ));
+    }
+    Ok((live, notes))
+}
+
+/// The `live` family: what this machine is set to.
+///
+/// These are the settings a *restart* applies (the engine rate, the ring sizes); `live reload`
+/// re-reads the file and says so rather than pretending a running engine can change its clock. The
+/// stem defaults it carries do apply to the next separation, which is why a reload is worth doing
+/// even mid-session.
+fn live_command<'a>(
+    words: &mut impl Iterator<Item = &'a str>,
+    dispatcher: &Dispatcher,
+) -> Action {
+    let Some(sub) = words.next() else {
+        return Action::Message(live_report(&dispatcher.live(), None));
+    };
+    match sub {
+        "show" | "list" => Action::Message(live_report(&dispatcher.live(), None)),
+        "reload" | "load" => {
+            let path = words
+                .next()
+                .map(str::to_owned)
+                .unwrap_or_else(|| dispatcher.live_path());
+            match read_live_config(&path) {
+                Ok((live, notes)) => {
+                    let restart = live.audio != dispatcher.live().audio;
+                    let mut text = live_report(&live, Some(&path));
+                    for note in notes {
+                        text.push_str(&format!("\n  {note}"));
+                    }
+                    if restart {
+                        text.push_str(
+                            "\n  audio settings changed: they apply on the next launch \
+                             (the engine's clock and rings are set when it starts)",
+                        );
+                    }
+                    dispatcher.with_live(live, Some(path));
+                    Action::Message(text)
+                }
+                Err(err) => Action::Failed(format!("{path}: {err}")),
+            }
+        }
+        other => Action::Failed(format!("unknown live subcommand `{other}` (show|reload)")),
+    }
+}
+
+/// The live settings, one line per group, with the file they came from when it is known.
+fn live_report(live: &LiveConfig, path: Option<&str>) -> String {
+    let mut text = match path {
+        Some(path) => format!("live settings ({path}):"),
+        None => "live settings:".to_owned(),
+    };
+    for line in live.report() {
+        text.push_str("\n  ");
+        text.push_str(&line);
+    }
+    text
+}
+
+/// The `mixer` family: reloading the topology while the engine runs.
+///
+/// The file is read here, on the front-end, and its **text** is sent to the engine — file IO stays
+/// out of the audio crate, and the engine never needs to know where a user keeps configs. Undefined
+/// keys take their defaults, exactly as at startup, so a partial file is a partial topology rather
+/// than a patch over the running one.
+fn mixer_command<'a>(
+    words: &mut impl Iterator<Item = &'a str>,
+    dispatcher: &Dispatcher,
+) -> Action {
+    let Some(sub) = words.next() else {
+        return Action::Message("usage: mixer reload [<file>]".into());
+    };
+    match sub {
+        "reload" | "load" => {
+            let path = words
+                .next()
+                .map(str::to_owned)
+                .unwrap_or_else(|| dispatcher.topology_path());
+            match std::fs::read_to_string(&path) {
+                Ok(text) => send(
+                    &dispatcher.command_tx,
+                    Command::MixerReload { text },
+                ),
+                Err(err) => Action::Failed(format!("{path}: {err}")),
+            }
+        }
+        other => Action::Failed(format!("unknown mixer subcommand `{other}` (reload)")),
+    }
+}
+
+/// The `output` family: which physical destination each logical output is bound to.
+///
+/// `output list` reports every destination with its state (`live` / `sink` / `missing` /
+/// `disabled`); `output refresh` re-binds them all, which is what to run after plugging a device in.
+fn output_command<'a>(
+    words: &mut impl Iterator<Item = &'a str>,
+    command_tx: &Sender<Command>,
+) -> Action {
+    let op = match words.next() {
+        Some("list") | Some("ls") | None => OutputOp::List,
+        Some("refresh") | Some("reload") | Some("reopen") => OutputOp::Refresh,
+        Some(other) => {
+            return Action::Failed(format!("unknown output subcommand `{other}` (list|refresh)"))
+        }
+    };
+    send(command_tx, Command::Output { op })
 }
 
 /// The `midi` family. Only port listing lands here: opening an input happens at launch
@@ -689,6 +874,14 @@ fn fx<'a>(
             action
         }
         "list" | "ls" => send(command_tx, Command::ListFx { chain }),
+        // The engine owns a slot's a/b state, so a toggle is a command rather than a front-end flip.
+        "toggle" | "tgl" => {
+            let index = match resolve_slot(words.next(), chain, dispatcher) {
+                Ok(index) => index,
+                Err(e) => return Action::Failed(e),
+            };
+            send(command_tx, Command::ToggleFx { slot: FxSlotRef { chain, index } })
+        }
         "set" => {
             let index = match resolve_slot(words.next(), chain, dispatcher) {
                 Ok(index) => index,
@@ -852,7 +1045,26 @@ fn stem_family<'a>(
     };
     match sub {
         "separate" | "split" => {
-            let mut options = hypermixx_stems::SeparateOptions::default();
+            let live = dispatcher.live();
+            // The bundled model is a 44.1 kHz export and the cache is keyed on that rate, so a
+            // 48k engine would feed it material it was not trained on. Refuse rather than resample
+            // silently in both directions — that is a job for a model whose spec says 48k.
+            if live.audio.sample_rate != SAMPLE_RATE {
+                return Action::Failed(format!(
+                    "separation needs the engine at {}Hz (the model is a {}Hz export); this run is \
+                     at {}Hz — set `[audio] sample_rate` in profile/live.toml and launch it",
+                    SAMPLE_RATE,
+                    SAMPLE_RATE,
+                    live.audio.sample_rate
+                ));
+            }
+            // The live file's `[stems]` block is the default; a flag on the line still wins.
+            let mut options = hypermixx_stems::SeparateOptions {
+                shifts: live.stems.shifts,
+                overlap: live.stems.overlap,
+                provider: hypermixx_stems::Provider::parse(&live.stems.provider)
+                    .unwrap_or_default(),
+            };
             while let Some(flag) = words.next() {
                 match flag {
                     // Every option is refused rather than clamped: a silent clamp makes `--shifts 8`
@@ -1161,12 +1373,15 @@ pub(crate) fn spawn_load(deck_id: u8, path: String, bpm: Option<f32>, dispatcher
     let command_tx = dispatcher.command_tx.clone();
     let notices_tx = dispatcher.notices.clone();
     let events = dispatcher.events.clone();
+    // The decoder resamples to the engine's rate, which is a live setting rather than a constant:
+    // after this call nothing downstream has a sample-rate concept left.
+    let sample_rate = dispatcher.live().audio.sample_rate;
     // Decoding a long track takes seconds; say so immediately so the user does not think the
     // command was ignored.
     notices::info(&notices_tx, format!("[load] deck{deck_id}: decoding {path}..."));
     std::thread::Builder::new()
         .name(format!("hypermixx-load-{deck_id}"))
-        .spawn(move || match hypermixx_media::decode_file(&path) {
+        .spawn(move || match hypermixx_media::decode_file_at(&path, sample_rate) {
             Ok(decoded) => {
                 let total_frames = decoded.total_frames;
                 let analysis = bpm.filter(|b| *b > 0.0).map(|bpm| {
@@ -1175,7 +1390,7 @@ pub(crate) fn spawn_load(deck_id: u8, path: String, bpm: Option<f32>, dispatcher
                             bpm,
                             0,
                             total_frames,
-                            SAMPLE_RATE,
+                            sample_rate,
                         ),
                         bpm,
                     )
@@ -1209,11 +1424,14 @@ fn spawn_analyse(deck_id: u8, source: Shared, backend: Backend, dispatcher: &Dis
     let command_tx = dispatcher.command_tx.clone();
     let notices_tx = dispatcher.notices.clone();
     let events = dispatcher.events.clone();
+    // The analyser's beat grid is in frames, so it needs the same rate the material was resampled
+    // to — the live setting, not the default.
+    let sample_rate = dispatcher.live().audio.sample_rate;
     std::thread::Builder::new()
         .name(format!("hypermixx-analyse-{deck_id}"))
         .spawn(move || {
             notices::info(&notices_tx, format!("[analyse] deck{deck_id}: running {backend:?}..."));
-            match hypermixx_library::analyser::analyze(source, SAMPLE_RATE, backend) {
+            match hypermixx_library::analyser::analyze(source, sample_rate, backend) {
                 Ok(analysis) => {
                     let bpm = analysis.bpm();
                     let key = analysis
@@ -1282,5 +1500,196 @@ mod tests {
         assert!(matches!(parse("volume 0.1", Target::Deck(0)), Action::Failed(_)));
         assert!(matches!(parse("gain loud", Target::Deck(0)), Action::Failed(_)));
         assert!(matches!(parse("gain", Target::Deck(0)), Action::Failed(_)));
+    }
+
+    /// The live file is TOML with this machine's settings; a typo is an error, a wild value is
+    /// clamped, and the shipped file parses.
+    #[test]
+    fn live_settings_parse_and_report() {
+        let path = std::env::temp_dir().join("hypermixx-live-test.toml");
+        std::fs::write(&path, "[audio]\nsample_rate = 48000\nring_frames = 99\n").unwrap();
+        let (live, notes) = read_live_config(&path.to_string_lossy()).unwrap();
+        assert_eq!(live.audio.sample_rate, 48_000, "a named value is honoured");
+        assert_eq!(live.audio.ring_frames, hypermixx_core::live::MIN_RING_FRAMES, "clamped");
+        assert!(!notes.is_empty(), "and the clamp is reported rather than silent");
+        let _ = std::fs::remove_file(&path);
+
+        // A typo is a failure, not a silent default: running at another rate than the file says is
+        // exactly the surprise this file exists to prevent.
+        std::fs::write(&path, "[audio]\nsample_rat = 48000\n").unwrap();
+        assert!(read_live_config(&path.to_string_lossy()).is_err());
+        let _ = std::fs::remove_file(&path);
+        // A missing file is the caller's to handle (the CLI falls back to the built-ins).
+        assert!(read_live_config("/nonexistent/live.toml").is_err());
+
+        // The shipped file parses and is sane.
+        let shipped = format!("{}/../../profile/live.toml", env!("CARGO_MANIFEST_DIR"));
+        let (live, notes) = read_live_config(&shipped).expect("the shipped live file parses");
+        assert!(notes.is_empty(), "the shipped file needs no clamping: {notes:?}");
+        assert_eq!(live.audio.sample_rate, hypermixx_core::SAMPLE_RATE);
+        assert_eq!(live.stems.provider, "cpu");
+    }
+
+    /// `live` reports what is in effect, and a reload says when a setting needs a restart.
+    #[test]
+    fn the_live_verb_shows_and_reloads() {
+        let (tx, _rx) = unbounded();
+        let (notice_tx, _notice_rx) = unbounded();
+        let dispatcher = Dispatcher::new(tx, notice_tx);
+        dispatcher.with_live(
+            hypermixx_core::LiveConfig::default(),
+            Some("/tmp/x.toml".to_owned()),
+        );
+        // A bare `live` and `live show` both report.
+        for line in ["", "show"] {
+            match live_command(&mut line.split_whitespace(), &dispatcher) {
+                Action::Message(text) => assert!(text.contains("44100Hz"), "{text}"),
+                other => panic!("expected a report, got {other:?}"),
+            }
+        }
+        // A path that is not there is a failure; a mistyped subcommand too.
+        assert!(matches!(
+            live_command(&mut "reload /nonexistent/live.toml".split_whitespace(), &dispatcher),
+            Action::Failed(_)
+        ));
+        assert!(matches!(
+            live_command(&mut "lst".split_whitespace(), &dispatcher),
+            Action::Failed(_)
+        ));
+    }
+
+    /// The grammars are one: every action a MIDI map can bind is also a session verb.
+    ///
+    /// The table below is the *counterpart* line for each registry action — a mapping that only one
+    /// side understood would be a binding that silently does nothing, and this is what catches it.
+    /// A new action forces a decision here rather than passing unnoticed.
+    #[test]
+    fn every_registry_action_is_a_session_verb() {
+        // The verb, plus whatever a session line has to spell out that a controller supplies
+        // (a value, a slot, a duration).
+        let counterpart = |name: &str| -> Option<&'static str> {
+            Some(match name {
+                "play" => "play",
+                "cue" => "cue",
+                "vinyl" => "vinyl",
+                "beatjump" => "beatjump 4",
+                "fader flow" => "fader flow -0.5",
+                "vocals fader" => "vocals fader -0.5",
+                "vocals mute" => "vocals mute on",
+                "vocals solo" => "vocals solo on",
+                "fader deck" => "fader deck -0.5",
+                "fader gain" => "fader gain 1.0",
+                "fader cuesend" => "fader cuesend 0.5",
+                "fader cross" => "fader cross -1.0",
+                "fader master" => "fader master 0",
+                "fader cue" => "fader cue 0",
+                "tempofader" => "tempofader 0.5",
+                "nudge" => "nudge 0.04 0.5",
+                "loop in" => "loop in",
+                "loop out" => "loop out",
+                "loop exit" => "loop exit",
+                "loop cancel" => "loop cancel",
+                "loop halve" => "loop halve",
+                "loop double" => "loop double",
+                "loop" => "loop 4",
+                "sync tempo" => "sync tempo",
+                "sync phase" => "sync phase pid",
+                "sync tempolock" => "sync tempolock",
+                "sync phaselock" => "sync phaselock pid",
+                "sync set-leader" => "sync set-leader",
+                "sync unlock" => "sync unlock",
+                "fx on" => "fx on eq",
+                "fx off" => "fx off eq",
+                "fx toggle" => "fx toggle eq",
+                "fx pad" => "fx pad eq press",
+                "fx trigger" => "fx trigger eq",
+                // The one place the grammars differ in *shape*: a session line carries the value
+                // (`fx set <slot> <param> <value>`) while a controller's value is the message, so the
+                // action names the parameter only. Same addressing, same parameter name.
+                "fx param" => "fx set eq low 0.5",
+                _ => return None,
+            })
+        };
+
+        // The reference topology with no outputs: a test must not open a sound card, and `eq`/`filter`
+        // exist so the `fx` verbs have slots to name.
+        let cfg = hypermixx_audio::MixerConfig {
+            outputs: vec![],
+            ..hypermixx_audio::simple_dj()
+        };
+        let pipeline = hypermixx_audio::AudioPipeline::start(cfg).expect("a headless engine starts");
+        let (notice_tx, _notice_rx) = unbounded();
+        let dispatcher = Dispatcher::new(pipeline.command_tx(), notice_tx);
+        // `fx …` addresses slots by *name*, which needs the chain lists the front-end normally
+        // primes at startup.
+        dispatcher.prime(1, pipeline.response_rx());
+        for spec in hypermixx_core::ACTIONS {
+            let Some(line) = counterpart(spec.name) else {
+                panic!("no session counterpart for `{}`", spec.name);
+            };
+            let full = format!("deck0 {line}");
+            if let Action::Failed(message) = dispatch(&full, &dispatcher, &pipeline, Backend::Auto, 2, 0)
+            {
+                panic!("`{full}` failed: {message}");
+            }
+        }
+    }
+
+    /// `mixer reload` reads a file here and sends its *text*: file IO stays out of the engine, and
+    /// an unreadable file never reaches it.
+    #[test]
+    fn the_mixer_verb_sends_the_files_text() {
+        let (tx, _rx) = unbounded();
+        let dispatcher = Dispatcher::new(tx, crossbeam_channel::unbounded().0);
+        // No subcommand is a usage message, not a silent no-op.
+        assert!(matches!(mixer_command(&mut "".split_whitespace(), &dispatcher), Action::Message(_)));
+        assert!(matches!(
+            mixer_command(&mut "nope".split_whitespace(), &dispatcher),
+            Action::Failed(_)
+        ));
+        // A path that does not exist is the front-end's failure, reported as such.
+        assert!(matches!(
+            mixer_command(&mut "reload /nonexistent/mixer.toml".split_whitespace(), &dispatcher),
+            Action::Failed(_)
+        ));
+        // And the file's text travels as-is.
+        let path = std::env::temp_dir().join("hypermixx-cli-reload-test.toml");
+        std::fs::write(&path, "[[channel]]\nside = \"left\"\n").unwrap();
+        let (tx, rx) = unbounded();
+        let dispatcher = Dispatcher::new(tx, crossbeam_channel::unbounded().0);
+        let line = format!("reload {}", path.display());
+        assert!(matches!(
+            mixer_command(&mut line.split_whitespace(), &dispatcher),
+            Action::Continue
+        ));
+        match rx.recv().unwrap() {
+            Command::MixerReload { text } => assert!(text.contains("side = \"left\"")),
+            other => panic!("expected MixerReload, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `output` is a global verb: `list` (the default) and `refresh`.
+    #[test]
+    fn the_output_verb_lists_and_refreshes() {
+        let (tx, rx) = unbounded();
+        for (line, expected) in [("list", OutputOp::List), ("refresh", OutputOp::Refresh)] {
+            let mut words = line.split_whitespace();
+            assert!(matches!(output_command(&mut words, &tx), Action::Continue), "{line}");
+            match rx.recv().unwrap() {
+                Command::Output { op } => assert_eq!(op, expected),
+                other => panic!("expected Output, got {other:?}"),
+            }
+        }
+        // Bare `output` lists, like `state` with no argument prints everything.
+        let mut words = "".split_whitespace();
+        assert!(matches!(output_command(&mut words, &tx), Action::Continue));
+        match rx.recv().unwrap() {
+            Command::Output { op: OutputOp::List } => {}
+            other => panic!("expected a list, got {other:?}"),
+        }
+        // A mistyped subcommand is the user's mistake, reported before the engine sees it.
+        let mut words = "opne".split_whitespace();
+        assert!(matches!(output_command(&mut words, &tx), Action::Failed(_)));
     }
 }

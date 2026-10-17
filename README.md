@@ -16,7 +16,7 @@ cli ─┬─► audio ───┐
 
 | crate | 职责 | 依赖 |
 |---|---|---|
-| `hypermixx-core` | 协议与类型：`Command`/`CommandResponse`、`DeckState`、`BeatGrid`、`Key`、`Source` | serde |
+| `hypermixx-core` | 协议与类型：`Command`/`CommandResponse`、`DeckState`、`BeatGrid`、`Key`、`Source`、action 语法表、live 设置、输出状态 | serde |
 | `hypermixx-media` | 解码与内存池：`decode_file`（symphonia → 44.1k 立体声）、`PcmPool` | core |
 | `hypermixx-audio` | 实时引擎：producer 线程 + cpal 输出、mixer/通道/FX 链、时间拉伸 | core, media |
 | `hypermixx-library` | 离线分析：beat 网格编译、stratum-dsp 适配、波形峰值 | core, media |
@@ -91,7 +91,9 @@ deck0> quit
 ```bash
 cargo run -p hypermixx-cli -- --backend auto        # 分析后端 auto | stratum | timestretch
 cargo run -p hypermixx-cli -- --config topo.toml    # 自定义拓扑
-cargo run -p hypermixx-cli -- --print-config        # 打印参考 TOML（= config/mixer.toml）
+cargo run -p hypermixx-cli -- --print-config        # 打印参考 TOML（= profile/mixer.toml）
+cargo run -p hypermixx-cli -- --profile dj          # 用 profile/dj.toml 指路（拓扑 + 本机设置 + MIDI 设备）
+cargo run -p hypermixx-cli -- --live live.toml      # 引擎采样率 / ring 大小 / stem 默认值
 cargo run -p hypermixx-cli -- --midi 0              # 打开 0 号 MIDI 输入，用默认 midi-map.toml
 cargo run -p hypermixx-cli -- --midi 0 --midi-map my.toml   # 指定映射文件
 cargo run -p hypermixx-cli -- --midi-guide          # learn 模式编辑映射（不启动引擎，端口/文件在 TUI 里选）
@@ -99,6 +101,12 @@ cargo run -p hypermixx-cli -- --midi-guide          # learn 模式编辑映射�
 
 TUI 内尽量不用启动参数:`--tui` 下按 `F2` 选 MIDI 端口、`F3` 选映射文件；`load` 不带路径则弹出
 文件浏览器；`--midi-guide` 即使不跟路径也会在 TUI 里选端口与文件。
+
+`profile/` 放全部默认文件：`profile.toml`（用哪几个文件）、`mixer.toml`（拓扑）、`live.toml`（本机设置）、
+`midi.toml`（设备名 + 映射）、`preference.toml`（前端设置，预留），命名 profile 也放这里
+（`--profile dj` → `profile/dj.toml`）。文件里的相对路径都相对它所在的文件夹。
+运行时改配置不必重启：`mixer reload` 重建拓扑（保留走带），`live reload` 重读本机设置
+（引擎率/ring 需重启，`[stems]` 立即生效）。
 
 终端内 `midi ports` 列出可用 MIDI 输入端口；映射表格式与全部 action 见 `midi-map.toml` 注释与 [`docs/midi-mapping.md`](docs/midi-mapping.md)。
 

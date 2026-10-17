@@ -15,11 +15,13 @@ cargo run -p hypermixx-cli -- [flags]
 | 参数 | 说明 |
 |---|---|
 | `--tui` | 终端界面（默认是行式 REPL） |
-| `--config <file>` | 自定义混音拓扑 TOML（通道/效果链/输出）；不给则读 `./config/mixer.toml`（缺文件/坏文件回落内置参考拓扑） |
+| `--config <file>` | 自定义混音拓扑 TOML（通道/效果链/输出）；不给则读 `./profile/mixer.toml`（缺文件/坏文件回落内置参考拓扑）。这个路径也是 `mixer reload` 不带参数时的默认 |
 | `--print-config` | 打印参考拓扑 TOML 后退出（不启动引擎） |
+| `--profile <name\|file>` | 一个**指路文件**：写 `mixer` / `live` / `midi`（各自是路径，`midi` 也可内联成表）。裸名字解析成 `profile/<name>.toml`；不给则读 `profile/profile.toml`（没有就用文件夹默认）。显式 flag 优先于它 |
+| `--live <file>` | 本机设置 TOML（引擎采样率、ring 大小、stem 默认值）；缺省 `./profile/live.toml`，两边都没有则用内置默认 |
 | `--backend auto\|stratum\|timestretch` | 离线分析后端，缺省 `auto`（stratum 优先，失败回落） |
 | `--midi <port>` | 启动时打开 MIDI 输入端口（端口号或名字，`midi ports` 可列） |
-| `--midi-map <file>` | 映射文件，缺省 `midi-map.toml`；**必须与 `--midi` 同给**，否则报错 |
+| `--midi-map <file>` | 映射文件，缺省 `midi-map.toml`；显式给时必须与 `--midi` 同给，否则报错（profile 里的 `[midi]` 不受此限） |
 | `--midi-guide [<file>]` | learn 模式地图编辑器（**不启动音频引擎**）；文件缺省 `midi-map.toml` |
 | `--decks <n>` | 仅作用于 `--midi-guide` 的目标清单宽度，缺省 2 |
 
@@ -98,6 +100,9 @@ cargo run -p hypermixx-cli -- [flags]
 [deck] fader <stage> <pos>  电平：`flow`/`deck`/`gain`/`cuesend` 作用在目标 deck，
                             `cross`/`master`/`cue` 是共用控制（忽略目标）
                             pos 为 `-1..1`（0 = unity），`cuesend` 是线性的 `0..1`
+output list|refresh         目的地与设备绑定（见 3.9）
+mixer reload [<file>]       热加载拓扑（见 3.8）
+live show|reload [<file>]   本机设置：引擎率/ring/stem 默认值（见 3.11）
 state                       打印全部 deck 的状态行
 ```
 
@@ -195,6 +200,7 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 ```
 [deck|master] fx add <kind>                追加到链尾（eq|filter|gain|limiter，含别名）
 [deck|master] fx remove|rm <slot>          删除该槽，后续槽位前移
+[deck|master] fx toggle <slot>             翻转槽位（引擎持有状态，前端不留镜像）
 [deck|master] fx list|ls                   列出槽位：索引、kind、开关、参数
 [deck|master] fx set <slot> <param> <value>   设参数（指数平滑，不咔哒）
 [deck|master] fx on|off <slot>             接入 / bypass（bypass→engage 会 reset 滤波器）
@@ -299,7 +305,50 @@ vocals = ["gain", "filter"]
 - **cue 总线与 master 混合**（`[cue] blend`：`-1` = 只听 cue（缺省）/ `0` = 两者 / `+1` =
   只听 master，`curve`/`cut_width` 同上），这就是耳机上那颗 cue-mix 旋钮。
 
-### 3.8 MIDI
+### 3.8 热加载拓扑 `mixer reload`
+
+```
+mixer reload [<file>]   重读拓扑并就地重建；不带路径则读 --config 的文件，否则 ./profile/mixer.toml
+```
+
+- **语义 = 内置默认 ← 文件**：文件里没写的键取**默认值**，而不是保留运行中的值。所以演出中途 reload
+  要把想保留的推子/trim 一起写上。
+- **保留的只有"不是配置值"的东西**：每个 channel 的 deck 与走带（reload 不会停音乐）与计量计数。
+  文件里没再出现的 channel 会被丢弃（连同它装载的曲目），并打印一行说明。
+- **要么整份生效，要么整份拒绝**：未知效果名 / 没有 `[[channel]]` 都在动任何状态之前失败 ——
+  半套拓扑会让引擎停在一个没有任何配置文件能描述的状态里。旧链在验证通过之前一直照常工作。
+- 设备绑定也在 reload 里重建并重新列出（见 3.9），所以"插上耳机 → `mixer reload`"一步到位。
+
+### 3.9 输出（设备绑定）
+
+```
+output list      （别名 ls；bare `output` 同义）列出每个目的地：名字、角色、状态、绑定的设备、声道
+output refresh   （别名 reload/reopen）重试所有不可用的目的地，并重新列出
+```
+
+每行形如 `output main  master live  Built-in Audio Analog Stereo`，状态四选一：
+
+| 状态 | 含义 |
+|---|---|
+| `live` | 流已打开，正在喂设备 |
+| `sink` | 宿主根本没有输出设备（CI/容器）；引擎照常跑，写进黑洞 |
+| `missing` | `device` 指定的设备现在不在（没插/没通电）。插上后 `output refresh` 即可 |
+| `disabled` | 设备存在但**不接受引擎的采样率**（或该输出的 `sample_rates` 不允许引擎率）。不会偷偷换个率跑 |
+
+- `device` 用**名字子串**匹配（大小写不敏感，第一个命中者胜），全数字则按设备序号；省略 = 系统默认
+  设备。子串而非硬件 id，因为名字是各平台唯一共通的东西，而 id 换机器就失效。
+- `sample_rates` 是该输出**允许**的采样率列表，缺省 = 引擎率本身；引擎率不在里面，或设备不提供它，
+  就 `disabled` + 警告。这条是刻意的：48k 设备被"顺手"当成 44.1k 用会让每首歌慢 8.8%，
+  比静音更糟——因为它听起来像是故意的。
+- 同一物理设备只保留**一条**流（服务器会把两条直接相加，而 cue 总线没有 limiter）：
+  第二条降级为 sink 并提示，解决办法是给它一个自己的 `device`。
+
+### 3.10 MIDI
+
+映射文件里的 `action` 就是**一条去掉目标的会话命令**（`"beatjump 4"`、`"vocals mute"`、
+`"sync phase pid"`），目标取 binding 的 `deck` 字段。语法表只有一份
+（`hypermixx-core::action::ACTIONS`），guide 的目标清单与 `docs/midi-mapping.md` 都由它生成；
+CLI 侧有一个测试逐一断言每个 action 都有对应的会话动词。
 
 ```
 midi ports    列出可用 MIDI 输入端口（别名 list；无端口则提示 midi: no input ports）
@@ -309,7 +358,73 @@ midi ports    列出可用 MIDI 输入端口（别名 list；无端口则提示 
 对运行中引擎接线一次，不支持会话中途开关。映射表格式与全部 action 见
 [`midi-mapping.md`](midi-mapping.md)。
 
-### 3.9 帮助与退出
+### 3.11 本机设置 `live`
+
+```
+live show             （bare `live` 同义）打印当前生效的设置：引擎采样率、ring/prefill、stem 默认值
+live reload [<file>]  重读 live 文件（缺省 --live 的路径，否则 ./profile/live.toml）
+```
+
+`profile/live.toml`（启动时读，`--live <file>` 可换）：
+
+| 键 | 缺省 | 说明 |
+|---|---|---|
+| `[audio] sample_rate` | 44100 | 引擎渲染率，同时也是向每个设备请求的率；素材在装载时重采样到它 |
+| `[audio] ring_frames` | 4096 | 输出 ring 容量（帧）：更多余量 = 更多延迟（44.1k 下 ~93 ms） |
+| `[audio] prefill_frames` | 2048 | 开流前预填的静音，避免设备等第一个块；上限为 ring 的一半 |
+| `[stems] model` | htdemucs | 模型名（`stem model list` 可列） |
+| `[stems] provider` | cpu | `cpu` 或 `cuda`（`--features cuda` 构建） |
+| `[stems] overlap` / `shifts` | 0.25 / 1 | 分离窗口重叠与集成趟数（`stem separate --overlap/--shifts` 可逐次覆盖） |
+| `[stems] chunk_seconds` | 0（整轨） | **预留**：分段分离并渐进装入 |
+
+- **采样率与 ring 需要重启**：引擎的时钟与 ring 在启动时定下（`live reload` 会明说这一点），
+  但 `[stems]` 的默认值下一次分离就生效。未知键报错（拼错的 `sample_rat` 静默按 44.1k 跑才是灾难），
+  越界的值被夹到有效范围并打印一行警告。
+- **分开分离仍要求引擎率为 44.1 kHz**：内置模型是 44.1k 导出、缓存也按这个率做 key，
+  非 44.1k 时 `stem separate` 直接报错而不是悄悄双向重采样。
+- `[audio] block_frames` **不在这里**，因为它是引擎内部契约（时间拉伸引擎按块喂入），不是本机性能参数。
+
+### 3.12 profile 与 preference
+
+```
+profile/                 # 全部配置文件都在这里
+├── profile.toml         # profile（--profile 不给时的默认）：只写"用哪几个文件"
+├── mixer.toml           # 拓扑（= --config 的默认路径，也是 --print-config 打印的文本）
+├── live.toml            # 本机设置（= --live 的默认路径）
+├── midi.toml            # MIDI：设备名 + 映射文件
+├── preference.toml      # 前端设置 —— 预留，目前不读
+└── example.toml         # 命名 profile 的样例：复制成 <name>.toml 后 --profile <name>
+```
+
+profile 是**指路而不是又一套 schema**：拓扑、本机设置、MIDI 各自保有文件与校验，于是
+`mixer reload` / `live reload` 仍然作用在它们被告知的那个文件上。
+**文件里任何相对路径都相对"写它的那个文件所在的文件夹"** —— 所以 `profile/profile.toml` 里
+`mixer = "mixer.toml"` 就是 `profile/mixer.toml`，命名 profile 和它指的文件放一起时不用写 `../`。
+
+```toml
+# profile/profile.toml
+mixer = "mixer.toml"     # -> profile/mixer.toml
+live  = "live.toml"      # -> profile/live.toml
+midi  = "midi.toml"      # -> profile/midi.toml（也可以内联成 [midi] 表，见下）
+
+[preference]             # 预留段：现在写进去的键会被**报告**，而不是被静默忽略
+
+# 内联写法（与 midi.toml 的键相同）：
+# [midi]
+# device = "DDJ-400"     # 端口名字子串，或 `midi ports` 的序号；不给 = 启动时不打开输入
+# map = "../midi-map.toml"   # 映射文件，相对本文件；不给则缺省 midi-map.toml（工作目录）
+```
+
+- 没有 profile（或 profile 里没写某项）时用文件夹默认：`profile/mixer.toml`、`profile/live.toml`、
+  `profile/midi.toml`，各自缺失则回落内置默认（MIDI 缺失 = 不打开输入，即出厂状态）。
+- **显式 flag 永远优先**：`--config` / `--live` / `--midi` / `--midi-map` > profile > 文件夹默认 > 内置默认。
+- 端口打不开时：**显式 `--midi` 直接报错退出**（你点名要的），**profile 里的设备只警告并继续**
+  （"这套设备通常长这样"，控制器没插不该让整场起不来；TUI 里 `F2` 仍可临时选）。
+- `--profile dj` 读 `profile/dj.toml`；`--profile path/to/p.toml` 直接读该路径。
+- 段名拼错（`[mixr]`、`[midi] portt`）是错误，不是静默回落 —— 否则看起来用了某套配置其实没有。
+- `[preference]` 是空段也合法（= 什么都没设）；`preference.toml` 目前不读，文件里写明了原因。
+
+### 3.13 帮助与退出
 
 ```
 help | h | ?      命令总表（含启动参数速览）

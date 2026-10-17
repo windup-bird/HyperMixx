@@ -16,14 +16,11 @@ pub mod waveform_view;
 use std::io;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender};
 use crossterm::event::{self, Event, KeyEventKind};
 use hypermixx_audio::{AudioPipeline, Command};
-use hypermixx_core::Backend;
 
 use crate::command::Dispatcher;
-use crate::notices::NoticeTx;
-use crate::response::LogLine;
+use crate::session::Session;
 use app::App;
 
 /// ~30Hz. The engine's block is 5.8ms, so this is comfortably inside its command handling.
@@ -36,24 +33,30 @@ const METERS_EVERY: u64 = 3;
 /// `midi_port` / `midi_map` come from the startup flags; when a port is given the TUI connects it
 /// itself (so the in-TUI pickers can replace it), otherwise it stays disconnected until F2.
 #[allow(clippy::too_many_arguments)]
-pub fn run(
-    pipeline: &AudioPipeline,
-    command_tx: Sender<Command>,
-    backend: Backend,
-    decks: usize,
-    notice_tx: NoticeTx,
-    notice_rx: Receiver<LogLine>,
-    midi_port: Option<&str>,
-    midi_map: &str,
-) {
+pub fn run(pipeline: &AudioPipeline, session: Session) {
+    let Session {
+        command_tx,
+        backend,
+        decks,
+        notice_tx,
+        notice_rx,
+        topology,
+        live,
+        live_source,
+        midi_port,
+        midi_map,
+    } = session;
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
-    let dispatcher = Dispatcher::new(command_tx.clone(), notice_tx).tap_events(event_tx);
+    let dispatcher = Dispatcher::new(command_tx.clone(), notice_tx)
+        .with_topology(topology)
+        .tap_events(event_tx);
+    dispatcher.with_live(live, live_source);
     // Prime every chain's slot list so `fx remove <name>` works from the first command.
     dispatcher.prime(decks, pipeline.response_rx());
     let mut app = App::new(decks, backend, notice_rx, event_rx, dispatcher.slots());
-    app.midi_map = Some(midi_map.to_owned());
+    app.midi_map = (!midi_map.is_empty()).then_some(midi_map);
     if let Some(port) = midi_port {
-        app.midi_port = Some(port.to_owned());
+        app.midi_port = Some(port);
         app.connect_midi(dispatcher.command_tx.clone(), &dispatcher.notices);
     }
 

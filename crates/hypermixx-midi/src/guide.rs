@@ -278,7 +278,7 @@ impl Guide {
             fx: None,
             param: None,
         };
-        if target.action == "loop.beat" {
+        if target.action == "loop" {
             bind.beats = Some(4);
         }
         match self.binding_index(&target) {
@@ -291,7 +291,7 @@ impl Guide {
                 bind.seconds = old.seconds;
                 self.map.binds[existing] = bind;
             }
-            None if target.action.starts_with("fx.") => {
+            None if target.action.starts_with("fx ") => {
                 return Err(format!(
                     "`{}` 需要 chain/fx/param,请在文件里补全后再重绑",
                     target.action
@@ -363,7 +363,11 @@ impl Guide {
         self.map.binds.iter().position(|bind| {
             // A global target (an FX action) ignores the binding's `deck`, which is meaningless
             // for a chain-addressed action and may be present from a hand-written file.
-            bind.action == target.action
+            //
+            // Compared **canonically**, so a file written before the grammar was unified (with the
+            // old dot spellings) still shows up as bound, and a rebind finds and replaces it rather
+            // than appending a second binding for the same target.
+            same_action(&bind.action, target.action)
                 && target.deck.is_none_or(|deck| bind.deck == Some(deck))
         })
     }
@@ -382,6 +386,11 @@ fn mode_label(mode: RelMode) -> &'static str {
         RelMode::Rel2 => "rel2",
         RelMode::Rel3 => "rel3",
     }
+}
+
+/// Whether two action spellings mean the same verb: `fx.toggle` and `fx toggle` do.
+fn same_action(left: &str, right: &str) -> bool {
+    hypermixx_core::action::canonical(left).as_deref() == Some(right)
 }
 
 /// A one-line description of a detected control, for the status bar.
@@ -515,7 +524,7 @@ fx = "filter"
         let index = guide
             .targets()
             .iter()
-            .position(|target| target.action == "fx.toggle")
+            .position(|target| target.action == "fx toggle")
             .unwrap();
         guide.move_selection(index as isize - guide.selected() as isize);
         guide.arm();
@@ -525,7 +534,7 @@ fx = "filter"
         let toml = guide.to_toml().unwrap();
         assert!(toml.contains("id = 20"), "{toml}");
         assert!(toml.contains("filter"), "fx params carried over:\n{toml}");
-        assert_eq!(toml.matches("fx.toggle").count(), 1, "replaced, not appended");
+        assert_eq!(toml.matches("fx toggle").count(), 1, "replaced, not appended");
     }
 
     #[test]
@@ -534,7 +543,7 @@ fx = "filter"
         let index = guide
             .targets()
             .iter()
-            .position(|target| target.action == "fx.toggle")
+            .position(|target| target.action == "fx toggle")
             .unwrap();
         guide.move_selection(index as isize);
         guide.arm();

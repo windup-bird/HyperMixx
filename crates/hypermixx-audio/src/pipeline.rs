@@ -31,6 +31,24 @@ use crate::sync::SyncGroup;
 use crate::BLOCK_SIZE;
 use crate::SAMPLE_RATE;
 
+/// Sizes the engine's device side needs, from the live config.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AudioTuning {
+    /// Output ring capacity in frames.
+    pub ring_frames: usize,
+    /// Frames of silence pushed before each stream starts.
+    pub prefill_frames: usize,
+}
+
+impl From<AudioTuning> for crate::mixer::OutputTuning {
+    fn from(tuning: AudioTuning) -> Self {
+        Self {
+            ring_frames: tuning.ring_frames,
+            prefill_frames: tuning.prefill_frames,
+        }
+    }
+}
+
 /// Why the engine could not start.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PipelineError {
@@ -128,10 +146,19 @@ impl AudioPipeline {
         Self::start_at(cfg, SAMPLE_RATE)
     }
 
-    /// As [`start`](Self::start) with an explicit rate, for a test that wants a specific clock.
-    /// Production callers want [`start`](Self::start): the decoder resamples to the engine rate, so
-    /// any other value would make the two disagree about what a second is.
+    /// As [`start`](Self::start) with an explicit rate and buffer sizes: the live config's values.
+    /// Everything downstream of the decoder is rate-agnostic, so the rate only has to match what
+    /// material was resampled to.
     pub fn start_at(cfg: MixerConfig, sample_rate: u32) -> Result<Self, PipelineError> {
+        Self::start_with(cfg, sample_rate, AudioTuning::default())
+    }
+
+    /// As [`start_at`](Self::start_at) with the ring sizes spelled out.
+    pub fn start_with(
+        cfg: MixerConfig,
+        sample_rate: u32,
+        tuning: AudioTuning,
+    ) -> Result<Self, PipelineError> {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<Command>();
         let (resp_tx, resp_rx) = crossbeam_channel::unbounded::<CommandResponse>();
         let (query_tx, query_rx) = crossbeam_channel::unbounded::<(Query, Sender<QueryResponse>)>();
@@ -143,7 +170,7 @@ impl AudioPipeline {
         let producer = std::thread::Builder::new()
             .name("hypermixx-producer".into())
             .spawn(move || {
-                let mixer = match Mixer::new(thread_cfg, sample_rate) {
+                let mixer = match Mixer::with_tuning(thread_cfg, sample_rate, tuning.into()) {
                     Ok(mixer) => mixer,
                     Err(err) => {
                         let _ = boot_tx.send(Err(err.into()));
@@ -422,6 +449,14 @@ fn route(
             Ok(()) => CommandResponse::Ok,
             Err(err) => error(err),
         }),
+        Output { op } => Some(match op {
+            hypermixx_core::OutputOp::List => CommandResponse::Outputs(mixer.output_statuses()),
+            hypermixx_core::OutputOp::Refresh => CommandResponse::Outputs(mixer.refresh_outputs()),
+        }),
+        MixerReload { text } => Some(match mixer.reload(&text) {
+            Ok(outputs) => CommandResponse::Outputs(outputs),
+            Err(err) => error(format!("reload: {}", err.message())),
+        }),
         Stem { deck_id, op } => Some(match mixer.apply_stem(deck_id, op) {
             Ok(()) => CommandResponse::Ok,
             Err(err) => error(err),
@@ -456,6 +491,7 @@ fn route(
         fx @ (AddFx { .. }
         | RemoveFx { .. }
         | SetFxEnabled { .. }
+        | ToggleFx { .. }
         | SetFxParam { .. }
         | FxTrigger { .. }
         | PadPress { .. }

@@ -5,7 +5,7 @@
 //! the TUI pushes it into its scrollback.
 
 use hypermixx_audio::fx::fader_amp;
-use hypermixx_core::{CommandResponse, DeckState, Stem, StemStatus, SAMPLE_RATE};
+use hypermixx_core::{CommandResponse, DeckState, OutputStatus, Stem, StemStatus, SAMPLE_RATE};
 
 /// How a line should be presented. `Error` lines already carry the `error: ` prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,9 +79,29 @@ pub fn format_response(response: &CommandResponse) -> Vec<LogLine> {
             }
             out
         }
+        CommandResponse::Outputs(outputs) => outputs.iter().map(output_line).map(LogLine::info).collect(),
         CommandResponse::Ok => Vec::new(),
         CommandResponse::Error(message) => vec![LogLine::error(message.clone())],
     }
+}
+
+/// One line per output destination: what it is, where it is bound, and whether it is audible.
+///
+/// The state word is the load-bearing part — `missing` says "plug it in and `output refresh`",
+/// `disabled` says "this device will not take the engine's rate".
+fn output_line(status: &OutputStatus) -> String {
+    let device = status.device.as_deref().unwrap_or("-");
+    let route = if status.channels == (0, 1) {
+        String::new()
+    } else {
+        format!("  ch {}-{}", status.channels.0, status.channels.1)
+    };
+    format!(
+        "output {:<12} {:<6} {:<8} {device}{route}",
+        status.name,
+        status.role.name(),
+        status.state.label()
+    )
 }
 
 /// The BPM the deck is *actually playing at*: the local grid BPM scaled by the stable tempo.
@@ -309,6 +329,8 @@ pub fn help_text(decks: usize) -> String {
   [deck] <stem> solo [on|off]  add/remove one stem from the solo set
   [deck] <stem> fx ...         inserts on *that stem's* chain, e.g. `deck0 vocals fx add filter`
                                (<stem> = drums | bass | other | vocals)
+  output list|refresh          output destinations and their bindings
+  live show|reload [<file>]    this machine's settings (engine rate, ring, stem defaults)
   state                        show every deck
   midi ports                   list MIDI input ports (open one at launch with --midi)
   zoom in|out|fit              waveform zoom (UI only)
@@ -318,7 +340,8 @@ In the TUI: `load` with no path opens a file picker; F2 picks a MIDI port and F3
 
 A leading `deck0` / `0` selects a deck, `master` the summed output. Without one the command
 follows the focused deck (TUI: `Tab` switches it).
-startup flags: --config <file> (custom topology), --print-config (reference TOML),
+startup flags: --config <file> (custom topology), --profile <name|file> (which files to use),
+               --print-config (reference TOML), --live <file> (engine rate, ring, stem defaults),
                --backend auto|stratum|timestretch, --tui (terminal UI),
                --midi <port> [--midi-map <file>] (MIDI input; default map midi-map.toml),
                --midi-guide [<file>] [--midi <port>] [--decks <n>] (learn-mode map editor)",
@@ -390,8 +413,36 @@ pub fn time(frames: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use hypermixx_core::{OutputRole, OutputState};
+
+    /// The output line carries the three things a user needs: what it is, where it is bound, and
+    /// whether it is audible.
+    #[test]
+    fn an_output_line_names_state_role_and_device() {
+        let status = |state, device: Option<&str>, channels| OutputStatus {
+            name: "cans".into(),
+            role: OutputRole::Cue,
+            state,
+            device: device.map(str::to_owned),
+            channels,
+            gain: 1.0,
+            writes: 0,
+            overruns: 0,
+        };
+        let live = output_line(&status(OutputState::Live, Some("USB Headset"), (0, 1)));
+        assert!(live.contains("cans") && live.contains("cue") && live.contains("live"));
+        assert!(live.contains("USB Headset"));
+        // A missing device has nothing to name, and says so rather than leaving a gap that reads
+        // like a bug.
+        let missing = output_line(&status(OutputState::Missing, None, (0, 1)));
+        assert!(missing.contains("missing") && missing.contains('-'));
+        // A non-default channel pair is worth showing; (0,1) is not.
+        assert!(output_line(&status(OutputState::Live, Some("x"), (2, 3))).contains("ch 2-3"));
+        assert!(!live.contains("ch 0-1"));
+    }
+
     use super::*;
-    use hypermixx_core::{KeylockMode, StemStatus};
+    use hypermixx_core::{OutputStatus, KeylockMode, StemStatus};
 
     /// A fully idle deck: nothing to report, so no badge.
     fn idle() -> DeckState {

@@ -6,7 +6,7 @@
 //! [`MergeBuffer`] coalesces the floods a fast fader sweep produces.
 
 use hypermixx_core::{
-    Command, CueOp, DeckId, FaderTarget, FxSlotRef, LoopEditOp, LoopOp, NudgeOp, PhaseMode, StemOp,
+    Command, CueOp, DeckId, FaderTarget, FxSlotRef, LoopEditOp, LoopOp, NudgeOp, StemOp,
     SyncOp, VinylOp,
 };
 
@@ -46,8 +46,6 @@ struct BindState {
     held: bool,
     /// Edge state for edge-triggered CC bindings.
     down: bool,
-    /// Toggle state for `fx.toggle`.
-    toggled: bool,
 }
 
 impl TranslateState {
@@ -89,7 +87,6 @@ impl BindState {
             prev: mirror,
             held: false,
             down: false,
-            toggled: false,
         }
     }
 }
@@ -395,9 +392,9 @@ impl<'a> BindingOut<'a> {
             }
             FxAction::Toggle { chain, fx } => {
                 if let Some(slot) = self.slot(chain, &fx) {
-                    let enabled = !self.state.toggled;
-                    self.state.toggled = enabled;
-                    self.out.push(Command::SetFxEnabled { slot, enabled });
+                    // The engine owns the state; a front-end mirror would go wrong the first time
+                    // anything else changed the slot.
+                    self.out.push(Command::ToggleFx { slot });
                 }
             }
             FxAction::Pad { chain, fx } => {
@@ -518,14 +515,8 @@ fn loop_op(op: LoopAction) -> LoopOp {
 fn sync_op(op: SyncAction) -> SyncOp {
     match op {
         SyncAction::Tempo => SyncOp::Tempo,
-        SyncAction::Phase => SyncOp::Phase {
-            mode: PhaseMode::Pid,
-            t_seconds: None,
-        },
-        SyncAction::PhaseLock => SyncOp::PhaseLock {
-            mode: PhaseMode::Pid,
-            t_seconds: None,
-        },
+        SyncAction::Phase { mode, t_seconds } => SyncOp::Phase { mode, t_seconds },
+        SyncAction::PhaseLock { mode, t_seconds } => SyncOp::PhaseLock { mode, t_seconds },
         SyncAction::TempoLock => SyncOp::TempoLock,
         SyncAction::Leader => SyncOp::SetLeader,
         SyncAction::Unlock => SyncOp::Unlock,
@@ -1109,24 +1100,20 @@ fx = "filter"
         translate(&map, &note(0, 20, false), &mut state);
 
         map.resolve_fx(hypermixx_core::FxChainId::Deck(0), "filter", 2);
+        // A toggle asks the *engine* to flip it: the truth about a slot lives there, so the
+        // front-end never has a state to drift out of sync.
         let commands = translate(&map, &note(0, 20, true), &mut state);
         assert!(matches!(
             commands.as_slice(),
-            [Command::SetFxEnabled {
+            [Command::ToggleFx {
                 slot: FxSlotRef {
                     chain: hypermixx_core::FxChainId::Deck(0),
                     index: 2,
                 },
-                enabled: true,
             }]
         ));
-        // Second press toggles it back off.
-        translate(&map, &note(0, 20, false), &mut state);
-        let commands = translate(&map, &note(0, 20, true), &mut state);
-        assert!(matches!(
-            commands.as_slice(),
-            [Command::SetFxEnabled { enabled: false, .. }]
-        ));
+        // And a note binding fires on the press edge only, whatever the slot ends up being.
+        assert!(translate(&map, &note(0, 20, false), &mut state).is_empty());
     }
 
     #[test]

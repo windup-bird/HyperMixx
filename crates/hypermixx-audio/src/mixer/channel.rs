@@ -260,6 +260,13 @@ impl Channel {
         self.deck = deck;
     }
 
+    /// Hands the transport out, leaving an empty one behind. Used by a topology reload, which
+    /// builds fresh channels but must not stop the music: the deck is not a config value, so it
+    /// survives the rebuild that every *config* value goes through.
+    pub fn take_deck(&mut self) -> Deck {
+        std::mem::replace(&mut self.deck, Deck::empty())
+    }
+
     /// Installs a separated track into this channel's deck.
     ///
     /// The swap is a source change at the current position, so it is seamless and whether the audio

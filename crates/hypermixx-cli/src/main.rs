@@ -9,14 +9,14 @@ mod command;
 mod midi;
 mod notices;
 mod repl;
+mod profile;
 mod response;
+mod session;
 mod tui;
 
 use crossbeam_channel::unbounded;
-use hypermixx_audio::{
-    reference_toml, simple_dj, AudioPipeline, MixerConfig, DECK_COUNT, SAMPLE_RATE,
-};
-use hypermixx_core::Backend;
+use hypermixx_audio::{reference_toml, simple_dj, AudioPipeline, MixerConfig, DECK_COUNT};
+use hypermixx_core::{Backend, LiveConfig};
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -30,17 +30,53 @@ fn main() {
     // is even read, so mapping a controller never depends on a working sound card.
     if let Some(path) = args.midi_guide.as_deref() {
         let decks = args.decks.unwrap_or(DECK_COUNT);
-        if let Err(err) = tui::guide::run(path, args.midi.as_deref(), decks) {
+        // The guide can be told its port by the profile too, so mapping a controller does not need
+        // the port repeated on the command line.
+        let guide_port = args.midi.clone().or_else(|| {
+            read_profile(args.profile.as_deref())
+                .and_then(|profile| profile.midi.device)
+        });
+        if let Err(err) = tui::guide::run(path, guide_port.as_deref(), decks) {
             eprintln!("error: {err}");
             std::process::exit(1);
         }
         return;
     }
     let backend = args.backend;
+    // A profile names the topology and the live file. It is a pointer, not a third schema: the two
+    // files keep their own validation, and an explicit `--config`/`--live` still wins over it.
+    let profile = read_profile(args.profile.as_deref());
+    let config_path = args.config.clone().or_else(|| profile.as_ref().and_then(|p| p.mixer.clone()));
+    let live_path = args.live.clone().or_else(|| profile.as_ref().and_then(|p| p.live.clone()));
+    // MIDI comes from the profile too: naming a controller there is what makes `--profile dj` bring
+    // up a whole rig rather than just a topology. Explicit flags still win.
+    //
+    // When the profile names neither a device nor a map, the folder default (`profile/midi.toml`)
+    // applies — the same shape as `mixer.toml` / `live.toml`. A missing file means "no MIDI", which
+    // is the shipped state: no controller is assumed.
+    let midi_from_profile = match profile.as_ref().map(|profile| profile.midi.clone()) {
+        Some(midi) if !midi.device.is_none() || midi.map.is_some() => midi,
+        _ => match profile::load_midi(profile::DEFAULT_MIDI) {
+            Ok((midi, notes)) => {
+                for note in &notes {
+                    eprintln!("warning: {}: {note}", profile::DEFAULT_MIDI);
+                }
+                midi
+            }
+            Err(_) => profile::MidiSettings::default(),
+        },
+    };
+    let midi_port = args.midi.clone().or_else(|| midi_from_profile.device.clone());
+    let midi_map = args
+        .midi_map
+        .clone()
+        .or_else(|| midi_from_profile.map.clone())
+        .unwrap_or_else(|| profile::DEFAULT_MAP.to_owned());
+
     // `--config` overrides the built-in reference topology; a bad file is a clean exit, not a
     // half-alive engine (and the mixer's own validation — unknown FX, empty channels — runs
     // inside `start`, on the thread that will own the result).
-    let cfg = match &args.config {
+    let cfg = match &config_path {
         Some(path) => match read_config(path) {
             Ok(cfg) => cfg,
             Err(err) => {
@@ -50,9 +86,43 @@ fn main() {
         },
         None => default_config(),
     };
+    // The live settings are this machine's, not the music's: the engine rate, the ring sizes and
+    // the stem defaults. A missing file is not an error (the shipped defaults are the built-ins);
+    // a broken one is, because silently running at another rate is the surprise this file exists
+    // to prevent.
+    let (live, live_source) = match live_path.as_deref() {
+        Some(path) => match command::read_live_config(path) {
+            Ok((live, notes)) => {
+                for note in &notes {
+                    eprintln!("warning: {note}");
+                }
+                (live, Some(path.to_owned()))
+            }
+            Err(err) => {
+                eprintln!("error: {path}: {err}");
+                std::process::exit(1);
+            }
+        },
+        None => match command::read_live_config(command::DEFAULT_LIVE) {
+            Ok((live, notes)) => {
+                for note in &notes {
+                    eprintln!("warning: {note}");
+                }
+                (live, Some(command::DEFAULT_LIVE.to_owned()))
+            }
+            Err(_) => (LiveConfig::default(), None),
+        },
+    };
     // `start` builds the mixer on the producer thread (cpal streams are !Send) and reports a bad
     // config back synchronously, so a failure here is a clean exit, not a half-alive engine.
-    let pipeline = match AudioPipeline::start(cfg) {
+    let pipeline = match AudioPipeline::start_with(
+        cfg,
+        live.audio.sample_rate,
+        hypermixx_audio::AudioTuning {
+            ring_frames: live.audio.ring_frames,
+            prefill_frames: live.audio.prefill_frames,
+        },
+    ) {
         Ok(pipeline) => pipeline,
         Err(err) => {
             eprintln!("error: {err}");
@@ -73,30 +143,43 @@ fn main() {
     if args.tui {
         tui::run(
             &pipeline,
-            command_tx,
-            backend,
-            decks,
-            notice_tx,
-            notice_rx,
-            args.midi.as_deref(),
-            args.midi_map.as_deref().unwrap_or("midi-map.toml"),
+            session::Session {
+                command_tx,
+                backend,
+                decks,
+                notice_tx,
+                notice_rx,
+                topology: config_path.clone(),
+                live,
+                live_source,
+                midi_port: midi_port.clone(),
+                midi_map,
+            },
         );
         return;
     }
 
-    let midi_session = match args.midi.as_deref() {
+    // A port the *user* named on the command line must open, or the run is a mistake; a port that
+    // came from the profile is "what this rig usually is", and a controller that is not plugged in
+    // yet should not stop the session — say so and carry on (the TUI's `F2` can still pick one).
+    let explicit_midi = args.midi.is_some();
+    let midi_session = match midi_port.as_deref() {
         Some(port) => match midi::attach_file(
             port,
-            args.midi_map.as_deref().unwrap_or("midi-map.toml"),
+            &midi_map,
             decks,
             command_tx.clone(),
             pipeline.response_rx(),
             &notice_tx,
         ) {
             Ok(session) => Some(session),
-            Err(err) => {
+            Err(err) if explicit_midi => {
                 eprintln!("error: midi: {err}");
                 std::process::exit(1);
+            }
+            Err(err) => {
+                eprintln!("warning: midi: {err}; continuing without it");
+                None
             }
         },
         None => None,
@@ -108,10 +191,25 @@ fn main() {
         .map(|path| format!(", config {path}"))
         .unwrap_or_default();
     println!(
-        "hypermixx {VERSION} — {decks} decks, {SAMPLE_RATE}Hz stereo, backend {backend:?}{config_note}. \
-         `help` for commands, `quit` to exit."
+        "hypermixx {VERSION} — {decks} decks, {}Hz stereo, backend {backend:?}{config_note}. \
+         `help` for commands, `quit` to exit.",
+        live.audio.sample_rate
     );
-    repl::run(&pipeline, command_tx, backend, decks, notice_tx, notice_rx);
+    repl::run(
+        &pipeline,
+        session::Session {
+            command_tx,
+            backend,
+            decks,
+            notice_tx,
+            notice_rx,
+            topology: config_path.clone(),
+            live,
+            live_source,
+            midi_port: midi_port.clone(),
+            midi_map,
+        },
+    );
     drop(midi_session);
 }
 
@@ -136,6 +234,10 @@ struct CliArgs {
     midi_guide: Option<String>,
     /// `--decks <n>`: the guide's target list width (no engine to ask).
     decks: Option<usize>,
+    /// `--live <file>`: this machine's settings (engine rate, ring sizes, stem defaults).
+    live: Option<String>,
+    /// `--profile <name|file>`: a file naming the topology and the live settings.
+    profile: Option<String>,
 }
 
 impl CliArgs {
@@ -156,6 +258,20 @@ impl CliArgs {
                             std::process::exit(1);
                         }
                     };
+                }
+                "--profile" => {
+                    args.profile = raw.next().or_else(|| {
+                        eprintln!(
+                            "error: --profile needs a name or a path (profile/<name>.toml)"
+                        );
+                        std::process::exit(1);
+                    });
+                }
+                "--live" => {
+                    args.live = raw.next().or_else(|| {
+                        eprintln!("error: --live needs a path");
+                        std::process::exit(1);
+                    });
                 }
                 "--config" => {
                     args.config = raw.next().or_else(|| {
@@ -195,7 +311,8 @@ impl CliArgs {
                 }
                 other => {
                     eprintln!(
-                        "error: unknown argument `{other}` (--config, --print-config, --backend, --tui, --midi, --midi-map, --midi-guide, --decks)"
+                        "error: unknown argument `{other}` (--config, --print-config, --profile, \
+                         --live, --backend, --tui, --midi, --midi-map, --midi-guide, --decks)"
                     );
                     std::process::exit(1);
                 }
@@ -211,17 +328,44 @@ impl CliArgs {
     }
 }
 
+/// Reads the profile `--profile` names, or the ambient one, and reports whatever it said that is
+/// worth saying (a reserved `[preference]` key, for instance).
+///
+/// A *missing* ambient profile is not an error — "no profile" is the documented way to run the
+/// built-in defaults. A missing **named** one is, because the user asked for it by name.
+fn read_profile(arg: Option<&str>) -> Option<profile::Profile> {
+    let (path, required) = match arg {
+        Some(name) => (profile::resolve(name), true),
+        None => (profile::AMBIENT.to_owned(), false),
+    };
+    match profile::load(&path) {
+        Ok((profile, notes)) => {
+            for note in &notes {
+                eprintln!("warning: {path}: {note}");
+            }
+            Some(profile)
+        }
+        Err(err) => {
+            if required {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+            None
+        }
+    }
+}
+
 /// Reads a topology file. Parse errors carry the TOML positions, so a typo points at its line.
 fn read_config(path: &str) -> Result<MixerConfig, String> {
     let text = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
     MixerConfig::from_toml_str(&text).map_err(|err| err.message())
 }
 
-/// The topology to run with when `--config` is absent: `config/mixer.toml` when the working
-/// directory has one (the shipped default, and the file a user edits), otherwise the built-in
-/// reference. The shipped file parses to exactly [`simple_dj`], so the two paths describe one mixer.
+/// The topology to run with when neither `--config` nor a profile names one: the shipped file under
+/// `profile/`, or the built-in reference. The shipped file parses to exactly [`simple_dj`], so the
+/// two paths describe one mixer.
 fn default_config() -> MixerConfig {
-    const PATH: &str = "config/mixer.toml";
+    const PATH: &str = profile::DEFAULT_MIXER;
     match std::fs::read_to_string(PATH) {
         Ok(text) => match MixerConfig::from_toml_str(&text) {
             Ok(cfg) => cfg,

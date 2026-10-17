@@ -6,6 +6,7 @@
 
 use crate::analysis::TrackAnalysis;
 use crate::deck::{DeckId, DeckState};
+use crate::output::{OutputOp, OutputStatus};
 use crate::source::Shared;
 use crate::stem::{Stem, StemOp, StemSet};
 
@@ -493,6 +494,11 @@ pub enum Command {
         slot: FxSlotRef,
         enabled: bool,
     },
+    /// Flips a slot's a/b state in the engine, which is where the truth is: a front-end that tracked
+    /// it locally would go wrong the first time anything else changed the slot.
+    ToggleFx {
+        slot: FxSlotRef,
+    },
     /// Sets one named parameter. The value lands on the audio thread through a smoothing filter,
     /// so sweeping a cutoff never clicks.
     SetFxParam {
@@ -515,6 +521,18 @@ pub enum Command {
     /// Reports every slot in a chain with its parameters, so a UI can build its controls.
     ListFx {
         chain: FxChainId,
+    },
+    /// The output destinations: list them, or retry the ones that could not be bound.
+    Output {
+        op: OutputOp,
+    },
+    /// Rebuilds the mixer's topology from a config file's text.
+    ///
+    /// The text, not a path: file IO belongs to the front-end, which is also the only layer that
+    /// knows where its user keeps configs. What arrives here is parsed, validated and applied, or
+    /// refused wholesale — a reload that half-applies would be worse than one that does not.
+    MixerReload {
+        text: String,
     },
     Quit,
 }
@@ -543,6 +561,8 @@ pub enum CommandResponse {
         chain: FxChainId,
         slots: Vec<FxSlotStatus>,
     },
+    /// The answer to [`Command::Output`].
+    Outputs(Vec<OutputStatus>),
     Ok,
     Error(String),
 }
@@ -661,6 +681,7 @@ impl std::fmt::Debug for Command {
                 .field("chain", chain)
                 .field("index", index)
                 .finish(),
+            Command::ToggleFx { slot } => f.debug_struct("ToggleFx").field("slot", slot).finish(),
             Command::SetFxEnabled { slot, enabled } => f
                 .debug_struct("SetFxEnabled")
                 .field("slot", slot)
@@ -678,6 +699,11 @@ impl std::fmt::Debug for Command {
                 f.debug_struct("PadRelease").field("slot", slot).finish()
             }
             Command::ListFx { chain } => f.debug_struct("ListFx").field("chain", chain).finish(),
+            Command::Output { op } => f.debug_struct("Output").field("op", op).finish(),
+            Command::MixerReload { text } => f
+                .debug_struct("MixerReload")
+                .field("bytes", &text.len())
+                .finish(),
             Command::Quit => f.write_str("Quit"),
         }
     }

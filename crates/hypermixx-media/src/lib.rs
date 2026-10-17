@@ -6,7 +6,7 @@
 mod decoder;
 mod pool;
 
-pub use decoder::{decode_file, DecodedAudio};
+pub use decoder::{decode_file, decode_file_at, DecodedAudio};
 pub use pool::PcmPool;
 
 // The `Source` trait is defined in `core` (the shared protocol) but re-exported here so media

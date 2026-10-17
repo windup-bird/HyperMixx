@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use hypermixx_core::{DeckId, FaderTarget, FxChainId, Stem};
+use hypermixx_core::{DeckId, FaderTarget, FxChainId, PhaseMode, Stem};
 use serde::{Deserialize, Serialize};
 
 /// A parse or validation failure. The message carries the TOML position when the error came from
@@ -267,11 +267,20 @@ pub enum LoopAction {
     Beats(u64),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SyncAction {
+    /// Match the other deck's BPM once.
     Tempo,
-    Phase,
-    PhaseLock,
+    /// Match the BPM and close the phase with `mode` over `t_seconds` (the engine's default when
+    /// the line does not say).
+    Phase {
+        mode: PhaseMode,
+        t_seconds: Option<f64>,
+    },
+    PhaseLock {
+        mode: PhaseMode,
+        t_seconds: Option<f64>,
+    },
     TempoLock,
     Leader,
     Unlock,
@@ -307,22 +316,16 @@ impl FxAction {
     }
 }
 
-/// One entry in the action registry. The registry is the single source of truth: the TOML
-/// validator, the guide's target list and the translator all read it, so they cannot drift.
-pub struct ActionSpec {
-    pub name: &'static str,
-    /// Whether the action must name a `deck`.
-    pub deck: bool,
-    /// Whether a note binding is held (both edges) rather than edge-triggered.
-    pub momentary: bool,
-}
+/// The action vocabulary, re-exported from `core`: there is exactly one table, and its names **are**
+/// the session command lines a front-end takes (minus the target).
+pub use hypermixx_core::action::{ActionSpec, ACTIONS};
 
 /// The baseline nudge, as a rate: one wheel message bends by this much (`0.15` = 15 % fast), and a
 /// binding that omits `step` gets it.
 ///
 /// Deliberately large, because most controller encoders report ±1 per message however fast you turn:
 /// the message *rate* is the only speed information there is, so one message has to be worth
-/// something on its own. With [`Nudge::bend`] accumulating up to `NUDGE_LIMIT`, two messages reach a
+/// something on its own. With `Nudge::bend` accumulating up to `NUDGE_LIMIT`, two messages reach a
 /// wheel-sized bend.
 pub const DEFAULT_NUDGE_STEP: f32 = 0.15;
 
@@ -338,7 +341,7 @@ pub const DEFAULT_NUDGE_STEP: f32 = 0.15;
 pub const DEFAULT_NUDGE_SECONDS: f64 = 0.06;
 
 /// Frames of audio one wheel tick moves the playhead while the platter is held, when a `vinyl`
-/// binding omits `step`.
+/// binding omits `step` (or an `action = "vinyl"` line omits its argument).
 ///
 /// Tune it with the physics: a record at 33⅓ RPM carries **1.8 s per revolution**, so
 ///
@@ -352,48 +355,6 @@ pub const DEFAULT_NUDGE_SECONDS: f64 = 0.06;
 /// and count the messages.
 pub const DEFAULT_VINYL_FRAMES_PER_TICK: f32 = 1323.0;
 
-/// Every action the mapping layer knows, in the order a guide should list them.
-pub const ACTIONS: &[ActionSpec] = &[
-    ActionSpec { name: "play", deck: true, momentary: false },
-    ActionSpec { name: "cue", deck: true, momentary: true },
-    ActionSpec { name: "vinyl", deck: true, momentary: true },
-    ActionSpec { name: "beatjump+", deck: true, momentary: false },
-    ActionSpec { name: "beatjump-", deck: true, momentary: false },
-    ActionSpec { name: "fader.flow", deck: true, momentary: false },
-    // One stem's level, and the two latching buttons per stem. `<stem>` is drums | bass | other |
-    // vocals; the guide lists the vocals spelling and the parser accepts any stem name.
-    ActionSpec { name: "fader.stem.vocals", deck: true, momentary: false },
-    ActionSpec { name: "stem.vocals.mute", deck: true, momentary: false },
-    ActionSpec { name: "stem.vocals.solo", deck: true, momentary: false },
-    ActionSpec { name: "fader.deck", deck: true, momentary: false },
-    ActionSpec { name: "fader.gain", deck: true, momentary: false },
-    ActionSpec { name: "fader.cuesend", deck: true, momentary: false },
-    ActionSpec { name: "fader.cross", deck: false, momentary: false },
-    ActionSpec { name: "fader.master", deck: false, momentary: false },
-    ActionSpec { name: "fader.cue", deck: false, momentary: false },
-    ActionSpec { name: "tempofader", deck: true, momentary: false },
-    ActionSpec { name: "nudge", deck: true, momentary: true },
-    ActionSpec { name: "loop.in", deck: true, momentary: false },
-    ActionSpec { name: "loop.out", deck: true, momentary: false },
-    ActionSpec { name: "loop.exit", deck: true, momentary: false },
-    ActionSpec { name: "loop.cancel", deck: true, momentary: false },
-    ActionSpec { name: "loop.halve", deck: true, momentary: false },
-    ActionSpec { name: "loop.double", deck: true, momentary: false },
-    ActionSpec { name: "loop.beat", deck: true, momentary: false },
-    ActionSpec { name: "sync.tempo", deck: true, momentary: false },
-    ActionSpec { name: "sync.phase", deck: true, momentary: false },
-    ActionSpec { name: "sync.phaselock", deck: true, momentary: false },
-    ActionSpec { name: "sync.tempolock", deck: true, momentary: false },
-    ActionSpec { name: "sync.leader", deck: true, momentary: false },
-    ActionSpec { name: "sync.unlock", deck: true, momentary: false },
-    ActionSpec { name: "fx.on", deck: false, momentary: false },
-    ActionSpec { name: "fx.off", deck: false, momentary: false },
-    ActionSpec { name: "fx.toggle", deck: false, momentary: false },
-    ActionSpec { name: "fx.pad", deck: false, momentary: true },
-    ActionSpec { name: "fx.trigger", deck: false, momentary: false },
-    ActionSpec { name: "fx.param", deck: false, momentary: false },
-];
-
 /// One selectable target in the guide's checklist: an action, scoped to a deck when it needs one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -405,6 +366,9 @@ pub struct Target {
 }
 
 /// Builds the standard checklist for `decks` decks from [`ACTIONS`].
+///
+/// The label is the command line, so what the guide shows is exactly what it writes into the file —
+/// and exactly what a user could have typed in the session.
 pub fn manifest(decks: usize) -> Vec<Target> {
     let mut out = Vec::new();
     for spec in ACTIONS {
@@ -531,170 +495,220 @@ fn stem_of(token: &str) -> Result<Stem, String> {
     })
 }
 
-/// Resolves an action name plus its optional parameters.
+/// Resolves a binding's `action` plus its optional parameters.
+///
+/// The action is **a session command line without the target**: `"play"`, `"beatjump 4"`,
+/// `"sync phase pid"`, `"vocals mute"`, `"fader flow"`. The target is the binding's `deck` field
+/// (or, when the line names one itself, that word). Legacy dot-spelled names are still accepted —
+/// see [`hypermixx_core::action::canonical`] — because the file is user-editable and a map that
+/// silently stops working after an upgrade is worse than one that keeps an old spelling.
+///
+/// Binding-level parameters stay fields (`step`, `seconds`, `beats`, `chain`/`fx`/`param`) because
+/// they describe the *control* rather than the command: a hardware encoder's detent size, a
+/// controller's nudge duration, the slot an FX button addresses by name.
 fn parse_action(raw: &RawBinding) -> Result<Action, String> {
-    let name = raw.action.as_str();
-    let deck = |spec: &str| -> Result<DeckId, String> {
-        raw.deck
-            .ok_or_else(|| format!("action `{spec}` needs a `deck`"))
+    let Some(line) = hypermixx_core::action::canonical(&raw.action) else {
+        return Err(format!(
+            "unknown action `{}` (see `docs/midi-mapping.md` for the list)",
+            raw.action
+        ));
     };
-    match name {
-        "play" => {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let original = raw.action.as_str();
+    let deck = |what: &str| -> Result<DeckId, String> {
+        raw.deck
+            .ok_or_else(|| format!("action `{what}` needs a `deck`"))
+    };
+    let number = |word: Option<&str>, what: &str| -> Result<Option<f64>, String> {
+        match word {
+            None => Ok(None),
+            Some(word) => word
+                .parse::<f64>()
+                .map(Some)
+                .map_err(|_| format!("`{what}` must be a number, got `{word}`")),
+        }
+    };
+
+    match words.as_slice() {
+        ["play"] => {
             deck("play")?;
             Ok(Action::Play)
         }
-        "cue" => {
+        ["cue"] => {
             deck("cue")?;
             Ok(Action::Cue)
         }
-        "vinyl" => {
-            deck(name)?;
-            let step = raw.step.unwrap_or(DEFAULT_VINYL_FRAMES_PER_TICK);
-            if !step.is_finite() || step <= 0.0 {
-                return Err("`step` (vinyl frames per tick) must be a positive number".to_owned());
-            }
-            Ok(Action::Vinyl { frames_per_tick: step })
-        }
-        "cue.smart" => {
-            deck("cue.smart")?;
+        // Not in the registry (the guide offers one cue row), but a valid spelling: a button that
+        // only *places* the cue point.
+        ["cue", "smart"] => {
+            deck("cue smart")?;
             Ok(Action::CueSmart)
         }
-        "beatjump+" | "beatjump-" => {
-            deck(name)?;
-            let magnitude = raw.step.unwrap_or(1.0);
-            if !magnitude.is_finite() || magnitude < 1.0 {
-                return Err("`step` must be at least 1 beat".to_owned());
+        ["vinyl"] | ["vinyl", _] => {
+            deck("vinyl")?;
+            let step = match number(words.get(1).copied(), "vinyl frames per tick")? {
+                Some(frames) => frames as f32,
+                None => raw.step.unwrap_or(DEFAULT_VINYL_FRAMES_PER_TICK),
+            };
+            if !step.is_finite() || step <= 0.0 {
+                return Err("vinyl frames per tick must be a positive number".to_owned());
             }
+            Ok(Action::Vinyl {
+                frames_per_tick: step,
+            })
+        }
+        ["beatjump"] | ["beatjump", _] => {
+            deck("beatjump")?;
+            // The sign can come from either the line (`beatjump -8`) or a legacy name
+            // (`beatjump-`), and the magnitude from the line or the binding's `step`.
+            let from_line = number(words.get(1).copied(), "beatjump beats")?;
+            let magnitude = match from_line {
+                Some(beats) => beats.abs(),
+                None => f64::from(raw.step.unwrap_or(1.0)).abs(),
+            };
+            if !magnitude.is_finite() || magnitude < 1.0 {
+                return Err("a beatjump needs at least one beat".to_owned());
+            }
+            let negative = from_line.map(|beats| beats < 0.0).unwrap_or(false)
+                || original.ends_with('-');
             let beats = magnitude.round() as i64;
             Ok(Action::BeatJump {
-                beats: if name.ends_with('-') { -beats } else { beats },
+                beats: if negative { -beats } else { beats },
             })
         }
-        "fader.flow" => Ok(Action::Fader(FaderTarget::Flow(deck(name)?))),
-        // `fader.stem.vocals` — the deck comes from the binding's `deck`, the stem from the action
-        // name, mirroring how `fader.flow` takes its deck.
-        _ if name.starts_with("fader.stem.") => {
-            let stem = stem_of(&name["fader.stem.".len()..])?;
-            Ok(Action::Fader(FaderTarget::Stem {
-                deck: deck(name)?,
-                stem,
-            }))
-        }
-        // `stem.vocals.mute` / `stem.vocals.solo`: latching buttons.
-        _ if name.starts_with("stem.") => {
-            let rest = &name["stem.".len()..];
-            let (stem_name, what) = rest
-                .rsplit_once('.')
-                .ok_or_else(|| format!("`{name}` needs the form stem.<stem>.mute|solo"))?;
+        ["fader", "flow"] => Ok(Action::Fader(FaderTarget::Flow(deck("fader flow")?))),
+        ["fader", "deck"] => Ok(Action::Fader(FaderTarget::Deck(deck("fader deck")?))),
+        ["fader", "gain"] => Ok(Action::Fader(FaderTarget::Gain(deck("fader gain")?))),
+        ["fader", "cuesend"] => Ok(Action::Fader(FaderTarget::CueSend(deck("fader cuesend")?))),
+        ["fader", "cross"] => Ok(Action::Fader(FaderTarget::Crossfader)),
+        ["fader", "master"] => Ok(Action::Fader(FaderTarget::Master)),
+        ["fader", "cue"] => Ok(Action::Fader(FaderTarget::Cue)),
+        // `<stem> fader | mute | solo` — the stem is the first word, exactly as a session line
+        // writes it (`deck0 vocals mute`).
+        [stem_name, what @ ("fader" | "mute" | "solo")] => {
             let stem = stem_of(stem_name)?;
-            deck(name)?;
-            match what {
+            let deck_id = deck(original)?;
+            match *what {
+                "fader" => Ok(Action::Fader(FaderTarget::Stem {
+                    deck: deck_id,
+                    stem,
+                })),
                 "mute" => Ok(Action::StemMute { stem }),
-                "solo" => Ok(Action::StemSolo { stem }),
-                other => Err(format!(
-                    "unknown stem action `{other}` (mute | solo) in `{name}`"
-                )),
+                _ => Ok(Action::StemSolo { stem }),
             }
         }
-        "fader.deck" => Ok(Action::Fader(FaderTarget::Deck(deck(name)?))),
-        "fader.gain" => Ok(Action::Fader(FaderTarget::Gain(deck(name)?))),
-        "fader.cuesend" => Ok(Action::Fader(FaderTarget::CueSend(deck(name)?))),
-        "fader.cross" => Ok(Action::Fader(FaderTarget::Crossfader)),
-        "fader.master" => Ok(Action::Fader(FaderTarget::Master)),
-        "fader.cue" => Ok(Action::Fader(FaderTarget::Cue)),
-        "tempofader" => {
-            deck(name)?;
+        ["tempofader"] => {
+            deck("tempofader")?;
             Ok(Action::TempoFader)
         }
-        "nudge" => {
-            deck(name)?;
-            let delta = raw.step.unwrap_or(DEFAULT_NUDGE_STEP);
+        ["nudge"] | ["nudge", _, _] => {
+            deck("nudge")?;
+            let delta = match number(words.get(1).copied(), "nudge delta")? {
+                Some(delta) => delta as f32,
+                None => raw.step.unwrap_or(DEFAULT_NUDGE_STEP),
+            };
             if !delta.is_finite() || delta == 0.0 {
-                return Err("`step` (nudge delta) must be non-zero".to_owned());
+                return Err("a nudge delta must be non-zero".to_owned());
             }
-            Ok(Action::Nudge {
-                delta,
-                seconds: raw.seconds,
-            })
+            let seconds = match number(words.get(2).copied(), "nudge seconds")? {
+                Some(seconds) => Some(seconds),
+                None => raw.seconds,
+            };
+            Ok(Action::Nudge { delta, seconds })
         }
-        "loop.in" => {
-            deck(name)?;
-            Ok(Action::Loop(LoopAction::In))
+        ["loop", what @ ("in" | "out" | "exit" | "cancel" | "halve" | "double")] => {
+            deck("loop")?;
+            Ok(Action::Loop(match *what {
+                "in" => LoopAction::In,
+                "out" => LoopAction::Out,
+                "exit" => LoopAction::Exit,
+                "cancel" => LoopAction::Cancel,
+                "halve" => LoopAction::Halve,
+                _ => LoopAction::Double,
+            }))
         }
-        "loop.out" => {
-            deck(name)?;
-            Ok(Action::Loop(LoopAction::Out))
-        }
-        "loop.exit" => {
-            deck(name)?;
-            Ok(Action::Loop(LoopAction::Exit))
-        }
-        "loop.cancel" => {
-            deck(name)?;
-            Ok(Action::Loop(LoopAction::Cancel))
-        }
-        "loop.halve" => {
-            deck(name)?;
-            Ok(Action::Loop(LoopAction::Halve))
-        }
-        "loop.double" => {
-            deck(name)?;
-            Ok(Action::Loop(LoopAction::Double))
-        }
-        "loop.beat" => {
-            deck(name)?;
-            let beats = raw
-                .beats
-                .filter(|beats| *beats > 0)
-                .ok_or_else(|| "`loop.beat` needs a positive `beats`".to_owned())?;
+        // `loop 8`, or `loop` with the length in the binding's `beats` field.
+        ["loop"] | ["loop", _] => {
+            deck("loop")?;
+            // A button with no length is the DJ default: four beats. (The CLI requires the number —
+            // a *line* has room for it, a button does not.)
+            let beats = match number(words.get(1).copied(), "loop beats")? {
+                Some(beats) if beats >= 1.0 => beats.round() as u64,
+                Some(_) => return Err("a beat loop needs at least one beat".to_owned()),
+                None => raw.beats.filter(|beats| *beats > 0).unwrap_or(4),
+            };
             Ok(Action::Loop(LoopAction::Beats(beats)))
         }
-        _ if name.starts_with("loop.beat") => {
-            deck(name)?;
-            let beats: u64 = name["loop.beat".len()..]
-                .parse()
-                .map_err(|_| format!("unknown action `{name}`"))?;
-            if beats == 0 {
-                return Err("beat-loop length must be positive".to_owned());
-            }
-            Ok(Action::Loop(LoopAction::Beats(beats)))
+        ["sync", what] => {
+            deck("sync")?;
+            Ok(Action::Sync(match *what {
+                "tempo" => SyncAction::Tempo,
+                "tempolock" => SyncAction::TempoLock,
+                "set-leader" | "leader" => SyncAction::Leader,
+                "unlock" => SyncAction::Unlock,
+                "phase" => SyncAction::Phase {
+                    mode: PhaseMode::Pid,
+                    t_seconds: None,
+                },
+                "phaselock" => SyncAction::PhaseLock {
+                    mode: PhaseMode::Pid,
+                    t_seconds: None,
+                },
+                other => return Err(format!("unknown sync action `{other}`")),
+            }))
         }
-        "sync.tempo" => {
-            deck(name)?;
-            Ok(Action::Sync(SyncAction::Tempo))
+        ["sync", phase @ ("phase" | "phaselock"), rest @ ..] => {
+            deck("sync")?;
+            let (mode, seconds) = phase_args(rest)?;
+            Ok(Action::Sync(if *phase == "phase" {
+                SyncAction::Phase { mode, t_seconds: seconds }
+            } else {
+                SyncAction::PhaseLock { mode, t_seconds: seconds }
+            }))
         }
-        "sync.phase" => {
-            deck(name)?;
-            Ok(Action::Sync(SyncAction::Phase))
+        ["fx", what @ ("on" | "off" | "toggle" | "pad" | "trigger")] => {
+            let kind = match *what {
+                "on" => FxActionKind::On,
+                "off" => FxActionKind::Off,
+                "toggle" => FxActionKind::Toggle,
+                "pad" => FxActionKind::Pad,
+                _ => FxActionKind::Trigger,
+            };
+            Ok(Action::Fx(fx_slot_action(raw, kind)?))
         }
-        "sync.phaselock" => {
-            deck(name)?;
-            Ok(Action::Sync(SyncAction::PhaseLock))
-        }
-        "sync.tempolock" => {
-            deck(name)?;
-            Ok(Action::Sync(SyncAction::TempoLock))
-        }
-        "sync.leader" => {
-            deck(name)?;
-            Ok(Action::Sync(SyncAction::Leader))
-        }
-        "sync.unlock" => {
-            deck(name)?;
-            Ok(Action::Sync(SyncAction::Unlock))
-        }
-        "fx.on" => Ok(Action::Fx(fx_slot_action(raw, FxActionKind::On)?)),
-        "fx.off" => Ok(Action::Fx(fx_slot_action(raw, FxActionKind::Off)?)),
-        "fx.toggle" => Ok(Action::Fx(fx_slot_action(raw, FxActionKind::Toggle)?)),
-        "fx.pad" => Ok(Action::Fx(fx_slot_action(raw, FxActionKind::Pad)?)),
-        "fx.trigger" => Ok(Action::Fx(fx_slot_action(raw, FxActionKind::Trigger)?)),
-        "fx.param" => {
+        ["fx", "param"] => {
             let (chain, fx) = fx_address(raw)?;
-            let param = raw.param.clone().ok_or("`fx.param` needs a `param` name")?;
+            let param = raw.param.clone().ok_or("`fx param` needs a `param` name")?;
             Ok(Action::Fx(FxAction::Param { chain, fx, param }))
         }
-        other => Err(format!("unknown action `{other}`")),
+        // The *canonical* line is what is named, so a legacy spelling gets an error about the
+        // spelling it resolves to (`vocals solo_only`) rather than about the string in the file.
+        _ => Err(format!("unknown action `{line}`")),
     }
+}
+
+/// The `<mode> [seconds]` tail of a `sync phase` line. Defaults to the PI controller, which is what
+/// a button wants: press it, and the decks converge.
+fn phase_args(rest: &[&str]) -> Result<(PhaseMode, Option<f64>), String> {
+    let mut mode = PhaseMode::Pid;
+    let mut seconds = None;
+    for word in rest {
+        if let Some(parsed) = PhaseMode::parse(word) {
+            mode = parsed;
+            continue;
+        }
+        let value = word
+            .parse::<f64>()
+            .map_err(|_| format!("`{word}` is neither a phase mode nor a duration"))?;
+        if value <= 0.0 {
+            return Err("a linear phase sync needs a positive duration".to_owned());
+        }
+        seconds = Some(value);
+    }
+    if mode == PhaseMode::Linear && seconds.is_none() {
+        return Err("`sync phase linear` needs a duration".to_owned());
+    }
+    Ok((mode, seconds))
 }
 
 /// The five slot-level FX actions, which all need `chain` + `fx` but no parameter.
@@ -770,7 +784,7 @@ step = 0.05
 type = "cc"
 id = 74
 deck = 0
-action = "loop.beat8"
+action = "loop 8"
 
 [[bind]]
 type = "cc"
@@ -814,6 +828,62 @@ param = "value"
         )
         .unwrap();
         assert_eq!(map.binds[0].action, Action::Fader(FaderTarget::Gain(1)));
+    }
+
+    /// The action is a session command line, so everything the CLI can say about these verbs, a map
+    /// can say too — including arguments.
+    #[test]
+    fn action_lines_take_the_arguments_a_session_line_takes() {
+        let bind = |action: &str, extra: &str| -> Action {
+            let text = format!(
+                "[[bind]]\ntype = \"note\"\nid = 1\ndeck = 1\n{extra}action = \"{action}\"\n"
+            );
+            Map::from_toml_str(&text).unwrap().binds[0].action.clone()
+        };
+        assert_eq!(bind("beatjump -8", ""), Action::BeatJump { beats: -8 });
+        assert_eq!(bind("beatjump", "step = 4\n"), Action::BeatJump { beats: 4 });
+        // The legacy minus name still means "backwards", with the magnitude from `step`.
+        assert_eq!(bind("beatjump-", "step = 3\n"), Action::BeatJump { beats: -3 });
+        assert_eq!(bind("loop 8", ""), Action::Loop(LoopAction::Beats(8)));
+        assert_eq!(bind("loop", ""), Action::Loop(LoopAction::Beats(4)), "the button default");
+        assert_eq!(bind("loop 8", "beats = 2\n"), Action::Loop(LoopAction::Beats(8)), "the line wins");
+        assert_eq!(
+            bind("sync phase linear 0.5", ""),
+            Action::Sync(SyncAction::Phase {
+                mode: PhaseMode::Linear,
+                t_seconds: Some(0.5)
+            })
+        );
+        assert_eq!(
+            bind("sync phase", ""),
+            Action::Sync(SyncAction::Phase { mode: PhaseMode::Pid, t_seconds: None })
+        );
+        assert_eq!(
+            bind("sync set-leader", ""),
+            Action::Sync(SyncAction::Leader)
+        );
+        assert_eq!(bind("vinyl 441", ""), Action::Vinyl { frames_per_tick: 441.0 });
+        assert_eq!(
+            bind("nudge 0.05 0.5", ""),
+            Action::Nudge { delta: 0.05, seconds: Some(0.5) }
+        );
+        assert_eq!(bind("nudge", "step = 0.2\n"), Action::Nudge { delta: 0.2, seconds: None });
+        assert_eq!(bind("vocals mute", ""), Action::StemMute { stem: Stem::Vocals });
+        assert_eq!(bind("drums solo", ""), Action::StemSolo { stem: Stem::Drums });
+        assert_eq!(
+            bind("bass fader", ""),
+            Action::Fader(FaderTarget::Stem { deck: 1, stem: Stem::Bass })
+        );
+        assert_eq!(bind("fader gain", ""), Action::Fader(FaderTarget::Gain(1)));
+
+        // A malformed argument is refused, and the message says which word was wrong.
+        let bad = "[[bind]]\ntype = \"note\"\nid = 1\ndeck = 0\naction = \"beatjump soon\"\n";
+        let err = Map::from_toml_str(bad).unwrap_err();
+        assert!(err.message().contains("soon"), "{}", err.message());
+        // A linear phase sync without a duration cannot converge, so it is refused rather than
+        // silently turning into a PI controller.
+        let bad = "[[bind]]\ntype = \"note\"\nid = 1\ndeck = 0\naction = \"sync phase linear\"\n";
+        assert!(Map::from_toml_str(bad).unwrap_err().message().contains("duration"));
     }
 
     #[test]
@@ -942,9 +1012,9 @@ action = "fader.flow"
         // A bad stem lists what it could have been.
         let err = map("stem.guitar.mute", "deck = 0\n").unwrap_err();
         assert!(err.contains("vocals") && err.contains("unknown stem"), "{err}");
-        // A bad verb is not silently accepted.
+        // A bad verb is not silently accepted, and the message points at the list.
         let err = map("stem.vocals.solo_only", "deck = 0\n").unwrap_err();
-        assert!(err.contains("unknown stem action") || err.contains("unknown stem"), "{err}");
+        assert!(err.contains("unknown action") && err.contains("vocals solo_only"), "{err}");
         // Every stem name the engine has is addressable, on both families.
         for stem in Stem::ALL {
             assert!(map(&format!("fader.stem.{stem}"), "deck = 0\n").is_ok(), "{stem}");
@@ -1040,8 +1110,8 @@ action = "play"
         // Every registry entry is accepted by the parser (given the fields it needs) and every
         // listed name is either accepted or requires parameters.
         for spec in ACTIONS {
-            let needs_beats = spec.name == "loop.beat";
-            let needs_fx = matches!(spec.name, "fx.on" | "fx.off" | "fx.toggle" | "fx.pad" | "fx.trigger" | "fx.param");
+            let needs_beats = spec.name == "loop";
+            let needs_fx = spec.name.starts_with("fx ");
             let needs_deck = spec.deck;
             let mut toml = String::from("[[bind]]\ntype = \"cc\"\nid = 1\n");
             if needs_deck {
@@ -1054,7 +1124,7 @@ action = "play"
             if needs_fx {
                 toml.push_str("chain = \"master\"\n");
                 toml.push_str("fx = \"gain\"\n");
-                if spec.name == "fx.param" {
+                if spec.name == "fx param" {
                     toml.push_str("param = \"value\"\n");
                 }
             }

@@ -56,6 +56,8 @@ const VERBS: &[(&str, &str)] = &[
     ("fader", "channel/master/cue levels (flow|deck|gain|cuesend|cross|master|cue)"),
     ("fx", "effect chain commands"),
     ("stem", "stem separation and per-stem control"),
+    ("output", "output destinations and their bindings"),
+    ("live", "machine settings: engine rate, ring sizes, stem defaults"),
     ("state", "show decks"),
     ("zoom", "waveform zoom"),
     ("help", "list commands"),

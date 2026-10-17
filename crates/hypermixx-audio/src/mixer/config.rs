@@ -9,7 +9,7 @@
 //! a mixer that quietly dropped the limiter the user configured is worse than one that refuses to
 //! start.
 
-use hypermixx_core::Stem;
+use hypermixx_core::{OutputRole, Stem};
 
 use super::channel::{CrossfaderCurve, CrossfaderPlace, CueTap, DeckSide};
 use super::output::OutputId;
@@ -151,10 +151,23 @@ pub struct OutputConfig {
     #[serde(default)]
     pub id: OutputId,
     pub name: String,
+    /// Which physical device to bind to: a **name substring** (case-insensitive, first match wins)
+    /// or an **index** into the host's output devices. Omitted = the system default device.
+    ///
+    /// A substring rather than an id because the names are the only thing every platform agrees on
+    /// (ALSA, PipeWire, WASAPI and future Android backends all have human names, and hardware ids
+    /// change between machines); an index is there for the moment, when you can see the list.
+    #[serde(default)]
+    pub device: Option<String>,
     /// `(left, right)` device channel indices.
     #[serde(default = "default_channels")]
     pub channels: (u16, u16),
     pub role: OutputRole,
+    /// The sample rates this destination is allowed to run at. Defaults to the engine's rate, so a
+    /// device that cannot take it leaves the output **disabled** (with a warning) rather than
+    /// silently playing at the wrong speed.
+    #[serde(default)]
+    pub sample_rates: Vec<u32>,
     /// Trim applied when the bus is handed over, so two destinations can differ in level without
     /// the mixer knowing about it.
     #[serde(default = "default_gain")]
@@ -224,17 +237,6 @@ impl Default for CueMixConfig {
     }
 }
 
-/// Whether an output carries the mix or the cue.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OutputRole {
-    /// The summed mix.
-    #[default]
-    Master,
-    /// The cue bus (the headphone destination).
-    Cue,
-}
-
 impl Default for OutputConfig {
     /// The plain stereo default: channels (0,1), main role, unity gain. `name` still has to come
     /// from the config — an anonymous destination cannot be named in a log line.
@@ -242,22 +244,22 @@ impl Default for OutputConfig {
         Self {
             id: 0,
             name: String::new(),
+            device: None,
             channels: (0, 1),
             role: OutputRole::Master,
+            sample_rates: Vec::new(),
             gain: 1.0,
         }
     }
 }
 
 impl OutputConfig {
-    /// A stereo master destination.
+    /// A stereo master destination on the system default device.
     pub fn master(id: OutputId, name: impl Into<String>) -> Self {
         Self {
             id,
             name: name.into(),
-            channels: (0, 1),
-            role: OutputRole::Master,
-            gain: 1.0,
+            ..Self::default()
         }
     }
 
@@ -267,6 +269,24 @@ impl OutputConfig {
             role: OutputRole::Cue,
             ..Self::master(id, name)
         }
+    }
+
+    /// The trim to apply, or unity when the config is nonsense.
+    pub fn gain_or_unity(&self) -> f32 {
+        if self.gain.is_finite() && self.gain >= 0.0 {
+            self.gain
+        } else {
+            1.0
+        }
+    }
+
+    /// Whether this destination may run at `rate`: the engine rate has to be one of the allowed
+    /// ones, which defaults to the engine rate alone.
+    pub fn allows_rate(&self, rate: u32) -> bool {
+        if self.sample_rates.is_empty() {
+            return rate == hypermixx_core::SAMPLE_RATE;
+        }
+        self.sample_rates.contains(&rate)
     }
 
     /// The mapping to use against a device with `device_channels` outputs: the configured pair if it
@@ -419,8 +439,8 @@ pub fn simple_dj() -> MixerConfig {
 /// schema and the constructor honest with each other.
 pub fn reference_toml() -> &'static str {
     // The reference topology ships as a file so there is exactly one source of truth: this text,
-    // `--print-config` and `config/mixer.toml` are the same bytes.
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/mixer.toml"))
+    // `--print-config` and `profile/mixer.toml` are the same bytes.
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../profile/mixer.toml"))
 }
 
 /// A single-channel config with no outputs at all: the mixer computes and writes nothing, which is

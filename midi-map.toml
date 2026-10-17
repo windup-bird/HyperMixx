@@ -20,14 +20,14 @@ type = "note"
 channel = 0
 id = 70
 deck = 0
-action = "beatjump-"
+action = "beatjump -1"
 
 [[bind]]
 type = "note"
 channel = 0
 id = 72
 deck = 0
-action = "beatjump+"
+action = "beatjump 1"
 
 [[bind]]
 type = "cc"
@@ -35,7 +35,7 @@ mode = "abs"
 channel = 0
 id = 28
 deck = 0
-action = "fader.flow"
+action = "fader flow"
 
 [[bind]]
 type = "cc"
@@ -43,21 +43,21 @@ mode = "abs"
 channel = 1
 id = 28
 deck = 1
-action = "fader.flow"
+action = "fader flow"
 
 [[bind]]
 type = "cc"
 mode = "abs"
 channel = 15
 id = 8
-action = "fader.cross"
+action = "fader cross"
 
 [[bind]]
 type = "cc"
 mode = "abs"
 channel = 15
 id = 10
-action = "fader.master"
+action = "fader master"
 
 [[bind]]
 type = "cc"
@@ -72,36 +72,35 @@ type = "note"
 channel = 4
 id = 20
 deck = 0
-action = "loop.in"
+action = "loop in"
 
 [[bind]]
 type = "note"
 channel = 4
 id = 21
 deck = 0
-action = "loop.out"
+action = "loop out"
 
 [[bind]]
 type = "note"
 channel = 0
 id = 66
 deck = 0
-action = "loop.beat"
-beats = 4
+action = "loop 4"
 
 [[bind]]
 type = "note"
 channel = 0
 id = 80
 deck = 1
-action = "sync.tempo"
+action = "sync tempo"
 
 [[bind]]
 type = "note"
 channel = 1
 id = 2
 deck = 1
-action = "sync.phase"
+action = "sync phase"
 
 [[bind]]
 type = "cc"
@@ -109,7 +108,7 @@ mode = "abs"
 channel = 0
 id = 74
 deck = 0
-action = "fx.param"
+action = "fx param"
 chain = "deck0"
 fx = "filter"
 param = "value"
@@ -119,7 +118,7 @@ type = "note"
 channel = 0
 id = 96
 deck = 0
-action = "fx.toggle"
+action = "fx toggle"
 chain = "deck0"
 fx = "filter"
 
@@ -135,21 +134,21 @@ type = "note"
 channel = 1
 id = 72
 deck = 1
-action = "beatjump+"
+action = "beatjump 1"
 
 [[bind]]
 type = "note"
 channel = 1
 id = 70
 deck = 1
-action = "beatjump-"
+action = "beatjump -1"
 
 [[bind]]
 type = "cc"
 mode = "abs"
 channel = 15
 id = 12
-action = "fader.cue"
+action = "fader cue"
 
 [[bind]]
 type = "cc"
@@ -207,112 +206,112 @@ type = "note"
 channel = 5
 id = 20
 deck = 1
-action = "loop.in"
+action = "loop in"
 
 [[bind]]
 type = "note"
 channel = 5
 id = 21
 deck = 1
-action = "loop.out"
+action = "loop out"
 
 [[bind]]
 type = "note"
 channel = 4
 id = 22
 deck = 0
-action = "loop.exit"
+action = "loop exit"
 
 [[bind]]
 type = "note"
 channel = 5
 id = 22
 deck = 1
-action = "loop.exit"
+action = "loop exit"
 
 [[bind]]
 type = "note"
 channel = 4
 id = 23
 deck = 0
-action = "loop.cancel"
+action = "loop cancel"
 
 [[bind]]
 type = "note"
 channel = 5
 id = 23
 deck = 1
-action = "loop.cancel"
+action = "loop cancel"
 
 [[bind]]
 type = "note"
 channel = 4
 id = 24
 deck = 0
-action = "loop.halve"
+action = "loop halve"
 
 [[bind]]
 type = "note"
 channel = 5
 id = 24
 deck = 1
-action = "loop.halve"
+action = "loop halve"
 
 [[bind]]
 type = "note"
 channel = 4
 id = 25
 deck = 0
-action = "loop.double"
+action = "loop double"
 
 [[bind]]
 type = "note"
 channel = 5
 id = 25
 deck = 1
-action = "loop.double"
+action = "loop double"
 
 [[bind]]
 type = "note"
 channel = 0
 id = 2
 deck = 0
-action = "sync.phase"
+action = "sync phase"
 
 [[bind]]
 type = "note"
 channel = 6
 id = 20
 deck = 0
-action = "stem.vocals.mute"
+action = "vocals mute"
 
 [[bind]]
 type = "note"
 channel = 6
 id = 21
 deck = 0
-action = "stem.drums.mute"
+action = "drums mute"
 
 [[bind]]
 type = "note"
 channel = 6
 id = 22
 deck = 0
-action = "stem.bass.mute"
+action = "bass mute"
 
 [[bind]]
 type = "note"
 channel = 6
 id = 23
 deck = 0
-action = "stem.other.mute"
+action = "other mute"
 
 [[bind]]
 type = "note"
 channel = 6
 id = 24
 deck = 0
-action = "stem.vocals.solo"
+action = "vocals solo"
 
 [[bind]]
 type = "cc"
@@ -320,7 +319,7 @@ mode = "abs"
 channel = 6
 id = 40
 deck = 0
-action = "fader.stem.vocals"
+action = "vocals fader"
 
 [[bind]]
 type = "note"

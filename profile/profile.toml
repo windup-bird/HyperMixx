@@ -1,0 +1,32 @@
+# Hypermixx profile: which files this run uses.
+#
+# The `profile/` folder holds everything — this file plus the toml files it points at (and any other
+# named profile you add, e.g. `profile/dj.toml`, run with `--profile dj`).
+#
+# A profile is a *pointer*, not another schema: the mixer topology, the live settings and the MIDI
+# input keep their own files and their own validation, so `mixer reload` / `live reload` keep working
+# on the file they were told about.
+#
+# **Every relative path here is relative to this file's own folder**, so `"mixer.toml"` means
+# `profile/mixer.toml`. The same rule applies inside the files pointed at.
+#
+#   --profile dj        reads profile/dj.toml
+#   --profile my.toml   reads that path
+#   (no --profile)      reads this file if it exists; otherwise the folder defaults below
+#
+# An explicit `--config` / `--live` / `--midi` / `--midi-map` always wins over what is named here.
+# A port named here that cannot be opened is a *warning* and the session continues (a controller that
+# is not plugged in should not stop the music); an explicit `--midi` that fails is an error.
+
+mixer = "mixer.toml"
+live = "live.toml"
+midi = "midi.toml"
+
+# MIDI can also be written inline instead of pointing at a file:
+# [midi]
+# device = "DDJ-400"
+# map = "../midi-map.toml"
+
+# Reserved: the front-end's own settings will live here (theme, key bindings, default deck count).
+# Until they exist, a key here is *reported* rather than silently ignored.
+# [preference]

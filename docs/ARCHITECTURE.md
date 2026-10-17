@@ -19,11 +19,14 @@ core ──→ serde
 crates/
 ├── hypermixx-core/       # 协议与类型(仅依赖 serde)
 │   └── src/
+│       ├── action.rs    # 唯一的 action 语法表(名字就是会话命令行,CLI/guide/文档共用)
 │       ├── beatgrid.rs   # BeatGrid:绝对帧拍网格 + 相位/拍宽查询
 │       ├── key.rs        # Key / KeyMode / KeyFormat(传统 + Camelot)
 │       ├── analysis.rs   # TrackAnalysis { beatgrid, key, bpm }
 │       ├── deck.rs       # DeckId = u8 / DeckState 快照
 │       ├── command.rs    # Command / CommandResponse / Backend / FxChainId / FxSlotRef
+│       ├── live.rs       # LiveConfig:引擎率 / ring / stem 默认值(TOML 由前端解析)
+│       ├── output.rs     # OutputRole / OutputState / OutputStatus(设备绑定的报告形状)
 │       └── source.rs     # Source trait + Shared = Arc<dyn Source>
 │
 ├── hypermixx-media/      # PCM:解码 + 内存池(core + symphonia)
@@ -82,7 +85,10 @@ crates/
 │       └── ports.rs      # midir 端口枚举/打开 → Sender<Received>
 │
 └── hypermixx-cli/        # 前端(二进制,依赖全部五层)
-    └── src/main.rs       # 行解析 / fx 命令族 / 后台 decode+analyse / 打印线程
+    ├── src/main.rs       # 启动参数 / 拓扑+live+profile 的读取 / 前端装配
+    ├── src/command.rs    # 行解析 / fx 命令族 / 后台 decode+analyse
+    ├── src/profile.rs    # profile:指路文件(mixer/live/midi),路径相对所在文件夹,preference 预留
+    └── src/session.rs    # 一次会话交给前端的全部东西(引擎 + 用户选择)
 ```
 
 ### 外部依赖(git,rev 锁定)
@@ -249,15 +255,24 @@ crossfader 影响;分叉在它之后则跟着它(把 crossfader 放早的代价,
 - `Output`(`output.rs`,crate 里唯一出现 cpal 类型的地方)— 每输出独立 ring + stream;
   回调外预分配 scratch、partial push 永不阻塞、声道重映射安全钳制(单声道取和);
   `gain` 逐目的地 trim;**预填半 ring 静音**(~46ms)避免启动竞速;producer 侧 overrun
-  有计数(callback 侧 underrun 与真实静音不可区分,故不数)
+  有计数(callback 侧 underrun 与真实静音不可区分,故不数)。设备按 `device` 模式解析
+  (**名字子串**或序号,缺省 = 系统默认),状态四态 `live | sink | missing | disabled` ——
+  "设备没插"和"设备不接受引擎率"都是**状态而不是失败**:引擎照跑、`output refresh` 重试
+  (`Mixer::refresh_outputs` 重新跑一遍 `build_outputs`,先 drop 旧流再开新流,免得两条流抢同一设备)
 - **同一物理设备只保留一条流**:master+cue 都落在 default device 时,PipeWire 会在
   graph 里把两条流直接相加——main 有 limiter(≤−1 dBFS)但 cue 总线没有(cue_send 1.0
   时电平可达 2.0),DAC 实收 ~2.9 → 硬削波。Mixer 检测设备名重复,第二条降级 sink 不路由
   (设备选择 `[[output]] device` 字段是后续工作)
 - `simple_dj()` — 参考拓扑:2 通道(各 eq+filter,cue_send 1.0,tap PostDeckFader)+
   master limiter + master/cue 输出;`reference_toml()` 是它的 TOML 文本 —— 直接
-  `include_str!("config/mixer.toml")`,所以文件、`--print-config` 与内置构造只有一个真源
+  `include_str!("profile/mixer.toml")`,所以文件、`--print-config` 与内置构造只有一个真源
   (测试钉死解析回 `simple_dj()`)
+
+**热加载**:`Command::MixerReload { text }`(文本而非路径 —— 文件 IO 属于前端)在 producer 线程上
+`Mixer::reload(&text)`:先解析+`build_chains` 全量校验,通过后才就地换掉 channels/chains/faders/
+master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默认),不是补丁**;保留的只有不属于配置的东西
+—— 每个 channel 的 deck 与走带(`Channel::take_deck`)、计量计数。文件里少掉的 channel 连同曲目一起丢,
+多出来的建空 deck。任一错误整份拒绝,旧链照常工作到验证通过为止。
 
 **TOML 配置**(`MixerConfig::from_toml_str`):文件 schema 由 `MixerFile`/`MasterFile`
 镜像结构定义(`deny_unknown_fields`,坏键报行号),Rust 类型与文件格式各自保有适合的
@@ -396,7 +411,16 @@ crossfader 影响;分叉在它之后则跟着它(把 crossfader 放早的代价,
 
 ---
 
-## 采样率约定
+## 采样率与 live 设置
+
+引擎率是 **live 设置**（`profile/live.toml` 的 `[audio] sample_rate`，缺省 44.1 kHz）：
+`media::decode_file_at(path, rate)` 在装载时重采样到它，`AudioPipeline::start_with(cfg, rate, tuning)`
+把它和 ring/prefill 大小一起交给引擎，此后引擎内部没有采样率概念（`BeatGrid`/deck/FX 都只认帧）。
+**stem 分离仍要求 44.1 kHz**（内置模型是 44.1k 导出、缓存 key 也按它），非 44.1k 时 CLI 直接拒绝
+`stem separate`，不做双向重采样。`block_frames` 保持编译期常量：它是时间拉伸引擎的喂入契约，
+不是本机性能参数。
+
+### 历史：固定 44.1 kHz 的理由
 
 引擎域固定 44.1 kHz:目标设备(ALSA `default`)原生 44.1 kHz,`preferred_config` 按引擎率
 请求即直通。历史教训——引擎 48k 而设备 44.1k 时,ALSA 静默接受 48k 请求却按 44.1k 时钟

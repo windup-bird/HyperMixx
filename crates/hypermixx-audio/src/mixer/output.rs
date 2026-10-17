@@ -14,13 +14,34 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer};
 
+use hypermixx_core::{OutputRole, OutputState, OutputStatus};
+
 use super::bus::Bus;
 use super::config::OutputConfig;
 use crate::ringbuf::{fill_with_silence_on_underrun, push_samples, AudioRingBuffer};
-use crate::{CHANNELS, OUTPUT_RING_CAPACITY, OUTPUT_RING_SAMPLES, PREFILL_FRAMES};
+use crate::{CHANNELS, OUTPUT_RING_CAPACITY, PREFILL_FRAMES};
 
 /// Identifies one output. Stable for the life of a `Mixer`; `MixerConfig` assigns them.
 pub type OutputId = u8;
+
+/// Per-destination buffer sizes, from the live config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputTuning {
+    /// Ring capacity in frames. Bigger = more slack, more latency.
+    pub ring_frames: usize,
+    /// Frames of silence pushed before the stream starts, so the device never waits on the first
+    /// block. Capped at half the ring.
+    pub prefill_frames: usize,
+}
+
+impl Default for OutputTuning {
+    fn default() -> Self {
+        Self {
+            ring_frames: OUTPUT_RING_CAPACITY,
+            prefill_frames: PREFILL_FRAMES,
+        }
+    }
+}
 
 /// Why an output could not be opened.
 #[derive(Clone, Debug, PartialEq)]
@@ -60,6 +81,9 @@ impl std::error::Error for OutputError {}
 pub struct Output {
     pub id: OutputId,
     pub name: String,
+    /// Whether this destination carries the mix or the cue (from the config, so a refresh can keep
+    /// reporting it).
+    pub role: OutputRole,
     /// `(left, right)` device channel indices this output writes to. `(0, 1)` on any stereo card;
     /// a 4-channel interface can carry main on `(0, 1)` and cue on `(2, 3)`.
     pub channels: (u16, u16),
@@ -72,10 +96,11 @@ pub struct Output {
     /// allocates.
     frame: Vec<f32>,
     device_channels: usize,
-    /// True when nothing is connected: writes are counted and dropped.
-    sink: bool,
-    /// The cpal device name this output's stream lives on, `None` for a sink. Two outputs on
-    /// the same device are the mixer's business to detect — the server (PipeWire's graph,
+    /// Whether audio reaches a device, and if not, why. Writes are counted and dropped for every
+    /// non-live state.
+    state: OutputState,
+    /// The cpal device name this output's stream lives on, `None` when none was found. Two outputs
+    /// on the same device are the mixer's business to detect — the server (PipeWire's graph,
     /// ALSA's dmix) sums two streams with no limiter in sight.
     device: Option<String>,
     /// Output trim from [`OutputConfig::gain`] — the field existed but was never applied, so
@@ -95,71 +120,105 @@ impl Output {
     /// that accepts and discards audio, so the engine stays runnable and testable everywhere. A
     /// device that exists but cannot be fed is an error, because then the user should hear something
     /// and will not.
-    pub fn open(cfg: &OutputConfig, sample_rate: u32, block_frames: usize) -> Result<Self, OutputError> {
+    pub fn open(
+        cfg: &OutputConfig,
+        sample_rate: u32,
+        block_frames: usize,
+    ) -> Result<Self, OutputError> {
+        Self::open_with(cfg, sample_rate, block_frames, crate::mixer::OutputTuning::default())
+    }
+
+    /// As [`Output::open`], with the ring and prefill sizes spelled out (they come from the live
+    /// config: how much slack a machine's device needs is a property of that machine).
+    pub fn open_with(
+        cfg: &OutputConfig,
+        sample_rate: u32,
+        block_frames: usize,
+        tuning: OutputTuning,
+    ) -> Result<Self, OutputError> {
         let host = cpal::default_host();
-        let Some(device) = host.default_output_device() else {
-            eprintln!("[audio] {}: no output device, writing to a silent sink", cfg.name);
-            return Ok(Self::sink(cfg, block_frames));
-        };
-        let device_name = device.name().unwrap_or_else(|_| "audio device".into());
-        let config = match preferred_config(&device, sample_rate) {
-            Some(config) => config,
-            None => match device.default_output_config() {
-                Ok(config) => config,
-                Err(err) => return Err(OutputError::Stream(format!("{device_name}: {err}"))),
-            },
-        };
-        let (rate, device_channels, format) = (
-            config.sample_rate().0,
-            config.channels() as usize,
-            config.sample_format(),
-        );
-        if rate != sample_rate {
+        // The config's own rate allow-list is checked first: it is a mistake in the file, and it is
+        // worth reporting as such whether or not a device happens to be plugged in.
+        if !cfg.allows_rate(sample_rate) {
             eprintln!(
-                "[audio] {}: device pinned to {rate}Hz but the engine produces {sample_rate}Hz, \
-                 so timing will be off",
+                "[audio] {}: the engine runs at {sample_rate}Hz, which its `sample_rates` does not \
+                 allow ({}); disabling it",
+                cfg.name,
+                describe_rates(&cfg.sample_rates)
+            );
+            return Ok(Self::placeholder(cfg, block_frames, OutputState::Disabled, None));
+        }
+        // A named device that is not there, or a device that cannot take the rate we need, are
+        // *states*, not errors: the engine keeps running with the destination unrouted and a
+        // `output refresh` retries it. Only a device that claims to work and then fails to build a
+        // stream is an error.
+        let found = match resolve_device(&host, cfg.device.as_deref()) {
+            DeviceLookup::Default(None) => {
+                eprintln!("[audio] {}: no output device, writing to a silent sink", cfg.name);
+                return Ok(Self::placeholder(cfg, block_frames, OutputState::Sink, None));
+            }
+            DeviceLookup::Named(None) => {
+                eprintln!(
+                    "[audio] {}: no device matches `{}` yet; `output refresh` retries",
+                    cfg.name,
+                    cfg.device.as_deref().unwrap_or_default()
+                );
+                return Ok(Self::placeholder(cfg, block_frames, OutputState::Missing, None));
+            }
+            DeviceLookup::Default(Some(device)) | DeviceLookup::Named(Some(device)) => device,
+        };
+        let device_name = found.name().unwrap_or_else(|_| "audio device".into());
+
+        // The device has to offer the engine's rate. Refused rather than papered over: a device
+        // pinned to 48k while the engine produces 44.1k plays every track 8.8% slow, which is worse
+        // than silence because it sounds intentional.
+        let Some(config) = preferred_config(&found, sample_rate) else {
+            let offered = describe_device_rates(&found);
+            eprintln!(
+                "[audio] {}: {device_name} does not accept {sample_rate}Hz (offers {offered}); \
+                 disabling it",
                 cfg.name
             );
-        }
+            return Ok(Self::placeholder(cfg, block_frames, OutputState::Disabled, Some(device_name)));
+        };
+        let (device_channels, format) = (config.channels() as usize, config.sample_format());
         eprintln!(
-            "[audio] {}: {}/{device_channels}ch/{format:?}",
-            cfg.name, config.sample_rate().0
+            "[audio] {}: {device_name} @ {}/{device_channels}ch/{format:?}",
+            cfg.name,
+            config.sample_rate().0
         );
         let mapping = cfg.channel_pair(device_channels);
-        let gain = if cfg.gain.is_finite() && cfg.gain >= 0.0 {
-            cfg.gain
-        } else {
-            1.0
-        };
         let mut output = Self {
             id: cfg.id,
             name: cfg.name.clone(),
+            role: cfg.role,
             channels: mapping,
             block_frames,
             producer: None,
             _stream: None,
             frame: vec![0.0; block_frames * device_channels.max(1)],
             device_channels: device_channels.max(1),
-            sink: false,
+            state: OutputState::Live,
             device: Some(device_name.clone()),
-            gain,
+            gain: cfg.gain_or_unity(),
             overruns: 0,
             writes: 0,
         };
 
-        let (mut producer, consumer) = AudioRingBuffer::new(OUTPUT_RING_CAPACITY).split();
+        let ring_frames = tuning.ring_frames.max(block_frames);
+        let (mut producer, consumer) = AudioRingBuffer::new(ring_frames * CHANNELS).split();
         // Prefill: the callback starts draining the instant the stream is built. Without a
         // cushion the first seconds are a race between the producer's first blocks and the
         // device, and every lost race is a silence gap the listener hears as a click. Half a
         // ring of silence buys the producer a standing head start; the mix simply starts
         // ~46 ms later, which nothing can hear.
-        let prefill = (PREFILL_FRAMES * CHANNELS).min(OUTPUT_RING_SAMPLES / 2);
+        let prefill = (tuning.prefill_frames * CHANNELS).min(ring_frames * CHANNELS / 2);
         if prefill > 0 {
             let silence = vec![0.0f32; prefill];
             push_samples(&mut producer, &silence);
         }
         output.producer = Some(producer);
-        let stream = build_stream(&device, &config, consumer, &cfg.name)?;
+        let stream = build_stream(&found, &config, consumer, &cfg.name)?;
         output._stream = Some(stream);
         Ok(output)
     }
@@ -167,23 +226,30 @@ impl Output {
     /// An output that accepts audio and throws it away — the headless case, and the default for
     /// tests that only care about the mix.
     pub fn sink(cfg: &OutputConfig, block_frames: usize) -> Self {
-        let gain = if cfg.gain.is_finite() && cfg.gain >= 0.0 {
-            cfg.gain
-        } else {
-            1.0
-        };
+        Self::placeholder(cfg, block_frames, OutputState::Sink, None)
+    }
+
+    /// A destination that takes audio and keeps nothing: the headless case, a device that is not
+    /// there, or one that cannot take the engine's rate. The three are told apart by `state`.
+    pub fn placeholder(
+        cfg: &OutputConfig,
+        block_frames: usize,
+        state: OutputState,
+        device: Option<String>,
+    ) -> Self {
         Self {
             id: cfg.id,
             name: cfg.name.clone(),
+            role: cfg.role,
             channels: (0, 1),
             block_frames,
             producer: None,
             _stream: None,
             frame: vec![0.0; block_frames],
             device_channels: CHANNELS,
-            sink: true,
-            device: None,
-            gain,
+            state,
+            device,
+            gain: cfg.gain_or_unity(),
             overruns: 0,
             writes: 0,
         }
@@ -194,8 +260,32 @@ impl Output {
         Self::sink(&OutputConfig::master(id, "null"), block_frames)
     }
 
-    pub fn is_sink(&self) -> bool {
-        self.sink
+    /// Whether a device is actually being fed.
+    pub fn is_live(&self) -> bool {
+        self.state.is_live()
+    }
+
+    /// Why this output is not live, or `Live`.
+    pub fn state(&self) -> OutputState {
+        self.state
+    }
+
+    /// What a front-end reports for this destination.
+    pub fn status(&self) -> OutputStatus {
+        OutputStatus {
+            name: self.name.clone(),
+            role: self.role,
+            state: self.state,
+            device: self.device.clone(),
+            channels: self.channels,
+            gain: self.gain,
+            writes: self.writes,
+            overruns: self.overruns,
+        }
+    }
+
+    pub fn role(&self) -> OutputRole {
+        self.role
     }
 
     /// The cpal device name this output's stream lives on, or `None` for a sink.
@@ -237,7 +327,7 @@ impl Output {
     /// `bus` is stereo; it is expanded to the device's channel count at [`Output::channels`], which
     /// is why this takes the bus rather than samples — the mapping is the output's business.
     pub fn write(&mut self, bus: &Bus) {
-        if self.sink || self.producer.is_none() {
+        if !self.state.is_live() || self.producer.is_none() {
             self.writes += 1;
             return;
         }
@@ -281,7 +371,88 @@ impl Output {
     }
 }
 
+/// What a device pattern resolved to.
+enum DeviceLookup {
+    /// No pattern was configured: the host's default device, if it has one.
+    Default(Option<cpal::Device>),
+    /// A pattern was configured: the matching device, or nothing.
+    Named(Option<cpal::Device>),
+}
+
+/// Resolves a `device` pattern against the host's outputs: an all-digit pattern is an **index** into
+/// the enumeration, anything else is a **case-insensitive name substring** (first match wins).
+/// No pattern means the system default device.
+///
+/// The enumeration is the only place a device name comes from, so `output list` and the resolution
+/// agree by construction.
+fn resolve_device(host: &cpal::Host, pattern: Option<&str>) -> DeviceLookup {
+    let Some(pattern) = pattern.map(str::trim).filter(|p| !p.is_empty()) else {
+        return DeviceLookup::Default(host.default_output_device());
+    };
+    let mut devices: Vec<(String, cpal::Device)> = host
+        .output_devices()
+        .map(|devices| devices.map(|d| (device_name(&d), d)).collect())
+        .unwrap_or_default();
+    let names: Vec<String> = devices.iter().map(|(name, _)| name.clone()).collect();
+    DeviceLookup::Named(match_device(&names, pattern).map(|index| devices.swap_remove(index).1))
+}
+
+/// Which device a pattern names, given the names in enumeration order: all digits is an index,
+/// anything else a case-insensitive substring (first match wins). Pure, so the rule is testable
+/// without a sound card.
+fn match_device(names: &[String], pattern: &str) -> Option<usize> {
+    let pattern = pattern.trim();
+    if let Ok(index) = pattern.parse::<usize>() {
+        return (index < names.len()).then_some(index);
+    }
+    let needle = pattern.to_ascii_lowercase();
+    names
+        .iter()
+        .position(|name| name.to_ascii_lowercase().contains(&needle))
+}
+
+/// A device's name, or a stand-in when the backend will not say.
+fn device_name(device: &cpal::Device) -> String {
+    device.name().unwrap_or_else(|_| "audio device".into())
+}
+
+/// `[44100]` / `[44100, 48000]` / `any` — for a warning that has to be readable.
+fn describe_rates(rates: &[u32]) -> String {
+    if rates.is_empty() {
+        return format!("defaults to {}Hz", hypermixx_core::SAMPLE_RATE);
+    }
+    rates
+        .iter()
+        .map(|rate| format!("{rate}Hz"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What rates a device offers, for the "it cannot take ours" warning.
+fn describe_device_rates(device: &cpal::Device) -> String {
+    let Ok(ranges) = device.supported_output_configs() else {
+        return "nothing it will tell us".into();
+    };
+    let mut seen: Vec<u32> = Vec::new();
+    for range in ranges {
+        for rate in [range.min_sample_rate().0, range.max_sample_rate().0] {
+            if !seen.contains(&rate) {
+                seen.push(rate);
+            }
+        }
+    }
+    seen.sort_unstable();
+    seen.iter()
+        .map(|rate| format!("{rate}Hz"))
+        .collect::<Vec<_>>()
+        .join("..")
+}
+
 /// Asks the device for `sample_rate` stereo, preferring native f32.
+///
+/// Unlike the old version this does **not** fall back to the device's default config: a device that
+/// cannot run at the engine's rate is refused (and the output disabled), because a silent fallback
+/// to another rate plays everything at the wrong speed.
 fn preferred_config(device: &cpal::Device, sample_rate: u32) -> Option<cpal::SupportedStreamConfig> {
     let ranges = device.supported_output_configs().ok()?;
     let wanted = CHANNELS as u16;
@@ -416,6 +587,11 @@ impl Outputs {
         }
     }
 
+    /// Every destination's binding, for `output list`.
+    pub fn statuses(&self) -> Vec<OutputStatus> {
+        self.items.iter().map(Output::status).collect()
+    }
+
     /// Total blocks accepted, across every output — a liveness check for tests.
     pub fn writes(&self) -> u64 {
         self.items.iter().map(Output::writes).sum()
@@ -443,8 +619,10 @@ impl Clone for Output {
             &OutputConfig {
                 id: self.id,
                 name: self.name.clone(),
+                device: self.device.clone(),
                 channels: self.channels,
-                role: super::config::OutputRole::Master,
+                role: self.role,
+                sample_rates: Vec::new(),
                 gain: self.gain,
             },
             self.block_frames,
@@ -455,7 +633,7 @@ impl Clone for Output {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::BLOCK_SIZE;
+    use crate::{BLOCK_SIZE, SAMPLE_RATE};
 
     fn bus(left: f32, right: f32) -> Bus {
         let mut b = Bus::new(BLOCK_SIZE);
@@ -466,7 +644,7 @@ mod tests {
     #[test]
     fn a_sink_counts_writes_and_holds_nothing() {
         let mut out = Output::null(0, BLOCK_SIZE);
-        assert!(out.is_sink());
+        assert!(!out.is_live());
         out.write(&bus(1.0, -1.0));
         out.write(&bus(1.0, -1.0));
         assert_eq!(out.writes(), 2);
@@ -494,6 +672,61 @@ mod tests {
         assert_eq!(empty.writes(), 0);
     }
 
+    /// A device pattern is a name substring, or an index when it is all digits. The rule is pure so
+    /// it can be pinned without a sound card.
+    #[test]
+    fn device_patterns_resolve_by_index_or_name_substring() {
+        let names = vec![
+            "Built-in Audio Analog Stereo".to_owned(),
+            "USB Headset".to_owned(),
+            "Speakers (Realtek)".to_owned(),
+        ];
+        // An index picks that device, in enumeration order.
+        assert_eq!(match_device(&names, "0"), Some(0));
+        assert_eq!(match_device(&names, "2"), Some(2));
+        assert_eq!(match_device(&names, "9"), None, "out of range is no match");
+        // A substring matches case-insensitively, first hit wins.
+        assert_eq!(match_device(&names, "usb"), Some(1));
+        assert_eq!(match_device(&names, "REALTEK"), Some(2));
+        assert_eq!(match_device(&names, "audio"), Some(0), "first match wins");
+        assert_eq!(match_device(&names, "  usb  "), Some(1), "trimmed");
+        assert_eq!(match_device(&names, "firewire"), None);
+    }
+
+    /// A destination that is configured but unavailable is a *state*, not a failed build: the mixer
+    /// still comes up, the output is listed, and `refresh` reports it again.
+    #[test]
+    fn an_unavailable_destination_is_a_state_not_a_failure() {
+        // A device pattern nothing will match.
+        let ghost = OutputConfig {
+            device: Some("hypermixx-no-such-device".into()),
+            ..OutputConfig::master(0, "ghost")
+        };
+        let out = Output::open(&ghost, SAMPLE_RATE, BLOCK_SIZE).expect("builds");
+        assert_eq!(out.state(), OutputState::Missing);
+        assert!(!out.is_live());
+        assert_eq!(out.status().name, "ghost");
+
+        // A rate the config does not allow: the engine rate has to be in `sample_rates`.
+        let wrong_rate = OutputConfig {
+            sample_rates: vec![48_000],
+            ..OutputConfig::master(0, "48k-only")
+        };
+        let out = Output::open(&wrong_rate, SAMPLE_RATE, BLOCK_SIZE).expect("builds");
+        assert_eq!(out.state(), OutputState::Disabled, "a rate mismatch disables the output");
+        assert!(wrong_rate.allows_rate(48_000));
+        assert!(!wrong_rate.allows_rate(SAMPLE_RATE));
+    }
+
+    /// The engine rate is allowed by default; anything else is not.
+    #[test]
+    fn the_default_rate_allow_list_is_the_engine_rate() {
+        let cfg = OutputConfig::master(0, "x");
+        assert!(cfg.sample_rates.is_empty(), "the default is empty, not a literal 44.1k");
+        assert!(cfg.allows_rate(SAMPLE_RATE));
+        assert!(!cfg.allows_rate(48_000));
+    }
+
     /// The device may be absent (CI) or present (a real card). Either way `open` must not panic, and
     /// must never hand back an output that silently produces nothing while claiming to be live.
     #[test]
@@ -502,7 +735,7 @@ mod tests {
         match Output::open(&cfg, crate::SAMPLE_RATE, BLOCK_SIZE) {
             Ok(out) => {
                 // A sink means "no device"; anything else means a started stream.
-                assert_eq!(out.is_sink(), out._stream.is_none(), "sink/stream disagree");
+                assert_eq!(!out.is_live(), out._stream.is_none(), "state/stream disagree");
             }
             Err(err) => assert!(!err.message().is_empty()),
         }

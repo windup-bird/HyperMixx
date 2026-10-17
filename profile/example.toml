@@ -1,0 +1,14 @@
+# An example named profile. Copy it to `profile/<your-name>.toml` and run `--profile <your-name>`.
+#
+# Paths are relative to *this file's folder* (`profile/`), which is also where the files it names
+# live — so a name alone is enough.
+
+mixer = "mixer.toml"
+live = "live.toml"
+midi = "midi.toml"
+
+# Or point at something else entirely:
+# mixer = "../sets/club.toml"
+
+# Reserved (see profile/preference.toml).
+[preference]

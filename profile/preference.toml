@@ -1,0 +1,5 @@
+# Hypermixx front-end preferences — reserved.
+#
+# Nothing here is read yet: the front-end (TUI/REPL) is going to change shape before it is worth
+# freezing a schema for it. The file exists so that the intent is visible and so that the first keys
+# have an obvious home; a key written here today is reported by `--profile` rather than honoured.

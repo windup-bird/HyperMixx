@@ -891,6 +891,7 @@ dependencies = [
  "hypermixx-midi",
  "hypermixx-stems",
  "ratatui",
+ "toml",
 ]
 
 [[package]]

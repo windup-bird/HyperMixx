@@ -1,0 +1,32 @@
+# Hypermixx live settings: what depends on *this machine* rather than on the music.
+#
+# Read at startup (or `--live <file>`); `live show` prints what is in effect and `live reload`
+# re-reads this file. A key that is missing takes the built-in default, so this file is a starting
+# point rather than a complete one.
+
+[audio]
+# The rate the engine renders at *and* asks every device for. Material is resampled to it when it is
+# loaded, so this is the engine's clock rather than a per-destination setting. A device that cannot
+# take it leaves its output `disabled` (see the `output` command) instead of playing at the wrong
+# speed.
+sample_rate = 44100
+# Output ring capacity in frames: more slack for a slow device, more latency (~93 ms at 44.1 kHz).
+# ring_frames = 4096
+# Frames of silence pushed into each ring before its stream starts, so the device never waits on the
+# producer's first block. Capped at half the ring.
+# prefill_frames = 2048
+
+[stems]
+# Which model to separate with, from the table in `hypermixx-stems` (`stem model list`).
+# model = "htdemucs"
+# Execution provider: cpu (always available) or cuda (needs a `--features cuda` build and CUDA 13 +
+# cuDNN 9 in the host).
+# provider = "cpu"
+# Window overlap, 0.0 ..= 0.5: lower is ~24% faster and weights window edges more.
+# overlap = 0.25
+# Ensemble shifts: 1 is one pass, 2 averages a second, shifted run for ~2× the time.
+# shifts = 1
+# Reserved: frames per separation chunk. Today a track is separated in one job and installed when it
+# is finished; the model is already windowed (7.8 s at a time), so progressive install is a matter of
+# feeding the deck as each chunk lands. 0 = whole track.
+# chunk_seconds = 0.0

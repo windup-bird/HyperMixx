@@ -5,25 +5,29 @@
 
 use std::io::{self, BufRead, Write};
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 use hypermixx_audio::{AudioPipeline, Command, CommandResponse};
-use hypermixx_core::Backend;
 
 use crate::command::{self, Action, Slots};
-use crate::notices::NoticeTx;
 use crate::response::{self, Level, LogLine};
+use crate::session::Session;
 
 /// Runs one REPL session. Returns when the user quits or stdin hits EOF.
-pub fn run(
-    pipeline: &AudioPipeline,
-    command_tx: Sender<Command>,
-    backend: Backend,
-    decks: usize,
-    notice_tx: NoticeTx,
-    notice_rx: Receiver<LogLine>,
-) {
+pub fn run(pipeline: &AudioPipeline, session: Session) {
+    let Session {
+        command_tx,
+        backend,
+        decks,
+        notice_tx,
+        notice_rx,
+        topology,
+        live,
+        live_source,
+        ..
+    } = session;
     let response_rx = pipeline.response_rx().clone();
-    let dispatcher = command::Dispatcher::new(command_tx.clone(), notice_tx);
+    let dispatcher = command::Dispatcher::new(command_tx.clone(), notice_tx).with_topology(topology);
+    dispatcher.with_live(live, live_source);
     // Prime every chain's slot list so `fx remove <name>` works from the first command.
     dispatcher.prime(decks, pipeline.response_rx());
     let print_slots = dispatcher.slots();
