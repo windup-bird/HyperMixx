@@ -40,6 +40,7 @@ symphonia = { version = "0.5", default-features = false, features = [
     "vorbis",
 ] }
 crossbeam-channel = "0.5"
+arc-swap = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 # TUI only. Minimal features: `crossterm` pulls in std + the widgets crate; the default

@@ -22,6 +22,13 @@ pub const DEFAULT_PREFILL_FRAMES: usize = 2048;
 pub const MIN_RING_FRAMES: usize = 512;
 /// Largest ring: past this, the latency a user hears is worse than any dropout it prevents.
 pub const MAX_RING_FRAMES: usize = 65_536;
+/// The most threads a config may ask for. Past any real machine's core count, so a typo cannot reach
+/// the runtime.
+pub const MAX_THREADS: usize = 256;
+
+/// The bundled model's window, in seconds (its ONNX export pins 343 980 samples at 44.1 kHz). Used
+/// only to *describe* the streaming cadence in `live show` — the runtime owns the real number.
+const SEGMENT_SECONDS: f64 = 7.8;
 
 /// Device-facing settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -46,7 +53,12 @@ impl Default for AudioSettings {
     }
 }
 
-/// Where the stem model comes from and how it is run.
+/// Everything the engine asks the separator for: the model, the session it runs in, and the two
+/// dials that change the produced audio.
+///
+/// All of it lives in `live.toml` rather than on a command line, because that is what it is: a
+/// property of *this machine* (how many cores to leave for playback, how much memory there is, which
+/// model the operator settled on), not of the track being separated.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct StemSettings {
@@ -56,15 +68,20 @@ pub struct StemSettings {
     pub provider: String,
     /// Window overlap, `0.0 ..= 0.5`: lower is faster and weights window edges more.
     pub overlap: f32,
-    /// Ensemble shifts: `1` is one pass, `2` averages a second, shifted run for ~2× the time.
-    pub shifts: usize,
-    /// Frames per separation chunk.
+    /// Threads the separator may use. `0` = the runtime decides (every core).
     ///
-    /// **Reserved**: today a track is separated in one job and installed when it is done. The number
-    /// is here because the model is already windowed (HTDemucs takes 7.8 s at a time), so chunked
-    /// separation with progressive install is a matter of feeding the deck as each chunk lands —
-    /// and that setting belongs in this file rather than in a code constant.
-    pub chunk_seconds: f32,
+    /// On a small device this is not a performance knob but a **playback** one: ONNX Runtime takes
+    /// every core by default, and a separation that saturates the machine starves the audio callback —
+    /// the mix stutters *while* the stems are being prepared. `2` leaves room for the music.
+    pub threads: usize,
+    /// Trade throughput for peak memory: on HTDemucs, ONNX Runtime's constant folding materialises
+    /// several gigabytes of index tensors at load, which does not fit a small device. Off is the
+    /// fastest setting and needs ~5.6 GB; on is the default and needs ~2.1 GB for ~11% less speed.
+    pub low_memory: bool,
+    /// Ensemble shifts: `1` is one pass (and the only setting that **streams**: blocks land in the
+    /// deck as the model finishes them). `2` averages a second, shifted run for ~2× the time, but the
+    /// runtime cannot shift a stream, so that path separates the whole track before installing it.
+    pub shifts: usize,
 }
 
 impl Default for StemSettings {
@@ -74,7 +91,8 @@ impl Default for StemSettings {
             provider: "cpu".to_owned(),
             overlap: 0.25,
             shifts: 1,
-            chunk_seconds: 0.0,
+            threads: 0,
+            low_memory: true,
         }
     }
 }
@@ -105,9 +123,9 @@ impl LiveConfig {
         }
         stems.overlap = stems.overlap.clamp(0.0, 0.5);
         stems.shifts = stems.shifts.clamp(1, 2);
-        if !stems.chunk_seconds.is_finite() || stems.chunk_seconds < 0.0 {
-            stems.chunk_seconds = 0.0;
-        }
+        // A thread count past any real machine is a typo, and handing ONNX Runtime a nonsense number
+        // is worse than ignoring it: clamp to something a machine could have, and let 0 mean "auto".
+        stems.threads = stems.threads.min(MAX_THREADS);
         if stems.model.trim().is_empty() {
             stems.model = StemSettings::default().model;
         }
@@ -125,15 +143,26 @@ impl LiveConfig {
                 self.audio.sample_rate, self.audio.ring_frames, self.audio.prefill_frames
             ),
             format!(
-                "stems  model {}  provider {}  overlap {:.2}  shifts {}  chunk {}",
+                "stems  model {}  provider {}  overlap {:.2}  shifts {}  threads {}  memory {}  {}",
                 self.stems.model,
                 self.stems.provider,
                 self.stems.overlap,
                 self.stems.shifts,
-                if self.stems.chunk_seconds > 0.0 {
-                    format!("{:.1}s", self.stems.chunk_seconds)
+                if self.stems.threads == 0 {
+                    "auto".to_owned()
                 } else {
-                    "whole track".to_owned()
+                    self.stems.threads.to_string()
+                },
+                if self.stems.low_memory { "low" } else { "max-speed" },
+                // The block length is the model's own window stride, so it is reported rather than
+                // configured: `(1 - overlap) × segment`.
+                if self.stems.shifts > 1 {
+                    "whole track (a shift ensemble cannot stream)".to_owned()
+                } else {
+                    format!(
+                        "streamed in ~{:.1}s blocks",
+                        (1.0 - self.stems.overlap) as f64 * SEGMENT_SECONDS
+                    )
                 }
             ),
         ]
@@ -150,9 +179,8 @@ mod tests {
         assert_eq!(live.audio.sample_rate, DEFAULT_SAMPLE_RATE);
         assert_eq!(live.audio.ring_frames, DEFAULT_RING_FRAMES);
         assert_eq!(live.stems.provider, "cpu", "a machine without a GPU never needs a flag");
-        assert_eq!(live.stems.chunk_seconds, 0.0, "whole tracks today");
-        assert_eq!(live.report().len(), 2);
-        assert!(live.report()[0].contains("44100Hz"));
+
+        assert_eq!(live.report().len(), 2);        assert!(live.report()[0].contains("44100Hz"));
     }
 
     #[test]
@@ -166,7 +194,6 @@ mod tests {
             stems: StemSettings {
                 overlap: 5.0,
                 shifts: 99,
-                chunk_seconds: -1.0,
                 model: "  ".to_owned(),
                 ..Default::default()
             },
@@ -177,7 +204,33 @@ mod tests {
         assert!(live.audio.prefill_frames <= live.audio.ring_frames / 2, "prefill cannot fill the ring");
         assert_eq!(live.stems.overlap, 0.5, "clamped to the useful range");
         assert_eq!(live.stems.shifts, 2, "two passes is the most worth offering");
-        assert_eq!(live.stems.chunk_seconds, 0.0);
+        assert!(live.stems.low_memory, "a small device is the default assumption");
+        // A thread count past any real machine is clamped rather than handed to the runtime.
+        let silly = LiveConfig {
+            stems: StemSettings {
+                threads: 100_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .sanitised();
+        assert_eq!(silly.stems.threads, MAX_THREADS);
+        // ...and `0` keeps meaning "the runtime decides", because it is not clamped up.
+        assert_eq!(
+            LiveConfig {
+                stems: StemSettings {
+                    threads: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+            .sanitised()
+            .stems
+            .threads,
+            0
+        );
+        // A negative chunk is nonsense, and the safe reading of nonsense is "whole track" rather
+        // than "a hundred tiny chunks".
         assert_eq!(live.stems.model, "htdemucs");
         // A huge ring is clamped down as well, and a NaN never survives.
         let live = LiveConfig {

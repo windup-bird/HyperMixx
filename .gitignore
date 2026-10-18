@@ -3,3 +3,6 @@
 /mp3
 midi-map.toml
 midi.toml
+# Separation artefacts and downloaded models: both live in the working directory.
+.cache/
+.model/

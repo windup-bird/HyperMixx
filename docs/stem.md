@@ -14,7 +14,7 @@
   加上逐 stem 的**电平 / 静音 / 独奏**——三件独立事实，由一处合成，所以 solo 压过 mute、取消静音能
   回到原电平。
 - **MIDI**：`fader.stem.<stem>`、`stem.<stem>.mute|solo`（latch 按钮，引擎自己翻转状态）。
-- **缓存**：结果按**内容哈希**落在 `~/.cache/hypermixx/stems/`（每曲约 300 MB），重复跑同一条
+- **缓存**：结果按**内容哈希**落在**工作目录** `.cache/stems/`（每曲约 300 MB），重复跑同一条
   曲目 0 s；`stem cache prune [--keep n]` / `clear`；跑着的任务可以 `stem cancel`。
 - **模型获取**：按 SHA-256 校验、边下边算哈希、失败即删除；`huggingface.co` 不通时走 `hf-mirror.com`
   （`HYPERMIXX_HF_ENDPOINT` 可覆盖）。

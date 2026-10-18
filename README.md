@@ -68,7 +68,8 @@ deck0> fx set filter value  0.5
 deck0> master fx list
 
 # stems：离线分离 4 条轨，然后逐条控制（分离在后台跑，期间照常 play/loop/jump/sync）
-deck0> deck0 stem separate         # CPU：首次 ~87s（3:39 曲目）+ ~2GB 内存；之后命中缓存 0s
+deck0> deck0 stem separate         # 分段分离：先装四路流（此刻仍听原曲），每 60s 一块落地即可用
+deck0> deck0 stem status           # 水位：`25% separated`（未装入部分是原曲回落）
 deck0> deck0 stem separate --gpu   # CUDA：13s（同曲目，RTX 4050）；需 --features cuda 构建
 deck0> deck0 stem separate --overlap 0.0   # 0.25→0.0：少 24% 时间，窗口边缘权重更大
 deck0> deck0 stem acapella         # 只要人声（instrumental | drums | bass | full）
@@ -93,6 +94,7 @@ cargo run -p hypermixx-cli -- --backend auto        # 分析后端 auto | stratu
 cargo run -p hypermixx-cli -- --config topo.toml    # 自定义拓扑
 cargo run -p hypermixx-cli -- --print-config        # 打印参考 TOML（= profile/mixer.toml）
 cargo run -p hypermixx-cli -- --profile dj          # 用 profile/dj.toml 指路（拓扑 + 本机设置 + MIDI 设备）
+#   会话内切换：`profile show` 看当前 profile，`profile reload dj` 换一套（MIDI 下次启动生效）
 cargo run -p hypermixx-cli -- --live live.toml      # 引擎采样率 / ring 大小 / stem 默认值
 cargo run -p hypermixx-cli -- --midi 0              # 打开 0 号 MIDI 输入，用默认 midi-map.toml
 cargo run -p hypermixx-cli -- --midi 0 --midi-map my.toml   # 指定映射文件
@@ -118,7 +120,7 @@ TUI 内尽量不用启动参数:`--tui` 下按 `F2` 选 MIDI 端口、`F3` 选�
 
 ## Stem Separate
 
-`stem separate` 把当前曲目离线分离成[drums/bass/other/vocals]，pcm缓存在`~/.config/hypermixx/stems/...`。
+`stem separate` 把当前曲目离线分离成[drums/bass/other/vocals]，pcm缓存在`./.cache/stems/...`（工作目录下的 `.cache`，可用 `HYPERMIXX_CACHE` 覆盖）。
 
 使用`--features cuda`构建并在cli使用`stem separate --gpu`可以用cudnn加速。
 

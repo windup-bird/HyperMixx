@@ -31,6 +31,7 @@ crates/
 │
 ├── hypermixx-media/      # PCM:解码 + 内存池(core + symphonia)
 │   └── src/
+│       ├── chunked.rs    # ChunkedStreams:可增长的 n 路流(水位外回落 + 前沿淡化),与 stem 无关
 │       ├── decoder.rs    # decode_file:symphonia → 44.1kHz 立体声 f32
 │       └── pool.rs       # PcmPool:不可变 Arc 数据的 Source 实现
 │
@@ -53,11 +54,12 @@ crates/
 │   └── tests/            # engine / beatlock / loop / sync / decode / tone_faithful
 │
 ├── hypermixx-stems/      # 离线 stem 分离(core + media + charon/ort, feature `onnx`)
+│   ├── src/chunked.rs    # 流式驱动:StemBlockSink + 缓存按块追加/续跑 + InputScale(整轨归一化)
 │   └── src/
 │       ├── lib.rs          # StemSeparator trait / Cancelled / read_source / separate_cached
 │       ├── mock.rs         # MockSeparator:无模型,CI 与开发用(两种精确可加的切法)
 │       ├── model.rs        # 模型表 + 镜像下载 + SHA-256 校验(不信任后端的下载器)
-│       ├── cache.rs        # 内容寻址缓存(~/.cache/hypermixx/stems/<key>/)
+│       ├── cache.rs        # 内容寻址缓存(./.cache/stems/<key>/);模型在 ./.model(`HYPERMIXX_CACHE`/`HYPERMIXX_MODELS` 可覆盖)
 │       ├── onnx.rs         # CharonSeparator:进度/取消桥接 + 帧对齐契约检查 + EP 选择
 │       └── onnx_options.rs # Provider(cpu|cuda)/SeparateOptions:改音频的旋钮,也就是缓存 key
 │
@@ -410,6 +412,28 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 响应由独立打印线程渲染(`thread::scope`,response channel 属于 pipeline),输入永不阻塞。
 
 ---
+
+## 流式分离与渐进装载
+
+整轨分离要等到最后一个窗口 ⇒ 第一次听到 stems 是几分钟后。改成**流式**：`CharonSeparator::stream_with_scale`
+走 charon 的 `separate_stream`，它按模型自己的窗口网格扫轨道、**一块一旦不再被后续窗口影响就交出来**
+（默认 overlap 0.25 时每块 = 一个 stride = 5.85 s 音频），并自己负责重叠相加与归一化。
+**没有自造的 chunk/margin/对齐**：模型的窗口铺在轨道自己的网格上，输出与整轨路径**逐样本相同**
+（charon 自己的保证，`tests/real_model.rs` 实测 worst sample difference = 0）。`shifts > 1` 时运行时
+拒绝流式（时间平移只能整轨做），那条路退回整轨一块。
+
+唯一保留的机制是**输入归一化**：`InputScale`（mono 参考的均值/样本标准差，Demucs 约定）在整轨上测一次，
+经 `MixSource` 施加、在 `BlockAdapter` 里撤回。这不是洁癖——**续跑**时运行时只拿到轨道尾部，
+若按尾部自己的统计归一化，接缝两侧就是从不同尺度的输入分离出来的（实测：Σ 差 −68 dB 但单条 stem 差 ~20 dB）。
+续跑从水位往前退一个 segment 的 stride 边界开始（窗口仍在全局网格上），已落盘的块被丢弃。
+
+装载是**一次**的：`media::ChunkedStreams` 是 n 条可增长的 `Source`（`ArcSwap` 快照，读端零锁），
+deck 装好后每个块 append 即可被 `feed()` 读到 —— 不重启 flow、不重装、不停音乐。水位之外**回落**
+（stream 0 放 fallback、其余静音，n 路之和不变）并在前沿 50 ms 淡化，所以跳到未装入区间也有声。
+它**不认识 stems**：几个流、有没有 fallback 都是参数；将来的渐进装载/网络流可以原样复用。
+`Source::available_frames()`（默认 = total）让引擎报 `StemStatus::separated`，`stem status` 显示百分比。
+缓存同一 entry **按块追加**，`meta.frames` = 已完成水位 ⇒ 完整命中即纯回放（连模型都不打开），
+部分命中即续跑。
 
 ## 采样率与 live 设置
 

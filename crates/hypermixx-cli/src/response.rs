@@ -218,9 +218,16 @@ pub fn stem_report(state: &DeckState) -> Vec<String> {
         )];
     }
     let mut out = vec![format!(
-        "deck{}  stems  {}   (level 0.0 = unity, -1.0 = silence; S solo, M mute)",
+        "deck{}  stems  {}{}   (level 0.0 = unity, -1.0 = silence; S solo, M mute)",
         state.deck_id,
-        stems_badge(&state.stems).unwrap_or_default()
+        stems_badge(&state.stems).unwrap_or_default(),
+        // How much of the track is *separated*: a chunked job installs its set before the first
+        // chunk lands, so "four streams exist" is not "there are stems yet".
+        if state.stems.separated > 0.0 && state.stems.separated < 1.0 {
+            format!("  {:.0}% separated", state.stems.separated * 100.0)
+        } else {
+            String::new()
+        }
     )];
     for stem in Stem::ALL {
         let effective = state.stems.effective_position(stem);
@@ -319,8 +326,13 @@ pub fn help_text(decks: usize) -> String {
   [deck] loop halve | double     ÷2 / ×2 the running loop's length (clamped 1/32 .. 64 beats)
   [deck] loop quantum <q>      out-point grid: beat | half | quarter | eighth
   [deck|master] fx ...         effects on a chain — `fx help` for the subcommands
-  [deck] stem separate         separate the loaded track into 4 stems and install them
-  [deck] stem status           show the per-stem level / mute / solo
+  [deck] stem separate [--model <name|path>]
+                               separate the loaded track and install it block by block as it comes.
+                               model/provider/overlap/shifts/threads/memory are `[stems]` keys in
+                               live.toml (`live show`, `live reload`)
+  [deck] stem model list       the models this build can fetch, and which are downloaded
+  [deck] stem model pull <m>   fetch and verify one
+  [deck] stem status           per-stem level / mute / solo, and how much is separated
   [deck] stem <preset>         full | acapella | instrumental | drums | bass
   [deck] stem clear            all four stems audible at unity
   [deck] stem cache            where separated stems are cached, and how much they take
@@ -331,6 +343,7 @@ pub fn help_text(decks: usize) -> String {
                                (<stem> = drums | bass | other | vocals)
   output list|refresh          output destinations and their bindings
   live show|reload [<file>]    this machine's settings (engine rate, ring, stem defaults)
+  profile show|reload [<name>] which files this session runs with; reload switches them
   state                        show every deck
   midi ports                   list MIDI input ports (open one at launch with --midi)
   zoom in|out|fit              waveform zoom (UI only)
@@ -352,10 +365,13 @@ startup flags: --config <file> (custom topology), --profile <name|file> (which f
 /// The `stem` family's own help, for the `stem` verb with no subcommand.
 pub fn stem_help_text() -> String {
     "stem commands (the deck is the line's target, focused by default):
-  stem separate [options]        separate the loaded track into 4 stems, install them when ready
-                                 --shifts <0..=2>  0/1 = one pass (default 1), 2 = ~2x time
-                                 --overlap <x>     0.0..=0.5, default 0.25; 0.0 is 24% faster
-                                 --gpu             run on CUDA (needs a --features cuda build)
+  stem separate [--model <name|path>]
+                                 separate the loaded track and install it block by block as the
+                                 model finishes each window. How it runs is `[stems]` in live.toml:
+                                 model / provider / overlap (the block length) / shifts / threads /
+                                 low_memory — `live show` lists them, `live reload` applies an edit
+  stem model list                the models this build can fetch, and which are downloaded
+  stem model pull <name>         fetch and verify one (or point `[stems] model` at a local .onnx)
   stem status                    show the per-stem level / mute / solo
   stem full | acapella | instrumental | drums | bass
                                  a named arrangement (mute flags; your levels survive)
@@ -371,8 +387,9 @@ One stem at a time (target it directly):
   deck0 vocals unsolo            leave the solo set
   deck0 vocals fx add filter     inserts on *that stem's* chain
 
-Separation is offline and asynchronous: the deck keeps playing the plain mix until the swap lands,
-and re-running it costs nothing when the result is already cached."
+Separation is offline and asynchronous: the deck keeps playing the mix (stream 0) until the first
+block lands, then turns into stems window by window. Re-running a separated track is served from the
+cache."
         .to_owned()
 }
 

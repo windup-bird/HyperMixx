@@ -45,7 +45,7 @@ fn main() {
     let backend = args.backend;
     // A profile names the topology and the live file. It is a pointer, not a third schema: the two
     // files keep their own validation, and an explicit `--config`/`--live` still wins over it.
-    let profile = read_profile(args.profile.as_deref());
+    let (profile, profile_path) = read_profile_at(args.profile.as_deref());
     let config_path = args.config.clone().or_else(|| profile.as_ref().and_then(|p| p.mixer.clone()));
     let live_path = args.live.clone().or_else(|| profile.as_ref().and_then(|p| p.live.clone()));
     // MIDI comes from the profile too: naming a controller there is what makes `--profile dj` bring
@@ -150,6 +150,7 @@ fn main() {
                 notice_tx,
                 notice_rx,
                 topology: config_path.clone(),
+                profile: profile_path.clone(),
                 live,
                 live_source,
                 midi_port: midi_port.clone(),
@@ -185,11 +186,13 @@ fn main() {
         None => None,
     };
 
-    let config_note = args
-        .config
-        .as_deref()
-        .map(|path| format!(", config {path}"))
-        .unwrap_or_default();
+    // Name the files this run picked up, so "which profile am I on?" is answerable without asking.
+    let config_note = match (&profile_path, &config_path) {
+        (Some(profile), Some(config)) => format!(", profile {profile}, config {config}"),
+        (Some(profile), None) => format!(", profile {profile}"),
+        (None, Some(config)) => format!(", config {config}"),
+        (None, None) => String::new(),
+    };
     println!(
         "hypermixx {VERSION} — {decks} decks, {}Hz stereo, backend {backend:?}{config_note}. \
          `help` for commands, `quit` to exit.",
@@ -204,6 +207,7 @@ fn main() {
             notice_tx,
             notice_rx,
             topology: config_path.clone(),
+            profile: profile_path.clone(),
             live,
             live_source,
             midi_port: midi_port.clone(),
@@ -334,6 +338,13 @@ impl CliArgs {
 /// A *missing* ambient profile is not an error — "no profile" is the documented way to run the
 /// built-in defaults. A missing **named** one is, because the user asked for it by name.
 fn read_profile(arg: Option<&str>) -> Option<profile::Profile> {
+    let (profile, _) = read_profile_at(arg);
+    profile
+}
+
+/// The profile and the path it came from: the path is what `profile show`/`profile reload` speak
+/// about, so the two travel together from the start.
+fn read_profile_at(arg: Option<&str>) -> (Option<profile::Profile>, Option<String>) {
     let (path, required) = match arg {
         Some(name) => (profile::resolve(name), true),
         None => (profile::AMBIENT.to_owned(), false),
@@ -343,14 +354,15 @@ fn read_profile(arg: Option<&str>) -> Option<profile::Profile> {
             for note in &notes {
                 eprintln!("warning: {path}: {note}");
             }
-            Some(profile)
+            (Some(profile), Some(path))
         }
         Err(err) => {
             if required {
                 eprintln!("error: {err}");
                 std::process::exit(1);
             }
-            None
+            // The ambient profile is optional by design: no profile means the folder defaults.
+            (None, None)
         }
     }
 }

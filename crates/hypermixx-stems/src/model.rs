@@ -1,5 +1,8 @@
 //! The model table and its acquisition.
 //!
+//! Files land in `.model` in the working directory (see [`models_root`]); the table below is the only
+//! thing that says where they come from and what they must hash to.
+//!
 //! `huggingface.co` is not reachable from everywhere (it is not reachable from the machine this was
 //! developed on), so acquisition is **explicit and mirror-aware** rather than delegated to a
 //! backend's downloader:
@@ -38,6 +41,14 @@ pub struct ModelSpec {
     /// The model's native sample rate. HTDemucs is 44.1 kHz, which is *also* the engine's rate, so
     /// a separated track needs no resampling anywhere in the chain.
     pub sample_rate: u32,
+    /// Frames the model takes at a time — its input is a **fixed** length, and the graph rejects
+    /// anything else.
+    ///
+    /// Two things are derived from it: how much audio one *block* covers (the window stride,
+    /// `(1 - overlap) × segment_frames` — that is the cadence the deck installs audio at), and where a
+    /// resumed stream may start (the same grid). A model with a different export length simply
+    /// changes both.
+    pub segment_frames: u64,
     /// What it separates a track into, in [`Stem::ALL`] order.
     pub stems: [Stem; Stem::COUNT],
 }
@@ -53,18 +64,83 @@ pub const HTDEMUCS: ModelSpec = ModelSpec {
     sha256: "68d0bf16428ef66e692cdff8a9ccf28f1ef3f69440d57e58605a4cc55fcc5e74",
     bytes: 316_446_953,
     sample_rate: hypermixx_core::SAMPLE_RATE,
+    // Pinned by the export: `mix [1, 2, 343980]` → `stems [1, 4, 2, 343980]`. Cross-checked against
+    // `charon_audio`'s own constant in the test below, so a fork that changed it cannot drift here.
+    segment_frames: 343_980,
     stems: Stem::ALL,
 };
+
+/// The fp16-weights variant of [`HTDEMUCS`]: the same graph with its weights stored in half
+/// precision.
+///
+/// **Half the download, the same speed.** ONNX Runtime converts the weights on load, so the runtime
+/// cost, the memory and the output are the same (the model card measures both at ~1.6 s/window and
+/// ~1.1 GB on CPU, and the parity difference is 4.6e-5). It is here because a 166 MB download is a
+/// different proposition from a 316 MB one on a laptop tethered to a phone — not because it is
+/// faster.
+pub const HTDEMUCS_FP16: ModelSpec = ModelSpec {
+    name: "htdemucs-fp16",
+    repo_path: "StemSplitio/htdemucs-onnx/resolve/main/htdemucs_fp16weights.onnx",
+    sha256: "d05c269d0178d2a72ad484b10b11dd370193fc923201c3b27a99f848745db70a",
+    bytes: 165_612_636,
+    sample_rate: hypermixx_core::SAMPLE_RATE,
+    segment_frames: 343_980,
+    stems: Stem::ALL,
+};
+
+/// Every model this crate can obtain, in the order a front-end should list them.
+///
+/// **A model is data, not code**: the table is the only place a model's identity, size, hash and
+/// window live, so adding one is an entry here plus whatever front-end flag selects it. What *does*
+/// not fit this shape is a model that is not a single waveform-in/waveform-out graph producing all
+/// `Stem::COUNT` stems — the spectrogram-domain separators (Spleeter, Open-Unmix, UVR's MDX-Net) need
+/// the STFT and the cross-stem mask done outside the graph, which is a different kind of work than a
+/// table entry.
+pub const MODELS: &[ModelSpec] = &[HTDEMUCS, HTDEMUCS_FP16];
+
+/// The default model: the fastest 4-stem ONNX export, in full precision.
+pub fn default_model() -> &'static ModelSpec {
+    &HTDEMUCS
+}
+
+/// Looks a model up by name, ignoring case. `None` for a name that is not in the table.
+pub fn model_by_name(name: &str) -> Option<&'static ModelSpec> {
+    let name = name.trim();
+    MODELS
+        .iter()
+        .find(|spec| spec.name.eq_ignore_ascii_case(name))
+}
+
+/// The model names, for an error message that says what *is* available.
+pub fn model_names() -> Vec<&'static str> {
+    MODELS.iter().map(|spec| spec.name).collect()
+}
 
 /// Where a mirror is preferred over the canonical host.
 pub const DEFAULT_ENDPOINT: &str = "https://hf-mirror.com";
 /// The canonical host, tried when the mirror fails.
 pub const FALLBACK_ENDPOINT: &str = "https://huggingface.co";
 
-/// `~/.cache/hypermixx/models`, or `$HYPERMIXX_CACHE`'s `models` when that is set.
+/// Where model files are kept: `$HYPERMIXX_MODELS`, or **`.model` in the working directory**.
+///
+/// Kept apart from [`crate::cache_root`] because the two have different lifetimes and sizes: a model
+/// is 166–316 MB of *software* that any project can reuse, while a separation is a few hundred
+/// megabytes of *this track's* audio. Mixing them would mean a `prune` of one could not be reasoned
+/// about without the other.
 pub fn models_root() -> PathBuf {
-    crate::cache::cache_root().join("models")
+    models_root_from(std::env::var("HYPERMIXX_MODELS").ok().as_deref())
 }
+
+/// The rule itself, as a pure function: an override, else the working directory's `.model`.
+fn models_root_from(override_dir: Option<&str>) -> PathBuf {
+    match override_dir.map(str::trim).filter(|dir| !dir.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(DEFAULT_MODELS_DIR),
+    }
+}
+
+/// Where models go when nothing overrides it: the working directory.
+pub const DEFAULT_MODELS_DIR: &str = ".model";
 
 /// Where `spec`'s file lives once obtained.
 pub fn model_path(spec: &ModelSpec) -> PathBuf {
@@ -268,6 +344,73 @@ mod tests {
         const { assert!(HTDEMUCS.bytes > 300_000_000) };
         assert!(HTDEMUCS.repo_path.ends_with(".onnx"));
         assert!(!HTDEMUCS.repo_path.starts_with('/'));
+    }
+
+    /// The segment length is the model's contract, not a tunable: a fork that changed it would make
+    /// every chunked job mis-align, so it is checked against the runtime's own value.
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn the_segment_length_matches_the_runtime() {
+        assert_eq!(
+            HTDEMUCS.segment_frames as usize,
+            charon_audio::models::HTDEMUCS_SEGMENT_SAMPLES,
+            "the model table and the runtime must agree on the window"
+        );
+    }
+
+    /// The table is data a front-end reads: names must be unique and lookupable, hashes pinned and
+    /// plausible, and the default present in it.
+    /// Models are *software* rather than *one track's audio*, so they live in their own directory —
+    /// and, like the cache, under the working directory instead of the home directory.
+    #[test]
+    fn the_default_model_directory_is_not_the_cache() {
+        assert_eq!(models_root_from(None), PathBuf::from(".model"));
+        assert_ne!(
+            models_root_from(None),
+            crate::cache::cache_root_from(None),
+            "a separation and the model that made it have different lifetimes; they are not one tree"
+        );
+        assert_eq!(models_root_from(Some("/tmp/m")), PathBuf::from("/tmp/m"));
+        assert_eq!(models_root_from(Some(" ")), PathBuf::from(".model"));
+    }
+
+    #[test]
+    fn the_model_table_is_consistent() {
+        assert!(!MODELS.is_empty());
+        for spec in MODELS {
+            assert!(!spec.name.is_empty() && !spec.name.contains(' '), "{spec:?}");
+            assert!(spec.repo_path.contains('/'), "{spec:?}: a lookup needs a repo path");
+            assert_eq!(spec.sha256.len(), 64, "{}: a pinned hash, not a placeholder", spec.name);
+            assert!(spec.sha256.chars().all(|c| c.is_ascii_hexdigit()), "{}", spec.name);
+            assert!(spec.bytes > 0, "{}: the size is what makes a wrong file cheap to reject", spec.name);
+            assert_eq!(spec.sample_rate, hypermixx_core::SAMPLE_RATE, "{}", spec.name);
+            assert!(spec.segment_frames > 0, "{}", spec.name);
+            assert_eq!(spec.stems.len(), Stem::COUNT);
+        }
+        // Names are unique, so `--model` cannot be ambiguous.
+        let mut names: Vec<&str> = MODELS.iter().map(|spec| spec.name).collect();
+        names.sort_unstable();
+        let unique = names.len();
+        names.dedup();
+        assert_eq!(names.len(), unique, "duplicate model names: {names:?}");
+
+        // Lookup ignores case and whitespace (a config file is typed by hand), and says what exists.
+        assert_eq!(model_by_name("htdemucs").map(|s| s.name), Some("htdemucs"));
+        assert_eq!(model_by_name(" HTDemucs ").map(|s| s.name), Some("htdemucs"));
+        assert_eq!(model_by_name("htdemucs-fp16").map(|s| s.name), Some("htdemucs-fp16"));
+        assert!(model_by_name("spleeter").is_none());
+        assert_eq!(model_names().len(), MODELS.len());
+        // The default is in the table, and the fp16 variant really is the same graph (same window,
+        // same stems) so a front-end can swap one for the other.
+        //
+        // Compared by *name*: a `const` item is copied into `MODELS`, so a pointer comparison against
+        // the constant would be false even though it is the same model.
+        assert!(MODELS.iter().any(|spec| spec.name == default_model().name));
+        assert_eq!(HTDEMUCS_FP16.segment_frames, HTDEMUCS.segment_frames);
+        assert_eq!(HTDEMUCS_FP16.stems, HTDEMUCS.stems);
+        // `const` so the check is a compile error rather than a test failure if the size claim stops
+        // holding (clippy asks for exactly this).
+        const { assert!(HTDEMUCS_FP16.bytes < HTDEMUCS.bytes, "fp16 halves the download") };
     }
 
     #[test]

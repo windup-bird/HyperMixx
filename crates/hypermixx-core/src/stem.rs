@@ -132,7 +132,14 @@ impl std::fmt::Debug for StemSet {
 /// for a moment.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StemStatus {
+    /// Whether the audio really has stems yet: more than one stream *and* at least one frame of it
+    /// separated. A chunked set is installed before its first chunk lands (the deck plays the mix
+    /// until then), so "four streams exist" is not the same as "the audio is separated".
     pub ready: bool,
+    /// How much of the track is separated, `0.0 ..= 1.0`: the active source's
+    /// [`available_frames`](crate::Source::available_frames) over the track's length. `1.0` for a
+    /// plain track and for a stem set that arrived in one piece.
+    pub separated: f32,
     /// Per-stem level, as a **bipolar fader position** (`-1.0` = exact silence, `0.0` = unity).
     pub level: [f32; Stem::COUNT],
     pub mute: [bool; Stem::COUNT],
@@ -146,6 +153,7 @@ impl Default for StemStatus {
     fn default() -> Self {
         Self {
             ready: false,
+            separated: 0.0,
             level: [0.0; Stem::COUNT],
             mute: [false; Stem::COUNT],
             solo: 0,

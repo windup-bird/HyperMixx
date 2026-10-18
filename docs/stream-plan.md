@@ -49,7 +49,7 @@ thread::spawn → hypermixx_media::decode_file(path) → PcmPool
 
 - `ureq` 3 已在工作区（`hypermixx-stems` 的 `onnx` feature 用它下载模型）；
 - `hypermixx-stems/src/model.rs` 提供可照抄的模式：进度回调 + 临时文件 + 原子改名 +
-  `.sha256` marker + `HYPERMIXX_CACHE` 环境变量（`cache::cache_root()`）；
+  `.sha256` marker + `HYPERMIXX_MODELS`/`HYPERMIXX_CACHE` 环境变量（`model::models_root()` / `cache::cache_root()`）；
 - **工作区无 async runtime**，全部是线程模型 —— 网络层应保持阻塞式 ureq + worker 线程。
 
 ### 1.5 解码格式现状（workspace `Cargo.toml` 的 symphonia features）
@@ -145,7 +145,7 @@ yt-dlp 源码可直接对照），保持零 async。
 
 ```
 resolve(url) → 直接当直链（HEAD/GET，取 Content-Length 与 Content-Type）
-            → fetch 到 ~/.cache/hypermixx/media/<sha1>.<ext>（原子写 + meta）
+            → fetch 到 ./.cache/media/<sha1>.<ext>（原子写 + meta）
             → decode_file → PcmPool → Command::Load
 ```
 
@@ -258,7 +258,7 @@ probe/track 选择/decode 循环，输入换成"可增长的 `MediaSource`"）�
   `serde_json`，与现有线程模型无冲突；
   - `resolve(spec) -> Resolved { direct_url, title, ext, duration, headers }`
     （本期只认 `http(s)://` 直链）；
-  - `fetch(url, dst, progress)` → `~/.cache/hypermixx/media/<sha1>.<ext>` +
+  - `fetch(url, dst, progress)` → `./.cache/media/<sha1>.<ext>` +
     `.meta.json`（照抄 stems 的临时文件 + 原子改名 + marker 模式）；
 - `hypermixx-cli`：`load` 见到 `://` 走 `spawn_stream_load`
   （resolve → fetch 进度 notices → `decode_file` → `Command::Load`）；

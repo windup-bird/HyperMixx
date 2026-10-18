@@ -181,6 +181,12 @@ impl Source for LoopSource {
         filled
     }
 
+    /// Forwarded, not derived: how much of a growing source exists is the inner source's business,
+    /// and the loop wrapper must not hide it from the status report.
+    fn available_frames(&self) -> u64 {
+        self.inner.available_frames()
+    }
+
     fn total_frames(&self) -> u64 {
         if self.cell.load().is_some() {
             u64::MAX

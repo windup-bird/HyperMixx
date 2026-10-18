@@ -666,6 +666,25 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
                 SyncAction::PhaseLock { mode, t_seconds: seconds }
             }))
         }
+        // `<stem> fx …` / `master fx …` / `d1 fx …`: the action names its chain, the way a session
+        // line's leading target word does (`deck0 vocals fx toggle filter`).
+        [target, "fx", what @ ("on" | "off" | "toggle" | "pad" | "trigger")] => {
+            let named = chain_of(raw, target)?;
+            let kind = match *what {
+                "on" => FxActionKind::On,
+                "off" => FxActionKind::Off,
+                "toggle" => FxActionKind::Toggle,
+                "pad" => FxActionKind::Pad,
+                _ => FxActionKind::Trigger,
+            };
+            Ok(Action::Fx(fx_slot_action(raw, Some(named), kind)?))
+        }
+        [target, "fx", "param"] => {
+            let named = chain_of(raw, target)?;
+            let (chain, fx) = fx_address(raw, Some(named))?;
+            let param = raw.param.clone().ok_or("`fx param` needs a `param` name")?;
+            Ok(Action::Fx(FxAction::Param { chain, fx, param }))
+        }
         ["fx", what @ ("on" | "off" | "toggle" | "pad" | "trigger")] => {
             let kind = match *what {
                 "on" => FxActionKind::On,
@@ -674,10 +693,10 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
                 "pad" => FxActionKind::Pad,
                 _ => FxActionKind::Trigger,
             };
-            Ok(Action::Fx(fx_slot_action(raw, kind)?))
+            Ok(Action::Fx(fx_slot_action(raw, None, kind)?))
         }
         ["fx", "param"] => {
-            let (chain, fx) = fx_address(raw)?;
+            let (chain, fx) = fx_address(raw, None)?;
             let param = raw.param.clone().ok_or("`fx param` needs a `param` name")?;
             Ok(Action::Fx(FxAction::Param { chain, fx, param }))
         }
@@ -721,8 +740,12 @@ enum FxActionKind {
 }
 
 /// Builds a slot-level FX action from its `chain`/`fx` fields.
-fn fx_slot_action(raw: &RawBinding, kind: FxActionKind) -> Result<FxAction, String> {
-    let (chain, fx) = fx_address(raw)?;
+fn fx_slot_action(
+    raw: &RawBinding,
+    named: Option<FxChainId>,
+    kind: FxActionKind,
+) -> Result<FxAction, String> {
+    let (chain, fx) = fx_address(raw, named)?;
     Ok(match kind {
         FxActionKind::On => FxAction::On { chain, fx },
         FxActionKind::Off => FxAction::Off { chain, fx },
@@ -732,28 +755,80 @@ fn fx_slot_action(raw: &RawBinding, kind: FxActionKind) -> Result<FxAction, Stri
     })
 }
 
-/// The `chain` + `fx` address every FX action carries.
-fn fx_address(raw: &RawBinding) -> Result<(FxChainId, String), String> {
-    let chain = raw
-        .chain
-        .as_deref()
-        .ok_or_else(|| "an FX action needs a `chain`".to_owned())
-        .and_then(|token| parse_chain(token).ok_or_else(|| format!("unknown chain `{token}`")))?;
+/// The `chain` + `fx` address every FX action carries: the chain from the action line if it named
+/// one, else from the binding's `chain` field.
+fn fx_address(raw: &RawBinding, named: Option<FxChainId>) -> Result<(FxChainId, String), String> {
+    let chain = match named {
+        Some(chain) => chain,
+        None => {
+            let token = raw
+                .chain
+                .as_deref()
+                .ok_or_else(|| "an FX action needs a `chain`".to_owned())?;
+            chain_of(raw, token)?
+        }
+    };
     let fx = raw.fx.clone().ok_or("an FX action needs an `fx` name")?;
     Ok((chain, fx))
 }
 
-/// Parses a chain address: `master`/`m`, `deck0`, `d0`, or a bare index.
-pub fn parse_chain(token: &str) -> Option<FxChainId> {
-    let lower = token.to_ascii_lowercase();
-    if lower == "master" || lower == "m" {
-        return Some(FxChainId::Master);
+/// Resolves an FX chain address the way the session grammar writes it:
+///
+/// * `master` / `m` — the summed mix;
+/// * `deck0` / `d0` / `0` — that deck's channel chain;
+/// * `<stem>` — that stem's own chain, with the deck from the binding's `deck` field
+///   (`deck = 0` + `chain = "vocals"` is `deck0 vocals`);
+/// * `deck0/<stem>` / `d1/<stem>` — the same, spelled outright.
+///
+/// The stem form is what makes "every stem its own FX" reachable from a controller: the CLI has had
+/// `deck0 vocals fx …` all along, and this is the mapping side of it.
+fn chain_of(raw: &RawBinding, token: &str) -> Result<FxChainId, String> {
+    let token = token.trim();
+    if let Some((head, stem_name)) = token.split_once('/') {
+        let stem = stem_of(stem_name.trim())?;
+        let deck = if head.trim().is_empty() {
+            raw.deck
+        } else {
+            parse_deck_token(head.trim())
+        };
+        let deck = deck.ok_or_else(|| format!("chain `{token}` needs a deck (`deck0/{stem}`)"))?;
+        return Ok(FxChainId::Stem { deck, stem });
     }
+    if let Some(deck) = parse_deck_token(token) {
+        return Ok(FxChainId::Deck(deck));
+    }
+    if token.eq_ignore_ascii_case("master") || token.eq_ignore_ascii_case("m") {
+        return Ok(FxChainId::Master);
+    }
+    // A bare stem name: the deck comes from the binding, exactly like `fader flow` does.
+    if let Some(stem) = Stem::parse(token) {
+        let deck = raw
+            .deck
+            .ok_or_else(|| format!("chain `{token}` needs a `deck`"))?;
+        return Ok(FxChainId::Stem { deck, stem });
+    }
+    Err(format!(
+        "unknown chain `{token}` (master | deck0 | <stem> | deck0/<stem>)"
+    ))
+}
+
+/// `deck0` / `d0` / `0` → that deck's id.
+fn parse_deck_token(token: &str) -> Option<DeckId> {
+    let lower = token.to_ascii_lowercase();
     let digits = lower
         .strip_prefix("deck")
         .or_else(|| lower.strip_prefix('d'))
         .unwrap_or(&lower);
-    digits.parse::<u8>().ok().map(FxChainId::Deck)
+    digits.parse::<u8>().ok()
+}
+
+/// Parses a chain address without a binding: `master`/`m` or a deck. Kept for callers that have no
+/// binding to take a stem's deck from.
+pub fn parse_chain(token: &str) -> Option<FxChainId> {
+    if token.eq_ignore_ascii_case("master") || token.eq_ignore_ascii_case("m") {
+        return Some(FxChainId::Master);
+    }
+    parse_deck_token(token).map(FxChainId::Deck)
 }
 
 #[cfg(test)]
@@ -818,6 +893,87 @@ param = "value"
         // Faders default to a bipolar domain; the FX param to the unit domain.
         assert_eq!((map.binds[0].min, map.binds[0].max), (-1.0, 1.0));
         assert_eq!((map.binds[3].min, map.binds[3].max), (0.0, 1.0));
+    }
+
+    /// Every stem has its own FX chain, and a binding can address it three ways: a bare stem in the
+    /// `chain` field, a spelled-out `deckN/<stem>`, or a leading target word on the action line.
+    #[test]
+    fn fx_chains_can_address_one_stems_chain() {
+        let bind = |action: &str, extra: &str| -> Action {
+            let text = format!(
+                "[[bind]]\ntype = \"note\"\nid = 1\n{extra}action = \"{action}\"\n"
+            );
+            Map::from_toml_str(&text).unwrap().binds[0].action.clone()
+        };
+        let bind_err = |action: &str, extra: &str| -> String {
+            let text = format!(
+                "[[bind]]\ntype = \"note\"\nid = 1\n{extra}action = \"{action}\"\n"
+            );
+            Map::from_toml_str(&text).unwrap_err().message().to_owned()
+        };
+        let on = |deck, stem| {
+            Action::Fx(FxAction::Toggle {
+                chain: FxChainId::Stem { deck, stem },
+                fx: "filter".to_owned(),
+            })
+        };
+
+        // A bare stem name in `chain`, with the deck from the binding.
+        assert_eq!(
+            bind("fx toggle", "deck = 1\nchain = \"vocals\"\nfx = \"filter\"\n"),
+            on(1, Stem::Vocals)
+        );
+        // Spelled out, so a binding can address another deck's stem too.
+        assert_eq!(
+            bind("fx toggle", "chain = \"d0/bass\"\nfx = \"filter\"\n"),
+            on(0, Stem::Bass)
+        );
+        assert_eq!(
+            bind("fx toggle", "chain = \"deck1/other\"\nfx = \"filter\"\n"),
+            on(1, Stem::Other)
+        );
+        // The action line names it — the session grammar's own form.
+        assert_eq!(
+            bind("vocals fx toggle", "deck = 0\nfx = \"filter\"\n"),
+            on(0, Stem::Vocals)
+        );
+        // ...including the deck: `master` / `d1` as a leading word.
+        assert_eq!(
+            bind("master fx toggle", "fx = \"filter\"\n"),
+            Action::Fx(FxAction::Toggle {
+                chain: FxChainId::Master,
+                fx: "filter".to_owned()
+            })
+        );
+        assert_eq!(
+            bind("d1 fx toggle", "fx = \"filter\"\n"),
+            Action::Fx(FxAction::Toggle {
+                chain: FxChainId::Deck(1),
+                fx: "filter".to_owned()
+            })
+        );
+        // A parameter is addressed the same way, and the parameter name still comes from the field.
+        assert_eq!(
+            bind(
+                "vocals fx param",
+                "deck = 0\nfx = \"filter\"\nparam = \"value\"\n"
+            ),
+            Action::Fx(FxAction::Param {
+                chain: FxChainId::Stem { deck: 0, stem: Stem::Vocals },
+                fx: "filter".to_owned(),
+                param: "value".to_owned(),
+            })
+        );
+
+        // A stem chain with no deck to hang it off is refused, and names what was wrong.
+        let err = bind_err("fx toggle", "chain = \"vocals\"\nfx = \"filter\"\n");
+        assert!(err.contains("deck"), "{err}");
+        let err = bind_err("vocals fx toggle", "fx = \"filter\"\n");
+        assert!(err.contains("deck"), "{err}");
+        let err = bind_err("fx toggle", "chain = \"guitar\"\nfx = \"filter\"\n");
+        assert!(err.contains("unknown chain") && err.contains("guitar"), "{err}");
+        let err = bind_err("fx toggle", "chain = \"vocals\"\nfx = \"filter\"\n");
+        assert!(!err.is_empty());
     }
 
     /// The channel trim is reachable by name, like every other level.

@@ -41,15 +41,16 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         notice_tx,
         notice_rx,
         topology,
+        profile,
         live,
         live_source,
         midi_port,
         midi_map,
     } = session;
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
-    let dispatcher = Dispatcher::new(command_tx.clone(), notice_tx)
-        .with_topology(topology)
-        .tap_events(event_tx);
+    let dispatcher = Dispatcher::new(command_tx.clone(), notice_tx).tap_events(event_tx);
+    dispatcher.with_topology(topology);
+    dispatcher.with_profile(profile);
     dispatcher.with_live(live, live_source);
     // Prime every chain's slot list so `fx remove <name>` works from the first command.
     dispatcher.prime(decks, pipeline.response_rx());

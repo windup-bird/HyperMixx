@@ -17,6 +17,7 @@
 //! playback side of stems could be built and verified before the ML side existed.
 
 pub mod cache;
+pub mod chunked;
 pub mod mock;
 pub mod model;
 mod onnx_options;
@@ -27,13 +28,20 @@ mod onnx;
 pub use onnx::CharonSeparator;
 
 pub use cache::{
-    cache_key, cache_root, cache_usage, load_cached, prune_cache, stems_root, store_cached,
-    CachedStems,
+    append_cached, cache_key, cache_root, cache_usage, load_cached, prune_cache, stems_root,
+    store_cached, CachedStems,
 };
-pub use onnx_options::{Provider, SeparateOptions, DEFAULT_OVERLAP, MAX_OVERLAP};
+pub use chunked::{stream_cached, stream_uncached, stride_frames};
+pub use onnx_options::{
+    Provider, RuntimeOptions, SeparateOptions, DEFAULT_OVERLAP, MAX_OVERLAP,
+};
 pub use mock::{MockMode, MockSeparator};
-pub use model::{ensure_model, model_path, models_root, ModelSpec, HTDEMUCS};
+pub use model::{
+    default_model, ensure_model, model_by_name, model_names, model_path, models_root, ModelSpec,
+    HTDEMUCS, HTDEMUCS_FP16, MODELS,
+};
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -128,9 +136,110 @@ pub trait StemSeparator: Send + Sync {
     ) -> Result<StemSet, StemError>;
 
     /// The model this separator needs, if any — so a front-end can offer to fetch it up front.
-    fn model(&self) -> Option<&'static ModelSpec> {
+    /// `None` for a backend with no model file (the mock), or for a local one nobody can fetch.
+    fn model(&self) -> Option<ModelSpec> {
         None
     }
+
+    /// The model's window: how much audio it takes at a time and how far each window advances.
+    ///
+    /// A front-end (and the driver) needs both for two things it cannot guess: reporting the block
+    /// cadence, and *resuming* a partial cache entry — a resumed stream has to start on the window
+    /// grid, or the blocks either side of the resume point come from differently-aligned windows.
+    /// `None` means the backend has no fixed windowing, and a resume may start anywhere.
+    fn window(&self) -> Option<chunked::Window> {
+        None
+    }
+
+    /// Separates `mix` **as it goes**, handing each finished block to `sink` in track order.
+    ///
+    /// This is the shape a front-end wants: the first block arrives after roughly one model window
+    /// instead of after the whole track, and the deck plays it immediately. The default below is
+    /// correct but not progressive — one block at the end — which is what a backend with nothing to
+    /// stream (the mock, a one-shot runtime) can offer.
+    ///
+    /// **A backend must not invent its own segmentation.** The model already windows the input, and a
+    /// second, unrelated cutting of the track would have to be aligned, margined and re-normalised to
+    /// sound like one piece — which is exactly the pile of machinery that streaming removes. If the
+    /// runtime offers a streaming path, use it.
+    fn stream(
+        &self,
+        mix: &dyn Source,
+        sink: &mut dyn StemBlockSink,
+        progress: &ProgressSink,
+        cancelled: &Cancelled,
+    ) -> Result<(), StemError> {
+        if cancelled.is_cancelled() {
+            return Err(StemError::Cancelled);
+        }
+        let set = self.separate(mix, progress, cancelled)?;
+        let frames = set.total_frames() as usize;
+        let blocks: Vec<Vec<f32>> = hypermixx_core::Stem::ALL
+            .iter()
+            .map(|stem| read_flat(set.get(*stem).as_ref(), frames))
+            .collect();
+        sink.block(0, &blocks);
+        Ok(())
+    }
+
+    /// As [`stream`](Self::stream), with the input scale given explicitly.
+    ///
+    /// A **resumed** stream is handed only the track's tail, so it must be normalised by the whole
+    /// track's statistics rather than its own — otherwise the audio either side of the resume point
+    /// was separated from differently-scaled input, which is a level step exactly where they meet.
+    /// The default ignores the scale and delegates, which is right for a backend that measures over
+    /// the source it is given (and for the mock).
+    fn stream_with_scale(
+        &self,
+        mix: &dyn Source,
+        sink: &mut dyn StemBlockSink,
+        progress: &ProgressSink,
+        cancelled: &Cancelled,
+        scale: crate::chunked::InputScale,
+    ) -> Result<(), StemError> {
+        let _ = scale;
+        self.stream(mix, sink, progress, cancelled)
+    }
+}
+
+/// Where a streaming separation puts its finished audio.
+///
+/// Called in track order, once per block, with one interleaved stereo buffer per stream and all of
+/// them the same length. Blocks cover the track exactly once, in increasing `start_frame`.
+pub trait StemBlockSink {
+    /// `blocks[i]` belongs to stream `i` (the model's stem order). Returning `false` stops the job —
+    /// the caller has nowhere to put the audio any more.
+    fn block(&mut self, start_frame: u64, blocks: &[Vec<f32>]) -> bool;
+}
+
+/// Reads a whole source into one interleaved buffer (a block's worth, for the default streaming path).
+fn read_flat(source: &dyn Source, frames: usize) -> Vec<f32> {
+    let mut pcm = vec![0.0f32; frames * CHANNELS];
+    let mut done = 0;
+    while done < frames {
+        let read = source.read_frames(done as u64, &mut pcm[done * CHANNELS..]);
+        if read == 0 {
+            break;
+        }
+        done += read;
+    }
+    pcm
+}
+
+/// An open backend, asked for one range of the mix at a time.
+///
+/// The contract is the same frame-alignment one [`StemSeparator::separate`] has, per range: the set
+/// that comes back is exactly `len` frames per stream, starting at `start`. A chunked job stitches
+/// those ranges into the whole track, so a backend that over- or under-reads would leave a seam.
+pub trait StemSession: Send {
+    fn separate_range(
+        &mut self,
+        mix: &dyn Source,
+        start: u64,
+        len: usize,
+        progress: &ProgressSink,
+        cancelled: &Cancelled,
+    ) -> Result<StemSet, StemError>;
 }
 
 /// Most random shifts worth asking for.
@@ -148,18 +257,24 @@ pub const MAX_SHIFTS: usize = 2;
 /// produce different samples, and none may share an entry with another setting.
 #[cfg(feature = "onnx")]
 pub fn default_separator(
+    spec: &'static ModelSpec,
     options: SeparateOptions,
+    runtime: RuntimeOptions,
     progress: &ProgressSink,
 ) -> Result<Box<dyn StemSeparator>, StemError> {
-    let model = ensure_model(&HTDEMUCS, None, progress)?;
-    Ok(Box::new(CharonSeparator::from_options(model, options)))
+    let model = ensure_model(spec, None, progress)?;
+    Ok(Box::new(
+        CharonSeparator::from_options_spec(model, spec, options).with_runtime(runtime),
+    ))
 }
 
 /// Without the `onnx` feature there is nothing to separate with; the mock is for tests, not for
 /// pretending a track was separated.
 #[cfg(not(feature = "onnx"))]
 pub fn default_separator(
+    _spec: &'static ModelSpec,
     _options: SeparateOptions,
+    _runtime: RuntimeOptions,
     _progress: &ProgressSink,
 ) -> Result<Box<dyn StemSeparator>, StemError> {
     Err(StemError::NoBackend)
@@ -173,6 +288,58 @@ pub fn provider_available(provider: Provider) -> bool {
     match provider {
         Provider::Cpu => cfg!(feature = "onnx"),
         Provider::Cuda => cfg!(all(feature = "onnx", feature = "cuda")),
+    }
+}
+
+/// A separator over a **local model file**: a user's own export (quantized, fine-tuned, or a
+/// different precision of the same family).
+///
+/// Deliberately not hash-checked. The table's hashes exist because a downloaded file has to be
+/// proven to be what the table says; a file the user produced on their own machine is theirs, and
+/// refusing it for lacking a hash nobody could know would make the feature useless. What is checked
+/// is that it loads and that it produces the stems its spec declares.
+pub fn local_separator(
+    path: impl Into<PathBuf>,
+    spec: ModelSpec,
+    options: SeparateOptions,
+    runtime: RuntimeOptions,
+) -> Result<Box<dyn StemSeparator>, StemError> {
+    let path = path.into();
+    let meta = std::fs::metadata(&path)
+        .map_err(|e| StemError::Model(format!("{}: {e}", path.display())))?;
+    if meta.len() == 0 {
+        return Err(StemError::Model(format!("{} is empty", path.display())));
+    }
+    #[cfg(feature = "onnx")]
+    {
+        Ok(Box::new(
+            CharonSeparator::for_spec(path, spec).with_runtime_options(options, runtime),
+        ))
+    }
+    #[cfg(not(feature = "onnx"))]
+    {
+        let _ = (path, spec, options, runtime);
+        Err(StemError::NoBackend)
+    }
+}
+
+/// Describes a **local** model file: its name, size and window, with nothing to download.
+///
+/// Built from a table entry's shape (the segment length and sample rate are properties of the
+/// architecture, not of the file) unless a front-end overrides them.
+pub fn local_spec(path: &Path, based_on: ModelSpec) -> ModelSpec {
+    let name = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "local".to_owned());
+    ModelSpec {
+        // Leaked: a spec lives for the process (it is `Copy` data handed to the engine and to the
+        // cache key), and a local model's name has to outlive the call that built it.
+        name: Box::leak(name.into_boxed_str()),
+        repo_path: "",
+        sha256: "",
+        bytes: std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
+        ..based_on
     }
 }
 
@@ -212,7 +379,73 @@ pub fn separate_cached(
 }
 
 /// Frames read per batch when pulling a whole source into memory.
-const READ_CHUNK_FRAMES: usize = 65_536;
+pub(crate) const READ_CHUNK_FRAMES: usize = 65_536;
+
+#[cfg(test)]
+mod local_model_tests {
+    use super::*;
+
+    /// A local file is *not* hash-checked (it never came from us), but it does have to be a file with
+    /// something in it — and the failure has to arrive before a runtime is built.
+    #[test]
+    fn a_local_model_must_be_a_non_empty_file() {
+        let default = *default_model();
+        let missing = Path::new("/nonexistent/htdemucs-int8.onnx");
+        let err = local_separator(missing, local_spec(missing, default), Default::default(), Default::default())
+            .err()
+            .expect("a missing file must be refused");
+        assert!(err.message().contains("htdemucs-int8"), "{}", err.message());
+
+        let empty = std::env::temp_dir().join("hypermixx-empty-model.onnx");
+        std::fs::write(&empty, b"").unwrap();
+        let err = local_separator(
+            &empty,
+            local_spec(&empty, default),
+            Default::default(),
+            Default::default(),
+        )
+        .err()
+        .expect("an empty file must be refused");
+        assert!(err.message().contains("empty"), "{}", err.message());
+        let _ = std::fs::remove_file(&empty);
+    }
+
+    /// The spec a local file gets describes the *file* (its name and size) and borrows the shape from
+    /// the entry it is based on — a quantized htdemucs is still a 7.8 s-window, 44.1 kHz model.
+    #[test]
+    fn a_local_spec_describes_the_file_and_borrows_the_shape() {
+        let default = *default_model();
+        let spec = local_spec(Path::new("/tmp/htdemucs-int8.onnx"), default);
+        assert_eq!(spec.name, "htdemucs-int8", "named after the file, so it lands in its own cache entry");
+        assert_eq!(spec.segment_frames, default.segment_frames);
+        assert_eq!(spec.sample_rate, default.sample_rate);
+        assert_eq!(spec.stems, default.stems);
+        assert_eq!(spec.sha256, "", "there is nothing to check a local file against");
+        assert_eq!(spec.repo_path, "", "and nothing to download");
+    }
+}
+
+/// Test support shared by the modules that touch the cache.
+#[cfg(test)]
+pub(crate) mod testing {
+    /// Runs `body` with its own cache and model roots, so tests cannot see each other's entries.
+    ///
+    /// Both roots are process-wide environment variables, so cache-touching tests are serialised
+    /// behind **one** lock shared by every module — two locks would let two tests race on the same
+    /// variable.
+    pub(crate) fn with_isolated_cache<T>(name: &str, body: impl FnOnce() -> T) -> T {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("hypermixx-cache-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("HYPERMIXX_CACHE", &dir);
+        std::env::set_var("HYPERMIXX_MODELS", dir.join("model"));
+        let out = body();
+        std::env::remove_var("HYPERMIXX_CACHE");
+        std::env::remove_var("HYPERMIXX_MODELS");
+        out
+    }
+}
 
 /// Reads a whole [`Source`] into interleaved stereo f32 — the separators' input form.
 ///

@@ -326,13 +326,22 @@ impl Channel {
         )
     }
 
-    /// The per-stem state: whether the audio is separated yet, plus level, mute and solo.
+    /// The per-stem state: whether the audio is separated yet (and how much of it), plus level,
+    /// mute and solo.
     pub fn stem_status(&self) -> StemStatus {
+        // Streams are not the same as separated audio: a growing set is installed *before* its first
+        // block arrives, and until then the deck plays the mix through the streams. So ask the source
+        // how much of itself exists — it is the only thing that knows.
+        let separated = match self.deck.sources().first() {
+            Some(source) if self.deck.stream_count() > 1 => {
+                let total = source.total_frames().max(1);
+                (source.available_frames() as f64 / total as f64).clamp(0.0, 1.0) as f32
+            }
+            _ => 0.0,
+        };
         let mut status = StemStatus {
-            // The audio has stems exactly when the active flow is rendering more than one stream.
-            // `SetStems` is warmed on another thread, so this is the honest answer rather than the
-            // intent.
-            ready: self.deck.stream_count() > 1,
+            ready: self.deck.stream_count() > 1 && separated > 0.0,
+            separated,
             solo: self.stem_solo.load(Ordering::Relaxed),
             ..Default::default()
         };

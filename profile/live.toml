@@ -1,5 +1,10 @@
 # Hypermixx live settings: what depends on *this machine* rather than on the music.
 #
+# Paths, for reference (all relative to the working directory, and overridable):
+#   ./.cache/stems/<key>/   separated audio            HYPERMIXX_CACHE
+#   ./.model/<name>.onnx    downloaded models          HYPERMIXX_MODELS
+#   ./profile/              this file and the topology
+#
 # Read at startup (or `--live <file>`); `live show` prints what is in effect and `live reload`
 # re-reads this file. A key that is missing takes the built-in default, so this file is a starting
 # point rather than a complete one.
@@ -17,16 +22,49 @@ sample_rate = 44100
 # prefill_frames = 2048
 
 [stems]
-# Which model to separate with, from the table in `hypermixx-stems` (`stem model list`).
+# Everything the separator is asked for. These are *machine* settings, which is why they live here
+# and not on the command line: `stem separate` takes no options, and `live reload` applies an edit
+# immediately (the next separation uses it).
+
+# Which model to separate with, from the table in `hypermixx-stems` (`stem model list`). A **path**
+# to a local `.onnx` works too — your own export, a quantized build, a fine-tune.
+#
+# htdemucs       316 MB  the fastest 4-stem export; 1 session, all four stems  (default)
+# htdemucs-fp16  166 MB  the same graph with fp16-stored weights: **half the download, same speed**
+#
+# `stem separate --model <name|path>` overrides this for one run; the model is part of the cache key,
+# so two models never share an entry.
 # model = "htdemucs"
+
 # Execution provider: cpu (always available) or cuda (needs a `--features cuda` build and CUDA 13 +
 # cuDNN 9 in the host).
-# provider = "cpu"
-# Window overlap, 0.0 ..= 0.5: lower is ~24% faster and weights window edges more.
+provider = "cuda"
+
+# Window overlap, 0.0 ..= 0.5. This is the **stride** dial: the model runs every
+# `(1 - overlap) × 7.8 s` and every run costs a full window of compute, so `0.0` removes about a
+# quarter of the work on a full track (31 → 24 windows) at the cost of weighting each window's edges
+# more — a listening judgement, not a numeric one.
 # overlap = 0.25
+
 # Ensemble shifts: 1 is one pass, 2 averages a second, shifted run for ~2× the time.
+#
+# 1 is also the only setting that **streams**: blocks land in the deck as the model finishes them,
+# which is what makes stems audible within seconds instead of after the whole track. The runtime
+# cannot shift a stream, so 2 separates the whole track before installing anything.
 # shifts = 1
-# Reserved: frames per separation chunk. Today a track is separated in one job and installed when it
-# is finished; the model is already windowed (7.8 s at a time), so progressive install is a matter of
-# feeding the deck as each chunk lands. 0 = whole track.
-# chunk_seconds = 0.0
+
+# Threads the separator may use. 0 = let ONNX Runtime decide (every core).
+#
+# On a small device this is a **playback** setting rather than a performance one: a separation that
+# takes every core starves the audio callback, and the mix stutters while the stems are prepared.
+# Measured on a 16-core machine, 40 s of audio: auto 20 s, `2` 28 s (+40%) but only two cores busy.
+# threads = 0
+
+# Trade throughput for peak memory. On, ONNX Runtime's constant folding is disabled and activation
+# memory is not pre-planned: HTDemucs drops from ~5.6 GB to ~2.1 GB of peak for ~11% less speed.
+# low_memory = true
+
+# There is no chunk length to set: the model already windows the track (7.8 s at a time, advancing
+# `(1 - overlap) × 7.8 s`), and a block is handed over as soon as no later window can change it. That
+# cadence *is* the chunking — a second, unrelated cutting of the track would have to be aligned to the
+# window grid and re-normalised to sound like one piece.

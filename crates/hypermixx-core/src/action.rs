@@ -321,12 +321,24 @@ pub fn canonical(name: &str) -> Option<String> {
     }) {
         return Some(name.to_owned());
     }
-    // A stem line: `<stem> fader | mute | solo`, for any of the four stems (`vocals mute` is in the
-    // registry as the guide's spelling; `drums mute` is the same verb).
-    if let Some((stem_name, verb)) = name.split_once(char::is_whitespace) {
-        if matches!(verb.trim(), "fader" | "mute" | "solo") && crate::stem::Stem::parse(stem_name).is_some()
+    if let Some((head, rest)) = name.split_once(char::is_whitespace) {
+        // A stem line: `<stem> fader | mute | solo`, for any of the four stems (`vocals mute` is in
+        // the registry as the guide's spelling; `drums mute` is the same verb).
+        if matches!(rest.trim(), "fader" | "mute" | "solo") && crate::stem::Stem::parse(head).is_some()
         {
             return Some(name.to_owned());
+        }
+        // `<target> fx <verb>`: the line names its own chain, the way a session line's leading
+        // target word does (`deck0 vocals fx toggle filter`, `master fx off limiter`).
+        if let Some(verb) = rest.trim().strip_prefix("fx ") {
+            let verb = verb.trim();
+            let known = ACTIONS.iter().any(|spec| {
+                spec.name.strip_prefix("fx ") == Some(verb)
+                    || (verb == "param" && spec.name == "fx param")
+            });
+            if known && is_chain_target(head) {
+                return Some(name.to_owned());
+            }
         }
     }
     // Not in the registry, but a valid spelling nonetheless: a button that only places the cue.
@@ -385,6 +397,23 @@ pub fn canonical(name: &str) -> Option<String> {
         }
     };
     Some(legacy)
+}
+
+/// Whether a word names an FX chain the way a session line's leading target does: `master`, `m`,
+/// a deck (`deck0` / `d0` / `0`), or a stem name.
+fn is_chain_target(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    if lower == "master" || lower == "m" {
+        return true;
+    }
+    if crate::stem::Stem::parse(&lower).is_some() {
+        return true;
+    }
+    let digits = lower
+        .strip_prefix("deck")
+        .or_else(|| lower.strip_prefix('d'))
+        .unwrap_or(&lower);
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
 /// The action list as one line of help per verb, for `--help` output and the documentation.

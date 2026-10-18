@@ -21,12 +21,15 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         notice_tx,
         notice_rx,
         topology,
+        profile,
         live,
         live_source,
         ..
     } = session;
     let response_rx = pipeline.response_rx().clone();
-    let dispatcher = command::Dispatcher::new(command_tx.clone(), notice_tx).with_topology(topology);
+    let dispatcher = command::Dispatcher::new(command_tx.clone(), notice_tx);
+    dispatcher.with_topology(topology);
+    dispatcher.with_profile(profile);
     dispatcher.with_live(live, live_source);
     // Prime every chain's slot list so `fx remove <name>` works from the first command.
     dispatcher.prime(decks, pipeline.response_rx());

@@ -14,6 +14,17 @@ pub trait Source: Send + Sync {
     fn read_frames(&self, start_frame: u64, output: &mut [f32]) -> usize;
     /// Total number of frames in this source.
     fn total_frames(&self) -> u64;
+
+    /// How many of those frames **exist yet**, for a source that is still being produced (a
+    /// separation arriving block by block, a track being fetched, anything streamed in).
+    /// The default says "all of it", which is what a decoded track is.
+    ///
+    /// Deliberately neutral: the engine's job is to play a source that may still be growing, and it
+    /// has no business knowing *why*. A front-end reads it to show "42% separated" or "42% buffered",
+    /// and a source that is not growing never has to answer differently.
+    fn available_frames(&self) -> u64 {
+        self.total_frames()
+    }
 }
 
 /// Convenience alias: the handle threaded through the pipeline and analyser.

@@ -227,7 +227,8 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 `stem separate` 把当前曲目离线分离成 4 条 stem（drums / bass / other / vocals）并热装进 deck。
 **分离在后台线程上跑，期间可以继续 play / loop / jump / sync / beatmatch** —— 装上的那一刻是
 一次"换源 jump"，所以无缝隙、不丢循环。首次约 80 s（3:39 曲目）/ ~1.9 GB 内存，结果按内容哈希
-缓存到 `~/.cache/hypermixx/stems/`，之后重跑是 0 s。
+缓存到**工作目录** `.cache/stems/<key>/`，之后重跑是 0 s；拉取的模型放在 `.model/<name>.onnx`
+（`HYPERMIXX_CACHE` / `HYPERMIXX_MODELS` 可覆盖，`stem cache prune` 只清前者）。
 
 | 命令 | 说明 |
 |---|---|
@@ -286,7 +287,39 @@ vocals = ["gain", "filter"]
 - **`deck0 fader flow <x>`（不带 stem）一次写全部四条**，所以单个硬件推子仍然可用；
   `deck0 vocals fader <x>` 只写一条。
 
-### 3.7.1 电平与信号路径
+### 3.7.1 边分离边播（分段就是模型自己的分段）
+
+`stem separate` 不在结尾才装 stems，而是**先把四路"可增长"的流装进 deck，再按模型自己的节奏逐块装入**：
+
+- 装上去的那一刻四路之和恰好等于原曲（stream 0 放混音、其余静音），所以你听到的还是那首歌；
+- **块的粒度就是模型的分段**：charon 按 7.8 s 窗口扫过轨道、每次前进 `(1−overlap)×7.8 s`，一块一旦不再被
+  后续窗口影响就吐出来（默认 overlap 0.25 ⇒ 每块 **5.85 s** 音频）。所以**没有 chunk 长度可设**，
+  也没有"第二套切分要和模型对齐"这回事——实测（真实模型）这样装出来的音频与整轨一次性分离**逐样本相同**；
+- 第一块在**约 1–2 个窗口的算力**之后就进了 deck：CPU 上 40 s 素材首个块 8 s 后落地，21 s 全部分离完；
+- 每块到达即替换它自己那段，**不重启 flow、不停音乐、无接缝**（通过已装好的 `Source` 句柄完成）；
+- 边界处 ~50 ms 交叉淡化；播放头越过已装入水位时回落到混音 —— 搓/跳到未装入的尾部照样有声；
+- `stem status` 显示 `25% separated` 这样的水位（`DeckState.stems.separated`）。
+
+```
+[deck] stem separate [--model <name|path>]
+```
+
+- **`stem separate` 不带调参旗标**：模型、provider、`overlap`、`shifts`、`threads`、`low_memory`
+  全都是 `live.toml` 的 `[stems]` 键 —— 它们是**这台机器**的属性，不是曲目的属性；编辑后
+  `live reload` 立即生效（下一次分离就用新的）。唯一的例外是 `--model <name|path>`：临时换一个
+  模型（表里名字，或本地 `.onnx` 路径）而不改配置。
+- `overlap` 同时决定块长（`(1−overlap) × 7.8 s`）与窗口重叠：更小 = 更快、块更长、窗口边缘权重更大。
+- **`shifts = 2` 不能流式**（运行时拒绝给一个流做时间平移）：那条路退回整轨一块、结尾才装，
+  `live show` 会直接这么写。默认 `1` 是流式的。
+- 缓存**按块追加**：`meta` 里记已完成水位，所以重跑命中缓存（一句 "was already separated"、0 s），
+  中途取消后重跑会从水位处接着做（续跑用**整轨**的输入归一化，所以接缝处的音频与一次跑完相同）。
+- 分离期间照常 play/loop/jump/sync；进度既按 % 也按块报告。
+- **低端设备**：`[stems] threads` 是**播放**参数 —— 分离占满 CPU 会让音频回调饿死、音乐卡顿；
+  `overlap = 0.0` 少跑 ~24% 窗口；`model = "htdemucs-fp16"` 下载少一半（同速）；`low_memory = true`
+  （默认）把峰值内存从 5.6 GB 压到 2.1 GB。实测（16 核，40 s 素材）：threads 自动 20 s，
+  `threads = 2` 28 s（+40%）但只占 2 核。
+
+### 3.7.2 电平与信号路径
 
 ```
 每条流:  source fader(门) → flow_fx → flow_fader ─┐
@@ -374,8 +407,9 @@ live reload [<file>]  重读 live 文件（缺省 --live 的路径，否则 ./pr
 | `[audio] prefill_frames` | 2048 | 开流前预填的静音，避免设备等第一个块；上限为 ring 的一半 |
 | `[stems] model` | htdemucs | 模型名（`stem model list` 可列） |
 | `[stems] provider` | cpu | `cpu` 或 `cuda`（`--features cuda` 构建） |
-| `[stems] overlap` / `shifts` | 0.25 / 1 | 分离窗口重叠与集成趟数（`stem separate --overlap/--shifts` 可逐次覆盖） |
-| `[stems] chunk_seconds` | 0（整轨） | **预留**：分段分离并渐进装入 |
+| `[stems] overlap` / `shifts` | 0.25 / 1 | 分离窗口重叠与集成趟数。`overlap` 同时决定块长 `(1−overlap)×7.8s`；`shifts 1` 才流式，`2` 退回整轨一块 |
+| `[stems] threads` / `low_memory` | 0 / true | 分离可用的线程数（0 = 自动）与内存取舍（低内存档峰值 5.6→2.1 GB，代价 ~11% 速度） |
+| `[stems] model` | htdemucs | 模型名，或本地 `.onnx` 路径（`stem model list` 列名字） |
 
 - **采样率与 ring 需要重启**：引擎的时钟与 ring 在启动时定下（`live reload` 会明说这一点），
   但 `[stems]` 的默认值下一次分离就生效。未知键报错（拼错的 `sample_rat` 静默按 44.1k 跑才是灾难），
@@ -383,6 +417,7 @@ live reload [<file>]  重读 live 文件（缺省 --live 的路径，否则 ./pr
 - **分开分离仍要求引擎率为 44.1 kHz**：内置模型是 44.1k 导出、缓存也按这个率做 key，
   非 44.1k 时 `stem separate` 直接报错而不是悄悄双向重采样。
 - `[audio] block_frames` **不在这里**，因为它是引擎内部契约（时间拉伸引擎按块喂入），不是本机性能参数。
+- **分离的块长也不在这里**：它就是模型自己的窗口步长（见 §3.7.1），设不了的才是对的。
 
 ### 3.12 profile 与 preference
 
@@ -418,6 +453,13 @@ midi  = "midi.toml"      # -> profile/midi.toml（也可以内联成 [midi] 表�
 - 没有 profile（或 profile 里没写某项）时用文件夹默认：`profile/mixer.toml`、`profile/live.toml`、
   `profile/midi.toml`，各自缺失则回落内置默认（MIDI 缺失 = 不打开输入，即出厂状态）。
 - **显式 flag 永远优先**：`--config` / `--live` / `--midi` / `--midi-map` > profile > 文件夹默认 > 内置默认。
+- **切换 profile**：
+  - 启动时 `--profile <name>`（裸名字 → `profile/<name>.toml`；`--profile path/x.toml` 直接给路径）；
+    不给则读 `profile/profile.toml`（存在就用，不存在就是文件夹默认）。仓库里自带 `profile/example.toml`
+    可复制成 `profile/dj.toml` 等处。
+  - 会话内 `profile show` 看当前用的 profile 与它解析出的 topology/live/stems 参数；
+    **`profile reload [<name|path>]` 切一个** —— profile 指到的 topology 走 `MixerReload`（立即生效）、
+    live 立即生效（下一次分离就用新值），**只有 MIDI 是启动时接线的**，reload 会明说"下次启动生效"。
 - 端口打不开时：**显式 `--midi` 直接报错退出**（你点名要的），**profile 里的设备只警告并继续**
   （"这套设备通常长这样"，控制器没插不该让整场起不来；TUI 里 `F2` 仍可临时选）。
 - `--profile dj` 读 `profile/dj.toml`；`--profile path/to/p.toml` 直接读该路径。

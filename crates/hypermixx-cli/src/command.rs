@@ -15,6 +15,7 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::fx::FxKind;
 use hypermixx_audio::{AudioPipeline, Command, SAMPLE_RATE};
+use hypermixx_media::ChunkedStreams;
 use hypermixx_core::{
     Backend, CommandResponse, CueOp, FxChainId, FxSlotRef, KeylockMode, LiveConfig, LoopEditOp,
     LoopOp, LoopQuantum, NudgeOp, OutputOp, PhaseMode, Shared, Stem, StemOp, StemPreset, SyncOp,
@@ -151,6 +152,9 @@ pub struct Dispatcher {
     topology: Arc<Mutex<Option<String>>>,
     /// Where `live reload` reads from: `--live`'s file, or the shipped default.
     live_path: Arc<Mutex<Option<String>>>,
+    /// The profile this session started with, or `None` for the folder defaults. `profile show`
+    /// reports it and `profile reload` replaces it.
+    profile: Arc<Mutex<Option<String>>>,
     /// The machine's settings: the engine rate, the ring sizes, and the stem defaults.
     live: Arc<Mutex<LiveConfig>>,
     slots: Slots,
@@ -172,6 +176,7 @@ impl Dispatcher {
             events: None,
             topology: Arc::new(Mutex::new(None)),
             live_path: Arc::new(Mutex::new(None)),
+            profile: Arc::new(Mutex::new(None)),
             live: Arc::new(Mutex::new(LiveConfig::default())),
             slots: Arc::new(SlotBook::default()),
             separations: Arc::new(Mutex::new(HashMap::new())),
@@ -182,6 +187,19 @@ impl Dispatcher {
     pub fn tap_events(mut self, events: Sender<UiEvent>) -> Self {
         self.events = Some(events);
         self
+    }
+
+    /// Remembers the profile this session started with, so `profile show` can name it and
+    /// `profile reload` can default to it.
+    pub fn with_profile(&self, path: Option<String>) {
+        if let Ok(mut slot) = self.profile.lock() {
+            *slot = path;
+        }
+    }
+
+    /// The profile in effect, if any.
+    pub fn profile_path(&self) -> Option<String> {
+        self.profile.lock().ok().and_then(|slot| slot.clone())
     }
 
     /// Installs the live settings and remembers where they came from, so `live reload` can re-read
@@ -212,12 +230,13 @@ impl Dispatcher {
             .unwrap_or_else(|| DEFAULT_LIVE.to_owned())
     }
 
-    /// Remembers which topology file `mixer reload` should fall back to (`--config`).
-    pub fn with_topology(self, path: Option<String>) -> Self {
+    /// Remembers which topology file `mixer reload` should fall back to (`--config`), and which one
+    /// the session is actually running: a profile switch replaces it, so it is a setter rather than a
+    /// builder step.
+    pub fn with_topology(&self, path: Option<String>) {
         if let Ok(mut slot) = self.topology.lock() {
             *slot = path;
         }
-        self
     }
 
     /// The topology file to reload: the one from `--config`, else the shipped default.
@@ -409,6 +428,7 @@ pub fn dispatch(
         "output" | "outputs" => output_command(&mut words, command_tx),
         "mixer" => mixer_command(&mut words, dispatcher),
         "live" => live_command(&mut words, dispatcher),
+        "profile" => profile_command(&mut words, dispatcher),
         "midi" => midi_command(&mut words),
         "help" | "h" | "?" => Action::Message(help_text(decks)),
         "quit" | "exit" => Action::Quit,
@@ -471,6 +491,75 @@ pub const DEFAULT_TOPOLOGY: &str = crate::profile::DEFAULT_MIXER;
 /// The shipped live settings, under `./profile/`. Also what a run without `--live` reads.
 pub const DEFAULT_LIVE: &str = crate::profile::DEFAULT_LIVE;
 
+/// Downloads a model on a worker thread, reporting progress through the notice channel.
+fn spawn_model_pull(
+    deck_id: u8,
+    spec: &'static hypermixx_stems::ModelSpec,
+    dispatcher: &Dispatcher,
+) -> Action {
+    let notices_tx = dispatcher.notices.clone();
+    std::thread::Builder::new()
+        .name("hypermixx-model".into())
+        .spawn(move || {
+            let progress = {
+                let notices_tx = notices_tx.clone();
+                let last = std::sync::atomic::AtomicU32::new(0);
+                std::sync::Arc::new(move |fraction: f32| {
+                    let percent = (fraction * 100.0) as u32;
+                    let previous = last.load(std::sync::atomic::Ordering::Relaxed);
+                    if percent >= previous + 10 {
+                        last.store(percent, std::sync::atomic::Ordering::Relaxed);
+                        notices::info(&notices_tx, format!("[model] {}: {percent}%", spec.name));
+                    }
+                }) as hypermixx_stems::ProgressSink
+            };
+            notices::info(
+                &notices_tx,
+                format!(
+                    "[model] {}: {:.0} MB ({})...",
+                    spec.name,
+                    spec.bytes as f32 / 1_000_000.0,
+                    spec.repo_path
+                ),
+            );
+            match hypermixx_stems::ensure_model(spec, None, &progress) {
+                Ok(path) => notices::info(
+                    &notices_tx,
+                    format!("[model] {}: verified and cached at {}", spec.name, path.display()),
+                ),
+                Err(err) => notices::error(&notices_tx, format!("[model] {}: {err}", spec.name)),
+            }
+            let _ = deck_id;
+        })
+        .ok();
+    Action::Continue
+}
+
+/// What `[stems] model` (or `--model`) names: a table entry, or a **path** to a local `.onnx`.
+///
+/// A path is recognised by shape (`.onnx`, or a separator in it) rather than by trying to open it,
+/// so a typo in a table name is still reported as an unknown model instead of a missing file.
+fn model_choice(
+    token: &str,
+) -> Result<(&'static hypermixx_stems::ModelSpec, Option<std::path::PathBuf>), String> {
+    let looks_like_a_path = token.ends_with(".onnx") || token.contains('/');
+    if looks_like_a_path {
+        let path = std::path::PathBuf::from(token);
+        // The spec is only a *description*: the shape comes from the default model, the name and size
+        // from the file. Nothing is downloaded for a local model.
+        let spec = hypermixx_stems::local_spec(&path, *hypermixx_stems::default_model());
+        return Ok((Box::leak(Box::new(spec)), Some(path)));
+    }
+    hypermixx_stems::model_by_name(token)
+        .map(|spec| (spec, None))
+        .ok_or_else(|| {
+            format!(
+                "unknown model `{token}` (available: {}; a path to a local `.onnx` works too)",
+                hypermixx_stems::model_names().join(", ")
+            )
+        })
+}
+
 /// Reads a live-settings file: TOML, then made sane. Returns the settings and whatever had to be
 /// substituted, so the caller can say so once rather than silently changing a user's machine.
 pub fn read_live_config(path: &str) -> Result<(LiveConfig, Vec<String>), String> {
@@ -484,6 +573,117 @@ pub fn read_live_config(path: &str) -> Result<(LiveConfig, Vec<String>), String>
         ));
     }
     Ok((live, notes))
+}
+
+/// The `profile` family: which files this session is running with, and switching them.
+///
+/// A profile is read **once at startup** (`--profile <name|path>`, else `profile/profile.toml` when
+/// it exists). This family is how a running session answers "which one am I on?" and how it switches
+/// without a restart: everything a profile names can be re-read, except the MIDI input, which is
+/// attached once at launch.
+fn profile_command<'a>(
+    words: &mut impl Iterator<Item = &'a str>,
+    dispatcher: &Dispatcher,
+) -> Action {
+    let Some(sub) = words.next() else {
+        return Action::Message(profile_report(dispatcher));
+    };
+    match sub {
+        "show" | "list" => Action::Message(profile_report(dispatcher)),
+        "reload" | "use" => {
+            let path = words
+                .next()
+                .map(crate::profile::resolve)
+                .or_else(|| dispatcher.profile_path())
+                .unwrap_or_else(|| crate::profile::AMBIENT.to_owned());
+            match crate::profile::load(&path) {
+                Ok((profile, notes)) => {
+                    let mut applied = Vec::new();
+                    // Reloading a profile is **exactly "start as if with `--profile X`"**, minus the
+                    // MIDI input (attached once at launch): a key the profile does not name falls back
+                    // to the folder default, rather than leaving whatever happened to be running.
+                    let mixer = profile
+                        .mixer
+                        .clone()
+                        .unwrap_or_else(|| crate::profile::DEFAULT_MIXER.to_owned());
+                    match std::fs::read_to_string(&mixer) {
+                        Ok(text) => {
+                            let _ = dispatcher.command_tx.send(Command::MixerReload { text });
+                            dispatcher.with_topology(Some(mixer.clone()));
+                            applied.push(format!("topology <- {mixer}"));
+                        }
+                        Err(err) => applied.push(format!("topology: {mixer}: {err}")),
+                    }
+                    // The live settings: they are read from the dispatcher on every use, so a reload
+                    // lands on the next separation.
+                    let live = profile
+                        .live
+                        .clone()
+                        .unwrap_or_else(|| crate::profile::DEFAULT_LIVE.to_owned());
+                    match read_live_config(&live) {
+                        Ok((config, live_notes)) => {
+                            for note in &live_notes {
+                                notices::info(&dispatcher.notices, format!("[live] {note}"));
+                            }
+                            applied.push(format!("live <- {live}"));
+                            dispatcher.with_live(config, Some(live));
+                        }
+                        Err(err) => applied.push(format!("live: {err}")),
+                    }
+                    if profile.midi.device.is_some() || profile.midi.map.is_some() {
+                        // Honest about the one thing that cannot change under a running session.
+                        applied.push(format!(
+                            "midi: {} — takes effect at the next launch",
+                            profile.midi.device.as_deref().unwrap_or("(no device)")
+                        ));
+                    }
+                    dispatcher.with_profile(Some(path.clone()));
+                    for note in notes {
+                        applied.push(note);
+                    }
+                    Action::Message(format!(
+                        "profile {path}:{}\n  (live reload applies now; MIDI only at launch)",
+                        applied
+                            .iter()
+                            .map(|line| format!("\n  {line}"))
+                            .collect::<String>()
+                    ))
+                }
+                Err(err) => Action::Failed(err),
+            }
+        }
+        other => Action::Failed(format!("unknown profile subcommand `{other}` (show|reload)")),
+    }
+}
+
+/// What this session is running with: the profile, and the files it resolved to.
+fn profile_report(dispatcher: &Dispatcher) -> String {
+    let mut text = match dispatcher.profile_path() {
+        Some(path) => format!("profile: {path}"),
+        None => "profile: none (folder defaults; `--profile <name>` reads profile/<name>.toml)"
+            .to_owned(),
+    };
+    text.push_str(&format!(
+        "\n  topology: {}",
+        dispatcher.topology_path()
+    ));
+    text.push_str(&format!("\n  live:     {}", dispatcher.live_path()));
+    let live = dispatcher.live();
+    text.push_str(&format!(
+        "\n  stems:    model {}  provider {}  overlap {:.2}  shifts {}  threads {}  memory {}",
+        live.stems.model,
+        live.stems.provider,
+        live.stems.overlap,
+        live.stems.shifts,
+        if live.stems.threads == 0 {
+            "auto".to_owned()
+        } else {
+            live.stems.threads.to_string()
+        },
+        if live.stems.low_memory { "low" } else { "max-speed" },
+    ));
+    text.push_str("\n  MIDI is attached at launch, so a switch takes effect on the next one.");
+    text
 }
 
 /// The `live` family: what this machine is set to.
@@ -1045,6 +1245,8 @@ fn stem_family<'a>(
     };
     match sub {
         "separate" | "split" => {
+            // One read of the live config for the whole arm: the rate guard, the model choice and
+            // every separator parameter come from it (`live reload` applies an edit immediately).
             let live = dispatcher.live();
             // The bundled model is a 44.1 kHz export and the cache is keyed on that rate, so a
             // 48k engine would feed it material it was not trained on. Refuse rather than resample
@@ -1058,77 +1260,102 @@ fn stem_family<'a>(
                     live.audio.sample_rate
                 ));
             }
-            // The live file's `[stems]` block is the default; a flag on the line still wins.
-            let mut options = hypermixx_stems::SeparateOptions {
+            // Everything the separator is asked for comes from `[stems]` in live.toml: the model, the
+            // provider, the window overlap, the shift ensemble, the thread budget and the memory
+            // trade. A hand-typed flag would be a second place to keep them in step — and these are
+            // properties of *this machine*, which is exactly what live.toml is for. `live reload`
+            // picks up an edit immediately.
+            let (mut spec, mut local_file) = match model_choice(&live.stems.model) {
+                Ok(choice) => choice,
+                Err(err) => return Action::Failed(err),
+            };
+            match words.next() {
+                // The one thing a run may override: try another model (a table name, or the path to a
+                // local file) without editing the config first.
+                Some("--model") => match words.next() {
+                    Some(token) => match model_choice(token) {
+                        Ok((named, path)) => {
+                            spec = named;
+                            local_file = path;
+                        }
+                        Err(err) => return Action::Failed(err),
+                    },
+                    None => return Action::Failed("--model needs a name or a path".into()),
+                },
+                Some(other) => {
+                    return Action::Failed(format!(
+                        "`stem separate` takes no options (got `{other}`): the model, provider, \
+                         overlap, shifts, threads and memory are `[stems]` keys in live.toml, and \
+                         `live reload` applies an edit. `--model <name|path>` is the one-off override."
+                    ))
+                }
+                None => {}
+            }
+            let options = hypermixx_stems::SeparateOptions {
                 shifts: live.stems.shifts,
                 overlap: live.stems.overlap,
                 provider: hypermixx_stems::Provider::parse(&live.stems.provider)
                     .unwrap_or_default(),
             };
-            while let Some(flag) = words.next() {
-                match flag {
-                    // Every option is refused rather than clamped: a silent clamp makes `--shifts 8`
-                    // look like it did something it did not.
-                    "--shifts" => match words.next().and_then(|v| v.parse::<usize>().ok()) {
-                        Some(value) if value <= hypermixx_stems::MAX_SHIFTS => {
-                            options.shifts = value
-                        }
-                        Some(value) => {
-                            return Action::Failed(format!(
-                                "--shifts {value} is past the useful range (0..={}); 0 and 1 are the \
-                                 same single pass, 2 averages a second run for ~2× the time",
-                                hypermixx_stems::MAX_SHIFTS
-                            ))
-                        }
-                        None => return Action::Failed("--shifts needs a number".into()),
-                    },
-                    "--overlap" => match words.next().and_then(|v| v.parse::<f32>().ok()) {
-                        Some(value)
-                            if value.is_finite() && (0.0..=hypermixx_stems::MAX_OVERLAP).contains(&value) =>
-                        {
-                            options.overlap = value
-                        }
-                        Some(value) => {
-                            return Action::Failed(format!(
-                                "--overlap {value} is outside 0.0..={}; 0.0 is 24% faster than the \
-                                 0.25 default and weights window edges more",
-                                hypermixx_stems::MAX_OVERLAP
-                            ))
-                        }
-                        None => return Action::Failed("--overlap needs a number".into()),
-                    },
-                    "--gpu" => options.provider = hypermixx_stems::Provider::Cuda,
-                    "--provider" => match words.next().and_then(hypermixx_stems::Provider::parse) {
-                        Some(provider) => options.provider = provider,
-                        None => {
-                            return Action::Failed(
-                                "--provider needs cpu or cuda (--gpu is short for the latter)".into(),
-                            )
-                        }
-                    },
-                    other => {
-                        return Action::Failed(format!(
-                            "unknown stem separate option `{other}` \
-                             (--shifts <n> | --overlap <x> | --gpu)"
-                        ))
-                    }
-                }
-            }
-            // A build without the feature must say so *before* fetching a model and starting an
-            // 80-second job, not after.
+            let runtime = hypermixx_stems::RuntimeOptions {
+                threads: hypermixx_stems::RuntimeOptions::threads_from(live.stems.threads),
+                low_memory: live.stems.low_memory,
+            };
+            // A build without the feature must say so *before* fetching a model and starting a job
+            // that takes minutes.
             if !hypermixx_stems::provider_available(options.provider) {
                 return Action::Failed(format!(
-                    "this build has no {} support (rebuild with --features cuda)",
+                    "this build has no {} support (rebuild with --features cuda, or set \
+                     `[stems] provider` in live.toml)",
                     options.provider.label()
                 ));
             }
             let Some(source) = pipeline.deck_source(deck_id) else {
                 return Action::Failed(format!("deck {deck_id} holds no track to separate"));
             };
-            spawn_separate(deck_id, source, options, dispatcher);
+            spawn_separate(deck_id, source, options, runtime, spec, local_file, dispatcher);
             Action::Continue
         }
         "status" => send(command_tx, Command::GetStemState { deck_id }),
+        "model" => match words.next() {
+            // What a model is (name, size, source) is data in the table, so this cannot drift from
+            // what `--model` accepts.
+            None | Some("list") | Some("ls") => {
+                let mut text = String::from("stem models:");
+                for spec in hypermixx_stems::MODELS {
+                    let cached = hypermixx_stems::model_path(spec).exists();
+                    text.push_str(&format!(
+                        "\n  {:<14} {:>6.0} MB  {}  {}{}",
+                        spec.name,
+                        spec.bytes as f32 / 1_000_000.0,
+                        spec.repo_path.split('/').next().unwrap_or("-"),
+                        // Presence, not validity: `ensure_model` verifies the hash when the file is
+                        // actually used, and a table entry that is missing is fetched then.
+                        if cached { "in .model" } else { "not fetched" },
+                        if spec.name == hypermixx_stems::default_model().name {
+                            "  (default)"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+                text.push_str("\n  `stem separate --model <name>` picks one, and it is part of the cache key.");
+                Action::Message(text)
+            }
+            Some("pull") => {
+                let Some(name) = words.next() else {
+                    return Action::Failed("usage: stem model pull <name>".into());
+                };
+                match hypermixx_stems::model_by_name(name) {
+                    Some(spec) => spawn_model_pull(deck_id, spec, dispatcher),
+                    None => Action::Failed(format!(
+                        "unknown model `{name}` (available: {})",
+                        hypermixx_stems::model_names().join(", ")
+                    )),
+                }
+            }
+            Some(other) => Action::Failed(format!("unknown stem model subcommand `{other}` (list|pull)")),
+        },
         "cache" => {
             // `stem cache prune [--keep <n>]` / `stem cache clear`; a bare `stem cache` reports.
             match words.next() {
@@ -1262,8 +1489,11 @@ fn command_tx_of(dispatcher: &Dispatcher) -> Sender<Command> {
 /// — so the user can keep playing, looping and beatmatching while this runs.
 pub(crate) fn spawn_separate(
     deck_id: u8,
-    source: Shared,
+    mix: Shared,
     options: hypermixx_stems::SeparateOptions,
+    runtime: hypermixx_stems::RuntimeOptions,
+    spec: &'static hypermixx_stems::ModelSpec,
+    local_file: Option<std::path::PathBuf>,
     dispatcher: &Dispatcher,
 ) {
     let command_tx = dispatcher.command_tx.clone();
@@ -1272,72 +1502,26 @@ pub(crate) fn spawn_separate(
     std::thread::Builder::new()
         .name(format!("hypermixx-stem-{deck_id}"))
         .spawn(move || {
-            let progress = {
-                let notices_tx = notices_tx.clone();
-                // Report in 10% steps: one notice per model window would flood the log.
-                // An atomic rather than a captured `mut`: the sink must be `Fn`, and the model
-                // reports from its own thread.
-                let last = std::sync::atomic::AtomicU32::new(0);
-                std::sync::Arc::new(move |fraction: f32| {
-                    let percent = (fraction * 100.0) as u32;
-                    let previous = last.load(std::sync::atomic::Ordering::Relaxed);
-                    if percent >= previous + 10 {
-                        last.store(percent, std::sync::atomic::Ordering::Relaxed);
-                        notices::info(&notices_tx, format!("[stem] deck{deck_id}: {percent}%"));
-                    }
-                }) as hypermixx_stems::ProgressSink
-            };
-            notices::info(
-                &notices_tx,
-                format!("[stem] deck{deck_id}: preparing the separator (may fetch a model)..."),
-            );
-            let separator = match hypermixx_stems::default_separator(options, &progress) {
-                Ok(separator) => separator,
-                Err(err) => {
-                    notices::error(&notices_tx, format!("[stem] deck{deck_id}: {err}"));
-                    return;
-                }
-            };
-            // The id names the model, shifts, overlap and provider — the four things that decide
-            // which audio this is, and which cache entry it will land in.
-            notices::info(
-                &notices_tx,
-                format!(
-                    "[stem] deck{deck_id}: {} (shifts {}, overlap {}, {})",
-                    separator.id(),
-                    options.shifts,
-                    options.overlap,
-                    options.provider.label()
-                ),
-            );
             let cancelled = hypermixx_stems::Cancelled::new();
             if let Ok(mut running) = cancellations.lock() {
                 running.insert(deck_id, cancelled.clone());
             }
-            let started = std::time::Instant::now();
-            match hypermixx_stems::separate_cached(
-                separator.as_ref(),
-                source.as_ref(),
-                &progress,
-                &cancelled,
-            ) {
-                Ok(stems) => {
-                    let frames = stems.total_frames();
-                    let seconds = started.elapsed().as_secs_f32();
-                    notices::info(
-                        &notices_tx,
-                        format!(
-                            "[stem] deck{deck_id}: {frames} frames in {seconds:.0}s — installing"
-                        ),
-                    );
-                    let _ = command_tx.send(Command::SetStems { deck_id, stems });
-                }
-                Err(err) => {
-                    if err == hypermixx_stems::StemError::Cancelled {
-                        notices::info(&notices_tx, format!("[stem] deck{deck_id}: cancelled"));
-                    } else {
-                        notices::error(&notices_tx, format!("[stem] deck{deck_id}: {err}"));
-                    }
+            let out = separate_into_deck(SeparateJob {
+                deck_id,
+                mix: &mix,
+                options,
+                runtime,
+                table_spec: spec,
+                local_file,
+                command_tx: &command_tx,
+                notices_tx: &notices_tx,
+                cancelled: &cancelled,
+            });
+            if let Err(err) = out {
+                if err == hypermixx_stems::StemError::Cancelled {
+                    notices::info(&notices_tx, format!("[stem] deck{deck_id}: cancelled"));
+                } else {
+                    notices::error(&notices_tx, format!("[stem] deck{deck_id}: {err}"));
                 }
             }
             if let Ok(mut running) = cancellations.lock() {
@@ -1346,6 +1530,232 @@ pub(crate) fn spawn_separate(
         })
         .ok();
 }
+
+/// The job body: install the growing streams, then separate **block by block into them**.
+///
+/// The install happens before the first block, which is the whole point: the deck immediately renders
+/// four streams, all of which are the mix (stream 0), so the listener keeps hearing the track — and
+/// every block that arrives replaces its own span of that mix with real stems. Nothing is restarted,
+/// nothing is re-installed, and the hand-over at the frontier is a 50 ms fade the growing source
+/// owns.
+///
+/// The block length is **the model's own**: the runtime windows the track, and each block is emitted
+/// once no later window can change it, so there is no chunk size to choose and no second segmentation
+/// to keep aligned with the first.
+/// One separation job's inputs. A struct because the job has grown past what an argument list reads
+/// well as, and because a front-end's own worker may want to fill it in pieces.
+struct SeparateJob<'a> {
+    deck_id: u8,
+    /// The **mix**: what the deck is playing, which is also what falls back in before a block lands.
+    mix: &'a Shared,
+    options: hypermixx_stems::SeparateOptions,
+    runtime: hypermixx_stems::RuntimeOptions,
+    /// The table entry (what gets downloaded, and what describes the architecture).
+    table_spec: &'static hypermixx_stems::ModelSpec,
+    /// A model file to run instead of the table entry: the user's own export.
+    local_file: Option<std::path::PathBuf>,
+    command_tx: &'a Sender<Command>,
+    notices_tx: &'a NoticeTx,
+    cancelled: &'a hypermixx_stems::Cancelled,
+}
+
+fn separate_into_deck(job: SeparateJob<'_>) -> Result<(), hypermixx_stems::StemError> {
+    let SeparateJob {
+        deck_id,
+        mix,
+        options,
+        runtime,
+        table_spec,
+        local_file,
+        command_tx,
+        notices_tx,
+        cancelled,
+    } = job;
+    let total = mix.total_frames();
+    let growing = ChunkedStreams::new(
+        Stem::COUNT,
+        total,
+        Some(Arc::clone(mix)),
+        hypermixx_media::DEFAULT_FADE_FRAMES,
+    );
+    let streams: [Shared; Stem::COUNT] = match growing.streams().try_into() {
+        Ok(streams) => streams,
+        Err(_) => {
+            return Err(hypermixx_stems::StemError::Backend(
+                "a growing set must hand out one stream per stem".into(),
+            ))
+        }
+    };
+    let _ = command_tx.send(Command::SetStems {
+        deck_id,
+        stems: hypermixx_core::StemSet::new(streams),
+    });
+
+    // Say what is about to happen before it happens: fetching 316 MB from a mirror with no message
+    // reads as a hang, and the fetch happens *before* the first progress report.
+    // A local file is described by a spec built from the table entry's *shape* (segment length and
+    // sample rate are properties of the architecture, not of the file) plus whatever the file says
+    // about itself. The table entry is kept as well: it is the one that knows how to be downloaded.
+    let spec: hypermixx_stems::ModelSpec = match &local_file {
+        Some(path) => hypermixx_stems::local_spec(path, *table_spec),
+        None => *table_spec,
+    };
+    let model = &spec;
+    // The block length is the model's own window stride, so it follows `--overlap`:
+    // `(1 - overlap) × segment`. There is no separate chunk size to set — see `docs/stem-info.md`.
+    let block_frames = hypermixx_stems::stride_frames(model.segment_frames, options.overlap);
+    notices::info(
+        notices_tx,
+        format!(
+            "[stem] deck{deck_id}: {} blocks of {:.1}s as the model finishes them — the deck plays \
+             the mix until the first one lands",
+            total.div_ceil(block_frames.max(1)),
+            block_frames as f32 / SAMPLE_RATE as f32,
+        ),
+    );
+    notices::info(
+        notices_tx,
+        if hypermixx_stems::model_path(model).exists() {
+            // The file is there; verifying it is a size check.
+            format!("[stem] deck{deck_id}: checking the {} model...", model.name)
+        } else {
+            format!(
+                "[stem] deck{deck_id}: fetching the {} model ({:.0} MB) — this happens once...",
+                model.name,
+                model.bytes as f32 / 1_000_000.0
+            )
+        },
+    );
+
+    // Progress in 10% steps: one notice per block would flood the log on a short window.
+    let progress = {
+        let notices_tx = notices_tx.clone();
+        let last = std::sync::atomic::AtomicU32::new(0);
+        std::sync::Arc::new(move |fraction: f32| {
+            let percent = (fraction * 100.0) as u32;
+            let previous = last.load(std::sync::atomic::Ordering::Relaxed);
+            if percent >= previous + 10 {
+                last.store(percent, std::sync::atomic::Ordering::Relaxed);
+                notices::info(&notices_tx, format!("[stem] deck{deck_id}: {percent}%"));
+            }
+        }) as hypermixx_stems::ProgressSink
+    };
+    let separator = match &local_file {
+        Some(path) => hypermixx_stems::local_separator(path, spec, options, runtime)?,
+        None => hypermixx_stems::default_separator(table_spec, options, runtime, &progress)?,
+    };
+    notices::info(
+        notices_tx,
+        format!(
+            "[stem] deck{deck_id}: {} (shifts {}, overlap {}, {}, threads {})",
+            separator.id(),
+            options.shifts,
+            options.overlap,
+            options.provider.label(),
+            match runtime.threads {
+                Some(threads) => threads.to_string(),
+                None => "auto".to_owned(),
+            },
+        ),
+    );
+
+    let started = std::time::Instant::now();
+    let mut blocks = 0u64;
+    let mut sink = DeckSink {
+        growing: &growing,
+        deck_id,
+        notices_tx,
+        started,
+        blocks: &mut blocks,
+    };
+    let out = hypermixx_stems::stream_cached(
+        separator.as_ref(),
+        mix.as_ref(),
+        &mut sink,
+        &progress,
+        cancelled,
+    );
+    let separated = growing.available_frames();
+    match &out {
+        Ok(()) => notices::info(
+            notices_tx,
+            format!(
+                "[stem] deck{deck_id}: {separated}/{total} frames separated in {:.0}s ({:.0}%), \
+                 {blocks} blocks{}",
+                started.elapsed().as_secs_f32(),
+                separated as f32 / total.max(1) as f32 * 100.0,
+                if separated >= total {
+                    ""
+                } else {
+                    " — the rest is still the mix"
+                },
+            ),
+        ),
+        // A failure is reported by the caller; the watermark is still worth saying, because the deck
+        // keeps playing what did arrive.
+        Err(_) => notices::info(
+            notices_tx,
+            format!(
+                "[stem] deck{deck_id}: stopping at {separated}/{total} frames after {:.0}s",
+                started.elapsed().as_secs_f32()
+            ),
+        ),
+    }
+    out
+}
+
+/// The sink the separation writes into: append to the growing streams, then say so.
+struct DeckSink<'a> {
+    growing: &'a ChunkedStreams,
+    deck_id: u8,
+    notices_tx: &'a NoticeTx,
+    started: std::time::Instant,
+    blocks: &'a mut u64,
+}
+
+impl hypermixx_stems::StemBlockSink for DeckSink<'_> {
+    fn block(&mut self, start_frame: u64, blocks: &[Vec<f32>]) -> bool {
+        if blocks.len() != Stem::COUNT {
+            notices::error(
+                self.notices_tx,
+                format!(
+                    "[stem] deck{}: a block carried {} streams, expected {}; stopping",
+                    self.deck_id,
+                    blocks.len(),
+                    Stem::COUNT
+                ),
+            );
+            return false;
+        }
+        let buffers: Vec<Arc<Vec<f32>>> = blocks.iter().map(|block| Arc::new(block.clone())).collect();
+        if let Err(err) = self.growing.append(start_frame, buffers) {
+            notices::error(
+                self.notices_tx,
+                format!("[stem] deck{}: {err}; stopping", self.deck_id),
+            );
+            return false;
+        }
+        *self.blocks += 1;
+        let total = self.growing.total_frames().max(1);
+        let separated = self.growing.available_frames();
+        // A block is short (a few seconds of audio), so the log line goes out every few blocks rather
+        // than every one: the percentage is what a user reads.
+        if *self.blocks % 4 == 1 || separated >= total {
+            notices::info(
+                self.notices_tx,
+                format!(
+                    "[stem] deck{}: block {} — {:.0}% separated ({:.0}s)",
+                    self.deck_id,
+                    self.blocks,
+                    separated as f32 / total as f32 * 100.0,
+                    self.started.elapsed().as_secs_f32()
+                ),
+            );
+        }
+        true
+    }
+}
+
 
 /// Prunes the stem cache and reports what went, in the same shape as `stem cache`.
 fn cache_prune(keep: usize) -> Action {
@@ -1633,6 +2043,97 @@ mod tests {
                 panic!("`{full}` failed: {message}");
             }
         }
+    }
+
+    /// `profile show` names what this session runs with, and `profile reload` switches the parts of
+    /// it that can change under a running engine (the topology and the live settings — MIDI is
+    /// attached at launch, and the reply says so).
+    #[test]
+    fn the_profile_family_reports_and_switches() {
+        let (tx, _rx) = unbounded();
+        let dispatcher = Dispatcher::new(tx, crossbeam_channel::unbounded().0);
+        dispatcher.with_topology(Some("profile/mixer.toml".to_owned()));
+        dispatcher.with_live(LiveConfig::default(), Some("profile/live.toml".to_owned()));
+        dispatcher.with_profile(Some("profile/dj.toml".to_owned()));
+
+        // `show` (and a bare `profile`) reports the profile and the files it resolved to.
+        for line in ["", "show"] {
+            match profile_command(&mut line.split_whitespace(), &dispatcher) {
+                Action::Message(text) => {
+                    assert!(text.contains("profile/dj.toml"), "{text}");
+                    assert!(text.contains("profile/mixer.toml"), "{text}");
+                    assert!(text.contains("profile/live.toml"), "{text}");
+                    assert!(text.contains("model htdemucs"), "{text}");
+                    assert!(text.to_lowercase().contains("midi"), "{text}");
+                }
+                other => panic!("expected a report, got {other:?}"),
+            }
+        }
+        // With no profile the report says so rather than looking broken.
+        let bare = Dispatcher::new(crossbeam_channel::unbounded().0, crossbeam_channel::unbounded().0);
+        match profile_command(&mut "".split_whitespace(), &bare) {
+            Action::Message(text) => assert!(text.contains("none"), "{text}"),
+            other => panic!("expected a report, got {other:?}"),
+        }
+
+        // A profile that names a topology: reload sends the file's *text* to the engine, and the
+        // profile becomes the current one.
+        let dir = std::env::temp_dir().join("hypermixx-profile-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("club.toml"), "[[channel]]\nside = \"center\"\n").unwrap();
+        let profile_file = dir.join("dj.toml");
+        std::fs::write(&profile_file, "mixer = \"club.toml\"\n").unwrap();
+        let (tx, rx) = unbounded();
+        let dispatcher = Dispatcher::new(tx, crossbeam_channel::unbounded().0);
+        let line = format!("reload {}", profile_file.display());
+        match profile_command(&mut line.split_whitespace(), &dispatcher) {
+            Action::Message(text) => assert!(text.contains("club.toml"), "{text}"),
+            other => panic!("expected a report, got {other:?}"),
+        }
+        match rx.recv().unwrap() {
+            Command::MixerReload { text } => assert!(text.contains("center"), "{text}"),
+            other => panic!("expected MixerReload, got {other:?}"),
+        }
+        assert_eq!(dispatcher.profile_path().as_deref(), Some(profile_file.to_string_lossy().as_ref()));
+        // The report follows the switch: the topology slot is the one the session is *running*, not
+        // the one it started with (a stale slot would make `profile show` lie).
+        assert_eq!(
+            dispatcher.topology_path(),
+            dir.join("club.toml").to_string_lossy(),
+            "the reload must record the topology it just loaded"
+        );
+        // A key the profile does not name falls back to the folder default — a reload is "start as
+        // if with `--profile X`", not a patch over whatever was running.
+        let bare_profile = dir.join("bare.toml");
+        std::fs::write(&bare_profile, "[preference]\n").unwrap();
+        let line = format!("reload {}", bare_profile.display());
+        dispatcher.with_topology(Some("stale/other.toml".to_owned()));
+        match profile_command(&mut line.split_whitespace(), &dispatcher) {
+            Action::Message(text) => {
+                assert!(text.contains(crate::profile::DEFAULT_MIXER), "{text}");
+                assert!(text.contains("topology:"), "a failure is reported, not hidden: {text}");
+            }
+            other => panic!("expected a report, got {other:?}"),
+        }
+        // The default file is not there in this test's working directory, so nothing was loaded —
+        // and the slot says exactly that rather than naming a file the session is not running.
+        assert_eq!(
+            dispatcher.topology_path(),
+            "stale/other.toml",
+            "a failed load must not be recorded as the running topology"
+        );
+
+        // A profile that is not there is a failure, and a mistyped subcommand too.
+        assert!(matches!(
+            profile_command(&mut "reload /nonexistent/p.toml".split_whitespace(), &dispatcher),
+            Action::Failed(_)
+        ));
+        assert!(matches!(
+            profile_command(&mut "swtich".split_whitespace(), &dispatcher),
+            Action::Failed(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `mixer reload` reads a file here and sends its *text*: file IO stays out of the engine, and

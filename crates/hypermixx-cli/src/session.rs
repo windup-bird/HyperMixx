@@ -22,6 +22,8 @@ pub struct Session {
     pub notice_rx: Receiver<LogLine>,
     /// `--config`'s path: what `mixer reload` falls back to.
     pub topology: Option<String>,
+    /// The profile this session was started with, for `profile show`. `None` = folder defaults.
+    pub profile: Option<String>,
     /// This machine's settings, already validated.
     pub live: LiveConfig,
     /// Where the live settings came from, for `live reload`.

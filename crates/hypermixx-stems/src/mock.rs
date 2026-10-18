@@ -41,6 +41,26 @@ impl MockSeparator {
     }
 }
 
+/// Frames per block the mock streams. Short on purpose: a test sees several blocks without waiting
+/// for 5.85 s of audio to pass between them.
+const MOCK_BLOCK_FRAMES: usize = 1_024;
+
+impl MockSeparator {
+    /// The mock's split, applied to one interleaved buffer.
+    fn shape(&self, stem: Stem, pcm: Vec<f32>) -> Vec<f32> {
+        match self.mode {
+            MockMode::QuarterEach => pcm.iter().map(|sample| sample * 0.25).collect(),
+            MockMode::Passthrough(target) => {
+                if target == stem {
+                    pcm
+                } else {
+                    vec![0.0; pcm.len()]
+                }
+            }
+        }
+    }
+}
+
 impl Default for MockSeparator {
     fn default() -> Self {
         Self::new(MockMode::QuarterEach)
@@ -48,6 +68,47 @@ impl Default for MockSeparator {
 }
 
 impl StemSeparator for MockSeparator {
+    /// Nothing to reuse: the mock is a pure function of the samples, so the per-call session is
+    /// exactly as fast as a reused one.
+    /// The mock streams in blocks of its own, so the plumbing that carries blocks to a deck is
+    /// exercised without a model (and the blocks are short, so a test does not wait for 5.85 s of
+    /// audio to see the second one).
+    fn stream(
+        &self,
+        mix: &dyn Source,
+        sink: &mut dyn crate::StemBlockSink,
+        progress: &crate::ProgressSink,
+        cancelled: &crate::Cancelled,
+    ) -> Result<(), StemError> {
+        let frames = mix.total_frames() as usize;
+        let mut at = 0usize;
+        while at < frames {
+            if cancelled.is_cancelled() {
+                return Err(StemError::Cancelled);
+            }
+            let take = MOCK_BLOCK_FRAMES.min(frames - at);
+            let mut blocks: Vec<Vec<f32>> = Vec::with_capacity(Stem::COUNT);
+            for stem in Stem::ALL {
+                let mut buf = vec![0.0f32; take * CHANNELS];
+                let read = mix.read_frames(at as u64, &mut buf);
+                if read == 0 {
+                    return Err(StemError::Io(format!(
+                        "the source ran out at frame {at} of {frames}"
+                    )));
+                }
+                let _ = read;
+                let buf = self.shape(stem, buf);
+                blocks.push(buf);
+            }
+            if !sink.block(at as u64, &blocks) {
+                return Ok(());
+            }
+            at += take;
+            progress(at as f32 / frames.max(1) as f32);
+        }
+        Ok(())
+    }
+
     fn id(&self) -> String {
         match self.mode {
             MockMode::Passthrough(stem) => format!("mock-passthrough-{stem}"),

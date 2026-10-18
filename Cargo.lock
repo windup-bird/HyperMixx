@@ -915,6 +915,7 @@ dependencies = [
 name = "hypermixx-media"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "hypermixx-core",
  "symphonia",
 ]

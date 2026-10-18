@@ -27,20 +27,34 @@ pub struct CachedStems {
     pub frames: u64,
 }
 
-/// `$HYPERMIXX_CACHE`, or `~/.cache/hypermixx`.
+/// Where separated audio is kept: `$HYPERMIXX_CACHE`, or **`.cache` in the working directory**.
+///
+/// Under the working directory rather than under `$HOME` on purpose: a separation is a few hundred
+/// megabytes *per track*, it is only useful next to the tracks it belongs to, and deleting a project
+/// directory should take its cached audio with it instead of leaving it in the home directory
+/// forever. (An explicit `HYPERMIXX_CACHE` still overrides everything, which is what the tests use.)
 pub fn cache_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("HYPERMIXX_CACHE") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
-    PathBuf::from(home).join(".cache").join("hypermixx")
+    cache_root_from(std::env::var("HYPERMIXX_CACHE").ok().as_deref())
 }
+
+/// The rule itself, as a pure function: an override, else the working directory's `.cache`.
+pub(crate) fn cache_root_from(override_dir: Option<&str>) -> PathBuf {
+    match override_dir.map(str::trim).filter(|dir| !dir.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(DEFAULT_CACHE_DIR),
+    }
+}
+
+/// Where separated audio goes when nothing overrides it: the working directory.
+pub const DEFAULT_CACHE_DIR: &str = ".cache";
 
 /// The stem cache's directory.
 pub fn stems_root() -> PathBuf {
-    cache_root().join("stems")
+    stems_root_from(std::env::var("HYPERMIXX_CACHE").ok().as_deref())
+}
+
+fn stems_root_from(override_dir: Option<&str>) -> PathBuf {
+    cache_root_from(override_dir).join("stems")
 }
 
 /// The cache key for `separator`'s output over `pcm`.
@@ -118,6 +132,73 @@ pub fn store_cached(key: &str, set: &StemSet) -> Result<(), StemError> {
     writeln!(meta, "sample_rate={SAMPLE_RATE}").ok();
     writeln!(meta, "stems={}", Stem::COUNT).ok();
     Ok(())
+}
+
+/// Appends one block to a cache entry, creating it if it is the first.
+///
+/// `blocks[i]` is interleaved stereo for stream `i`, all the same length. The entry's `meta` carries
+/// the **completed** watermark, so a partial entry is a valid, if short, cache hit — which is what
+/// makes a cancelled or interrupted job resumable instead of a rewrite. Best-effort: a cache that
+/// fails to write is not a failed separation.
+pub fn append_cached(
+    key: &str,
+    total_frames: u64,
+    start_frame: u64,
+    blocks: &[Vec<f32>],
+) -> Result<(), StemError> {
+    let dir = entry_dir(key);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| StemError::Io(format!("{}: {e}", dir.display())))?;
+    let Some(first) = blocks.first() else {
+        return Ok(());
+    };
+    let frames = (first.len() / CHANNELS) as u64;
+    if blocks.iter().any(|block| block.len() != first.len()) {
+        return Err(StemError::Io(
+            "a cached block's streams must be frame-aligned".to_owned(),
+        ));
+    }
+    for (index, samples) in blocks.iter().enumerate() {
+        let Some(stem) = Stem::from_index(index) else {
+            return Err(StemError::Io(format!("no stem for stream {index}")));
+        };
+        let path = stem_file(key, stem);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| StemError::Io(format!("{}: {e}", path.display())))?;
+        let mut bytes: Vec<u8> = Vec::with_capacity(samples.len() * 4);
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        file.write_all(&bytes)
+            .map_err(|e| StemError::Io(format!("{}: {e}", path.display())))?;
+    }
+    // The watermark moves only once every stream is on disk, so a crash mid-append leaves the entry
+    // *shorter* than its files — which `load_cached` refuses (a half-written stem is a wrong result).
+    let completed = start_frame + frames;
+    let mut meta = std::fs::File::create(meta_file(key))
+        .map_err(|e| StemError::Io(format!("{}: {e}", meta_file(key).display())))?;
+    writeln!(meta, "frames={completed}").ok();
+    writeln!(meta, "total={total_frames}").ok();
+    writeln!(meta, "sample_rate={SAMPLE_RATE}").ok();
+    writeln!(meta, "stems={}", Stem::COUNT).ok();
+    Ok(())
+}
+
+/// How many frames an entry already holds, without reading any audio. `None` when there is no entry.
+///
+/// This is what makes opening a cache entry cheap: the answer decides whether a job replays, resumes
+/// or starts from nothing, and none of those decisions should cost a file read the size of a track.
+pub fn cached_frames(key: &str) -> Option<u64> {
+    let meta = std::fs::read_to_string(meta_file(key)).ok()?;
+    for line in meta.lines() {
+        if let Some(value) = line.strip_prefix("frames=") {
+            return value.trim().parse::<u64>().ok();
+        }
+    }
+    None
 }
 
 /// Loads a cached set, or `None` when the key is absent or incomplete.
@@ -251,19 +332,8 @@ mod tests {
     use crate::{MockMode, MockSeparator, StemSeparator};
     use hypermixx_media::{DecodedAudio, PcmPool};
 
-    /// Every test in this module gets its own cache root, so they cannot see each other. The cache
-    /// root is process-wide (`HYPERMIXX_CACHE`), so these tests are serialised — otherwise two of
-    /// them would race on the same environment variable.
-    fn with_isolated_cache<T>(name: &str, body: impl FnOnce() -> T) -> T {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("hypermixx-cache-test-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("HYPERMIXX_CACHE", &dir);
-        let out = body();
-        std::env::remove_var("HYPERMIXX_CACHE");
-        out
-    }
+    /// The shared helper: one lock across every module that touches the cache.
+    use crate::testing::with_isolated_cache;
 
     fn mix(frames: u64, tag: f32) -> Arc<dyn Source> {
         Arc::new(PcmPool::from_decoded(DecodedAudio {
@@ -302,6 +372,18 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// The default location is a fact about this program, so it is pinned: a separation belongs next
+    /// to the tracks it came from, not in the home directory forever.
+    #[test]
+    fn the_default_roots_are_in_the_working_directory() {
+        assert_eq!(cache_root_from(None), PathBuf::from(".cache"));
+        assert_eq!(stems_root_from(None), PathBuf::from(".cache/stems"));
+        // An override wins, and an empty one is treated as absent rather than as "the root of `/`".
+        assert_eq!(cache_root_from(Some("/tmp/x")), PathBuf::from("/tmp/x"));
+        assert_eq!(cache_root_from(Some("  ")), PathBuf::from(".cache"));
+        assert_eq!(cache_root_from(Some("")), PathBuf::from(".cache"));
     }
 
     #[test]

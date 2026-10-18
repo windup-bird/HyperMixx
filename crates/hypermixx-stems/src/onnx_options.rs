@@ -79,9 +79,55 @@ impl SeparateOptions {
     }
 }
 
+/// How the runtime is set up: threads and memory. **None of this changes the audio.**
+///
+/// Kept apart from [`SeparateOptions`] on purpose: those take part in the separator's id and so in
+/// the cache key (they produce different samples), while a thread count only decides how the same
+/// arithmetic is scheduled. A low-end device needs this dial for a reason that has nothing to do with
+/// quality: ONNX Runtime takes every core by default, and a separation that saturates the machine
+/// starves the audio callback — the mix glitches *while* the stems are being prepared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeOptions {
+    /// Intra-op threads, or `None` for "let ONNX Runtime decide" (every core).
+    ///
+    /// On a 4-core laptop, `Some(2)` leaves two cores for playback; the separation takes longer and
+    /// the music does not stutter, which is the right trade when someone is listening.
+    pub threads: Option<usize>,
+    /// Trade throughput for peak memory: constant folding materialises several gigabytes of index
+    /// tensors at load time on HTDemucs, which does not fit a small device.
+    pub low_memory: bool,
+}
+
+impl Default for RuntimeOptions {
+    fn default() -> Self {
+        Self {
+            threads: None,
+            // The bundled model is configured low-memory already; this keeps that the default.
+            low_memory: true,
+        }
+    }
+}
+
+impl RuntimeOptions {
+    /// Parse `[stems] threads`: `0` (or a missing key) means "the runtime decides".
+    pub fn threads_from(value: usize) -> Option<usize> {
+        (value > 0).then_some(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_runtime_dials_are_defaults_that_do_not_touch_the_audio() {
+        let runtime = RuntimeOptions::default();
+        assert_eq!(runtime.threads, None, "let ONNX Runtime decide unless asked");
+        assert!(runtime.low_memory, "the small-device default is the low-memory one");
+        // `0` means auto, so a config file can say "no limit" without a special case.
+        assert_eq!(RuntimeOptions::threads_from(0), None);
+        assert_eq!(RuntimeOptions::threads_from(2), Some(2));
+    }
 
     #[test]
     fn providers_parse_by_name_and_spell_gpu_as_cuda() {

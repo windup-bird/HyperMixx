@@ -8,3 +8,4 @@ description = "PCM sources: decoding (symphonia) and the in-memory pool"
 [dependencies]
 hypermixx-core = { path = "../hypermixx-core" }
 symphonia = { workspace = true }
+arc-swap = { workspace = true }

@@ -58,6 +58,7 @@ const VERBS: &[(&str, &str)] = &[
     ("stem", "stem separation and per-stem control"),
     ("output", "output destinations and their bindings"),
     ("live", "machine settings: engine rate, ring sizes, stem defaults"),
+    ("profile", "which files this session runs with; switch them"),
     ("state", "show decks"),
     ("zoom", "waveform zoom"),
     ("help", "list commands"),
@@ -75,6 +76,7 @@ const STEM_SUBS: &[(&str, &str)] = &[
     ("bass", "bass only"),
     ("clear", "all four audible, nothing soloed"),
     ("cache", "where stems are cached"),
+    ("model", "list or download stem models"),
 ];
 
 const STEMS: &[(&str, &str)] = &[
