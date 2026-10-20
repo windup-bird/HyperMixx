@@ -245,7 +245,7 @@ pub fn quantize_offset(
 /// The range a *pending* loop would have if `loop out` were pressed with the playhead at
 /// `position`: `quantize_offset(p_in, position, quantum)`, clamped to the track.
 ///
-/// This is "the out point if pressed now" — the formula the LoopFlow's lockstep driver stores
+/// This is "the out point if pressed now" — the formula the looper's lockstep driver stores
 /// before every chunk and the exact expression `loop_out` stores at the press, which is what
 /// makes the promotion a no-op on the fed-but-unheard window. `None` on a degenerate result
 /// (no grid, or a range that collapsed against the track end).

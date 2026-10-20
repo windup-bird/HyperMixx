@@ -137,13 +137,30 @@ pub fn load(path: &str) -> Result<(Profile, Vec<String>), String> {
     Profile::from_toml_str(&text, &dir).map_err(|err| format!("{path}: {err}"))
 }
 
-/// Reads a `profile/midi.toml`-shaped file: a table of `device` / `map`.
+/// Reads a `profile/midi.toml`-shaped file.
+///
+/// It is normally a table of `device` / `map`, but a **mapping file** is accepted directly as
+/// well: `[[bind]]` + optional `[meta]` is detected, validated with the same parser `--midi-map`
+/// uses, and wired as the map with no device (the operator passes `--midi <port>` or picks one in
+/// the TUI). That lets a guide session save straight to `profile/midi.toml`.
 pub fn load_midi(path: &str) -> Result<(MidiSettings, Vec<String>), String> {
     let text = std::fs::read_to_string(path).map_err(|err| format!("{path}: {err}"))?;
     let value: toml::Value = toml::from_str(&text).map_err(|err| format!("{path}: {err}"))?;
     let table = value
         .as_table()
         .ok_or_else(|| format!("{path}: a midi file is a table of settings"))?;
+    if table.contains_key("bind") {
+        hypermixx_midi::Map::from_toml_str(&text)
+            .map_err(|err| format!("{path}: {err}"))?;
+        return Ok((
+            MidiSettings {
+                device: None,
+                map: Some(path.to_owned()),
+            },
+            vec!["`map` is set but no `device`, so no MIDI input is opened until `--midi` or F2"
+                .to_owned()],
+        ));
+    }
     MidiSettings::from_table(table, &parent_dir(path)).map_err(|err| format!("{path}: {err}"))
 }
 
@@ -297,16 +314,29 @@ mod tests {
     }
 
     /// The shipped folder must be loadable: its profile points at files that exist, and its midi file
-    /// parses (with nothing wired, since no controller is assumed).
+    /// parses. The port is still optional; the map is wired so `--midi <port>` uses it.
     #[test]
     fn the_shipped_profile_folder_loads() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let profile_path = root.join(AMBIENT);
         let (profile, notes) =
             load(&profile_path.to_string_lossy()).expect("the shipped profile parses");
-        assert!(notes.is_empty(), "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .all(|note| note.contains("map") && note.contains("device")),
+            "the only note is that the map needs a port: {notes:?}"
+        );
         assert_eq!(profile.midi.device, None, "no controller is assumed");
-        assert_eq!(profile.midi.map, None);
+        assert!(
+            profile
+                .midi
+                .map
+                .as_deref()
+                .is_some_and(|path| path.ends_with("profile/midi.toml")),
+            "the shipped profile points at the map: {:?}",
+            profile.midi.map
+        );
         // Each pointer resolved against the profile's own folder, so the files really are there.
         for path in [profile.mixer, profile.live] {
             let path = path.expect("the shipped profile names its files");
@@ -318,7 +348,12 @@ mod tests {
         // A named profile sitting next to the files it names resolves them the same way.
         let (named, notes) =
             load(&root.join("profile/example.toml").to_string_lossy()).expect("parses");
-        assert!(notes.is_empty(), "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .all(|note| note.contains("map") && note.contains("device")),
+            "{notes:?}"
+        );
         assert!(Path::new(&named.mixer.expect("names a mixer")).exists());
     }
 }

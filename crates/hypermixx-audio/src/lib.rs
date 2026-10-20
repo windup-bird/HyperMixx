@@ -22,8 +22,8 @@ pub mod ringbuf;
 pub mod sync;
 
 // The engine's public surface: the core types it trades in, plus its own runtime types.
-pub use deck::{Deck, FlowShift, LoopRange, Seek};
-pub use flow::{Flow, FlowState, PitchShiftEngine};
+pub use deck::{Deck, LoopRange, Seek};
+pub use flow::{Direction, Playing, PitchShiftEngine};
 pub use fx::{Fx, FxChain, FxContext, FxError, FxKind, FxSlot, FxTarget, Param};
 pub use mixer::{
     reference_toml, silent_test_channel, simple_dj, Bus, Channel, ChannelConfig,

@@ -1,42 +1,32 @@
-//! Deck: one source, one active flow, non-blocking jumps — plus the loop state machine.
+//! Deck: one `playing` voice, an optional `shadow`, hard switches — plus the loop state machine.
 //!
 //! Two clocks, deliberately split:
 //!
-//! - **`virtual_frame`** — the active flow's engine clock. Monotonic while playing, never folded
-//!   by a loop. Jump compensation, loop bookkeeping and the LoopFlow lockstep all speak this
-//!   position. A loop *exit* resumes where the looped flow's output stopped (the audible plays
-//!   out its lap and flows past `out` on its own) — landing on the slipped clock instead is the
-//!   separate `slip loop` feature.
-//! - **`current_frame`** — `virtual` mapped through the flow's `loop_range`: what the listener
-//!   hears, what the waveform shows, what a beatjump resolves from.
+//! - **`virtual_frame`** — `playing`'s clock. Monotonic while playing, never folded by a loop.
+//!   Slip modes keep it running while the `shadow` is audible; exiting a slip mode needs no seek.
+//! - **`current_frame`** — the audible voice (`playing`, or the slip `shadow`) folded through its
+//!   loop range.
 //!
-//! A loop's range lives **on the flow**, not the deck: an in-loop edit is one atomic store (no
-//! flow change), and any flow switch destroys the range with the flow it belonged to — the deck
-//! never clears a range in place.
-//!
-//! The armed manual loop-in (the *LoopFlow*) is a second flow the deck keeps **outside** the
-//! `flows` vector so switches can't reach it. It warms on the FlowShift thread, then runs in
-//! lockstep with the active flow — driven block for block into a scratch buffer whose output is
-//! discarded — so its engine stays live and its clock stays identical to the deck's. Pressing
-//! `out` stores the range the lockstep driver already put there and promotes it in place: the
-//! switch is a no-op on both the clock and the fed-but-unheard window.
+//! A normal loop promotes the prepared `shadow` into `playing`. A slip loop / slip roll keeps
+//! `playing` alive and makes the `shadow` audible; exiting drops the shadow and resumes `playing`
+//! at the slip position. No crossfade: every switch is a hard swap at a block boundary.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::flow::EngineProfile;
 use arc_swap::ArcSwapOption;
 use hypermixx_core::{
     CueOp, Key, KeylockMode, LoopEditOp, LoopOp, LoopQuantum, Source, TrackAnalysis, VinylOp,
 };
-use crate::flow::EngineProfile;
 
 use super::jump::{resolve, Seek};
+use super::Scratch;
 use super::loop_::{
-    beats_after, beat_shift, provisional_range, quantize_offset, quantize_to_beat, LoopRange,
+    beat_shift, beats_after, provisional_range, quantize_offset, quantize_to_beat, LoopRange,
 };
-use super::sync::{MAX_RATE, MIN_RATE, PhaseAlign, Playhead, SyncCtx, DEFAULT_TEMPO_RANGE};
-use super::FlowShift;
-use crate::flow::{Flow, FlowState};
+use super::sync::{PhaseAlign, Playhead, SyncCtx, DEFAULT_TEMPO_RANGE, MAX_RATE, MIN_RATE};
+use crate::flow::{Direction, Playing};
 use crate::fx::FxContext;
 use crate::mixer::Bus;
 use crate::CHANNELS;
@@ -44,28 +34,32 @@ use hypermixx_media::PcmPool;
 
 /// Why a loop command was refused when the deck has no usable grid.
 const LOOP_NO_GRID: &str = "loop needs a beat grid — `analyse` the track, or load it with a bpm";
-/// Upper bound on catch-up blocks when an armed LoopFlow first arrives (its warm-up gap plus a
-/// generous margin): 64 blocks ≈ 372 ms, an order of magnitude beyond any real warm-up.
+/// Upper bound on catch-up blocks for a looper/shadow: 64 blocks ≈ 372 ms, beyond any real
+/// seek/pre-roll.
 const MAX_CATCHUP_BLOCKS: usize = 64;
+/// One-pole smoothing for the wheel's signed rate. At 256-frame blocks this is ~25 ms.
+const VINYL_RATE_SMOOTHING: f64 = 0.22;
 
-/// An armed manual loop-in: the id of the LoopFlow warming for it, its quantized in point, and
-/// the flow itself once announced ready.
+/// An armed manual loop-in: its quantized in point and the looper being driven in lockstep.
 struct LoopArm {
-    id: u64,
     p_in: u64,
-    flow: Option<Flow>,
-    /// The profile the deck wanted when the arm was (re)built; applied on arrival if the deck's
-    /// profile changed while the flow was still on the worker.
-    profile: EngineProfile,
+    shadow: Option<Playing>,
+    slip: bool,
+}
+
+/// A second voice that is either waiting to take over (`swap`) or is the audible slip effect.
+struct Shadow {
+    playing: Playing,
+    slip: bool,
+    /// True for a source/profile swap waiting for the next block boundary.
+    swap: bool,
 }
 
 /// A single playback deck.
 ///
-/// `flows` holds every flow the deck still cares about; v1 keeps exactly one active flow and
-/// replaces it on a jump, but the shape is already right for a future crossfade (two active flows
-/// plus a mixer). A flow in turn carries **one engine over N streams** (see [`Flow`]), so "stream"
-/// is the axis stems live on and the deck is the thing every stream shares: one clock, one loop
-/// mapping, one tempo.
+/// `playing` is the main (slip) timeline; `shadow` is the one optional second voice used for
+/// loops, rolls, slip effects and source/profile swaps. Both carry **one engine over N streams**,
+/// so stems always share a clock, a loop mapping and a tempo.
 pub struct Deck {
     /// The **track** — the mix this deck was loaded with, kept even after stems replace it.
     ///
@@ -75,32 +69,23 @@ pub struct Deck {
     /// is held separately and [`source`](Self::source) returns it.
     original: Arc<dyn Source>,
     /// The deck's streams, in order. One for a plain track; one per stem once they are installed.
-    /// The *active flow* is the authority on how many are audible right now — a swap is warmed on
-    /// the background thread and lands a few blocks later, so `sources.len()` alone would be ahead
-    /// of the audio. Use [`stream_count`](Self::stream_count).
+    /// The audible voice is the authority on how many are rendered right now — a source swap lands
+    /// on the next block, so `sources.len()` alone can be ahead of the audio. Use
+    /// [`stream_count`](Self::stream_count).
     sources: Vec<Arc<dyn Source>>,
-    flows: Vec<Flow>,
-    active_index: usize,
-    flowshift: FlowShift,
-    next_flow_id: u64,
-    /// Deck position when the pending jump was submitted (**virtual**, so the compensation is in
-    /// the same clock the landing is expressed in), used to shift the landing point by the audio
-    /// the deck played while the new flow warmed up.
-    cued_from: u64,
-    playing: AtomicBool,
+    /// The main (slip) timeline. It is never discarded by a slip mode.
+    playing: Playing,
+    /// The second voice: loop/roll/vinyl effect, or a hard-swap candidate.
+    shadow: Option<Shadow>,
+    /// The loop range currently in effect (on `playing`, or on the shadow for slip).
+    loop_range: Option<LoopRange>,
+    playing_flag: AtomicBool,
     /// Analysis can arrive from the decode thread while the producer thread is sampling the deck,
     /// so it swaps in lock-free instead of riding on the deck mutex.
     analysis: ArcSwapOption<TrackAnalysis>,
     /// Armed manual loop-in waiting for its `out` press.
     loop_arm: Option<LoopArm>,
-    /// LoopFlow ids abandoned mid-warm-up (re-armed, cancelled, jumped past). Reaped when they
-    /// announce, so an abandoned engine cannot leak in FlowShift's warm map.
-    loop_reap: Vec<u64>,
-    /// Set by [`loop_exit`](Self::loop_exit): the *next* switch resumes where the looped flow's
-    /// output stopped instead of applying `cued_from + played`. Cleared by the next
-    /// [`jump`](Self::jump) (which supersedes that exit) and consumed by the switch itself.
-    pending_exit_resume: bool,
-    /// Out-point quantization for `loop out`, the LoopFlow's provisional range, and edits.
+    /// Out-point quantization for `loop out`, the looper's provisional range, and edits.
     loop_quantum: LoopQuantum,
     /// Transport every spawned flow inherits: a tempo (or profile) the DJ set must survive jumps.
     ///
@@ -128,6 +113,14 @@ pub struct Deck {
     /// flow keeps advancing on its own between seeks, so its position would drift forward at tempo
     /// and a backward turn would only cancel that out.
     vinyl_frame: u64,
+    /// A dedicated signed-rate Tape reader for vinyl scratch (keylock remains on `playing`).
+    scratch: Option<Scratch>,
+    /// Source frames the wheel asked for since the last block; turned into a target velocity.
+    vinyl_delta: f64,
+    /// Smoothed signed scratch velocity (source frames per output frame).
+    vinyl_rate: f64,
+    /// The next touch is a slip vinyl: keep `playing` running and hear a Tape shadow.
+    vinyl_slip: bool,
     /// Whether the wheel moved during the block just begun. A held platter that is *not* being turned
     /// is silent (a stationary groove carries no signal, and a frozen grain would just buzz).
     vinyl_moved: bool,
@@ -157,33 +150,17 @@ impl Deck {
         // Stream 0 is the track here: this constructor is "load these streams", and a caller with
         // four already-separated stems is describing a deck whose mix is unavailable.
         let original = Arc::clone(&sources[0]);
-        let flowshift = FlowShift::new();
-        // The first flow has to be born with the profile: `Flow::new` hardcodes Tape, and a later
-        // `set_profile` would rebuild rather than start there.
-        let mut first = Flow::new_with(
-            0,
-            sources.clone(),
-            0,
-            None,
-            flowshift.ready_sender(),
-            1.0,
-            EngineProfile::Keylock,
-        );
-        first.prepare();
-        first.activate();
+        let playing = Playing::with_profile(sources.clone(), 0, 1.0, EngineProfile::Keylock)
+            .expect("stretch engine config is statically valid");
         Self {
             original,
             sources,
-            flows: vec![first],
-            active_index: 0,
-            flowshift,
-            next_flow_id: 1,
-            cued_from: 0,
-            playing: AtomicBool::new(false),
+            playing,
+            shadow: None,
+            loop_range: None,
+            playing_flag: AtomicBool::new(false),
             analysis: ArcSwapOption::empty(),
             loop_arm: None,
-            loop_reap: Vec::new(),
-            pending_exit_resume: false,
             loop_quantum: LoopQuantum::default(),
             playhead: Playhead::new(),
             applied_rate: 1.0,
@@ -194,6 +171,10 @@ impl Deck {
             vinyl_held: false,
             vinyl_resume: false,
             vinyl_frame: 0,
+            scratch: None,
+            vinyl_delta: 0.0,
+            vinyl_rate: 0.0,
+            vinyl_slip: false,
             vinyl_moved: false,
             key_shift: 0,
             tempo_range: DEFAULT_TEMPO_RANGE,
@@ -207,16 +188,16 @@ impl Deck {
     }
 
     pub fn play(&self) {
-        self.playing.store(true, Ordering::Relaxed);
+        self.playing_flag.store(true, Ordering::Relaxed);
     }
 
     pub fn pause(&self) {
-        self.playing.store(false, Ordering::Relaxed);
+        self.playing_flag.store(false, Ordering::Relaxed);
     }
 
     /// Flips the transport; the bare `play` command and a MIDI play button both land here.
     pub fn toggle_play(&self) {
-        self.playing.fetch_xor(true, Ordering::Relaxed);
+        self.playing_flag.fetch_xor(true, Ordering::Relaxed);
     }
 
     /// The cue point in source frames.
@@ -277,28 +258,51 @@ impl Deck {
     /// Runs one `vinyl` command: the platter sensor, the release, and the wheel.
     pub fn apply_vinyl(&mut self, op: VinylOp) {
         match op {
+            VinylOp::Slip => {
+                self.vinyl_slip = true;
+            }
             VinylOp::Touch => {
                 if !self.vinyl_held {
-                    // Remember the transport the touch interrupted, so the release restores *it*
-                    // rather than guessing. A second touch without a release changes nothing.
-                    self.vinyl_resume = self.is_playing();
-                    self.pause();
-                    self.vinyl_held = true;
+                    self.disarm_loop();
+                    self.loop_range = None;
+                    self.playing.set_loop_range(None);
+                    self.shadow = None;
                     self.vinyl_frame = self.current_frame();
+                    self.vinyl_delta = 0.0;
+                    self.vinyl_rate = 0.0;
                     self.vinyl_moved = false;
+                    self.vinyl_held = true;
+                    self.scratch = Some(Scratch::new(
+                        self.sources.clone(),
+                        self.vinyl_frame,
+                    ));
+
+                    if !self.vinyl_slip {
+                        // Normal scratch pauses the keylock voice; the scratch reader is audible.
+                        self.vinyl_resume = self.is_playing();
+                        self.pause();
+                    }
                 }
             }
             VinylOp::Release => {
                 if self.vinyl_held {
                     self.vinyl_held = false;
                     self.vinyl_moved = false;
-                    // The flow may be a block ahead of the last seek; put it exactly where the hand
-                    // left it before the transport takes over again.
-                    self.scrub_to(self.vinyl_frame);
-                    if self.vinyl_resume {
-                        self.play();
+                    if let Some(scratch) = self.scratch.take() {
+                        self.vinyl_frame = scratch.position();
                     }
-                    self.vinyl_resume = false;
+                    self.vinyl_delta = 0.0;
+                    self.vinyl_rate = 0.0;
+                    if self.vinyl_slip {
+                        // `playing` was never touched; just drop the effect reader.
+                        self.vinyl_slip = false;
+                    } else {
+                        self.playing.reset_to(self.vinyl_frame);
+                        if self.vinyl_resume {
+                            self.play();
+                        }
+                        self.vinyl_resume = false;
+                    }
                 }
             }
             VinylOp::Turn {
@@ -306,39 +310,27 @@ impl Deck {
                 frames_per_tick,
             } => {
                 if self.vinyl_held {
-                    // Accumulate in the deck's own frame, not in the flow's: the flow advances at
-                    // tempo between seeks, so reading its position back would bias every scratch
-                    // forward by a block.
                     let frames = f64::from(ticks) * f64::from(frames_per_tick);
+                    self.vinyl_delta += frames;
                     self.vinyl_frame = self.shift_position(self.vinyl_frame, frames as i64);
                     self.vinyl_moved = true;
                 } else {
-                    // Nobody is on the platter: the wheel is a pitch bend, and turning harder bends
-                    // harder (the bend accumulates, clamped by the engine) rather than longer.
                     self.bend_nudge(Self::VINYL_BEND * f64::from(ticks), Self::VINYL_BEND_SECONDS);
                 }
             }
         }
     }
 
+    /// Arm the next touch as a slip vinyl. Idempotent; `apply_vinyl(Touch)` consumes it.
+    pub fn slip_vinyl(&mut self) -> Result<(), String> {
+        self.vinyl_slip = true;
+        Ok(())
+    }
+
     /// `frame` moved by `frames`, clamped to the track. Negative is back.
     fn shift_position(&self, frame: u64, frames: i64) -> u64 {
         let last = self.total_frames().saturating_sub(1) as i64;
         (frame as i64 + frames).clamp(0, last.max(0)) as u64
-    }
-
-    /// Repositions the active flow **in place**, without a flow switch: a switch is warmed on another
-    /// thread and crossfaded in, which is neither immediate enough for a scratch nor what a scratch
-    /// sounds like.
-    fn scrub_to(&mut self, target: u64) {
-        if self.flows.get(self.active_index).is_none() {
-            return;
-        }
-        if let Some(flow) = self.flows.get_mut(self.active_index) {
-            // The flow's clock is both the audible position and the slip/virtual clock, so a
-            // reposition here keeps the loop and compensation math consistent with what is heard.
-            flow.reset_to(target);
-        }
     }
 
     /// True while a hand is on the platter.
@@ -355,13 +347,19 @@ impl Deck {
         self.vinyl_held = false;
         self.vinyl_moved = false;
         self.vinyl_resume = false;
+        self.vinyl_slip = false;
+        self.vinyl_delta = 0.0;
+        self.vinyl_rate = 0.0;
+        self.scratch = None;
+        self.shadow = None;
     }
 
     /// True when this block has audio to render: playing, or a hand is *moving* the record. A
     /// stationary held platter is silent — the groove is not moving, and a frozen grain would only
     /// buzz.
     fn renders_audio(&self) -> bool {
-        self.is_playing() || (self.vinyl_held && self.vinyl_moved)
+        self.is_playing()
+            || (self.vinyl_held && (self.vinyl_moved || self.vinyl_rate.abs() > 1e-4))
     }
 
     /// The press edge of a held cue button: while playing it is a back cue (the transport was
@@ -411,7 +409,7 @@ impl Deck {
     }
 
     pub fn is_playing(&self) -> bool {
-        self.playing.load(Ordering::Relaxed)
+        self.playing_flag.load(Ordering::Relaxed)
     }
 
     /// Total frames of the loaded track. A stem set is rendered frame-exactly the same length
@@ -428,10 +426,12 @@ impl Deck {
     /// before it the deck is still playing the old stream count. A mixer sizes its per-stream
     /// chains from this, not from what it just asked to install.
     pub fn stream_count(&self) -> usize {
-        self.flows
-            .get(self.active_index)
-            .map(Flow::stream_count)
-            .unwrap_or(1)
+        if self.vinyl_held {
+            if let Some(scratch) = &self.scratch {
+                return scratch.stream_count();
+            }
+        }
+        self.audible().stream_count()
     }
 
     /// The **track** (the mix), not stream 0 — see [`Deck::original`]. This is what the analysis
@@ -454,13 +454,11 @@ impl Deck {
     /// and a stale in point would otherwise engage a loop over a position the DJ left.
     pub fn jump(&mut self, target_frame: u64) {
         self.disarm_loop();
-        self.pending_exit_resume = false;
+        self.loop_range = None;
+        self.shadow = None;
+        self.playing.set_loop_range(None);
         let target = target_frame.min(self.total_frames());
-        // Hard seek in place: no new flow, no warm-up, no `cued_from` compensation.
-        if let Some(flow) = self.flows.get_mut(self.active_index) {
-            flow.set_loop_range(None);
-            flow.reset_to(target);
-        }
+        self.playing.reset_to(target);
         self.playhead.suppress();
     }
 
@@ -651,20 +649,18 @@ impl Deck {
         self.apply_rate(rate);
     }
 
-    /// Writes `rate` to every flow this deck is driving — the active one and an armed LoopFlow
-    /// that has already arrived — and remembers it as the last rate sent.
+    /// Writes `rate` to `playing`, `shadow` and an armed looper, and remembers the last rate sent.
     fn apply_rate(&mut self, rate: f64) {
         self.applied_rate = rate;
         let ratio = rate as f32;
-        if let Some(flow) = self.flows.get_mut(self.active_index) {
-            flow.set_ratio(ratio);
+        self.playing.set_ratio(ratio);
+        if let Some(shadow) = &mut self.shadow {
+            shadow.playing.set_ratio(ratio);
         }
-        if let Some(flow) = self
-            .loop_arm
-            .as_mut()
-            .and_then(|arm| arm.flow.as_mut())
-        {
-            flow.set_ratio(ratio);
+        if let Some(arm) = &mut self.loop_arm {
+            if let Some(shadow) = &mut arm.shadow {
+                shadow.set_ratio(ratio);
+            }
         }
     }
 
@@ -686,25 +682,34 @@ impl Deck {
         self.push_rate();
     }
 
-    /// Sets the tempo rate on the active flow's time-stretch engine — and remembers it, so the
-    /// next spawned flow (or an armed LoopFlow warming right now) is built at the same rate.
+    /// Sets the tempo rate on the engine — and remembers it for an armed looper/shadow.
     pub fn set_ratio(&mut self, rate: f32) {
         self.set_tempo(f64::from(rate));
     }
 
-    /// Rebuilds the active flow's engine with a different time-stretch profile, remembering the
-    /// choice for flows spawned later (an arm still warming gets it on arrival).
+    /// Rebuilds the engine with a different profile. The new voice is prepared at the current
+    /// position and swapped in on the next block (hard switch, no fade).
     pub fn set_profile(&mut self, profile: EngineProfile) {
         self.profile = profile;
-        if let Some(flow) = self.flows.get_mut(self.active_index) {
-            flow.set_profile(profile);
-        }
-        if let Some(arm) = self.loop_arm.as_mut() {
-            arm.profile = profile;
-            if let Some(flow) = arm.flow.as_mut() {
-                flow.set_profile(profile);
-            }
-        }
+        let at = self.playing.virtual_frame();
+        let range = if self.shadow.as_ref().is_some_and(|shadow| shadow.slip) {
+            None
+        } else {
+            self.loop_range
+        };
+        let mut next =
+            Playing::with_profile(self.sources.clone(), at, self.playing.ratio(), profile)
+                .expect("stretch engine config is statically valid");
+        next.set_loop_range(range);
+        next.prepare_jump(at);
+        self.loop_range = range;
+        self.shadow = Some(Shadow {
+            playing: next,
+            slip: false,
+            swap: true,
+        });
+        self.loop_arm = None;
+        self.playhead.suppress();
     }
 
     /// Runs the block's pre-render work: apply any completed switch, then the sync math.
@@ -716,14 +721,30 @@ impl Deck {
     /// reflected. Sync runs first so the rate handed to the engine belongs to the same block as the
     /// positions the leader was sampled at — a follower must never compare against last block.
     pub fn begin_block(&mut self) {
-        self.poll_ready_flows();
+        if self.shadow.as_ref().is_some_and(|shadow| shadow.swap) {
+            let shadow = self.shadow.take().expect("just checked");
+            self.playing = shadow.playing;
+        }
+        self.drive_loop_flow();
         self.apply_sync();
-        // A hand on the platter: pin the flow to where the hand has scrubbed to, every block. The
-        // flow still advances at tempo *within* the block (that is the grain you hear while moving)
-        // and this pulls it back, so the position follows the wheel exactly — including backwards,
-        // which a tempo-only engine could not do at all.
         if self.vinyl_held {
-            self.scrub_to(self.vinyl_frame);
+            // The wheel is a velocity control, not a per-block position jump. Smooth the ticks
+            // into a signed rate; when they stop, the target is zero and the rate decays instead
+            // of cutting to silence on the next block.
+            let target = if self.vinyl_moved {
+                (self.vinyl_delta / crate::BLOCK_SIZE as f64)
+                    .clamp(-super::scratch::MAX_SCRATCH_RATE, super::scratch::MAX_SCRATCH_RATE)
+            } else {
+                0.0
+            };
+            self.vinyl_rate += (target - self.vinyl_rate) * VINYL_RATE_SMOOTHING;
+            if target == 0.0 && self.vinyl_rate.abs() < 1e-4 {
+                self.vinyl_rate = 0.0;
+            }
+            if let Some(scratch) = &mut self.scratch {
+                scratch.set_rate(self.vinyl_rate);
+            }
+            self.vinyl_delta = 0.0;
         }
     }
 
@@ -744,22 +765,33 @@ impl Deck {
         for bus in extra.iter_mut() {
             bus.clear();
         }
-        match self.flows.get_mut(self.active_index) {
-            Some(flow) => flow.process_streams(live),
-            None => {
-                for bus in live.iter_mut() {
-                    bus.clear();
-                }
-                0
+        let frames = live.first().map(Bus::frames).unwrap_or(0);
+        if self.vinyl_held {
+            let written = match &mut self.scratch {
+                Some(scratch) => scratch.process_streams(live, frames),
+                None => 0,
+            };
+            if self.vinyl_slip {
+                self.playing.render_discard(frames);
             }
+            return written;
         }
+        let written = self.audible_mut().process_streams(live);
+        if self.shadow.as_ref().is_some_and(|shadow| shadow.slip) {
+            self.playing.render_discard(frames);
+        }
+        written
     }
 
-    /// Post-render bookkeeping: the armed LoopFlow is brought to exactly the clock the active flow
-    /// just reached (catching up its warm-up gap, then one block per block). Its render is thrown
-    /// away — the engine runs, the listener never hears it.
+    /// Post-render bookkeeping: an armed looper is brought to the clock `playing` just reached.
+    /// Its render is thrown away until promotion (`loop out` / slip engagement).
     pub fn end_block(&mut self) {
         self.drive_loop_flow();
+        if self.vinyl_held {
+            if let Some(scratch) = &self.scratch {
+                self.vinyl_frame = scratch.position();
+            }
+        }
         // Cleared *after* the render, because whether the wheel moved this block is what decides
         // whether there was any audio to hear in it.
         self.vinyl_moved = false;
@@ -786,13 +818,22 @@ impl Deck {
             output[..capacity * CHANNELS].fill(0.0);
             return 0;
         }
-        match self.flows.get_mut(self.active_index) {
-            Some(flow) => flow.process_block(output),
-            None => {
-                output[..capacity * CHANNELS].fill(0.0);
-                0
+        let frames = capacity;
+        if self.vinyl_held {
+            let written = match &mut self.scratch {
+                Some(scratch) => scratch.process_block(output),
+                None => 0,
+            };
+            if self.vinyl_slip {
+                self.playing.render_discard(frames);
             }
+            return written;
         }
+        let written = self.audible_mut().process_block(output);
+        if self.shadow.as_ref().is_some_and(|shadow| shadow.slip) {
+            self.playing.render_discard(frames);
+        }
+        written
     }
 
     /// One block of per-stream buses: `begin_block` → [`render_streams`](Self::render_streams) →
@@ -809,15 +850,10 @@ impl Deck {
 
     /// Replaces the deck's streams — installing stems, or a fresh `load` on a deck that had them.
     ///
-    /// The switch is a **source swap at the current position**, so it reuses the jump machinery
-    /// exactly: a new flow is warmed on the `FlowShift` thread and swapped in on a later block, with
-    /// `cued_from` compensation and the `reset_to` priming drain that make every flow change
-    /// seamless. The loop range is carried over, so installing stems mid-loop does not drop the
-    /// loop, and an armed loop-in is rebuilt against the new streams too (its engine would
-    /// otherwise keep reading the old track).
-    ///
-    /// Until the switch lands the deck keeps playing the *old* streams — one reason
-    /// [`stream_count`](Self::stream_count) and not this call's intent is what sizes a mixer.
+    /// The new engine is prepared at the current position and parked as `shadow`; the next block
+    /// swaps it in (hard switch). The loop range is carried over for a normal loop. Until the swap
+    /// lands the deck keeps playing the *old* streams — one reason [`stream_count`](Self::stream_count)
+    /// and not this call's intent is what sizes a mixer.
     ///
     /// The deck's [`source`](Self::source) (the track) is deliberately **not** replaced: installing
     /// stems must not change what the deck *is*, or analysing it afterwards would analyse a stem and
@@ -827,27 +863,26 @@ impl Deck {
             return;
         }
         self.sources = sources;
-        let at = self.virtual_frame();
-        let range = self.loop_range();
-        let flow = self.make_flow(at, range);
-        self.cued_from = at;
-        self.flowshift.submit_prepare(flow);
-
-        if let Some(arm) = self.loop_arm.take() {
-            if arm.flow.is_none() {
-                // Still warming: abandon the old submission rather than leak it in the warm map.
-                self.loop_reap.push(arm.id);
-            }
-            let flow = self.make_flow(self.virtual_frame(), None);
-            let id = flow.id;
-            self.flowshift.submit_prepare_loop_flow(flow);
-            self.loop_arm = Some(LoopArm {
-                id,
-                p_in: arm.p_in,
-                flow: None,
-                profile: arm.profile,
-            });
-        }
+        let at = self.playing.virtual_frame();
+        let ratio = self.playing.ratio();
+        let profile = self.profile;
+        let range = if self.shadow.as_ref().is_some_and(|shadow| shadow.slip) {
+            None
+        } else {
+            self.loop_range
+        };
+        let mut next = Playing::with_profile(self.sources.clone(), at, ratio, profile)
+            .expect("stretch engine config is statically valid");
+        next.set_loop_range(range);
+        next.prepare_jump(at);
+        self.loop_range = range;
+        self.shadow = Some(Shadow {
+            playing: next,
+            slip: false,
+            swap: true,
+        });
+        self.loop_arm = None;
+        self.playhead.suppress();
     }
 
     /// Renders one block into a [`Bus`], de-interleaving the transport's output as it goes.
@@ -868,7 +903,11 @@ impl Deck {
         self.begin_block();
         let written = self.render_sum(&mut block[..want]);
         self.end_block();
-        for (i, (left, right)) in bus.l[..frames].iter_mut().zip(&mut bus.r[..frames]).enumerate() {
+        for (i, (left, right)) in bus.l[..frames]
+            .iter_mut()
+            .zip(&mut bus.r[..frames])
+            .enumerate()
+        {
             let base = i * CHANNELS;
             if base + 1 < want {
                 *left = block[base];
@@ -883,13 +922,29 @@ impl Deck {
         written
     }
 
-    /// What the listener hears, in frames: the virtual clock folded through the active flow's
-    /// loop range (identity with no loop). The waveform, `state` and beat-seek all read this.
+    fn audible(&self) -> &Playing {
+        match &self.shadow {
+            Some(shadow) if shadow.slip => &shadow.playing,
+            _ => &self.playing,
+        }
+    }
+
+    fn audible_mut(&mut self) -> &mut Playing {
+        match &mut self.shadow {
+            Some(shadow) if shadow.slip => &mut shadow.playing,
+            _ => &mut self.playing,
+        }
+    }
+
+    /// What the listener hears, in frames: the audible voice's clock folded through its loop range
+    /// (identity with no loop). The waveform, `state` and beat-seek all read this.
     pub fn current_frame(&self) -> u64 {
-        self.flows
-            .get(self.active_index)
-            .map(Flow::actual_frame)
-            .unwrap_or(0)
+        if self.vinyl_held {
+            if let Some(scratch) = &self.scratch {
+                return scratch.position();
+            }
+        }
+        self.audible().actual_frame()
     }
 
     /// The slip clock: monotonic while playing, never folded by a loop. Jump compensation is
@@ -898,22 +953,17 @@ impl Deck {
     /// [`loop_exit`](Self::loop_exit). Exiting onto this clock instead is the separate
     /// `slip loop` feature.
     pub fn virtual_frame(&self) -> u64 {
-        self.flows
-            .get(self.active_index)
-            .map(Flow::virtual_frame)
-            .unwrap_or(0)
+        self.playing.virtual_frame()
     }
 
-    /// The active loop as a whole range, or `None`. Read from the active flow, so it goes `None`
-    /// by itself the moment a switch replaces that flow — the range dies with its flow.
+    /// The loop currently in effect, or `None`. A slip loop lives on the shadow; a normal loop on
+    /// `playing`.
     pub fn loop_range(&self) -> Option<LoopRange> {
-        self.flows
-            .get(self.active_index)
-            .and_then(Flow::loop_range)
+        self.loop_range
     }
 
-    /// The armed manual in point (quantized), or `None`. Present while the LoopFlow warms *and*
-    /// while it runs lockstep — arming is immediate, warmth is not.
+    /// The armed manual in point (quantized), or `None`. Arming is immediate; the looper catches
+    /// up in the background of the same thread.
     pub fn loop_in_armed(&self) -> Option<u64> {
         self.loop_arm.as_ref().map(|arm| arm.p_in)
     }
@@ -923,12 +973,9 @@ impl Deck {
         self.loop_quantum
     }
 
-    /// True once the active flow ran out of audio. A looped flow reports an unbounded virtual
-    /// source, so a looping deck is never "at the end".
+    /// True once `playing` ran out of audio. A looping deck is never "at the end".
     pub fn is_at_end(&self) -> bool {
-        self.flows
-            .get(self.active_index)
-            .is_none_or(Flow::reached_end)
+        self.loop_range.is_none() && self.playing.reached_end()
     }
 
     // ------------------------------------------------------------------ loop state machine
@@ -938,6 +985,10 @@ impl Deck {
         match op {
             LoopOp::In => self.loop_in(),
             LoopOp::Out => self.loop_out(),
+            LoopOp::SlipIn => self.slip_in(),
+            LoopOp::SlipOut => self.loop_out(),
+            LoopOp::SlipBeats(beats) => self.slip_beats(beats),
+            LoopOp::SlipRoll(beats) => self.slip_roll(beats),
             LoopOp::Cancel => {
                 self.disarm_loop();
                 Ok(())
@@ -952,19 +1003,33 @@ impl Deck {
         }
     }
 
-    /// Arm a manual loop-in: quantize `in` to the beat, spawn the LoopFlow at the deck's virtual
-    /// position and let it warm ahead in lockstep. Audible nothing — the loop starts at `out`.
+    /// Arm a manual loop-in: quantize `in` to the beat and prepare the looper at the deck's
+    /// virtual position. Audible nothing — the loop starts at `out`.
     ///
     /// A running loop is exited first (循环中再按 in → 退出当前,开新) and any previous arm is
     /// dropped (in 后又按 in → 丢弃旧). `p_in` quantizes what is *heard*; the clock itself never
     /// moves — the quantization lands on the range, not on `virtual_pos`.
     fn loop_in(&mut self) -> Result<(), String> {
+        self.loop_in_impl(false, false)
+    }
+
+    /// Arm a slip loop: `playing` keeps running unlooped, `shadow` is the audible loop.
+    pub fn slip_in(&mut self) -> Result<(), String> {
+        self.loop_in_impl(true, false)
+    }
+
+    /// Arm a slip roll: like `slip_in`, but the shadow reads the loop backwards.
+    pub fn slip_roll_in(&mut self) -> Result<(), String> {
+        self.loop_in_impl(true, true)
+    }
+
+    fn loop_in_impl(&mut self, slip: bool, reverse: bool) -> Result<(), String> {
         let analysis = self.require_grid()?;
         let p_in = quantize_to_beat(&analysis.beatgrid, self.current_frame())
             .ok_or_else(|| LOOP_NO_GRID.to_owned())?
             .min(self.total_frames().saturating_sub(1));
         self.disarm_loop();
-        if self.loop_range().is_some() {
+        if self.loop_range.is_some() {
             self.loop_exit()?;
         }
         let start = self.virtual_frame();
@@ -975,43 +1040,65 @@ impl Deck {
             self.loop_quantum,
             self.total_frames(),
         );
-        let flow = self.make_flow(start, range);
-        let id = flow.id;
-        self.flowshift.submit_prepare_loop_flow(flow);
+        let direction = if reverse {
+            Direction::Reverse
+        } else {
+            Direction::Forward
+        };
+        let mut shadow = Playing::with_profile_and_direction(
+            self.sources.clone(),
+            start,
+            self.playing.ratio(),
+            self.profile,
+            direction,
+        )
+        .map_err(|err| err.to_string())?;
+        shadow.set_loop_range(range);
+        shadow.prepare_jump(start);
         self.loop_arm = Some(LoopArm {
-            id,
             p_in,
-            flow: None,
-            profile: self.profile,
+            shadow: Some(shadow),
+            slip,
         });
         Ok(())
     }
 
-    /// Set the quantized `out` and engage. The store writes exactly the provisional the lockstep
-    /// driver last wrote (both are `quantize_offset(p_in, virtual_now, quantum)`), so nothing
-    /// changes for the fed-but-unheard window: the warmed LoopFlow is promoted in place — no
-    /// `cued_from`, no re-warm, no delay. If the LoopFlow is *still* warming (faster than its
-    /// warm-up), fall back to the beat-loop path: a fresh ranged flow with jump compensation.
+    /// Set the quantized `out` and engage. The looper has been fed through the provisional range,
+    /// so a normal loop swaps it in and a slip loop makes it audible while `playing` keeps going.
     fn loop_out(&mut self) -> Result<(), String> {
         let analysis = self.require_grid()?;
         let Some(arm) = self.loop_arm.take() else {
             return Err("no loop-in armed — press `loop in` first".into());
         };
-        let out = quantize_offset(&analysis.beatgrid, arm.p_in, self.virtual_frame(), self.loop_quantum)
-            .ok_or_else(|| LOOP_NO_GRID.to_owned())?
-            .min(self.total_frames());
-        if let Some(mut flow) = arm.flow {
-            flow.set_loop_range(Some(LoopRange::new(arm.p_in, out)));
-            flow.activate();
-            for other in &mut self.flows {
-                other.retire();
+        let out = quantize_offset(
+            &analysis.beatgrid,
+            arm.p_in,
+            self.virtual_frame(),
+            self.loop_quantum,
+        )
+        .ok_or_else(|| LOOP_NO_GRID.to_owned())?
+        .min(self.total_frames())
+        .max(arm.p_in + 1);
+        let range = LoopRange::new(arm.p_in, out);
+
+        if let Some(mut shadow) = arm.shadow {
+            self.catch_up(&mut shadow, self.virtual_frame());
+            shadow.set_loop_range(Some(range));
+            if arm.slip {
+                self.loop_range = Some(range);
+                self.shadow = Some(Shadow {
+                    playing: shadow,
+                    slip: true,
+                    swap: false,
+                });
+            } else {
+                self.playing = shadow;
+                self.loop_range = Some(range);
+                self.shadow = None;
             }
-            self.flows.push(flow);
-            self.flows.retain(|f| f.state != FlowState::Retired);
-            self.active_index = self.flows.len() - 1;
+            self.playhead.suppress();
             Ok(())
         } else {
-            self.loop_reap.push(arm.id);
             self.open_beat_loop(arm.p_in, out);
             Ok(())
         }
@@ -1021,6 +1108,20 @@ impl Deck {
     /// clock untouched (halve/double). Otherwise it opens a fresh N-beat loop at the quantized
     /// current beat: a flow born *with* the range, warmed, then switched in (不跟跑).
     fn loop_beats(&mut self, beats: u64) -> Result<(), String> {
+        self.loop_beats_impl(beats, false, false)
+    }
+
+    /// Slip beat loop: the loop is heard, `playing` keeps the slip clock.
+    pub fn slip_beats(&mut self, beats: u64) -> Result<(), String> {
+        self.loop_beats_impl(beats, true, false)
+    }
+
+    /// Slip roll: a slip beat loop whose shadow reads backwards.
+    pub fn slip_roll(&mut self, beats: u64) -> Result<(), String> {
+        self.loop_beats_impl(beats, true, true)
+    }
+
+    fn loop_beats_impl(&mut self, beats: u64, slip: bool, reverse: bool) -> Result<(), String> {
         if beats == 0 {
             return Err("a loop needs at least 1 beat".into());
         }
@@ -1041,32 +1142,28 @@ impl Deck {
             .ok_or_else(|| LOOP_NO_GRID.to_owned())?
             .min(self.total_frames())
             .max(p_in + 1);
-        self.open_beat_loop(p_in, out);
+        self.open_loop(p_in, out, slip, reverse);
         Ok(())
     }
 
-    /// Leave the loop with **an unbroken stream**: the switch is prepared eagerly (press →
-    /// warm-up → switch, [`cued_from`] compensation untouched) but its landing is pinned to
-    /// wherever the looped flow's output stops — the first frame after it would be the next
-    /// audible either way. So the listener hears no splice at all: the current position plays out
-    /// the rest of its lap and flows straight past `out`, continuing beyond the loop.
+    /// Leave the loop at the current audible position. For a normal loop this clears the range and
+    /// hard-seeks `playing` there; for a slip loop it simply drops the shadow, because `playing`
+    /// has been running unlooped the whole time and is already at the slip position.
     ///
-    /// The `switch_to` landing rule for this jump is selected by [`pending_exit_resume`], set
-    /// here (and cleared by the next [`jump`](Self::jump), which would supersede the exit).
-    ///
-    /// Exiting onto the slipped `virtual_pos` is kept as the separate **slip loop** feature.
     /// Idempotent: exiting with nothing engaged just cancels an arm.
     fn loop_exit(&mut self) -> Result<(), String> {
         self.disarm_loop();
-        if self.loop_range().is_some() {
-            // Hard exit at the audible position: the stream continues from exactly where it was
-            // heard, with no mapping left. This is the old `pending_exit_resume` landing, without
-            // a flow switch or warm-up.
-            let at = self.current_frame();
-            if let Some(flow) = self.flows.get_mut(self.active_index) {
-                flow.set_loop_range(None);
-                flow.reset_to(at);
+        if let Some(shadow) = self.shadow.take() {
+            if shadow.slip {
+                self.loop_range = None;
+                self.playhead.suppress();
+                return Ok(());
             }
+        }
+        if self.loop_range.take().is_some() {
+            let at = self.playing.actual_frame();
+            self.playing.set_loop_range(None);
+            self.playing.reset_to(at);
             self.playhead.suppress();
         }
         Ok(())
@@ -1082,9 +1179,7 @@ impl Deck {
         let grid = &analysis.beatgrid;
         let total = self.total_frames();
         let beat = grid.beat_width(grid.floor_beat(range.in_frame)).max(1);
-        let quantum_frames = ((beat as f64) * self.loop_quantum.beats())
-            .round()
-            .max(1.0) as u64;
+        let quantum_frames = ((beat as f64) * self.loop_quantum.beats()).round().max(1.0) as u64;
         let next = match edit {
             LoopEditOp::Length { beats } => {
                 if !beats.is_finite() || beats <= 0.0 {
@@ -1161,185 +1256,106 @@ impl Deck {
         Ok(analysis)
     }
 
-    /// Opens a loop `[p_in, out)` as a flow change: born with the range, started at the current
-    /// virtual position, warmed on the worker, switched in with `cued_from` compensation (the
-    /// same machinery as a beatjump).
+    /// Opens a loop `[p_in, out)`: prepare a shadow at `p_in`, catch it up to the current clock,
+    /// then promote it (normal) or make it audible while `playing` keeps running (slip).
     fn open_beat_loop(&mut self, p_in: u64, out: u64) {
-        // A new loop targets its own range + compensation; it is not a loop exit's resume.
-        self.pending_exit_resume = false;
-        let start = self.virtual_frame();
-        let flow = self.make_flow(start, Some(LoopRange::new(p_in, out)));
-        self.cued_from = start;
-        self.flowshift.submit_prepare(flow);
+        self.open_loop(p_in, out, false, false);
+    }
+
+    fn open_loop(&mut self, p_in: u64, out: u64, slip: bool, reverse: bool) {
+        let target = self.virtual_frame();
+        let range = LoopRange::new(p_in, out);
+        let direction = if reverse {
+            Direction::Reverse
+        } else {
+            Direction::Forward
+        };
+        let mut shadow = Playing::with_profile_and_direction(
+            self.sources.clone(),
+            p_in,
+            self.playing.ratio(),
+            self.profile,
+            direction,
+        )
+        .expect("stretch engine config is statically valid");
+        shadow.set_loop_range(Some(range));
+        shadow.prepare_jump(p_in);
+        self.catch_up(&mut shadow, target);
+        if slip {
+            self.playing.set_loop_range(None);
+            self.loop_range = Some(range);
+            self.shadow = Some(Shadow {
+                playing: shadow,
+                slip: true,
+                swap: false,
+            });
+        } else {
+            self.playing = shadow;
+            self.loop_range = Some(range);
+            self.shadow = None;
+        }
+        self.playhead.suppress();
     }
 
     /// Stores a new range on the active flow — the in-loop edit primitive (one atomic store).
-    fn set_active_loop_range(&self, range: LoopRange) {
-        if let Some(flow) = self.flows.get(self.active_index) {
-            flow.set_loop_range(Some(range));
-        }
-    }
-
-    /// Drops the armed loop-in. An arm whose LoopFlow is still warming is reaped on announcement
-    /// so its engine cannot leak in FlowShift's warm map; a warmed one the deck owns is freed
-    /// with the `LoopArm` itself.
-    fn disarm_loop(&mut self) {
-        if let Some(arm) = self.loop_arm.take() {
-            if arm.flow.is_none() {
-                self.loop_reap.push(arm.id);
+    fn set_active_loop_range(&mut self, range: LoopRange) {
+        self.loop_range = Some(range);
+        if let Some(shadow) = &self.shadow {
+            if shadow.slip {
+                shadow.playing.set_loop_range(Some(range));
+                return;
             }
         }
+        self.playing.set_loop_range(Some(range));
     }
 
-    /// Brings the armed LoopFlow's clock to the deck's `virtual_frame`, rendering into a scratch
-    /// block whose output is discarded.
+    /// Drops the armed loop-in and its looper.
+    fn disarm_loop(&mut self) {
+        self.loop_arm = None;
+    }
+
+    /// Brings the armed looper's clock to the deck's `virtual_frame`, discarding its output.
     ///
     /// Before each chunk the provisional range is stored — `quantize_offset(p_in, next, quantum)`,
     /// "the out point if `loop out` were pressed at the position this chunk ends on". That is the
     /// same formula `loop_out` uses, so the press writes the value already there: promotion is a
     /// no-op store and the ring's pending frames are mapped exactly as they will need to be.
     fn drive_loop_flow(&mut self) {
-        if self.loop_arm.is_none() {
-            return;
-        }
         let target = self.virtual_frame();
-        let analysis = self.analysis(); // Arc bump — no allocation on this path
+        let analysis = self.analysis();
         let quantum = self.loop_quantum;
         let total = self.total_frames();
         let Some(arm) = self.loop_arm.as_mut() else {
             return;
         };
-        let Some(flow) = arm.flow.as_mut() else {
-            return; // still warming; it catches up as soon as it arrives
+        let Some(shadow) = arm.shadow.as_mut() else {
+            return;
         };
         let p_in = arm.p_in;
-        let max_catchup = (MAX_CATCHUP_BLOCKS * crate::BLOCK_SIZE) as u64;
-        let store_provisional = |flow: &Flow, at: u64| {
+        let mut driven = 0usize;
+        while shadow.virtual_frame() < target && driven < MAX_CATCHUP_BLOCKS {
+            let next = (shadow.virtual_frame() + crate::BLOCK_SIZE as u64).min(target);
             if let Some(analysis) = &analysis {
-                flow.set_loop_range(provisional_range(
+                shadow.set_loop_range(provisional_range(
                     &analysis.beatgrid,
                     p_in,
-                    at,
+                    next,
                     quantum,
                     total,
                 ));
             }
-        };
-        let mut driven = 0usize;
-        // Clock discontinuity: a flow switch re-anchored the deck behind this arm's back — a loop
-        // exit resumes at `out`, which sits *behind* where the slipped clock had lapped (or ahead
-        // by up to a lap on a first-pass exit). Block-by-block grinding can't cross that gap, so
-        // re-anchor the arm to the deck's clock with one reset; its discarded renders then drain
-        // the priming that reset re-warms, and the parity the promotion depends on is exact.
-        let clock = flow.virtual_frame();
-        if clock > target || target - clock > max_catchup {
-            store_provisional(flow, target);
-            flow.reset_to(target);
-        }
-        while flow.virtual_frame() < target && driven < MAX_CATCHUP_BLOCKS {
-            let next = (flow.virtual_frame() + crate::BLOCK_SIZE as u64).min(target);
-            let chunk = (next - flow.virtual_frame()) as usize;
-            store_provisional(flow, next);
-            // Discard the audio but drive every stream: they are one engine, so one render keeps
-            // them all converged and on the deck's clock.
-            flow.render_discard(chunk);
+            shadow.render_discard((next - shadow.virtual_frame()) as usize);
             driven += 1;
         }
     }
 
-    /// Builds a flow at `start_frame`, inheriting this deck's transport (tempo and profile), and
-    /// stamps its loop range before anything warms.
-    fn make_flow(&mut self, start_frame: u64, range: Option<LoopRange>) -> Flow {
-        let id = self.next_flow_id;
-        self.next_flow_id = id.wrapping_add(1);
-        let flow = Flow::new_with(
-            id,
-            self.sources.clone(),
-            start_frame,
-            None,
-            self.flowshift.ready_sender(),
-            self.playhead.playing_rate() as f32,
-            self.profile,
-        );
-        flow.set_loop_range(range);
-        flow
-    }
-
-    fn poll_ready_flows(&mut self) {
-        while let Some(id) = self.flowshift.poll_ready() {
-            if self.loop_arm.as_ref().is_some_and(|arm| arm.id == id) {
-                let Some(flow) = self.flowshift.take_ready_flow(id) else {
-                    continue;
-                };
-                let rate = self.playhead.playing_rate() as f32;
-                let Some(arm) = self.loop_arm.as_mut() else {
-                    continue; // disarmed between announcement and poll: fall through to reaping
-                };
-                arm.flow = Some(flow);
-                let flow = arm.flow.as_mut().expect("just stored");
-                // Land on the deck's transport; profile only if the deck changed it mid-warm
-                // (that rebuild re-primes, which the catch-up drive then runs through).
-                flow.set_ratio(rate);
-                if flow.profile() != arm.profile {
-                    let profile = arm.profile;
-                    flow.set_profile(profile);
-                }
-            } else if let Some(pos) = self.loop_reap.iter().position(|&wid| wid == id) {
-                self.loop_reap.remove(pos);
-                let _ = self.flowshift.take_ready_flow(id);
-            } else {
-                self.switch_to(id);
-            }
+    fn catch_up(&self, shadow: &mut Playing, target: u64) {
+        let mut driven = 0usize;
+        while shadow.virtual_frame() < target && driven < MAX_CATCHUP_BLOCKS {
+            let next = (shadow.virtual_frame() + crate::BLOCK_SIZE as u64).min(target);
+            shadow.render_discard((next - shadow.virtual_frame()) as usize);
+            driven += 1;
         }
-    }
-
-    fn switch_to(&mut self, flow_id: u64) {
-        let Some(mut flow) = self.flowshift.take_ready_flow(flow_id) else {
-            return;
-        };
-        // The target was computed when the command arrived; this deck kept playing while the flow
-        // warmed up, so move the landing point forward by exactly that much — in the *virtual*
-        // clock, the same clock the compensation is measured in. Otherwise every jump loses a block
-        // of gap against a running sibling deck — and with a real time-stretch engine, whose warm-up
-        // costs several blocks, the loss would grow with it.
-        //
-        // A loop exit is the exception: its landing is *not* `target + played` but exactly where
-        // the looped flow's output stopped, so the stream is unbroken across the flow change — the
-        // audible finishes its lap and continues past `out` without a seam.
-        let landing = if std::mem::take(&mut self.pending_exit_resume) {
-            self.flows
-                .get(self.active_index)
-                .map(Flow::actual_frame)
-                .unwrap_or_else(|| flow.virtual_frame())
-        } else {
-            let played = self.virtual_frame().saturating_sub(self.cued_from);
-            flow.virtual_frame() + played
-        };
-        if landing != flow.virtual_frame() {
-            // `reset_to` re-warms *and* settles (priming drained) — the first block after the
-            // switch is already converged audio, so no transition breathes a warm-up gap.
-            flow.reset_to(landing);
-        }
-        for other in &mut self.flows {
-            if other.id != flow_id {
-                other.retire();
-            }
-        }
-        flow.activate();
-        self.flows.push(flow);
-        self.flows.retain(|f| f.state != FlowState::Retired);
-        self.active_index = self
-            .flows
-            .iter()
-            .position(|f| f.id == flow_id)
-            .unwrap_or(self.active_index);
-        // The new flow was built at the rate it was spawned with; the playhead may have moved
-        // since (a controller runs while it warms), so land it on today's rate rather than
-        // replaying a stale one for a block.
-        self.apply_rate(self.playhead.playing_rate().clamp(MIN_RATE, MAX_RATE));
-        // The playhead moved because of the switch, not because of tempo — tell the controller not
-        // to read the jump as a phase error.
-        self.playhead.suppress();
     }
 }
 
@@ -1405,8 +1421,16 @@ mod tests {
         assert!(!deck.is_playing());
         assert_eq!(deck.current_frame(), 0);
         assert_eq!(deck.total_frames(), 10_000);
-        assert_eq!(deck.keylock_mode(), KeylockMode::On, "keylock is the production default");
-        assert_eq!(deck.cue_point(), 0, "a fresh deck cues at the loaded origin");
+        assert_eq!(
+            deck.keylock_mode(),
+            KeylockMode::On,
+            "keylock is the production default"
+        );
+        assert_eq!(
+            deck.cue_point(),
+            0,
+            "a fresh deck cues at the loaded origin"
+        );
         assert_eq!(deck.key_shift(), 0);
         deck.set_keylock_mode(KeylockMode::Wide);
         assert_eq!(deck.keylock_mode(), KeylockMode::Wide);
@@ -1417,14 +1441,28 @@ mod tests {
     #[test]
     fn the_tempo_fader_maps_through_the_range_and_range_changes_leave_tempo_alone() {
         let mut deck = tape_deck(pool(10_000));
-        assert!((deck.tempo_range() - 0.1).abs() < 1e-9, "default range is ±10%");
+        assert!(
+            (deck.tempo_range() - 0.1).abs() < 1e-9,
+            "default range is ±10%"
+        );
         deck.set_tempo_fader(0.5);
         assert!((deck.tempo() - 1.05).abs() < 1e-9, "tempo {}", deck.tempo());
-        assert!((deck.tempo_fader() - 0.5).abs() < 1e-9, "fader {}", deck.tempo_fader());
+        assert!(
+            (deck.tempo_fader() - 0.5).abs() < 1e-9,
+            "fader {}",
+            deck.tempo_fader()
+        );
         // Changing the range is a mapping change only: tempo stays, the derived fader shifts.
         deck.set_tempo_range(0.2);
-        assert!((deck.tempo() - 1.05).abs() < 1e-9, "range change moved the tempo");
-        assert!((deck.tempo_fader() - 0.25).abs() < 1e-9, "fader {}", deck.tempo_fader());
+        assert!(
+            (deck.tempo() - 1.05).abs() < 1e-9,
+            "range change moved the tempo"
+        );
+        assert!(
+            (deck.tempo_fader() - 0.25).abs() < 1e-9,
+            "fader {}",
+            deck.tempo_fader()
+        );
         // Full deflection, and anything past it, clamps to the travel.
         deck.set_tempo_fader(5.0);
         assert!((deck.tempo() - 1.2).abs() < 1e-9, "tempo {}", deck.tempo());
@@ -1445,9 +1483,16 @@ mod tests {
         // A hand goes on: it pauses, and the deck remembers it was playing.
         deck.apply_vinyl(VinylOp::Touch);
         assert!(deck.vinyl_held());
-        assert!(!deck.is_playing(), "the platter is held, so the deck is paused");
+        assert!(
+            !deck.is_playing(),
+            "the platter is held, so the deck is paused"
+        );
         // Holding still is silent: the groove is not moving. (A frozen grain would just buzz.)
-        assert_eq!(deck.process_block(&mut out), 0, "a stationary platter is silent");
+        assert_eq!(
+            deck.process_block(&mut out),
+            0,
+            "a stationary platter is silent"
+        );
         assert!(out.iter().all(|sample| *sample == 0.0));
         // A second touch without a release is not a second pause.
         deck.apply_vinyl(VinylOp::Touch);
@@ -1464,21 +1509,33 @@ mod tests {
             deck.process_block(&mut out) > 0,
             "turning the wheel is audible"
         );
+        // The wheel is a velocity control: the two ticks' 882 frames are spread over a short
+        // decaying tail, not dumped into one block. Keep rendering until it settles.
+        let mut audible_blocks = 1;
+        for _ in 0..60 {
+            if deck.process_block(&mut out) > 0 {
+                audible_blocks += 1;
+            }
+        }
         let forward = deck.current_frame() as i64 - before;
         assert!(
-            (882..882 + 257).contains(&forward),
-            "two ticks forward: {forward}"
+            (forward - 882).abs() < 120,
+            "two ticks forward should integrate to ~882, got {forward}"
         );
+        assert!(audible_blocks > 2, "the rate must decay over several blocks");
 
         // Backwards goes behind where it was.
+        let turned = deck.current_frame();
         deck.apply_vinyl(VinylOp::Turn {
             ticks: -4,
             frames_per_tick: 441.0,
         });
-        deck.process_block(&mut out);
+        for _ in 0..60 {
+            deck.process_block(&mut out);
+        }
         assert!(
-            (deck.current_frame() as i64) < before,
-            "four ticks back: {} vs {before}",
+            deck.current_frame() < turned,
+            "four ticks back: {} vs {turned}",
             deck.current_frame()
         );
 
@@ -1487,19 +1544,55 @@ mod tests {
             ticks: -10_000,
             frames_per_tick: 441.0,
         });
-        deck.process_block(&mut out);
+        for _ in 0..60 {
+            deck.process_block(&mut out);
+        }
         assert!(deck.current_frame() <= 256, "{}", deck.current_frame());
-        deck.apply_vinyl(VinylOp::Turn {
-            ticks: 1_000_000,
-            frames_per_tick: 441.0,
-        });
-        deck.process_block(&mut out);
-        assert!(deck.current_frame() >= 10_000 - 257, "{}", deck.current_frame());
+        // A huge turn is rate-limited (it is varispeed, not a teleport): keep the wheel moving
+        // until the clamp at the end of the track.
+        for _ in 0..20 {
+            deck.apply_vinyl(VinylOp::Turn {
+                ticks: 1_000,
+                frames_per_tick: 441.0,
+            });
+            deck.process_block(&mut out);
+        }
+        assert!(
+            deck.current_frame() >= 10_000 - 257,
+            "{}",
+            deck.current_frame()
+        );
 
         // Letting go resumes, because that is what the touch interrupted.
         deck.apply_vinyl(VinylOp::Release);
         assert!(!deck.vinyl_held());
         assert!(deck.is_playing(), "the touch is what paused it");
+    }
+
+    #[test]
+    fn vinyl_ticks_keep_playing_between_messages() {
+        let mut deck = tape_deck(pool(100_000));
+        deck.play();
+        let mut out = vec![0.0f32; 256 * CHANNELS];
+        deck.process_block(&mut out);
+        deck.apply_vinyl(VinylOp::Touch);
+
+        // One tick every four blocks: the smoothed velocity must bridge the gaps, not gate the
+        // audio on tick blocks only.
+        let mut silent = 0;
+        for block in 0..24 {
+            if block % 4 == 0 {
+                deck.apply_vinyl(VinylOp::Turn {
+                    ticks: 1,
+                    frames_per_tick: 441.0,
+                });
+            }
+            if deck.process_block(&mut out) == 0 {
+                silent += 1;
+            }
+        }
+        assert_eq!(silent, 0, "the scratch must not stop between ticks");
+        assert!(deck.current_frame() > 256, "the position should have moved");
     }
 
     /// The shape of one wheel message: a strong, short kick. The phase really moves, and the bend is
@@ -1542,6 +1635,39 @@ mod tests {
     /// explicit transport command always lets go of the platter, so a missed note-off cannot leave a
     /// deck that never resumes; and a turn with nobody on the plate is a bend that *accumulates*.
     #[test]
+    fn slip_vinyl_uses_a_signed_tape_reader_and_keeps_playing() {
+        let mut deck = Deck::new(pool(100_000));
+        deck.play();
+        let mut out = vec![0.0f32; 256 * CHANNELS];
+        deck.process_block(&mut out);
+
+        deck.slip_vinyl().expect("arm slip vinyl");
+        deck.apply_vinyl(VinylOp::Touch);
+        assert!(deck.vinyl_held());
+        assert!(deck.scratch.is_some(), "slip vinyl uses the signed Tape reader");
+        assert!(deck.shadow.is_none());
+        let before = deck.virtual_frame();
+
+        deck.apply_vinyl(VinylOp::Turn {
+            ticks: 120,
+            frames_per_tick: 64.0,
+        });
+        for _ in 0..4 {
+            deck.process_block(&mut out);
+        }
+        assert!(
+            deck.virtual_frame() > before,
+            "playing must keep the slip clock during slip vinyl"
+        );
+        assert!(deck.scratch.is_some());
+
+        deck.apply_vinyl(VinylOp::Release);
+        assert!(!deck.vinyl_held());
+        assert!(deck.scratch.is_none(), "release drops the Tape reader");
+        assert!(deck.is_playing(), "slip vinyl never paused playing");
+    }
+
+    #[test]
     fn vinyl_works_while_paused_and_cannot_lock_the_deck() {
         let mut deck = tape_deck(pool(10_000));
         let mut out = vec![0.0f32; 256 * CHANNELS];
@@ -1567,7 +1693,10 @@ mod tests {
         );
         // Back by the tick, plus at most the block's own grain.
         let moved = deck.current_frame() as i64 - before as i64;
-        assert!((-100..=-100 + 256).contains(&moved), "one tick back: {moved}");
+        assert!(
+            (-100..=-100 + 256).contains(&moved),
+            "one tick back: {moved}"
+        );
         deck.apply_vinyl(VinylOp::Release);
         assert!(!deck.is_playing(), "a paused deck stays paused");
         assert!(!deck.vinyl_held());
@@ -1694,7 +1823,11 @@ mod tests {
         // Paused: the press takes the playhead as the cue point and plays it — no jump, so this half
         // needs no settling.
         deck.apply_cue(CueOp::Hold);
-        assert_eq!(deck.cue_point(), parked, "the playhead became the cue point");
+        assert_eq!(
+            deck.cue_point(),
+            parked,
+            "the playhead became the cue point"
+        );
         assert!(deck.is_playing(), "and the hold started playing");
         assert_eq!(deck.current_frame(), parked, "without moving");
 
@@ -1771,7 +1904,11 @@ mod tests {
                 // The ramp source encodes the frame index in the sample value, so this also checks
                 // that the de-interleave picked the right channel.
                 assert_eq!(bus.l[i], out[i * CHANNELS], "block {block} frame {i} left");
-                assert_eq!(bus.r[i], out[i * CHANNELS + 1], "block {block} frame {i} right");
+                assert_eq!(
+                    bus.r[i],
+                    out[i * CHANNELS + 1],
+                    "block {block} frame {i} right"
+                );
             }
             assert_eq!(via_bus.current_frame(), via_block.current_frame());
         }
@@ -1799,7 +1936,10 @@ mod tests {
         let ctx = crate::fx::FxContext::gridless(crate::SAMPLE_RATE, 256);
         let mut bus = Bus::stereo(1_024);
         deck.pull_into(&mut bus, &ctx);
-        assert!(bus.l[300..].iter().all(|s| *s == 0.0), "tail was not cleared");
+        assert!(
+            bus.l[300..].iter().all(|s| *s == 0.0),
+            "tail was not cleared"
+        );
         assert!(bus.l[1] > 0.0, "the head must still carry audio");
     }
 
@@ -1865,8 +2005,7 @@ mod tests {
             "jump did not take effect: {}",
             deck.current_frame()
         );
-        assert_eq!(deck.flows.len(), 1, "retired flows must be cleaned up");
-        assert_eq!(deck.flows[deck.active_index].state, FlowState::Active);
+        assert_eq!(deck.stream_count(), 1, "one playback voice");
     }
 
     #[test]
@@ -2083,8 +2222,7 @@ mod tests {
             let before = deck.current_frame();
             deck.process_block(&mut out);
             assert_eq!(
-                out[0],
-                before as f32,
+                out[0], before as f32,
                 "block audio must be the mapped position {before}"
             );
             if before + 256 > range.out_frame && deck.virtual_frame() > range.out_frame {
@@ -2104,18 +2242,24 @@ mod tests {
         deck.apply_loop(LoopOp::In).expect("arm");
         let armed = deck.loop_in_armed().expect("in is armed immediately");
         assert!(deck.loop_range().is_none(), "arming alone must not engage");
-        // Run blocks until the LoopFlow finishes warming and arrives (the test lives in this
+        // Run blocks until the looper catches up (the test lives in this
         // module, so the private arm is observable), then it is driven in lockstep.
         for _ in 0..500 {
             deck.process_block(&mut out);
-            if deck.loop_arm.as_ref().is_some_and(|arm| arm.flow.is_some()) {
+            if deck
+                .loop_arm
+                .as_ref()
+                .is_some_and(|arm| arm.shadow.is_some())
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         assert!(
-            deck.loop_arm.as_ref().is_some_and(|arm| arm.flow.is_some()),
-            "the LoopFlow never finished warming"
+            deck.loop_arm
+                .as_ref()
+                .is_some_and(|arm| arm.shadow.is_some()),
+            "the looper never arrived"
         );
         let before = deck.virtual_frame();
         deck.apply_loop(LoopOp::Out).expect("engage");
@@ -2123,7 +2267,11 @@ mod tests {
         assert_eq!(range.in_frame, armed, "the armed in point is the loop's in");
         assert!(range.out_frame > range.in_frame);
         // Promotion: no jump, no compensation — the slip clock is untouched by the switch.
-        assert_eq!(deck.virtual_frame(), before, "the promotion must not move the clock");
+        assert_eq!(
+            deck.virtual_frame(),
+            before,
+            "the promotion must not move the clock"
+        );
         // And the audio continues from exactly the mapped position (sample-exact on the ramp).
         let mapped = range.map(before);
         deck.process_block(&mut out);
@@ -2207,6 +2355,93 @@ mod tests {
     }
 
     #[test]
+    fn slip_loop_keeps_playing_running_and_exit_lands_on_the_slip_clock() {
+        let total = crate::SAMPLE_RATE as u64 * 60;
+        let mut deck = loop_deck(total);
+        let mut out = vec![0.0f32; 256 * CHANNELS];
+        deck.process_block(&mut out);
+
+        deck.slip_beats(4).expect("slip loop");
+        let range = deck.loop_range().expect("engaged");
+        let start_virtual = deck.virtual_frame();
+        assert!(deck.shadow.as_ref().is_some_and(|s| s.slip));
+
+        for _ in 0..((6 * fpb()) / 256) as usize {
+            deck.process_block(&mut out);
+        }
+        assert!(
+            deck.virtual_frame() > start_virtual + 4 * fpb(),
+            "playing must keep the slip clock: {} -> {}",
+            start_virtual,
+            deck.virtual_frame()
+        );
+        assert!(
+            deck.current_frame() >= range.in_frame && deck.current_frame() < range.out_frame,
+            "the audible position is the shadow loop: {} outside {range:?}",
+            deck.current_frame()
+        );
+
+        deck.apply_loop(LoopOp::Exit).expect("exit slip");
+        assert!(deck.shadow.is_none(), "slip exit drops the shadow");
+        assert_eq!(
+            deck.current_frame(),
+            deck.virtual_frame(),
+            "playing is the audible voice again, at the slip position"
+        );
+    }
+
+    #[test]
+    fn manual_slip_in_out_keeps_playing_and_engages_the_shadow() {
+        let total = crate::SAMPLE_RATE as u64 * 60;
+        let mut deck = loop_deck(total);
+        let mut out = vec![0.0f32; 256 * CHANNELS];
+        deck.process_block(&mut out);
+
+        deck.apply_loop(LoopOp::SlipIn).expect("slip in");
+        assert!(deck.loop_in_armed().is_some());
+        for _ in 0..4 {
+            deck.process_block(&mut out);
+        }
+        deck.apply_loop(LoopOp::SlipOut).expect("slip out");
+        assert!(deck.loop_range().is_some());
+        assert!(deck.shadow.as_ref().is_some_and(|s| s.slip));
+        let before = deck.virtual_frame();
+        for _ in 0..8 {
+            deck.process_block(&mut out);
+        }
+        assert!(
+            deck.virtual_frame() > before,
+            "playing keeps the slip clock"
+        );
+        deck.apply_loop(LoopOp::Exit).expect("slip exit");
+        assert!(deck.shadow.is_none());
+        assert_eq!(deck.current_frame(), deck.virtual_frame());
+    }
+
+    #[test]
+    fn slip_roll_reads_the_loop_backwards() {
+        let total = crate::SAMPLE_RATE as u64 * 60;
+        let mut deck = loop_deck(total);
+        let mut out = vec![0.0f32; 8 * CHANNELS];
+        deck.process_block(&mut out);
+
+        deck.slip_roll(4).expect("slip roll");
+        let range = deck.loop_range().expect("engaged");
+        assert!(deck.shadow.as_ref().is_some_and(|s| s.slip));
+        let before = deck.current_frame();
+        deck.process_block(&mut out);
+        // Tape is exact: the first samples walk down from the loop's out edge.
+        assert!(out[0] <= (range.out_frame - 1) as f32);
+        assert!(
+            out[0] > out[CHANNELS] && out[CHANNELS] > out[2 * CHANNELS],
+            "reverse read must descend: {} {} {} (before {before})",
+            out[0],
+            out[CHANNELS],
+            out[2 * CHANNELS]
+        );
+    }
+
+    #[test]
     fn in_loop_edits_retime_the_range_and_leave_the_clock_alone() {
         let total = crate::SAMPLE_RATE as u64 * 60;
         let mut deck = loop_deck(total);
@@ -2255,7 +2490,10 @@ mod tests {
         deck.apply_loop(LoopOp::Edit(LoopEditOp::Move { beats: 2 }))
             .expect("move");
         let moved = deck.loop_range().unwrap();
-        assert_eq!(moved.out_frame - moved.in_frame, before.out_frame - before.in_frame);
+        assert_eq!(
+            moved.out_frame - moved.in_frame,
+            before.out_frame - before.in_frame
+        );
         assert_eq!(moved.in_frame, before.in_frame + beats_from_in(2));
         assert_eq!(deck.virtual_frame(), clock, "still no clock movement");
 
@@ -2298,7 +2536,8 @@ mod tests {
 
         // One double is exactly ×2 — scaling the *current* length, not a grid figure.
         let base = engaged.len();
-        deck.apply_loop(LoopOp::Edit(LoopEditOp::Double)).expect("double");
+        deck.apply_loop(LoopOp::Edit(LoopEditOp::Double))
+            .expect("double");
         assert_eq!(len(&deck), base * 2, "double must scale the current length");
         assert_eq!(
             deck.loop_range().unwrap().in_frame,
@@ -2310,26 +2549,30 @@ mod tests {
         // Keep doubling: the length saturates exactly at 64 beats and goes no further.
         let mut guard = 0;
         while len(&deck) < max_len {
-            deck.apply_loop(LoopOp::Edit(LoopEditOp::Double)).expect("double");
+            deck.apply_loop(LoopOp::Edit(LoopEditOp::Double))
+                .expect("double");
             guard += 1;
             assert!(guard <= 8, "doubles must reach the 64-beat ceiling");
             assert!(len(&deck) <= max_len, "…and never exceed it");
         }
         assert_eq!(len(&deck), max_len, "the ceiling is exactly 64 beats");
-        deck.apply_loop(LoopOp::Edit(LoopEditOp::Double)).expect("double");
+        deck.apply_loop(LoopOp::Edit(LoopEditOp::Double))
+            .expect("double");
         assert_eq!(len(&deck), max_len, "already at the ceiling");
 
         // Halving walks all the way down to exactly 1/32 beat — below the beat quantum — and
         // stops there instead of collapsing the range.
         let mut guard = 0;
         while len(&deck) > min_len {
-            deck.apply_loop(LoopOp::Edit(LoopEditOp::Halve)).expect("halve");
+            deck.apply_loop(LoopOp::Edit(LoopEditOp::Halve))
+                .expect("halve");
             guard += 1;
             assert!(guard <= 16, "halves must reach the 1/32-beat floor");
             assert!(len(&deck) >= min_len, "…and never fall under it");
         }
         assert_eq!(len(&deck), min_len, "the floor is exactly 1/32 beat");
-        deck.apply_loop(LoopOp::Edit(LoopEditOp::Halve)).expect("halve");
+        deck.apply_loop(LoopOp::Edit(LoopEditOp::Halve))
+            .expect("halve");
         assert_eq!(len(&deck), min_len, "already at the floor");
         assert_eq!(
             deck.loop_range().unwrap().in_frame,
@@ -2344,7 +2587,10 @@ mod tests {
             deck.process_block(&mut out);
             let now = deck.current_frame();
             let range = deck.loop_range().expect("still looping");
-            assert!(now >= range.in_frame && now < range.out_frame, "in range: {now}");
+            assert!(
+                now >= range.in_frame && now < range.out_frame,
+                "in range: {now}"
+            );
         }
 
         // …and with no loop running, both keys are refusals rather than no-ops.
@@ -2391,12 +2637,15 @@ mod tests {
         // Pressing `in` again replaces the arm instead of stacking one.
         deck.apply_loop(LoopOp::In).expect("re-arm");
         assert!(deck.loop_in_armed().is_some());
-        // The abandoned LoopFlow announces eventually and must be reaped, not switched in:
+        // A re-arm must not engage the abandoned looper:
         for _ in 0..16 {
             deck.process_block(&mut out);
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        assert!(deck.loop_range().is_none(), "a reap must not engage a loop");
+        assert!(
+            deck.loop_range().is_none(),
+            "re-arming must not engage a loop"
+        );
         assert!(deck.loop_in_armed().is_some(), "the new arm survives");
 
         // Cancel drops the arm entirely.
@@ -2412,8 +2661,7 @@ mod tests {
         assert!(deck.apply_loop(LoopOp::Beats(0)).is_err(), "0-beat loop");
         // Editing with no loop is refused.
         assert!(
-            deck
-                .apply_loop(LoopOp::Edit(LoopEditOp::Move { beats: 1 }))
+            deck.apply_loop(LoopOp::Edit(LoopEditOp::Move { beats: 1 }))
                 .is_err(),
             "edit without a loop"
         );
@@ -2433,7 +2681,10 @@ mod tests {
                 LoopOp::Cancel | LoopOp::Exit | LoopOp::SetQuantum(_) => {
                     assert!(gridless.apply_loop(op).is_ok(), "{op:?} needs no grid")
                 }
-                other => assert!(gridless.apply_loop(other).is_err(), "{other:?} without a grid"),
+                other => assert!(
+                    gridless.apply_loop(other).is_err(),
+                    "{other:?} without a grid"
+                ),
             }
         }
         assert_eq!(deck.loop_in_armed(), None);
@@ -2470,12 +2721,19 @@ mod tests {
         deck.apply_loop(LoopOp::In).expect("arm");
         assert!(deck.loop_in_armed().is_some());
         deck.beatjump(8);
-        assert_eq!(deck.loop_in_armed(), None, "jumping re-cues: the arm is gone");
+        assert_eq!(
+            deck.loop_in_armed(),
+            None,
+            "jumping re-cues: the arm is gone"
+        );
         for _ in 0..16 {
             deck.process_block(&mut out);
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        assert!(deck.loop_range().is_none(), "the abandoned LoopFlow must be reaped");
+        assert!(
+            deck.loop_range().is_none(),
+            "a jump must not promote the abandoned looper"
+        );
     }
 
     #[test]
@@ -2519,9 +2777,7 @@ mod tests {
         let before = deck.current_frame();
 
         let tags = [0.0f32, 1000.0, 2000.0, 3000.0];
-        deck.set_sources(
-            tags.iter().map(|tag| tagged_pool(200_000, *tag)).collect(),
-        );
+        deck.set_sources(tags.iter().map(|tag| tagged_pool(200_000, *tag)).collect());
         // The swap warms on the background thread, so until it lands the deck is still one stream —
         // which is exactly why `stream_count` (not the install call) is what sizes a mixer.
         for _ in 0..500 {
@@ -2585,7 +2841,10 @@ mod tests {
         assert_eq!(deck.stream_count(), 4);
 
         // Same handle, same audio: the track, not the drums stem.
-        assert!(Arc::ptr_eq(&track, &deck.source()), "the track handle is unchanged");
+        assert!(
+            Arc::ptr_eq(&track, &deck.source()),
+            "the track handle is unchanged"
+        );
         let mut got = [0.0f32; CHANNELS];
         deck.source().read_frames(5, &mut got);
         assert_eq!(got[0], 5.0, "source() is still the untagged ramp");
@@ -2674,5 +2933,47 @@ mod tests {
             }
         }
         panic!("the slip clock never ran past the loop after the swap");
+    }
+    #[test]
+    fn slip_loop_applies_to_all_stems_uniformly() {
+        let total = 200_000u64;
+        let tags = [0.0f32, 1000.0, 2000.0, 3000.0];
+        let mut deck = tape_deck(tagged_pool(total, 0.0));
+        deck.play();
+        let frames = crate::BLOCK_SIZE;
+        let mut out = vec![0.0f32; frames * CHANNELS];
+        deck.process_block(&mut out);
+        deck.set_sources(
+            tags.iter()
+                .map(|tag| tagged_pool(total, *tag) as Arc<dyn Source>)
+                .collect(),
+        );
+        for _ in 0..500 {
+            deck.begin_block();
+            let streams = deck.stream_count();
+            deck.end_block();
+            if streams == 4 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(deck.stream_count(), 4);
+        deck.set_analysis(grid_122bpm(total));
+
+        deck.slip_beats(4).expect("slip loop over stems");
+        let mut buses: Vec<Bus> = (0..4).map(|_| Bus::stereo(frames)).collect();
+        deck.pull_streams_into(&mut buses);
+        for i in 0..frames {
+            let base = buses[0].l[i];
+            for stream in 1..4 {
+                let delta = buses[stream].l[i] - base;
+                let want = tags[stream] - tags[0];
+                assert!(
+                    (delta - want).abs() < 1e-2,
+                    "frame {i} stream {stream}: delta {delta} != {want}"
+                );
+            }
+        }
+        assert!(deck.shadow.as_ref().is_some_and(|s| s.slip));
     }
 }

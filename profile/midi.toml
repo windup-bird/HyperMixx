@@ -1,13 +1,43 @@
-# MIDI input for this profile.
-#
-# `device` is what `--midi` takes: a **port name substring** (case-insensitive, first match wins) or
-# an index from `midi ports`. With no device, no input is opened at startup — the TUI can still pick
-# one with `F2`.
-#
-# device = "DDJ-400"
-#
-# The mapping file. Relative paths are relative to *this file*, so `"midi-map.toml"` here means
-# `profile/midi-map.toml`; the shipped root map is one directory up. Left unset, the historical
-# default applies: `midi-map.toml` in the working directory.
-#
-# map = "../midi-map.toml"
+[[bind]]
+type = "note"
+channel = 0
+id = 0
+deck = 0
+action = "play"
+
+[[bind]]
+type = "note"
+channel = 0
+id = 1
+deck = 0
+action = "cue"
+
+[[bind]]
+type = "note"
+channel = 1
+id = 1
+deck = 1
+action = "cue"
+
+[[bind]]
+type = "note"
+channel = 1
+id = 0
+deck = 1
+action = "play"
+
+[[bind]]
+type = "cc"
+mode = "rel1"
+channel = 0
+id = 6
+deck = 0
+action = "vinyl"
+
+[[bind]]
+type = "cc"
+mode = "rel1"
+channel = 1
+id = 6
+deck = 1
+action = "vinyl"

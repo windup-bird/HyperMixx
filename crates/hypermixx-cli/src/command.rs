@@ -401,6 +401,7 @@ pub fn dispatch(
             let op = match words.next() {
                 None | Some("touch") => VinylOp::Touch,
                 Some("release") => VinylOp::Release,
+                Some("slip") => VinylOp::Slip,
                 Some("turn") => match words.next().and_then(|value| value.parse::<i32>().ok()) {
                     Some(ticks) => VinylOp::Turn {
                         ticks,
@@ -410,7 +411,7 @@ pub fn dispatch(
                 },
                 Some(other) => {
                     return Action::Failed(format!(
-                        "unknown vinyl subcommand `{other}` — touch|release|turn <ticks>"
+                        "unknown vinyl subcommand `{other}` — touch|release|slip|turn <ticks>"
                     ))
                 }
             };
@@ -961,7 +962,7 @@ fn loop_command<'a>(
     deck_id: u8,
     command_tx: &Sender<Command>,
 ) -> Action {
-    let usage = "usage: [deck] loop in | out | <beats> | exit | cancel | halve | double | edit <len|move|in|out> <beats> | quantum <beat|half|quarter|eighth>";
+    let usage = "usage: [deck] loop in | out | <beats> | slip in | slip out | slip <beats> | slip roll <beats> | exit | cancel | halve | double | edit <len|move|in|out> <beats> | quantum <beat|half|quarter|eighth>";
     let Some(sub) = words.next() else {
         return Action::Message(usage.into());
     };
@@ -970,6 +971,25 @@ fn loop_command<'a>(
         "out" => LoopOp::Out,
         "cancel" => LoopOp::Cancel,
         "exit" | "off" => LoopOp::Exit,
+        "slip" => match words.next() {
+            Some("in") => LoopOp::SlipIn,
+            Some("out") => LoopOp::SlipOut,
+            Some("roll") => match words.next().and_then(|token| token.parse::<u64>().ok()) {
+                Some(beats) if beats > 0 => LoopOp::SlipRoll(beats),
+                _ => return Action::Failed("usage: [deck] loop slip roll <beats>".into()),
+            },
+            Some(raw) => match raw.parse::<u64>() {
+                Ok(beats) if beats > 0 => LoopOp::SlipBeats(beats),
+                _ => {
+                    return Action::Failed(format!(
+                        "unknown slip loop subcommand `{raw}` — in|out|roll <beats>|<beats>"
+                    ));
+                }
+            },
+            None => {
+                return Action::Failed("usage: [deck] loop slip in|out|<beats>|roll <beats>".into())
+            }
+        },
         "quantum" => match words.next() {
             Some(token) => match LoopQuantum::parse(token) {
                 Some(quantum) => LoopOp::SetQuantum(quantum),
@@ -1937,7 +1957,11 @@ mod tests {
         let (live, notes) = read_live_config(&shipped).expect("the shipped live file parses");
         assert!(notes.is_empty(), "the shipped file needs no clamping: {notes:?}");
         assert_eq!(live.audio.sample_rate, hypermixx_core::SAMPLE_RATE);
-        assert_eq!(live.stems.provider, "cpu");
+        assert!(
+            matches!(live.stems.provider.as_str(), "cpu" | "cuda" | "gpu"),
+            "the shipped provider is a known EP: {}",
+            live.stems.provider
+        );
     }
 
     /// `live` reports what is in effect, and a reload says when a setting needs a restart.

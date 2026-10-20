@@ -5,21 +5,21 @@
 //! engine's internal `use crate::deck::…` imports.
 
 mod deck;
-mod flowshift;
 mod jump;
 mod loop_;
+mod scratch;
 mod sync;
 
 pub use deck::Deck;
-pub use flowshift::FlowShift;
+use scratch::Scratch;
 pub use jump::{phase_preserving, Seek};
 pub use loop_::{
-    beats_after, beat_shift, provisional_range, quantize_offset, quantize_to_beat, LoopRange,
+    beat_shift, beats_after, provisional_range, quantize_offset, quantize_to_beat, LoopRange,
     LoopRangeCell, LoopSource,
 };
 pub use sync::{
     wrap_phase, LeaderSample, Nudge, PhaseAlign, Playhead, Pll, SyncCtx, BLOCK_SECONDS,
-    DEFAULT_TEMPO_RANGE, MAX_RATE, MAX_TEMPO_RANGE, MIN_RATE, NUDGE_LIMIT, NUDGERATE_LIMIT,
+    DEFAULT_TEMPO_RANGE, MAX_RATE, MAX_TEMPO_RANGE, MIN_RATE, NUDGERATE_LIMIT, NUDGE_LIMIT,
     PLL_LIMIT,
 };
 

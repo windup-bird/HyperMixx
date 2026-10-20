@@ -129,6 +129,8 @@ fn blocks_can_arrive_while_the_audio_thread_reads() {
     deck.play();
     deck.set_sources(handle.streams());
     settle(&mut deck, 4);
+    // One block to settle the new engine after the source swap (same as the first test).
+    render(&mut deck);
 
     let writer = {
         let handle = Arc::clone(&handle);

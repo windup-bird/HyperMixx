@@ -148,8 +148,8 @@ fn manual_loop_arms_immediately_and_engages_on_out() {
     );
     assert!(armed.loop_range.is_none(), "arming alone must not engage");
 
-    // `out` engages — whether by promoting the LoopFlow or (if it is still warming) by falling
-    // back to a fresh ranged flow; either way the range appears without a clock jump backwards.
+    // `out` engages — the prepared looper is promoted, or the hard fallback engages it; either
+    // way the range appears without a clock jump backwards.
     let before = state(&tx, &rx, 0).virtual_frame;
     ask_loop(&tx, 0, LoopOp::Out);
     ack(&rx);

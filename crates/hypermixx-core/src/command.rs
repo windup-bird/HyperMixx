@@ -122,17 +122,25 @@ pub enum LoopEditOp {
 /// loop state machine stays one match arm.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LoopOp {
-    /// Arm a manual loop-in: quantize `in` to the beat and start the LoopFlow warm-up.
+    /// Arm a manual loop-in: quantize `in` to the beat and prepare the looper.
     In,
-    /// Set the quantized `out` and engage: the LoopFlow becomes the active flow, zero delay.
+    /// Set the quantized `out` and engage: the prepared looper becomes `playing`.
     Out,
-    /// Drop an armed loop-in (a pending LoopFlow).
+    /// Drop an armed loop-in (a pending looper).
     Cancel,
-    /// Leave the active loop, continuing from the slipped `virtual_pos` (a flow change).
+    /// Leave the active loop; a slip loop drops its shadow and resumes `playing`.
     Exit,
     /// Beat loop: with no loop engaged, open an N-beat loop at the quantized current beat; while
     /// looping, re-time the current loop's `out` to `in + N` beats (halve/double), in place.
     Beats(u64),
+    /// Arm a slip loop: `playing` keeps its slip clock, `shadow` is the audible loop.
+    SlipIn,
+    /// Engage the armed slip loop.
+    SlipOut,
+    /// Slip beat loop: audible loop, `playing` continues silently underneath.
+    SlipBeats(u64),
+    /// Slip roll: a slip beat loop whose shadow reads backwards.
+    SlipRoll(u64),
     /// Edit the active loop's range in place — no flow change.
     Edit(LoopEditOp),
     /// Set the deck's out-point quantization granularity.
@@ -234,6 +242,10 @@ pub enum VinylOp {
     Touch,
     /// The hand came off: resume if the touch is what paused it.
     Release,
+    /// Arm the next touch as a **slip** vinyl: `playing` keeps its slip clock, and the audible
+    /// scratch is a Tape shadow. Release drops the shadow; `playing` is already at the slip
+    /// position.
+    Slip,
     /// The wheel turned by `ticks` (signed — negative is anticlockwise). **Held** (a hand on the
     /// platter): the playhead moves by `ticks × frames_per_tick`. **Not held**: it is a pitch bend,
     /// which is what a wheel does on a deck when nobody is touching the record.
@@ -587,9 +599,11 @@ impl std::fmt::Debug for Command {
                 .debug_struct("TogglePlay")
                 .field("deck_id", deck_id)
                 .finish(),
-            Command::Cue { deck_id, op } => {
-                f.debug_struct("Cue").field("deck_id", deck_id).field("op", op).finish()
-            }
+            Command::Cue { deck_id, op } => f
+                .debug_struct("Cue")
+                .field("deck_id", deck_id)
+                .field("op", op)
+                .finish(),
             Command::Vinyl { deck_id, op } => f
                 .debug_struct("Vinyl")
                 .field("deck_id", deck_id)
@@ -623,15 +637,21 @@ impl std::fmt::Debug for Command {
                 .field("deck_id", deck_id)
                 .field("range", range)
                 .finish(),
-            Command::Loop { deck_id, op } => {
-                f.debug_struct("Loop").field("deck_id", deck_id).field("op", op).finish()
-            }
-            Command::Sync { deck_id, op } => {
-                f.debug_struct("Sync").field("deck_id", deck_id).field("op", op).finish()
-            }
-            Command::Nudge { deck_id, op } => {
-                f.debug_struct("Nudge").field("deck_id", deck_id).field("op", op).finish()
-            }
+            Command::Loop { deck_id, op } => f
+                .debug_struct("Loop")
+                .field("deck_id", deck_id)
+                .field("op", op)
+                .finish(),
+            Command::Sync { deck_id, op } => f
+                .debug_struct("Sync")
+                .field("deck_id", deck_id)
+                .field("op", op)
+                .finish(),
+            Command::Nudge { deck_id, op } => f
+                .debug_struct("Nudge")
+                .field("deck_id", deck_id)
+                .field("op", op)
+                .finish(),
             Command::SetFader { target, value } => f
                 .debug_struct("SetFader")
                 .field("target", target)
@@ -642,10 +662,7 @@ impl std::fmt::Debug for Command {
                 .field("deck_id", deck_id)
                 .field("mode", mode)
                 .finish(),
-            Command::SetKey {
-                deck_id,
-                semitones,
-            } => f
+            Command::SetKey { deck_id, semitones } => f
                 .debug_struct("SetKey")
                 .field("deck_id", deck_id)
                 .field("semitones", semitones)
@@ -673,9 +690,11 @@ impl std::fmt::Debug for Command {
                 .field("deck_id", deck_id)
                 .finish(),
             Command::GetAllStates => f.write_str("GetAllStates"),
-            Command::AddFx { chain, kind } => {
-                f.debug_struct("AddFx").field("chain", chain).field("kind", kind).finish()
-            }
+            Command::AddFx { chain, kind } => f
+                .debug_struct("AddFx")
+                .field("chain", chain)
+                .field("kind", kind)
+                .finish(),
             Command::RemoveFx { chain, index } => f
                 .debug_struct("RemoveFx")
                 .field("chain", chain)

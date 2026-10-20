@@ -42,11 +42,10 @@ crates/
 │   │   ├── deck/
 │   │   │   ├── deck.rs      # Deck:流状态机 + cued_from 跳转补偿 + pull_into + apply_sync
 │   │   │   ├── jump.rs      # Seek{Frames,Beats,Beat,Quantized} + phase_preserving
-│   │   │   ├── flowshift.rs # FlowShift(原 TimeShift):后台流预热
 │   │   │   ├── loop_.rs     # LoopRange/原子 cell/LoopSource(virtual→actual 映射读) + 量化
 │   │   │   └── sync.rs      # Playhead(tempo+nudgerate)/PhaseAlign/Pll/Nudge/SyncCtx
 │   │   ├── flow/
-│   │   │   ├── flow.rs       # Flow:单次播放单元(状态机)
+│   │   │   ├── playing.rs    # Playing:一个独立播放声部(引擎+时钟+loop cell)
 │   │   │   └── pitchshift.rs # PitchShiftEngine:Signalsmith / Tape 后端
 │   │   ├── sync.rs          # SyncGroup:谁领谁跟 + 每块预扫(编排,不进 mixer)
 │   │   ├── mixer/         # 混音拓扑(见下)
@@ -310,22 +309,18 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 
 ### `deck/`
 - `Deck` — `sources: Vec<Shared>`(1 条 = 普通曲目,4 条 = stems)、单活跃 flow;
-  `set_sources()` 在当前 virtual 位置做**换源 jump**(带 loop range、重建 armed LoopFlow),
+  `set_sources()` 在当前 virtual 位置准备一个新 `Playing`，下一块硬切（带 loop range），
   所以"播放中装 stems"是无缝的;`begin_block`/`render_streams`/`end_block` 三相位拆分,让 mixer
   能在同一块内先让换源落地、再按 `stream_count()` 备好逐 stream 的链;`jump()` 记 `cued_from`(**virtual 时钟**),`switch_to()` 把新流
   落点前移预热期间已播放的帧量,保证跨 deck 相位锁定(`phase_probe.sh` 的 `err` 恒 +0);
   `pull_into(&mut Bus, &FxContext)` 是 `process_block` 的面内薄包装
 - **两个时钟**:`virtual_frame()` = 引擎播放头,只增不减、loop 不碰(slip);
   `current_frame()` = `map(virtual)` = 听到的位置(波形/state/beatjump 都读它)
-- **Loop 状态机**:`loop_range` 挂在 Flow 上(切流即消亡,从不原地清);手动 in 生成
-  **LoopFlow**(预热流,存于 deck 而非 flows 向量)——预热完后**与主流逐块同速跑、输出丢弃**,
-  每块按“此刻按 out 会得到的区间”更新临时 range,`out` 按下存的就是该值(no-op store)⇒
-  主流 retire、LoopFlow 原地转正,**无 cued_from、零延迟**;beatloop 不跟跑(建流即带 range,
-  预热完经 FlowShift 换流);`loop <n>` 循环中=只调 out(halve/double);循环中编辑=整段
-  Range 一次原子 store(不换流);退出 = 按下即预热换流、**落点 = 旧流输出停止处**
-  (`pending_exit_resume`)——无缝:当前圈自然播完、越过 out 续行;旧 range 随流消亡;
-  slip 落位是单列功能 `slip loop`;LoopFlow 驱动遇换流重锚时钟走 **rebase 分支**
-  (倒退/大步 → `reset_to` 对齐)
+- **Loop 状态机**:deck 持有 `playing` + 可选 `shadow`。普通 loop 的 `shadow` 提前按
+  provisional range 喂好，`loop out` 硬切；beat loop 同样准备后硬切。slip 模式不丢弃
+  `playing`：`playing` 继续 slip 时钟（静音），`shadow` 是听到的 loop/roll/vinyl，退出只丢
+  `shadow`。`loop exit` 从当前可听位置硬切；循环中编辑只改 range，不移动时钟；
+  slip roll 反向读 PCM，slip vinyl 以 Tape shadow 实现（手势尚未接入）。
 - `jump::phase_preserving` — 目标帧 = 目标拍位 + `phase(当前) × 目标拍宽`,兼容非均匀网格
 - `sync.rs` — **`Playhead { tempo, nudgerate, align, lock }`**,引擎拿到的是
   `playing_rate = tempo + nudgerate`:
@@ -338,15 +333,10 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   积分抗饱和,输出 ±5% 限幅 = 收敛超时的兜底)。**相位差先包裹到 [-0.5, 0.5]、再换算成秒**
   (`err_beats × 60/bpm`):秒÷秒才是无量纲比率,增益与限幅才量纲自洽
   - **`nudgerate` 总限幅 ±15%** = PLL ±5%(收敛兜底)+ nudge ±10%(DJ 手掰),两者同向叠满也不越界
-- `FlowShift` — 后台预热线程,双通道:**jump 通道**保留 supersede(快跳只认最新);
-  **LoopFlow 通道**双向豁免(`loop in` 循环中 = exit 换流 + 新 LoopFlow 同时在飞);
-  被作废的 LoopFlow 记入 reap,通报时回收,不漏在 warm map 里
-
 ### `flow/`
-- `Flow` — `Preparing → Ready → Active → Retired`;活跃时经引擎采样,暂停/耗尽补静音;
-  持有自己的 `LoopRangeCell`,`render()` 无状态门(LoopFlow 的同速驱动用它),
-  `prepare()` 与 `reset_to()` = seek 协议 + **排空 warm-start 锄热**——宣布 ready 与
-  换流后的第一块都已是收敛音频(任何切换都不呼吸锄热间隙,换流无缝)
+- `Playing` — 一个独立播放声部：引擎 + 时钟 + `LoopRangeCell`。`playing` 是主/滑时钟，
+  `shadow` 是 loop/roll/slip 的第二声部；切换都是块边界硬切，无 crossfade。
+- `Direction::Reverse` — slip roll 用：反向读 loop range 的 PCM，Signalsmith 仍正向处理。
 - `PitchShiftEngine` — 两套后端:`Tape`(零延迟 varispeed) / Signalsmith Stretch
   (`Keylock` = 2048/512，`WideKeylock` = 4096/1024)。一个 2N 通道实例承载全部 stem；
   `prepare_jump` 用 `outputSeek` 对齐，loop wrap 只是喂入流内的 splice，引擎不复位
@@ -382,7 +372,7 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 - `analyse` — 后台跑 `library::analyser::analyze`,完成后 `SetAnalysis`
 - `play / cue [play|back|set] / jump <frame> / beatjump <beats> / tempo / tempofader / temporange / keylock on|off|wide / key / state / quit`
 - `loop` 族:`loop in|out|<n>|exit|cancel|halve|double|edit <len|move|in|out> <beats>|quantum <q>`
-  (手动 in/out 带量化与 LoopFlow 锄热,`<n>` 循环中 = 只调 out,halve/double = 当前长度
+  (手动 in/out 带量化与 looper 预喂,`<n>` 循环中 = 只调 out,halve/double = 当前长度
   ÷2/×2、域 1/32..64 拍,循环中编辑原地原子 store,exit 无缝续播越过 out)
 - `fx` 族:`fx add|remove|list|set|on|off|trigger|pad press|release`,chain 地址
   `master`/`m`/`deck0`/`d0`/`0`;`fx help` 从注册表生成 kind/参数清单(永不与引擎脱节)

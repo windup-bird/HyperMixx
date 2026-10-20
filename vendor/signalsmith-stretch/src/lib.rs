@@ -2,7 +2,7 @@
 //! [Signalsmith Stretch](https://github.com/Signalsmith-Audio/signalsmith-stretch)
 //! audio stretching and pitch-shifting library.
 
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, dead_code)]
 mod sys {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }

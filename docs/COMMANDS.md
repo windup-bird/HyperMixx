@@ -86,7 +86,7 @@ cargo run -p hypermixx-cli -- [flags]
                              记为 cue 点，`smart` = 引擎按走带决定（播放中→back，暂停中→set）
                              **bare `cue` = 整颗 cue 键**：第一次是按下、再一次是松开
                              （状态在引擎里，所以前端不需要自己记走带）
-[deck] vinyl [touch|release|turn <ticks>]
+[deck] vinyl [touch|release|slip|turn <ticks>]
                              唱盘：`touch` = 手放上去（暂停并记住走带），`turn` = 转轮（手持时
                              按 tick 移动播放头，空手时是 pitch bend），`release` = 松手（恢复
                              被 touch 打断的走带）。bare = touch
@@ -108,6 +108,8 @@ state                       打印全部 deck 的状态行
 
 - `cue` 点默认在装载原点（帧 0）；`Load` 换 deck 时回到 0。`back`/`play`/`hold` 走非阻塞
   jump，落地可能滞后一个块 + 预热时间（`hold` 在**暂停**那一路不跳，所以是即时的）。
+- **`vinyl` 走 Tape 风格的 signed-rate 读取器**（cubic、零 FFT、支持反向）；`vinyl slip` 让下一次 touch
+  成为 slip vinyl：`playing` 继续跑，signed-rate scratch 出声。
 - **`vinyl`（唱盘）**：一颗转盘在真实设备上是两个控件 —— 一个 note（贴盘传感器）+ 一个相对
   CC（轮子本身）。两个绑定都写 `action = "vinyl"`，**转一下到底什么意思由引擎判定**（只有它
   知道此刻手在不在盘上）：
@@ -176,10 +178,14 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 ### 3.5 循环 `loop`
 
 ```
-[deck] loop in                    武装 in 点（按拍量化），后台预热 LoopFlow
-[deck] loop out                   按量化后的 out 点切入，零延迟
+[deck] loop in                    武装 in 点（按拍量化），后台准备 looper
+[deck] loop out                   按量化后的 out 点硬切入
 [deck] loop <beats>               N 拍循环（u64 ≥ 1）；循环中 = 只调 out 到 in+N
-[deck] loop exit                  退出循环，无缝续播越过 out（别名 off）
+[deck] loop slip in               武装 slip loop：playing 继续跑，shadow 出声
+[deck] loop slip out              切入 slip loop
+[deck] loop slip <beats>          N 拍 slip loop（playing 不丢弃）
+[deck] loop slip roll <beats>     N 拍反向 slip roll
+[deck] loop exit                  退出普通/slip loop；slip 退出回到 playing 的 slip 位置
 [deck] loop cancel                丢弃已武装的 in
 [deck] loop halve | double        当前长度 ÷2 / ×2，域 1/32..64 拍（别名 /2 ÷2 / x2 *2 ×2）
 [deck] loop edit len <beats>      设长度（保留 in，可小数到一个 quantum）
@@ -189,7 +195,8 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
                                   （别名 b 1 / 1/2 2 / 1/4 4 / 1/8 8；缺省 beat）
 ```
 
-- 循环中编辑 = 整段 Range 一次原子 store，不换流、无间隙。
+- 循环中编辑 = 整段 Range 一次原子 store，不换 voice、无间隙。
+- slip 模式不丢弃 `playing`：退出只丢 `shadow`，`playing` 已经在 slip 位置。
 - `state` 行会显示 `loop [in-out]`、`in armed@帧`、以及 slip 时的 `slip <virtual帧>`。
 
 ### 3.6 效果 `fx`

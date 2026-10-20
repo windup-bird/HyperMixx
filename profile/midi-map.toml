@@ -1,3 +1,11 @@
+# Hypermixx MIDI map.
+#
+# Schema: optional [meta], then one [[bind]] per control.
+#   type = "cc" | "note" | "bend"   mode = "abs" | "rel1" | "rel2" | "rel3" (cc only)
+#   channel / id = 0-based MIDI channel and CC/note number
+#   deck = optional deck id; action = a session command line (target omitted)
+#   action parameters stay fields: chain/fx/param, step, seconds, beats, min/max/curve
+#
 [meta]
 name = "example"
 

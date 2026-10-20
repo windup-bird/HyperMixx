@@ -1,4 +1,4 @@
-//! Pitchshift: the per-flow stretch engine.
+//! Pitchshift: the playback stretch engine.
 //!
 //! Two backends behind one API:
 //!
@@ -165,12 +165,7 @@ impl PitchShiftEngine {
                 carry: 0.0,
             },
             EngineProfile::WideKeylock => Backend::Stretch {
-                stretch: Stretch::new_split(
-                    channels as u32,
-                    WIDE_BLOCK,
-                    WIDE_INTERVAL,
-                    false,
-                ),
+                stretch: Stretch::new_split(channels as u32, WIDE_BLOCK, WIDE_INTERVAL, false),
                 feed_position: 0,
                 carry: 0.0,
             },
@@ -338,7 +333,8 @@ impl PitchShiftEngine {
                 phase,
             } => {
                 let step = f64::from(self.ratio).clamp(MIN_TEMPO_RATE, MAX_TEMPO_RATE);
-                let need = (((frames.saturating_sub(1)) as f64) * step + *phase).ceil() as usize + 4;
+                let need =
+                    (((frames.saturating_sub(1)) as f64) * step + *phase).ceil() as usize + 4;
                 let need = need.max(4);
                 if self.feed_buf.len() < need * self.channels {
                     self.feed_buf.resize(need * self.channels, 0.0);
@@ -354,8 +350,7 @@ impl PitchShiftEngine {
                     &mut self.feed_buf[..need * self.channels],
                 );
                 if step == 1.0 && *phase == 0.0 {
-                    self.out_buf[..samples]
-                        .copy_from_slice(&self.feed_buf[..samples]);
+                    self.out_buf[..samples].copy_from_slice(&self.feed_buf[..samples]);
                     *feed_position += frames as u64;
                 } else {
                     let channels = self.channels;
@@ -372,8 +367,7 @@ impl PitchShiftEngine {
                             let s1 = self.feed_buf[i1 * channels + c];
                             let s2 = self.feed_buf[i2 * channels + c];
                             let s3 = self.feed_buf[i3 * channels + c];
-                            self.out_buf[i * channels + c] =
-                                cubic(s0, s1, s2, s3, frac as f32);
+                            self.out_buf[i * channels + c] = cubic(s0, s1, s2, s3, frac as f32);
                         }
                     }
                     let advance = (*phase + frames as f64 * step).floor();
@@ -452,8 +446,6 @@ fn read_interleaved(
     }
     read
 }
-
-
 
 #[cfg(test)]
 mod tests {
