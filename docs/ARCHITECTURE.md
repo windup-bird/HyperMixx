@@ -7,7 +7,7 @@ library(分析)与 audio 零交叉依赖,只被 cli 调用;stems(离线分离)�
 
 ```
 cli ──→ core / media / audio / library / stems / midi
-audio ──→ core, media          (+ timestretch, git 依赖 rev 锁定; serde + toml)
+audio ──→ core, media          (+ signalsmith-stretch, vendored C++; serde + toml)
 library ──→ core, media        (+ stratum-dsp, git 依赖 rev 锁定)
 stems ───→ core, media         (+ charon-audio/ort, `onnx` 默认开, `cuda` 可选)
 midi ───→ core                 (+ midir, serde + toml)
@@ -35,7 +35,7 @@ crates/
 │       ├── decoder.rs    # decode_file:symphonia → 44.1kHz 立体声 f32
 │       └── pool.rs       # PcmPool:不可变 Arc 数据的 Source 实现
 │
-├── hypermixx-audio/      # 实时引擎(core + media + timestretch + serde/toml)
+├── hypermixx-audio/      # 实时引擎(core + media + signalsmith-stretch + serde/toml)
 │   ├── src/
 │   │   ├── ringbuf.rs    # rtrb SPSC 封装 + 自由函数
 │   │   ├── pipeline.rs   # AudioPipeline:producer 线程 + 命令/查询通道
@@ -47,7 +47,7 @@ crates/
 │   │   │   └── sync.rs      # Playhead(tempo+nudgerate)/PhaseAlign/Pll/Nudge/SyncCtx
 │   │   ├── flow/
 │   │   │   ├── flow.rs       # Flow:单次播放单元(状态机)
-│   │   │   └── pitchshift.rs # PitchShiftEngine:timestretch 引擎包装
+│   │   │   └── pitchshift.rs # PitchShiftEngine:Signalsmith / Tape 后端
 │   │   ├── sync.rs          # SyncGroup:谁领谁跟 + 每块预扫(编排,不进 mixer)
 │   │   ├── mixer/         # 混音拓扑(见下)
 │   │   └── fx/            # 效果子系统(见下)
@@ -98,9 +98,9 @@ crates/
 | crate | 来源 | 锁定 |
 |---|---|---|
 | `stratum-dsp` | `github.com/HLLMR/stratum-dsp`(第三方库) | `rev = 758e0b6` |
-| `timestretch` | `github.com/robmorgan/timestretch-rs`(经 gh-proxy 镜像地址) | `rev = 2628090` |
+| `signalsmith-stretch` | `vendor/signalsmith-stretch`（上游 1.3.2 + `outputSeek` wrapper） | 本地路径 |
 
-不随本仓库分发;升级 = 改 rev + `cargo update -p <crate>`。
+`signalsmith-stretch` 连同 C++ 头文件一起 vendor，不依赖 git submodule。
 此外 `midir` 0.11 为 crates.io 依赖(MIDI 输入);其 ALSA 后端复用 cpal 已引入的
 `alsa`/`alsa-sys`,不新增 C 依赖。
 
@@ -347,11 +347,9 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   持有自己的 `LoopRangeCell`,`render()` 无状态门(LoopFlow 的同速驱动用它),
   `prepare()` 与 `reset_to()` = seek 协议 + **排空 warm-start 锄热**——宣布 ready 与
   换流后的第一块都已是收敛音频(任何切换都不呼吸锄热间隙,换流无缝)
-- `PitchShiftEngine` — timestretch-rs 三 Profile 对应 `KeylockMode::Off/On/Wide`:**Tape**(零延迟直通,
-  默认**不再**用它)/ **Keylock**(生产默认)/ **WideKeylock**(预热走 `reset → set_track_position → warm_start`);`feed()` 按
-  `demand_hint` **按需喂入**(超前量 32768→~1100 帧 ≈25ms,loop_range 变更影响窗口小到
-  可被 overlap 淡化),按 LoopRange **分段读 + 每段 `set_track_position(实际位置)`**——
-  wrap 只是喂入流内的 splice,引擎永不复位(Keylock 下无瞬态)
+- `PitchShiftEngine` — 两套后端:`Tape`(零延迟 varispeed) / Signalsmith Stretch
+  (`Keylock` = 2048/512，`WideKeylock` = 4096/1024)。一个 2N 通道实例承载全部 stem；
+  `prepare_jump` 用 `outputSeek` 对齐，loop wrap 只是喂入流内的 splice，引擎不复位
 - **播放头是曲目帧,不是输出帧**:`output_frame_exact += capacity × ratio`(f64 累加,
   逐块取整不累积漂移)。数输出帧会让位置与 tempo 脱钩——波形、beatjump 的 `cued_from`
   补偿、loop 映射、相位同步在**任何非 1.0 速度**下都会读到错的钟。ratio=1.0 时两者逐位

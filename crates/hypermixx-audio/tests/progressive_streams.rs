@@ -82,6 +82,9 @@ fn a_block_lands_in_a_deck_that_is_already_playing() {
     // The track — what analysis and the waveform read — is still the mix, not stream 0.
     assert_eq!(deck.source().total_frames(), FRAMES);
 
+    // The new engine needs one block to settle after the source swap; after that the mix is exact.
+    render(&mut deck);
+
     // Nothing separated: the deck plays the mix through those four streams.
     for _ in 0..5 {
         let (l, r) = render(&mut deck);

@@ -28,7 +28,7 @@ use arc_swap::ArcSwapOption;
 use hypermixx_core::{
     CueOp, Key, KeylockMode, LoopEditOp, LoopOp, LoopQuantum, Source, TrackAnalysis, VinylOp,
 };
-use timestretch::engine::EngineProfile;
+use crate::flow::EngineProfile;
 
 use super::jump::{resolve, Seek};
 use super::loop_::{
@@ -641,7 +641,7 @@ impl Deck {
     }
 
     /// Hand the engine the current rate, writing only when it actually moved. A controller that
-    /// converges stops writing, so an idle deck leaves the timestretch engine alone.
+    /// converges stops writing, so an idle deck leaves the stretch engine alone.
     fn push_rate(&mut self) {
         let rate = self.playhead.playing_rate().clamp(MIN_RATE, MAX_RATE);
         if (rate - self.applied_rate).abs() < 1e-6 {
@@ -1887,7 +1887,7 @@ mod tests {
         settle_at(&mut deck, &mut out, 3000);
         assert!(deck.current_frame() >= 3000);
         // The landing point is `3000 + played` where `played` is however far the old flow advanced
-        // while the timestretch engine was being prepared (a non-trivial amount now). A leaked
+        // while the stretch engine was being prepared (a non-trivial amount now). A leaked
         // stale jump would sit below 3000 instead, so the lower bound is the discriminating check.
         assert!(
             deck.current_frame() <= 10_000,

@@ -8,7 +8,7 @@
 use crossbeam_channel::Sender;
 use std::sync::Arc;
 
-use timestretch::engine::EngineProfile;
+use super::EngineProfile;
 
 use super::PitchShiftEngine;
 use crate::deck::{LoopRange, LoopRangeCell, LoopSource};
@@ -79,13 +79,8 @@ impl Flow {
             state: FlowState::Preparing,
             start_frame,
             end_frame,
-            pitchshift: PitchShiftEngine::with_profile(
-                wrapped,
-                ratio,
-                profile,
-                Arc::clone(&loop_cell),
-            )
-            .expect("timestretch engine config is statically valid"),
+            pitchshift: PitchShiftEngine::with_profile(wrapped, ratio, profile)
+                .expect("stretch engine config is statically valid"),
             ready_tx: Some(ready_tx),
             loop_cell,
         }
@@ -114,8 +109,7 @@ impl Flow {
     /// Repositions the playhead and settles there — the path every flow switch goes through
     /// (jump, beatjump, loop exit).
     ///
-    /// Delegates to `prepare_jump` (the timestretch engine always needs its seek protocol for
-    /// correctness) and then **drains the warm-start priming here, discarded**: the switch's very
+    /// Delegates to `prepare_jump` (a reposition is a hard seek for the new engine) and then **drains the warm-start priming here, discarded**: the switch's very
     /// first block is already converged audio. A breath between two flows would read as a gap in
     /// the mix, and every transition this deck makes is required to be seamless.
     pub fn reset_to(&mut self, target_frame: u64) {
@@ -129,20 +123,13 @@ impl Flow {
     }
 
     /// Rebuilds the engine with a different profile, preserving position, ratio and every stream.
-    pub fn set_profile(&mut self, profile: timestretch::engine::EngineProfile) {
+    pub fn set_profile(&mut self, profile: EngineProfile) {
         let sources = self.pitchshift.sources_ref();
         let fallback = sources.clone();
         let ratio = self.pitchshift.ratio();
         let position = self.pitchshift.current_frame();
-        self.pitchshift = PitchShiftEngine::with_profile(
-            sources,
-            ratio,
-            profile,
-            Arc::clone(&self.loop_cell),
-        )
-        .unwrap_or_else(|_| {
-            PitchShiftEngine::new(fallback, ratio, Arc::clone(&self.loop_cell))
-        });
+        self.pitchshift = PitchShiftEngine::with_profile(sources, ratio, profile)
+            .unwrap_or_else(|_| PitchShiftEngine::new(fallback, ratio));
         self.pitchshift.prepare_jump(position);
     }
 

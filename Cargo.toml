@@ -9,6 +9,7 @@ members = [
     "crates/hypermixx-midi",
     "crates/hypermixx-cli",
 ]
+exclude = ["vendor/signalsmith-stretch"]
 
 # Hypermixx needs one change to `charon-audio` that upstream 0.1.2 does not have: a CUDA
 # execution provider alongside its CPU/CoreML ones. It lives in our fork,

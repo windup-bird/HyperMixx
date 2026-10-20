@@ -41,7 +41,7 @@ pub const PLL_LIMIT: f64 = 0.05;
 /// which reads as "not responsive" no matter how short the bend is. ±30 % is a wheel-sized bend and
 /// still well inside [`MIN_RATE`]/[`MAX_RATE`], so a bend can never push playback out of range.
 pub const NUDGE_LIMIT: f64 = 0.30;
-/// Engine tempo bounds, mirroring timestretch's `EngineConfig` clamp.
+/// Engine tempo bounds, mirroring the stretch backend's clamp.
 pub const MIN_RATE: f64 = 0.25;
 pub const MAX_RATE: f64 = 4.0;
 /// Default full-deflection range of the tempo fader (±10%).

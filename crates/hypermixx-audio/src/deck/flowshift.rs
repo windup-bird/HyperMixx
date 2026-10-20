@@ -61,7 +61,7 @@ impl FlowShift {
                                 continue;
                             }
                             // Move (not clone) the prepared flow into the warm map, then announce.
-                            // The timestretch engine handles are not Clone, so the deck receives
+                            // The stretch engine handles are not Clone, so the deck receives
                             // the exact engine instance that was warmed up.
                             if let Ok(mut guard) = thread_warm.lock() {
                                 flow.mark_ready();

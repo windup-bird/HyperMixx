@@ -279,11 +279,11 @@ pub enum CueOp {
 /// The keylock profile a deck runs: whether the time-stretch corrects pitch while the tempo moves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeylockMode {
-    /// Pure varispeed: pitch follows tempo (timestretch `Tape`).
+    /// Pure varispeed: pitch follows tempo (Tape backend).
     Off,
-    /// Keylock through the DJ range (timestretch `Keylock`).
+    /// Keylock through the DJ range (Signalsmith 2048/512).
     On,
-    /// Full-spectrum keylock across the whole tempo range (timestretch `WideKeylock`).
+    /// Higher-quality keylock (Signalsmith 4096/1024).
     Wide,
 }
 

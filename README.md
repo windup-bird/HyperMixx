@@ -24,7 +24,7 @@ cli ─┬─► audio ───┐
 | `hypermixx-midi` | MIDI 输入：字节解析、TOML 映射表、`Event → Command` 翻译（纯逻辑，可无硬件单测） | core, midir |
 | `hypermixx-cli` | 前端：行 REPL、`--tui` 终端界面、命令解析与补全 | 全部 |
 
-外部依赖：`stratum-dsp`、`timestretch`、`midir`、`charon-audio-cuda`(forked from `charon-audio`)
+外部依赖：`stratum-dsp`、`signalsmith-stretch`(vendored)、`midir`、`charon-audio-cuda`(forked from `charon-audio`)
 
 ## 安装
 
@@ -127,7 +127,7 @@ TUI 内尽量不用启动参数:`--tui` 下按 `F2` 选 MIDI 端口、`F3` 选�
 
 ## Vinyl
 
-目前仅简单实现，`timestretch`目前似乎没法负速度播放。
+目前仅简单实现；负速度仍不支持（scratch 走 Tape 路径）。
 
 ## todo
 

@@ -1,4 +1,4 @@
-//! 引擎忠实度回归:Deck(含 Flow + timestretch 引擎)在 Tape@ratio=1.0 时必须透传,
+//! 引擎忠实度回归:Deck(含 Flow + stretch 引擎)在 Tape@ratio=1.0 时必须透传,
 //! 输出频率 = 输入频率。任何慢放/快放/伸缩都会直接体现为频率偏移。
 //!
 //! 生产默认是 keylock on,所以这里显式切到 Tape —— 测的是零延迟直通路径本身。
