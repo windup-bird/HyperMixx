@@ -454,13 +454,14 @@ impl Deck {
     /// and a stale in point would otherwise engage a loop over a position the DJ left.
     pub fn jump(&mut self, target_frame: u64) {
         self.disarm_loop();
-        // A fresh jump supersedes any pending exit's landing rule: only `loop_exit` opts in, and
-        // only until the switch it belongs to lands (or the next jump takes it over).
         self.pending_exit_resume = false;
         let target = target_frame.min(self.total_frames());
-        self.cued_from = self.virtual_frame();
-        let flow = self.make_flow(target, None);
-        self.flowshift.submit_prepare(flow);
+        // Hard seek in place: no new flow, no warm-up, no `cued_from` compensation.
+        if let Some(flow) = self.flows.get_mut(self.active_index) {
+            flow.set_loop_range(None);
+            flow.reset_to(target);
+        }
+        self.playhead.suppress();
     }
 
     /// Publishes track analysis (beat grid). Safe to call while the deck is playing.
@@ -1056,12 +1057,17 @@ impl Deck {
     /// Exiting onto the slipped `virtual_pos` is kept as the separate **slip loop** feature.
     /// Idempotent: exiting with nothing engaged just cancels an arm.
     fn loop_exit(&mut self) -> Result<(), String> {
+        self.disarm_loop();
         if self.loop_range().is_some() {
-            // Warm around where we'll land: the audible position (mapped through the range).
-            self.jump(self.current_frame());
-            self.pending_exit_resume = true;
-        } else {
-            self.disarm_loop();
+            // Hard exit at the audible position: the stream continues from exactly where it was
+            // heard, with no mapping left. This is the old `pending_exit_resume` landing, without
+            // a flow switch or warm-up.
+            let at = self.current_frame();
+            if let Some(flow) = self.flows.get_mut(self.active_index) {
+                flow.set_loop_range(None);
+                flow.reset_to(at);
+            }
+            self.playhead.suppress();
         }
         Ok(())
     }
