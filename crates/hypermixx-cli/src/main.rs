@@ -121,6 +121,7 @@ fn main() {
         hypermixx_audio::AudioTuning {
             ring_frames: live.audio.ring_frames,
             prefill_frames: live.audio.prefill_frames,
+            keylock: live.keylock,
         },
     ) {
         Ok(pipeline) => pipeline,

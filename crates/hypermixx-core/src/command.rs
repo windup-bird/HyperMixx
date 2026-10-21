@@ -289,14 +289,14 @@ pub enum CueOp {
 }
 
 /// The keylock profile a deck runs: whether the time-stretch corrects pitch while the tempo moves.
+///
+/// The keylock STFT window is a machine setting (`[keylock]` in `live.toml`), not a runtime mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeylockMode {
     /// Pure varispeed: pitch follows tempo (Tape backend).
     Off,
-    /// Keylock through the DJ range (Signalsmith 2048/512).
+    /// Keylock with the configured STFT window (Signalsmith; `[keylock]` in live.toml).
     On,
-    /// Higher-quality keylock (Signalsmith 4096/1024).
-    Wide,
 }
 
 impl KeylockMode {
@@ -305,7 +305,6 @@ impl KeylockMode {
         match token.to_ascii_lowercase().as_str() {
             "off" | "tape" | "false" | "0" => Some(KeylockMode::Off),
             "on" | "keylock" | "true" | "1" => Some(KeylockMode::On),
-            "wide" | "widekeylock" => Some(KeylockMode::Wide),
             _ => None,
         }
     }
@@ -315,7 +314,6 @@ impl KeylockMode {
         match self {
             KeylockMode::Off => "off",
             KeylockMode::On => "on",
-            KeylockMode::Wide => "wide",
         }
     }
 }
@@ -458,7 +456,7 @@ pub enum Command {
         deck_id: DeckId,
         op: StemOp,
     },
-    /// Switches the keylock profile (`off` = tape, `on` = keylock, `wide` = wide keylock).
+    /// Switches the keylock profile (`off` = tape, `on` = the configured keylock window).
     SetKeylock {
         deck_id: DeckId,
         mode: KeylockMode,

@@ -2,7 +2,7 @@
 //!
 //! The command box is always focused, so printable characters are text and every engine action goes
 //! through a typed command. The only keys this layer owns are editing/navigation plus `Tab` to
-//! switch the focused deck. `Ctrl+C` still quits outright.
+//! cycle the command target (deck0 / deck1 / … / browser). `Ctrl+C` still quits outright.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hypermixx_audio::AudioPipeline;
@@ -72,14 +72,14 @@ pub fn handle(app: &mut App, key: KeyEvent, dispatcher: &Dispatcher, pipeline: &
             if popup {
                 app.completion_accept();
             } else {
-                cycle_deck(app, 1);
+                app.cycle_target(1);
             }
         }
         KeyCode::BackTab => {
             if popup {
                 app.completion_move(-1);
             } else {
-                cycle_deck(app, -1);
+                app.cycle_target(-1);
             }
         }
         KeyCode::Up => {
@@ -115,17 +115,6 @@ pub fn handle(app: &mut App, key: KeyEvent, dispatcher: &Dispatcher, pipeline: &
     }
 }
 
-/// Moves the focus between decks; the command box prefix and the deck border follow it.
-fn cycle_deck(app: &mut App, delta: isize) {
-    let decks = app.decks as isize;
-    if decks == 0 {
-        return;
-    }
-    app.focused = (app.focused as isize + delta).rem_euclid(decks) as usize;
-    // The implicit fx chain changed, so slot candidates must be rebuilt.
-    app.refresh_completion();
-}
-
 /// Sends the buffer as a command line and logs the echo, exactly like the REPL prompt.
 fn submit(app: &mut App, dispatcher: &Dispatcher, pipeline: &AudioPipeline) {
     let line = app.command_string();
@@ -135,17 +124,23 @@ fn submit(app: &mut App, dispatcher: &Dispatcher, pipeline: &AudioPipeline) {
         return;
     }
     app.history.push(line.clone());
-    app.push_log(LogLine::info(format!("> {line}")));
+    let prefix = app.target.prefix();
+    app.push_log(LogLine::info(if prefix.is_empty() {
+        format!("> {line}")
+    } else {
+        format!("{prefix}> {line}")
+    }));
     if apply_ui_command(app, &line) {
         return;
     }
+    let deck = app.default_deck();
     let action = command::dispatch(
         &line,
         dispatcher,
         pipeline,
         app.backend,
         app.decks,
-        app.focused as u8,
+        deck as u8,
     );
     match action {
         Action::Continue => {}
@@ -167,7 +162,7 @@ fn apply_ui_command(app: &mut App, line: &str) -> bool {
         return true;
     }
     // A bare `load` (no path) opens the file picker instead of failing on a missing argument.
-    if let Some(deck) = bare_load_deck(line, app.decks, app.focused) {
+    if let Some(deck) = bare_load_deck(line, app.decks, app.default_deck()) {
         app.overlay = Some(Overlay::Files {
             picker: FilePicker::new(None, AUDIO_EXTENSIONS, "load track"),
             purpose: FilePurpose::Load { deck },

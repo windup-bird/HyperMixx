@@ -95,7 +95,7 @@ cargo run -p hypermixx-cli -- [flags]
 [deck] tempo <ratio>        设 tempo 绝对值（1.0 = 原速，0.25..4.0）
 [deck] tempofader <-1..1>   推子位置，tempo = 1 + pos × temporange（MIDI 走这条）
 [deck] temporange <0..1>    推子满量程（缺省 0.1 = ±10%）；只改映射，不动当前 tempo
-[deck] keylock on|off|wide  变调引擎（缺省 on；off = tape 零延迟直通，wide = widekeylock）
+[deck] keylock on|off       变调引擎（缺省 on；off = tape 零延迟直通；窗口见 live.toml 的 [keylock]）
 [deck] key <semitones>      变调（**占位**：只记录并回读，暂不发声）
 [deck] fader <stage> <pos>  电平：`flow`/`deck`/`gain`/`cuesend` 作用在目标 deck，
                             `cross`/`master`/`cue` 是共用控制（忽略目标）

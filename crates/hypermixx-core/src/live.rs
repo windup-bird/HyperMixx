@@ -22,6 +22,16 @@ pub const DEFAULT_PREFILL_FRAMES: usize = 2048;
 pub const MIN_RING_FRAMES: usize = 512;
 /// Largest ring: past this, the latency a user hears is worse than any dropout it prevents.
 pub const MAX_RING_FRAMES: usize = 65_536;
+
+/// Keylock STFT window defaults: 2048/512 at 44.1 kHz is ~46 ms of read-ahead.
+pub const DEFAULT_KEYLOCK_BLOCK: usize = 2048;
+pub const DEFAULT_KEYLOCK_INTERVAL: usize = 512;
+/// Smallest useful keylock FFT window.
+pub const MIN_KEYLOCK_BLOCK: usize = 256;
+/// Largest keylock FFT window: more fidelity, but ~186 ms of read-ahead at 44.1 kHz.
+pub const MAX_KEYLOCK_BLOCK: usize = 8192;
+/// Smallest STFT hop. Must stay below half the block.
+pub const MIN_KEYLOCK_INTERVAL: usize = 32;
 /// The most threads a config may ask for. Past any real machine's core count, so a typo cannot reach
 /// the runtime.
 pub const MAX_THREADS: usize = 256;
@@ -49,6 +59,28 @@ impl Default for AudioSettings {
             sample_rate: DEFAULT_SAMPLE_RATE,
             ring_frames: DEFAULT_RING_FRAMES,
             prefill_frames: DEFAULT_PREFILL_FRAMES,
+        }
+    }
+}
+
+/// The keylock engine's STFT window, a machine/latency tradeoff rather than a per-track choice.
+///
+/// A bigger block resolves bass and dense material better, at the cost of more read-ahead before
+/// the engine can produce sound. The interval is the hop: `block / 4` is the DJ preset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct KeylockSettings {
+    /// FFT block length, in frames. Clamped to a power of two in `256 ..= 8192`.
+    pub block: usize,
+    /// STFT hop, in frames. Clamped to a power of two in `32 ..= block / 2`.
+    pub interval: usize,
+}
+
+impl Default for KeylockSettings {
+    fn default() -> Self {
+        Self {
+            block: DEFAULT_KEYLOCK_BLOCK,
+            interval: DEFAULT_KEYLOCK_INTERVAL,
         }
     }
 }
@@ -102,6 +134,8 @@ impl Default for StemSettings {
 #[serde(deny_unknown_fields, default)]
 pub struct LiveConfig {
     pub audio: AudioSettings,
+    /// Keylock STFT window (read at startup; changing it requires a restart).
+    pub keylock: KeylockSettings,
     pub stems: StemSettings,
 }
 
@@ -117,6 +151,19 @@ impl LiveConfig {
         }
         audio.ring_frames = audio.ring_frames.clamp(MIN_RING_FRAMES, MAX_RING_FRAMES);
         audio.prefill_frames = audio.prefill_frames.min(audio.ring_frames / 2);
+        let keylock = &mut self.keylock;
+        // Signalsmith's FFT needs a power-of-two block, and the hop cannot exceed half of it.
+        keylock.block = keylock
+            .block
+            .clamp(MIN_KEYLOCK_BLOCK, MAX_KEYLOCK_BLOCK)
+            .next_power_of_two()
+            .min(MAX_KEYLOCK_BLOCK);
+        let max_interval = keylock.block / 2;
+        keylock.interval = keylock
+            .interval
+            .clamp(MIN_KEYLOCK_INTERVAL, max_interval)
+            .next_power_of_two()
+            .min(max_interval);
         let stems = &mut self.stems;
         if !stems.overlap.is_finite() {
             stems.overlap = StemSettings::default().overlap;
@@ -141,6 +188,13 @@ impl LiveConfig {
             format!(
                 "audio  sample_rate {}Hz  ring {} frames  prefill {} frames",
                 self.audio.sample_rate, self.audio.ring_frames, self.audio.prefill_frames
+            ),
+            format!(
+                "keylock block {} interval {} frames (~{:.0} ms read-ahead at {}Hz)",
+                self.keylock.block,
+                self.keylock.interval,
+                self.keylock.block as f64 * 1000.0 / f64::from(self.audio.sample_rate),
+                self.audio.sample_rate
             ),
             format!(
                 "stems  model {}  provider {}  overlap {:.2}  shifts {}  threads {}  memory {}  {}",
@@ -178,9 +232,12 @@ mod tests {
         let live = LiveConfig::default();
         assert_eq!(live.audio.sample_rate, DEFAULT_SAMPLE_RATE);
         assert_eq!(live.audio.ring_frames, DEFAULT_RING_FRAMES);
+        assert_eq!(live.keylock, KeylockSettings::default());
         assert_eq!(live.stems.provider, "cpu", "a machine without a GPU never needs a flag");
 
-        assert_eq!(live.report().len(), 2);        assert!(live.report()[0].contains("44100Hz"));
+        assert_eq!(live.report().len(), 3);
+        assert!(live.report()[0].contains("44100Hz"));
+        assert!(live.report()[1].contains("keylock block 2048 interval 512"));
     }
 
     #[test]
@@ -190,6 +247,10 @@ mod tests {
                 sample_rate: 7,
                 ring_frames: 99,
                 prefill_frames: 999_999,
+            },
+            keylock: KeylockSettings {
+                block: 3_000,
+                interval: 5_000,
             },
             stems: StemSettings {
                 overlap: 5.0,
@@ -232,6 +293,9 @@ mod tests {
         // A negative chunk is nonsense, and the safe reading of nonsense is "whole track" rather
         // than "a hundred tiny chunks".
         assert_eq!(live.stems.model, "htdemucs");
+        assert!(live.keylock.block.is_power_of_two());
+        assert!(live.keylock.interval.is_power_of_two());
+        assert!(live.keylock.interval <= live.keylock.block / 2);
         // A huge ring is clamped down as well, and a NaN never survives.
         let live = LiveConfig {
             audio: AudioSettings {
@@ -242,6 +306,7 @@ mod tests {
                 overlap: f32::NAN,
                 ..Default::default()
             },
+            ..Default::default()
         }
         .sanitised();
         assert_eq!(live.audio.ring_frames, MAX_RING_FRAMES);

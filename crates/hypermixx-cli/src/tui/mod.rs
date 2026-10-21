@@ -6,10 +6,12 @@
 //! audio thread.
 
 pub mod app;
+pub mod browser;
 pub mod completer;
 pub mod guide;
 pub mod input;
 pub mod picker;
+pub mod text;
 pub mod view;
 pub mod waveform_view;
 
@@ -51,10 +53,13 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     let dispatcher = Dispatcher::new(command_tx.clone(), notice_tx).tap_events(event_tx);
     dispatcher.with_topology(topology);
     dispatcher.with_profile(profile);
+    let ring_frames = live.audio.ring_frames;
     dispatcher.with_live(live, live_source);
     // Prime every chain's slot list so `fx remove <name>` works from the first command.
     dispatcher.prime(decks, pipeline.response_rx());
     let mut app = App::new(decks, backend, notice_rx, event_rx, dispatcher.slots());
+    // The header reports the configured ring, not the compile-time default.
+    app.ring_frames = ring_frames;
     app.midi_map = (!midi_map.is_empty()).then_some(midi_map);
     if let Some(port) = midi_port {
         app.midi_port = Some(port);

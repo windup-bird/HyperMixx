@@ -17,7 +17,8 @@ use std::sync::Arc;
 use crate::flow::EngineProfile;
 use arc_swap::ArcSwapOption;
 use hypermixx_core::{
-    CueOp, Key, KeylockMode, LoopEditOp, LoopOp, LoopQuantum, Source, TrackAnalysis, VinylOp,
+    CueOp, Key, KeylockMode, KeylockSettings, LoopEditOp, LoopOp, LoopQuantum, Source,
+    TrackAnalysis, VinylOp,
 };
 
 use super::jump::{resolve, Seek};
@@ -99,6 +100,9 @@ pub struct Deck {
     /// then gets no group tempo and no phase correction — but still a ticking nudge.
     sync: Option<SyncCtx>,
     profile: EngineProfile,
+    /// The keylock window to use when the profile is (or returns to) Keylock. Stored separately so
+    /// switching to Tape and back does not lose the live.toml setting.
+    keylock: KeylockSettings,
     /// The cue point in source frames; `cue play`/`cue back` land here. Defaults to the loaded
     /// origin (0), reset whenever a fresh deck is built for a load.
     cue_frame: u64,
@@ -150,7 +154,8 @@ impl Deck {
         // Stream 0 is the track here: this constructor is "load these streams", and a caller with
         // four already-separated stems is describing a deck whose mix is unavailable.
         let original = Arc::clone(&sources[0]);
-        let playing = Playing::with_profile(sources.clone(), 0, 1.0, EngineProfile::Keylock)
+        let keylock = KeylockSettings::default();
+        let playing = Playing::with_profile(sources.clone(), 0, 1.0, EngineProfile::Keylock(keylock))
             .expect("stretch engine config is statically valid");
         Self {
             original,
@@ -165,7 +170,8 @@ impl Deck {
             playhead: Playhead::new(),
             applied_rate: 1.0,
             sync: None,
-            profile: EngineProfile::Keylock,
+            profile: EngineProfile::Keylock(keylock),
+            keylock,
             cue_frame: 0,
             cue_held: false,
             vinyl_held: false,
@@ -393,17 +399,33 @@ impl Deck {
     pub fn keylock_mode(&self) -> KeylockMode {
         match self.profile {
             EngineProfile::Tape => KeylockMode::Off,
-            EngineProfile::Keylock => KeylockMode::On,
-            EngineProfile::WideKeylock => KeylockMode::Wide,
+            EngineProfile::Keylock(_) => KeylockMode::On,
         }
     }
 
-    /// Switches the keylock profile (the engine's `Tape`/`Keylock`/`WideKeylock` chain).
+    /// The STFT window keylock will use when enabled.
+    pub fn keylock_window(&self) -> KeylockSettings {
+        self.keylock
+    }
+
+    /// Applies the machine's keylock window (from `live.toml`). If keylock is already on, the
+    /// engine is rebuilt at the current position and swapped in at the next block.
+    pub fn set_keylock_window(&mut self, window: KeylockSettings) {
+        if self.keylock == window {
+            return;
+        }
+        self.keylock = window;
+        if matches!(self.profile, EngineProfile::Keylock(_)) {
+            self.set_profile(EngineProfile::Keylock(window));
+        }
+    }
+
+    /// Switches the keylock profile (the engine's `Tape` / `Keylock` chain). The window itself is
+    /// a live setting, not a runtime mode.
     pub fn set_keylock_mode(&mut self, mode: KeylockMode) {
         let profile = match mode {
             KeylockMode::Off => EngineProfile::Tape,
-            KeylockMode::On => EngineProfile::Keylock,
-            KeylockMode::Wide => EngineProfile::WideKeylock,
+            KeylockMode::On => EngineProfile::Keylock(self.keylock),
         };
         self.set_profile(profile);
     }
@@ -690,6 +712,9 @@ impl Deck {
     /// Rebuilds the engine with a different profile. The new voice is prepared at the current
     /// position and swapped in on the next block (hard switch, no fade).
     pub fn set_profile(&mut self, profile: EngineProfile) {
+        if let EngineProfile::Keylock(window) = profile {
+            self.keylock = window;
+        }
         self.profile = profile;
         let at = self.playing.virtual_frame();
         let range = if self.shadow.as_ref().is_some_and(|shadow| shadow.slip) {
@@ -1432,10 +1457,27 @@ mod tests {
             "a fresh deck cues at the loaded origin"
         );
         assert_eq!(deck.key_shift(), 0);
-        deck.set_keylock_mode(KeylockMode::Wide);
-        assert_eq!(deck.keylock_mode(), KeylockMode::Wide);
+        deck.set_keylock_mode(KeylockMode::Off);
+        assert_eq!(deck.keylock_mode(), KeylockMode::Off);
+        deck.set_keylock_mode(KeylockMode::On);
+        assert_eq!(deck.keylock_mode(), KeylockMode::On);
         deck.set_key_shift(2);
         assert_eq!(deck.key_shift(), 2);
+    }
+
+    #[test]
+    fn the_configured_keylock_window_survives_tape_and_reaches_the_deck() {
+        let mut deck = Deck::new(pool(10_000));
+        let window = KeylockSettings {
+            block: 4096,
+            interval: 1024,
+        };
+        deck.set_keylock_window(window);
+        assert_eq!(deck.keylock_window(), window);
+        deck.set_keylock_mode(KeylockMode::Off);
+        deck.set_keylock_mode(KeylockMode::On);
+        assert_eq!(deck.keylock_window(), window, "tape must not forget the window");
+        assert_eq!(deck.keylock_mode(), KeylockMode::On);
     }
 
     #[test]
@@ -1770,7 +1812,10 @@ mod tests {
         // Both profiles, because that is the whole question for scratch quality: `Keylock` runs a
         // band-split corrector with ~12.7 ms of pipeline delay and a warm-start preroll on *every*
         // seek, `Tape` is bare varispeed (a sinc resampler) with no preroll at all.
-        for profile in [EngineProfile::Keylock, EngineProfile::Tape] {
+        for profile in [
+            EngineProfile::Keylock(KeylockSettings::default()),
+            EngineProfile::Tape,
+        ] {
             let mut deck = tape_deck(pool(1_000_000));
             deck.set_keylock_mode(match profile {
                 EngineProfile::Tape => KeylockMode::Off,

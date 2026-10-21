@@ -317,7 +317,7 @@ pub fn help_text(decks: usize) -> String {
   [deck] fader <stage> <pos>   levels: flow|deck|gain|cuesend on a deck, cross|master|cue shared
   [deck] nudge <delta> <sec>   temporary rate bend to hand-align phase (0.04 = 4% fast)
   [deck] nudge off             release the bend (it ramps back, no click)
-  [deck] keylock on|off|wide   keylock profile (default: on)
+  [deck] keylock on|off        keylock profile (default: on; window in live.toml)
   [deck] key <semitones>       pitch shift (placeholder: stored, not yet audible)
   [deck] loop in | out         manual loop: arm at the beat, engage at the quantized out
   [deck] loop <beats>          beat loop; while looping it re-times out to in+n (halve/double)
@@ -352,7 +352,8 @@ pub fn help_text(decks: usize) -> String {
 In the TUI: `load` with no path opens a file picker; F2 picks a MIDI port and F3 the map file.
 
 A leading `deck0` / `0` selects a deck, `master` the summed output. Without one the command
-follows the focused deck (TUI: `Tab` switches it).
+follows the focused deck (TUI: `Tab` cycles the command target deck0 → deck1 → browser; the
+browser has no command prefix yet).
 startup flags: --config <file> (custom topology), --profile <name|file> (which files to use),
                --print-config (reference TOML), --live <file> (engine rate, ring, stem defaults),
                --backend auto|stratum|timestretch, --tui (terminal UI),

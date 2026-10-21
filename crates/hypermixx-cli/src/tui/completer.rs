@@ -233,7 +233,7 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
         }
         "keylock" => {
             if rest.len() == 1 {
-                pairs(&[("on", ""), ("off", ""), ("wide", "")], partial)
+                pairs(&[("on", ""), ("off", "")], partial)
             } else {
                 Vec::new()
             }
@@ -545,7 +545,7 @@ mod tests {
         let fixture = Fixture::new();
         assert_eq!(
             fixture.complete("keylock ", 8),
-            vec!["on", "off", "wide"]
+            vec!["on", "off"]
         );
     }
 

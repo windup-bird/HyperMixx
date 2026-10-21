@@ -22,7 +22,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
-use hypermixx_core::{Command, CommandResponse, DeckId, DeckState, Shared};
+use hypermixx_core::{Command, CommandResponse, DeckId, DeckState, KeylockSettings, Shared};
 
 use crate::deck::Deck;
 use crate::mixer::config::{MixerConfig, MixerError};
@@ -38,6 +38,8 @@ pub struct AudioTuning {
     pub ring_frames: usize,
     /// Frames of silence pushed before each stream starts.
     pub prefill_frames: usize,
+    /// Keylock STFT window, read from `live.toml` at startup.
+    pub keylock: KeylockSettings,
 }
 
 impl From<AudioTuning> for crate::mixer::OutputTuning {
@@ -104,7 +106,8 @@ pub struct Meters {
     pub master_peak: f32,
     /// Peak of the last cue block, linear.
     pub cue_peak: f32,
-    /// Producer-side samples dropped because an output ring was full, summed over all outputs.
+    /// Output writes whose block did not fully fit in the ring, summed over all outputs. This
+    /// counts overrun events, not the samples inside them.
     pub overruns: u64,
 }
 
@@ -170,13 +173,14 @@ impl AudioPipeline {
         let producer = std::thread::Builder::new()
             .name("hypermixx-producer".into())
             .spawn(move || {
-                let mixer = match Mixer::with_tuning(thread_cfg, sample_rate, tuning.into()) {
+                let mut mixer = match Mixer::with_tuning(thread_cfg, sample_rate, tuning.into()) {
                     Ok(mixer) => mixer,
                     Err(err) => {
                         let _ = boot_tx.send(Err(err.into()));
                         return;
                     }
                 };
+                mixer.set_keylock_window(tuning.keylock);
                 let _ = boot_tx.send(Ok(()));
                 Self::producer_loop(mixer, SyncGroup::default(), cmd_rx, query_rx, resp_tx, sample_rate);
             })
@@ -389,6 +393,7 @@ fn route(
             let range = mixer
                 .deck(deck_id as usize)
                 .map(crate::deck::Deck::tempo_range);
+            let keylock = mixer.keylock_window();
             let Some(channel) = mixer.channel_mut(deck_id as usize) else {
                 return Some(error(unknown_deck(deck_id, mixer.channel_count())));
             };
@@ -397,6 +402,7 @@ fn route(
             // reloading a track should not reset the mixer a user is standing at.
             // `set_analysis` takes `&self` (the grid swaps in lock-free), so no `mut` needed.
             let mut deck = Deck::new(source);
+            deck.set_keylock_window(keylock);
             if let Some(range) = range {
                 deck.set_tempo_range(range);
             }

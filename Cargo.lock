@@ -1004,6 +1004,7 @@ dependencies = [
  "hypermixx-stems",
  "ratatui",
  "toml",
+ "unicode-width",
 ]
 
 [[package]]

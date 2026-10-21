@@ -1,9 +1,10 @@
 //! Line parsing and dispatch, shared by the REPL and the TUI.
 //!
-//! Syntax is target-first: the target is the focused deck in the TUI (shown as the command box
-//! prefix), and can be overridden per line with `deck0` / `0` / `master`. So in the TUI `play`
-//! means "play the focused deck" while `deck1 play` or `master fx list` address something else.
-//! The engine's [`Command`] protocol is unchanged — this is purely the front-end's grammar.
+//! Syntax is target-first: the target is the TUI's selected deck (its prefix is shown on the
+//! command panel's divider line), and can be overridden per line with `deck0` / `0` / `master`. So
+//! in the TUI `play` means "play the selected deck" while `deck1 play` or `master fx list` address
+//! something else. The engine's [`Command`] protocol is unchanged — this is purely the front-end's
+//! grammar.
 //!
 //! `load` decodes on a worker thread and hands the pipeline a ready source; `analyse` runs the
 //! library analyser and publishes a compiled grid. Nothing here blocks the audio path.
@@ -383,7 +384,7 @@ pub fn dispatch(
         "keylock" => with_deck(target, "keylock", |deck_id| {
             match words.next().and_then(KeylockMode::parse) {
                 Some(mode) => send(command_tx, Command::SetKeylock { deck_id, mode }),
-                None => Action::Failed("usage: [deck] keylock on|off|wide".into()),
+                None => Action::Failed("usage: [deck] keylock on|off".into()),
             }
         }),
         "key" => with_deck(target, "key", |deck_id| {
@@ -709,15 +710,16 @@ fn live_command<'a>(
                 .unwrap_or_else(|| dispatcher.live_path());
             match read_live_config(&path) {
                 Ok((live, notes)) => {
-                    let restart = live.audio != dispatcher.live().audio;
+                    let previous = dispatcher.live();
+                    let restart = live.audio != previous.audio || live.keylock != previous.keylock;
                     let mut text = live_report(&live, Some(&path));
                     for note in notes {
                         text.push_str(&format!("\n  {note}"));
                     }
                     if restart {
                         text.push_str(
-                            "\n  audio settings changed: they apply on the next launch \
-                             (the engine's clock and rings are set when it starts)",
+                            "\n  audio/keylock settings changed: they apply on the next launch \
+                             (the engine's clock, rings and keylock window are set when it starts)",
                         );
                     }
                     dispatcher.with_live(live, Some(path));

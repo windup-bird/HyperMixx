@@ -124,7 +124,8 @@ crates/
 - `Play` / `Pause` / `TogglePlay` / `Cue { deck_id, op }` / `Jump { target_frame }` / `BeatJump { beats }`;
   `CueOp = Play | Back | Set | Smart`(`Smart` 由 deck 自己的 `is_playing()` 决定,前端不猜)
 - `SetTempo` / `SetTempoFader` / `SetTempoRange` / `SetKeylock { mode: KeylockMode }` / `SetKey { semitones }` / `SetAnalysis` —
-  分析结果从这里进入 deck,**没有 `Analyse` 命令**;`KeylockMode = Off | On | Wide`(默认 On),
+  分析结果从这里进入 deck,**没有 `Analyse` 命令**;`KeylockMode = Off | On`(默认 On),
+  STFT 窗口是 live.toml 的 `[keylock]` 设置(见 `KeylockSettings`)
   `SetKey` 是占位(streaming 引擎无变调轴)。**推子是控制器输入**:`SetTempoFader{position}`
   由 deck 按 `1 + position×tempo_range` 算 rate,再走 `SyncGroup::set_tempo` 的三分支
 - sync 族:`Sync { deck_id, op }`,op = `Tempo` / `Phase{mode,t}` / `TempoLock` /
@@ -135,7 +136,7 @@ crates/
   只动 `nudgerate`,结束时 `tempo` 原封不动(CLI 秒数必填,MIDI `seconds=None` 为按住)
 - `DeckState` 除 transport 外还报 `bpm` / `bpm_at_frame` / `tempo` / `tempo_fader` / `tempo_range` / `nudgerate` / `playing_rate` / `lock` / `align` /
   `nudge` / `sync_leader` / `sync_mode` / `group_bpm` / `cue_frame` / `keylock` / `key_shift`
-  —— TUI 徽标与 `sync_phase.sh` 的判据都读它(deck 头行的 `keylock on|off|wide` 直接读 `DeckState`);
+  —— TUI 徽标与 `sync_phase.sh` 的判据都读它(deck 信息行的 `keylock on|off` 直接读 `DeckState`);
   前端的“当前 BPM” = `bpm_at_frame × tempo`(`response::bpm_label`,不含 nudgerate)
 - `GetState` / `GetAllStates`(同块原子快照)/ `Quit`
 - FX 族:`AddFx { chain, kind }` / `RemoveFx { chain, index }` / `SetFxEnabled` /
@@ -338,7 +339,7 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   `shadow` 是 loop/roll/slip 的第二声部；切换都是块边界硬切，无 crossfade。
 - `Direction::Reverse` — slip roll 用：反向读 loop range 的 PCM，Signalsmith 仍正向处理。
 - `PitchShiftEngine` — 两套后端:`Tape`(零延迟 varispeed) / Signalsmith Stretch
-  (`Keylock` = 2048/512，`WideKeylock` = 4096/1024)。一个 2N 通道实例承载全部 stem；
+  (`Keylock` 的窗口来自 live.toml `[keylock]`，默认 2048/512)。一个 2N 通道实例承载全部 stem；
   `prepare_jump` 用 `outputSeek` 对齐，loop wrap 只是喂入流内的 splice，引擎不复位
 - **播放头是曲目帧,不是输出帧**:`output_frame_exact += capacity × ratio`(f64 累加,
   逐块取整不累积漂移)。数输出帧会让位置与 tempo 脱钩——波形、beatjump 的 `cued_from`
@@ -370,7 +371,7 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 会话命令(target-first:行首 `deck0`/`0`/`master` 选目标,缺省用焦点 deck):
 - `load <path> [bpm]` — 后台解码;给 bpm 则建常网格跳过分析
 - `analyse` — 后台跑 `library::analyser::analyze`,完成后 `SetAnalysis`
-- `play / cue [play|back|set] / jump <frame> / beatjump <beats> / tempo / tempofader / temporange / keylock on|off|wide / key / state / quit`
+- `play / cue [play|back|set] / jump <frame> / beatjump <beats> / tempo / tempofader / temporange / keylock on|off / key / state / quit`
 - `loop` 族:`loop in|out|<n>|exit|cancel|halve|double|edit <len|move|in|out> <beats>|quantum <q>`
   (手动 in/out 带量化与 looper 预喂,`<n>` 循环中 = 只调 out,halve/double = 当前长度
   ÷2/×2、域 1/32..64 拍,循环中编辑原地原子 store,exit 无缝续播越过 out)
@@ -379,10 +380,15 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 - `sync` 族:`sync tempo | phase <instant|linear [秒]|pid> | tempolock |
   phaselock <mode> [秒] | set-leader | unlock`;`nudge <delta> <秒> | nudge off`。
   解析错误(`linear 0`、非数字秒数)前端直接 `Failed`;引擎拒绝(无网格、反向同步)后到为 `Error`
-- TUI deck 头行多一枚黄色徽标:`sync phaselock 122.0 BPM ← deck0 phase pid locked`,
+- TUI deck 信息行多一枚黄色徽标:`sync phaselock 122.0 BPM ← deck0 phase pid locked`,
   与 CLI 的 `deck_line` 共用 `response::sync_badge`(所以测它就同时覆盖两边)
 - `midi ports` — 列出 MIDI 输入端口(`--midi` 在启动时打开并把映射翻译成 `Command`,
   接线在 `src/midi.rs`:translator 线程 + 1ms 合并 flush + `ListFx` 名字解析)
+- TUI 布局(`src/tui/view.rs`):顶部一行全局 header;deck 区合计不超过屏幕一半,每个 deck
+  只保留一行状态(文件名在边框标题,右侧是 `已播放 / -剩余`)+ 波形;底部
+  `browser : command = 2 : 1`,browser 内部再按 1 : 3 分栏(目录/歌单 | 曲目列表)。command
+  上半是响应日志,下半输入带的顶线嵌入 `deck0 / deck1 / browser` 目标(`Tab` 循环;browser
+  目前没有 CLI 前缀),目标文字与面板标题 `command` 左对齐
 - TUI 内选择器(`src/tui/picker.rs`,两个前端共用):`--tui` 下 `F2` 选 MIDI 端口、`F3` 选映射
   文件、`load` 不带路径弹文件浏览器;`Load` 完成后 `App::connect_midi` 连上,`--midi/--midi-map`
   仅是免选择的快捷方式

@@ -34,7 +34,7 @@ pub use config::{
 pub use hypermixx_core::{OutputRole, OutputState, OutputStatus};
 pub use output::{Output, OutputError, OutputId, OutputTuning, Outputs};
 
-use hypermixx_core::{CommandResponse, FxChainId, FxSlotStatus, StemOp, StemSet};
+use hypermixx_core::{CommandResponse, FxChainId, FxSlotStatus, KeylockSettings, StemOp, StemSet};
 
 use channel::Channel as ChannelInner;
 use crate::deck::Deck;
@@ -89,6 +89,8 @@ pub struct Mixer {
     sample_rate: u32,
     /// Buffer sizes, kept so a reload/refresh opens the same kind of ring.
     tuning: OutputTuning,
+    /// Keylock STFT window from the live config; re-applied to every freshly loaded deck.
+    keylock: KeylockSettings,
 }
 
 impl Mixer {
@@ -162,6 +164,7 @@ impl Mixer {
             config: cfg,
             sample_rate,
             tuning,
+            keylock: KeylockSettings::default(),
         })
     }
 
@@ -243,6 +246,20 @@ impl Mixer {
         // Destinations are the part that most often *needs* a reload (a device that appeared), so
         // they are rebuilt last and reported.
         Ok(self.refresh_outputs())
+    }
+
+    /// The keylock window every deck uses (from `live.toml`).
+    pub fn keylock_window(&self) -> KeylockSettings {
+        self.keylock
+    }
+
+    /// Applies the live keylock window to the current decks and remembers it for future loads.
+    /// Running decks rebuild their keylock engine at the current position (a block-boundary swap).
+    pub fn set_keylock_window(&mut self, window: KeylockSettings) {
+        self.keylock = window;
+        for channel in &mut self.channels {
+            channel.deck_mut().set_keylock_window(window);
+        }
     }
 
     /// The rate the engine renders at (a destination refusing it is what `OutputState::Disabled`

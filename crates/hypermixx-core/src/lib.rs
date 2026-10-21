@@ -23,7 +23,7 @@ pub use command::{
 };
 pub use deck::{DeckId, DeckState};
 pub use key::{Key, KeyFormat, KeyMode};
-pub use live::{AudioSettings, LiveConfig, StemSettings};
+pub use live::{AudioSettings, KeylockSettings, LiveConfig, StemSettings};
 pub use output::{OutputOp, OutputRole, OutputState, OutputStatus};
 pub use source::{Shared, Source};
 pub use stem::{Stem, StemOp, StemPreset, StemSet, StemStatus};

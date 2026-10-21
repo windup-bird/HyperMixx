@@ -5,6 +5,7 @@
 //! input mapping testable without a terminal.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,7 @@ use hypermixx_core::{Backend, BeatGrid, Command, CommandResponse, DeckState, Key
 use crate::command::{Slots, UiEvent};
 use crate::notices::NoticeTx;
 use crate::response::{self, LogLine};
+use crate::tui::browser::Browser;
 use crate::tui::completer::{self, Completion, Ctx};
 use crate::tui::picker::{FilePicker, PortList};
 
@@ -28,6 +30,42 @@ pub const DEFAULT_FRAMES_PER_DOT: f64 = 1_024.0;
 const LOG_CAP: usize = 500;
 /// Candidates shown in the completion popup.
 pub const COMPLETION_ROWS: usize = 8;
+
+/// Which prefix the command line currently speaks for.
+///
+/// `Browser` has no CLI prefix yet, so a submitted line falls back to the last focused deck; when
+/// the browser grows its own command family it will route there instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Deck(usize),
+    Browser,
+}
+
+impl Target {
+    /// The prefix shown on the command rule: `deck0`, `deck1`, … or empty for the browser.
+    pub fn prefix(self) -> String {
+        match self {
+            Self::Deck(index) => format!("deck{index}"),
+            Self::Browser => String::new(),
+        }
+    }
+
+    /// Full tab label used by the command rule.
+    pub fn label(self) -> String {
+        match self {
+            Self::Deck(index) => format!("deck{index}"),
+            Self::Browser => "browser".to_owned(),
+        }
+    }
+
+    /// Short tab label for a narrow command panel.
+    pub fn compact_label(self) -> String {
+        match self {
+            Self::Deck(index) => format!("d{index}"),
+            Self::Browser => "br".to_owned(),
+        }
+    }
+}
 
 /// The open completion popup and which row is highlighted.
 pub struct CompletionState {
@@ -60,8 +98,14 @@ pub struct App {
     pub version: &'static str,
     pub backend: Backend,
     pub sample_rate: u32,
+    /// Output ring capacity in frames, from the live config (the sliders can change it).
+    pub ring_frames: usize,
     pub decks: usize,
     pub focused: usize,
+    /// The command-line target: one deck, or the (still prefix-less) browser.
+    pub target: Target,
+    /// The browser pane: layout/state only until folder scanning lands.
+    pub browser: Browser,
 
     pub states: Vec<DeckState>,
     /// File name per deck (from the load tap), for the deck header.
@@ -120,12 +164,16 @@ impl App {
     ) -> Self {
         let decks = decks.max(1);
         let (waveform_tx, waveform_rx) = crossbeam_channel::unbounded();
+        let browser = Browser::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         Self {
             version: crate::VERSION,
             backend,
             sample_rate: hypermixx_core::SAMPLE_RATE,
+            ring_frames: hypermixx_audio::OUTPUT_RING_CAPACITY,
             decks,
             focused: 0,
+            target: Target::Deck(0),
+            browser,
             states: (0..decks)
                 .map(|index| DeckState {
                     deck_id: index as u8,
@@ -344,6 +392,35 @@ impl App {
         changed
     }
 
+    /// The deck a command with no explicit target acts on. The browser has no commands of its
+    /// own yet, so it keeps pointing at the last focused deck instead of silently disabling input.
+    pub fn default_deck(&self) -> usize {
+        match self.target {
+            Target::Deck(index) => index,
+            Target::Browser => self.focused,
+        }
+    }
+
+    /// Cycles the command target: deck0 → deck1 → … → browser → deck0. The browser has no CLI
+    /// prefix yet, but it is already a stop on the ring.
+    pub fn cycle_target(&mut self, delta: isize) {
+        let slots = self.decks as isize + 1;
+        let current = match self.target {
+            Target::Deck(index) => index as isize,
+            Target::Browser => self.decks as isize,
+        };
+        let next = (current + delta).rem_euclid(slots) as usize;
+        self.target = if next == self.decks {
+            Target::Browser
+        } else {
+            Target::Deck(next)
+        };
+        if let Target::Deck(index) = self.target {
+            self.focused = index;
+        }
+        self.refresh_completion();
+    }
+
     pub fn zoom_in(&mut self) {
         self.frames_per_dot = (self.frames_per_dot / 2.0).max(MIN_FRAMES_PER_DOT);
     }
@@ -424,7 +501,7 @@ impl App {
         let slots = self.fx_slots.snapshot();
         let ctx = Ctx {
             decks: self.decks,
-            chain: format!("deck{}", self.focused),
+            chain: format!("deck{}", self.default_deck()),
             slots: &slots,
         };
         self.completion = completer::complete(&self.command, self.cursor, &ctx).map(|completion| {

@@ -314,10 +314,11 @@ impl Output {
         self.free_samples().map(|free| free / self.device_channels.max(1))
     }
 
-    /// Producer-side overruns since construction: samples the ring could not take and were
-    /// dropped. Callback-side underruns (silence padding) are *not* counted anywhere today — a
-    /// padded gap and a genuinely silent block look identical from the consumer side, so this
-    /// counter is the honest half of the story.
+    /// Producer-side overruns since construction: writes whose whole block could not fit in the
+    /// ring. Each event is counted once, regardless of how many samples were dropped. Callback-side
+    /// underruns (silence padding) are *not* counted anywhere today — a padded gap and a genuinely
+    /// silent block look identical from the consumer side, so this counter is the honest half of the
+    /// story.
     pub fn overruns(&self) -> u64 {
         self.overruns
     }

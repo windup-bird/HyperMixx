@@ -23,20 +23,17 @@ use signalsmith_stretch::Stretch;
 
 use crate::mixer::Bus;
 use crate::{BLOCK_SIZE, CHANNELS};
-use hypermixx_core::Source;
+use hypermixx_core::{KeylockSettings, Source};
 
 /// Keylock profile / engine configuration.
 ///
-/// `Keylock` and `WideKeylock` differ only in the Signalsmith STFT window; Tape is a separate
-/// backend. The names are kept from the public `KeylockMode` so the mapping in `Deck` stays direct.
+/// `Keylock` carries the configured STFT window (from `live.toml`); Tape is a separate backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EngineProfile {
     /// Pure varispeed: pitch follows tempo.
     Tape,
-    /// Keylock through the DJ range (46 ms read-ahead).
-    Keylock,
-    /// Higher-quality keylock preset (93 ms read-ahead).
-    WideKeylock,
+    /// Keylock through the DJ range, with its configured block/interval.
+    Keylock(KeylockSettings),
 }
 
 /// Why an engine could not be built.
@@ -75,15 +72,8 @@ const MAX_ENGINE_CHANNELS: usize = MAX_STREAMS * CHANNELS;
 const MIN_TEMPO_RATE: f64 = 0.25;
 const MAX_TEMPO_RATE: f64 = 4.0;
 
-/// Keylock: 2048/512 at 44.1 kHz ≈ 46 ms read-ahead, measured ~31× realtime on 8 channels.
-const KEYLOCK_BLOCK: usize = 2048;
-const KEYLOCK_INTERVAL: usize = 512;
-/// Wide: 4096/1024 ≈ 93 ms read-ahead, ~30× realtime on 8 channels.
-const WIDE_BLOCK: usize = 4096;
-const WIDE_INTERVAL: usize = 1024;
-
 /// Maximum source frames `output_seek` may need at the highest supported rate.
-/// `presetDefault` at 4× needs ~13k; leave margin for the wider presets.
+/// `presetDefault` at 4× needs ~13k; leave margin for the larger windows.
 const MAX_SEEK_FRAMES: usize = 16_384;
 /// Maximum source frames one output block needs at 4×, plus interpolation guard.
 const MAX_FEED_FRAMES: usize = MAX_TEMPO_RATE as usize * BLOCK_SIZE + 8;
@@ -154,18 +144,13 @@ impl PitchShiftEngine {
                 feed_position: 0,
                 phase: 0.0,
             },
-            EngineProfile::Keylock => Backend::Stretch {
+            EngineProfile::Keylock(window) => Backend::Stretch {
                 stretch: Stretch::new_split(
                     channels as u32,
-                    KEYLOCK_BLOCK,
-                    KEYLOCK_INTERVAL,
+                    window.block,
+                    window.interval,
                     false,
                 ),
-                feed_position: 0,
-                carry: 0.0,
-            },
-            EngineProfile::WideKeylock => Backend::Stretch {
-                stretch: Stretch::new_split(channels as u32, WIDE_BLOCK, WIDE_INTERVAL, false),
                 feed_position: 0,
                 carry: 0.0,
             },
@@ -494,7 +479,7 @@ mod tests {
         let mut engine = PitchShiftEngine::with_profile(
             vec![crate::deck::LoopSource::new(source, cell) as Arc<dyn Source>],
             1.0,
-            EngineProfile::Keylock,
+            EngineProfile::Keylock(Default::default()),
         )
         .unwrap();
         engine.prepare_jump(1000);

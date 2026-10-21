@@ -59,7 +59,7 @@ deck0> fader gain 1.0              # 通道 trim：0 = 0 dB，1 = +6 dB
 deck0> fader cross -1.0            # crossfader（共用；位置与曲线见 [crossfader]）
 deck0> tempofader 0.5              # 推子位置（tempo = 1 + pos × temporange）
 deck0> temporange 0.16             # 推子满量程 ±16%（缺省 0.1）
-deck0> keylock wide                # 变调引擎：on（默认）| off | wide
+deck0> keylock on                  # 变调引擎：on（默认）| off；窗口在 live.toml 的 [keylock]
 deck0> key 1                       # 变调半音（占位：只记录，暂不发声）
 deck0> beatjump 16
 deck0> fx list                    # 列出fx
@@ -95,7 +95,7 @@ cargo run -p hypermixx-cli -- --config topo.toml    # 自定义拓扑
 cargo run -p hypermixx-cli -- --print-config        # 打印参考 TOML（= profile/mixer.toml）
 cargo run -p hypermixx-cli -- --profile dj          # 用 profile/dj.toml 指路（拓扑 + 本机设置 + MIDI 设备）
 #   会话内切换：`profile show` 看当前 profile，`profile reload dj` 换一套（MIDI 下次启动生效）
-cargo run -p hypermixx-cli -- --live live.toml      # 引擎采样率 / ring 大小 / stem 默认值
+cargo run -p hypermixx-cli -- --live live.toml      # 引擎采样率 / ring 大小 / keylock 窗口 / stem 默认值
 cargo run -p hypermixx-cli -- --midi 0              # 打开 0 号 MIDI 输入，用默认 midi-map.toml
 cargo run -p hypermixx-cli -- --midi 0 --midi-map my.toml   # 指定映射文件
 cargo run -p hypermixx-cli -- --midi-guide          # learn 模式编辑映射（不启动引擎，端口/文件在 TUI 里选）

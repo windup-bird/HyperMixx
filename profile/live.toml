@@ -21,6 +21,14 @@ sample_rate = 44100
 # producer's first block. Capped at half the ring.
 # prefill_frames = 2048
 
+[keylock]
+# The STFT window used by the keylock engine. Both values are in frames and are rounded to powers of
+# two; interval is clamped to at most block / 2. Bigger block = better frequency resolution and more
+# read-ahead: 2048/512 is ~46 ms, 4096/1024 is ~93 ms, 8192/1024 is ~186 ms. Read at startup, so a
+# running deck only picks up an edit after a restart (`live show` reports the effective values).
+# block = 2048
+# interval = 512
+
 [stems]
 # Everything the separator is asked for. These are *machine* settings, which is why they live here
 # and not on the command line: `stem separate` takes no options, and `live reload` applies an edit
