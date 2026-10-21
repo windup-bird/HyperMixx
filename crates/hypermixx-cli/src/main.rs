@@ -8,6 +8,7 @@
 mod command;
 mod midi;
 mod notices;
+mod preference;
 mod repl;
 mod profile;
 mod response;

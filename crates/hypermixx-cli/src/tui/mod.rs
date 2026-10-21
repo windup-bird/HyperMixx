@@ -16,19 +16,26 @@ pub mod view;
 pub mod waveform_view;
 
 use std::io;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyEventKind};
 use hypermixx_audio::{AudioPipeline, Command};
 
 use crate::command::Dispatcher;
+use crate::preference;
+use crate::response::LogLine;
 use crate::session::Session;
 use app::App;
 
-/// ~30Hz. The engine's block is 5.8ms, so this is comfortably inside its command handling.
-const TICK: Duration = Duration::from_millis(33);
-/// Ask for meters every third tick (~10Hz): enough for a readable meter, far from chatty.
-const METERS_EVERY: u64 = 3;
+/// ~60Hz. The image waveform transports can use the extra ticks; braille is still cheap at this
+/// rate, and the engine block (5.8ms) is comfortably inside it.
+const TICK: Duration = Duration::from_millis(16);
+/// Ask for meters every sixth tick (~10Hz): enough for a readable meter, far from chatty.
+const METERS_EVERY: u64 = 6;
+/// Poll state every tick: the playhead is what the image transports animate, so 60Hz polling is
+/// what makes a 60Hz Kitty waveform actually move at 60Hz. Still one request outstanding.
+const STATE_EVERY: u64 = 1;
 
 /// Runs the TUI until the user quits. Restores the terminal and stops the engine on the way out.
 ///
@@ -49,6 +56,7 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         midi_port,
         midi_map,
     } = session;
+    let preference_path = preference_path(profile.as_deref());
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
     let dispatcher = Dispatcher::new(command_tx.clone(), notice_tx).tap_events(event_tx);
     dispatcher.with_topology(topology);
@@ -60,6 +68,15 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     let mut app = App::new(decks, backend, notice_rx, event_rx, dispatcher.slots());
     // The header reports the configured ring, not the compile-time default.
     app.ring_frames = ring_frames;
+    match preference::load(&preference_path) {
+        Ok((preference, notes)) => {
+            app.waveform = preference.waveform;
+            for note in notes {
+                app.push_log(LogLine::info(format!("[preference] {note}")));
+            }
+        }
+        Err(err) => app.push_log(LogLine::error(format!("preference: {err}"))),
+    }
     app.midi_map = (!midi_map.is_empty()).then_some(midi_map);
     if let Some(port) = midi_port {
         app.midi_port = Some(port);
@@ -73,6 +90,17 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
             return;
         }
     };
+    // Detection needs the terminal's cell size, so it runs after `try_init` and before the first
+    // draw. A failed guess falls back to braille, never to a broken screen.
+    let (waveform_view, note) = crate::tui::waveform_view::WaveformView::detect(app.waveform, app.decks);
+    app.waveform_view = waveform_view;
+    app.push_log(LogLine::info(format!(
+        "[waveform] renderer {}",
+        app.waveform_view.backend().label()
+    )));
+    if let Some(note) = note {
+        app.push_log(LogLine::info(format!("[waveform] {note}")));
+    }
     let outcome = event_loop(&mut terminal, &mut app, pipeline, &dispatcher);
     ratatui::restore();
 
@@ -84,6 +112,17 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     if let Err(err) = outcome {
         eprintln!("tui: {err}");
     }
+}
+
+/// Preferences live next to the profile that names them, so a profile folder carries its own
+/// colours. No profile means the shipped default path.
+fn preference_path(profile: Option<&str>) -> String {
+    profile
+        .and_then(|path| Path::new(path).parent())
+        .map(|dir| dir.join("preference.toml"))
+        .unwrap_or_else(|| std::path::PathBuf::from(preference::DEFAULT_PATH))
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn event_loop(
@@ -105,12 +144,15 @@ fn event_loop(
         }
         app.drain();
 
+        ticks = ticks.wrapping_add(1);
         // One outstanding state request at a time: a stalled engine must not build a backlog.
-        if app.pending_states == 0 && dispatcher.command_tx.send(Command::GetAllStates).is_ok() {
+        if ticks.is_multiple_of(STATE_EVERY)
+            && app.pending_states == 0
+            && dispatcher.command_tx.send(Command::GetAllStates).is_ok()
+        {
             app.pending_states = 1;
             app.state_sent = Some(Instant::now());
         }
-        ticks = ticks.wrapping_add(1);
         if ticks.is_multiple_of(METERS_EVERY) {
             app.meters = pipeline.meters();
         }

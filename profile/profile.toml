@@ -27,6 +27,6 @@ midi = "midi.toml"
 # device = "DDJ-400"
 # map = "../midi-map.toml"
 
-# Reserved: the front-end's own settings will live here (theme, key bindings, default deck count).
-# Until they exist, a key here is *reported* rather than silently ignored.
+# The front-end's own settings live in preference.toml next to this file (theme, waveform colours,
+# renderer). This inline section stays reserved for profile-local overrides.
 # [preference]

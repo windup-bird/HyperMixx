@@ -19,7 +19,7 @@ use hypermixx_core::{DeckState, Stem};
 
 use crate::response::{bpm_label, sync_badge, time, Level, LogLine};
 use crate::tui::app::{App, Overlay, Target, COMPLETION_ROWS};
-use crate::tui::{browser, picker, text, waveform_view};
+use crate::tui::{browser, picker, text};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -124,15 +124,27 @@ fn render_deck(frame: &mut Frame, area: Rect, app: &mut App, index: usize) {
     let info_area = rows[1];
 
     // `fit` reads this back next keypress, so the viewport width is always fresh.
-    app.wave_width_dots = wave_area.width as usize * 2;
-    waveform_view::render(
-        frame,
-        wave_area,
-        app.waveforms[index].as_ref(),
-        app.grids[index].as_ref(),
-        app.states[index].current_frame as f64,
-        app.frames_per_dot,
-    );
+    app.wave_width_cells = wave_area.width as usize;
+    {
+        // Split the borrow: the transport mutates its image state while the peaks/grid are read.
+        let App {
+            waveform_view,
+            waveforms,
+            grids,
+            states,
+            frames_per_cell,
+            ..
+        } = app;
+        waveform_view.render(
+            frame,
+            index,
+            wave_area,
+            waveforms[index].as_ref(),
+            grids[index].as_ref(),
+            states[index].current_frame as f64,
+            *frames_per_cell,
+        );
+    }
     render_deck_info(frame, info_area, app, index);
 }
 
@@ -530,7 +542,7 @@ mod tests {
     use std::sync::Arc;
 
     use hypermixx_core::{Backend, BeatGrid};
-    use hypermixx_library::{BandPeaks, Waveform};
+    use hypermixx_library::{BandPeaks, StereoPeaks, Waveform};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -539,10 +551,17 @@ mod tests {
         let (_event_tx, event_rx) = crossbeam_channel::unbounded();
         let mut app = App::new(2, Backend::Auto, notice_rx, event_rx, Default::default());
         let buckets = (0..400)
-            .map(|index| BandPeaks {
-                low: (index % 7) as f32 / 7.0,
-                mid: (index % 5) as f32 / 5.0,
-                high: (index % 3) as f32 / 3.0,
+            .map(|index| StereoPeaks {
+                left: BandPeaks {
+                    low: ((index % 7) * 36) as u8,
+                    mid: ((index % 5) * 51) as u8,
+                    high: ((index % 3) * 85) as u8,
+                },
+                right: BandPeaks {
+                    low: ((index % 3) * 85) as u8,
+                    mid: ((index % 5) * 51) as u8,
+                    high: ((index % 7) * 36) as u8,
+                },
             })
             .collect();
         app.waveforms[0] = Some(Arc::new(Waveform::from_buckets(buckets, 256, 100_000)));
@@ -748,6 +767,62 @@ mod tests {
         assert!(
             reds.iter().all(|x| x.abs_diff(center) <= 3),
             "playhead off center: {reds:?}"
+        );
+    }
+
+    fn row_has_wave_color(buffer: &ratatui::buffer::Buffer, y: u16) -> bool {
+        (0..buffer.area.width).any(|x| {
+            matches!(
+                buffer.cell((x, y)).map(|cell| cell.fg),
+                Some(Color::Blue | Color::Green | Color::White)
+            )
+        })
+    }
+
+    #[test]
+    fn stereo_waveform_puts_left_above_and_right_below_the_centre() {
+        let mut app = test_app();
+        let left_only = (0..400)
+            .map(|_| StereoPeaks {
+                left: BandPeaks {
+                    low: 255,
+                    mid: 255,
+                    high: 255,
+                },
+                right: BandPeaks::ZERO,
+            })
+            .collect();
+        app.waveforms[0] = Some(Arc::new(Waveform::from_buckets(left_only, 256, 100_000)));
+        let buffer = render_buffer(&mut app);
+        // Deck0's inner waveform is rows 2..=8 at 120x40; the two decks split at row 10.
+        assert!(
+            (2..=4).any(|y| row_has_wave_color(&buffer, y)),
+            "left channel should paint above the centre"
+        );
+        assert!(
+            !(6..=8).any(|y| row_has_wave_color(&buffer, y)),
+            "right channel is empty, so nothing should paint below the centre"
+        );
+
+        let right_only = (0..400)
+            .map(|_| StereoPeaks {
+                left: BandPeaks::ZERO,
+                right: BandPeaks {
+                    low: 255,
+                    mid: 255,
+                    high: 255,
+                },
+            })
+            .collect();
+        app.waveforms[0] = Some(Arc::new(Waveform::from_buckets(right_only, 256, 100_000)));
+        let buffer = render_buffer(&mut app);
+        assert!(
+            !(2..=4).any(|y| row_has_wave_color(&buffer, y)),
+            "left channel is empty, so nothing should paint above the centre"
+        );
+        assert!(
+            (6..=8).any(|y| row_has_wave_color(&buffer, y)),
+            "right channel should paint below the centre"
         );
     }
 

@@ -102,10 +102,13 @@ cargo run -p hypermixx-cli -- --midi-guide          # learn 模式编辑映射�
 ```
 
 TUI 内尽量不用启动参数:`--tui` 下按 `F2` 选 MIDI 端口、`F3` 选映射文件；`load` 不带路径则弹出
-文件浏览器；`--midi-guide` 即使不跟路径也会在 TUI 里选端口与文件。
+文件浏览器；`--midi-guide` 即使不跟路径也会在 TUI 里选端口与文件。波形左右声道上下镜像，三频段颜色、
+分频点（`low_hz`/`high_hz`，默认 200/4000Hz）、渲染 backend 与图像刷新率在 `profile/preference.toml` 配置：
+`auto` 按 kitty → sixel → braille 选择
+（Windows Terminal 1.22+ 走 sixel；tmux/screen 暂回 braille），kitty 可 60Hz，sixel 上限 30Hz。
 
 `profile/` 放全部默认文件：`profile.toml`（用哪几个文件）、`mixer.toml`（拓扑）、`live.toml`（本机设置）、
-`midi.toml`（设备名 + 映射）、`preference.toml`（前端设置，预留），命名 profile 也放这里
+`midi.toml`（设备名 + 映射）、`preference.toml`（波形颜色/backend/刷新率），命名 profile 也放这里
 （`--profile dj` → `profile/dj.toml`）。文件里的相对路径都相对它所在的文件夹。
 运行时改配置不必重启：`mixer reload` 重建拓扑（保留走带），`live reload` 重读本机设置
 （引擎率/ring 需重启，`[stems]` 立即生效）。

@@ -1,5 +1,29 @@
-# Hypermixx front-end preferences — reserved.
+# Hypermixx front-end preferences.
 #
-# Nothing here is read yet: the front-end (TUI/REPL) is going to change shape before it is worth
-# freezing a schema for it. The file exists so that the intent is visible and so that the first keys
-# have an obvious home; a key written here today is reported by `--profile` rather than honoured.
+# Read at TUI startup, next to the profile that names it (`profile/preference.toml` by default).
+# A missing key takes the built-in default; an invalid value is reported in the response log and the
+# default is used, so a typo never stops the music.
+#
+[waveform]
+# Renderer: auto (kitty -> sixel -> braille), or force one. Detection is environment-based; under
+# tmux/screen auto falls back to braille because passthrough is not enabled yet.
+backend = "auto"
+#
+# Target refresh for the image backends (10..240). Braille follows the 60Hz UI tick; sixel is
+# capped at 30Hz, kitty can use the full value.
+# refresh_hz = 60
+#
+# Terminal cell size in pixels. crossterm cannot report this on every platform (Windows returns 0),
+# and sixel cannot scale, so set it when the image does not fill the deck. Accepts "8x16" or [8, 16].
+# cell = "8x16"
+#
+# Band crossovers in Hz. Low is below low_hz, mid between the two, high above high_hz. Raising
+# high_hz (2k → 4k) keeps the white high band out of the body; lower it if you want more white.
+# low_hz = 200
+# high_hz = 4000
+#
+# The three band colours, `#rrggbb` or `#rgb`. The left channel is mirrored above the centre line,
+# the right channel below it.
+# low = "#0000ff"
+# mid = "#00ff00"
+# high = "#ffffff"

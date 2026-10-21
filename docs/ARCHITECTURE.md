@@ -70,7 +70,7 @@ crates/
 │       ├── beat_spec.rs     # BeatSpec/Segment:可编辑网格真源
 │       ├── grid_compiler.rs # GridCompiler:前填/等距/接缝去重/尾外推 → BeatGrid
 │       ├── track.rs         # TrackInfo:持 BeatSpec,惰性缓存编译结果
-│       ├── waveform.rs      # 峰值概览
+│       ├── waveform.rs      # 立体声三频段 u8 峰值概览（2:1 mipmap）
 │       └── analyser/
 │           ├── mod.rs         # analyze(source) = backend → refine → compile
 │           ├── stratum.rs     # stratum-dsp 适配(兜 panic,关静音裁剪)
@@ -385,8 +385,11 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 - `midi ports` — 列出 MIDI 输入端口(`--midi` 在启动时打开并把映射翻译成 `Command`,
   接线在 `src/midi.rs`:translator 线程 + 1ms 合并 flush + `ListFx` 名字解析)
 - TUI 布局(`src/tui/view.rs`):顶部一行全局 header;deck 区合计不超过屏幕一半,每个 deck
-  只保留一行状态(文件名在边框标题,右侧是 `已播放 / -剩余`)+ 波形;底部
-  `browser : command = 2 : 1`,browser 内部再按 1 : 3 分栏(目录/歌单 | 曲目列表)。command
+  只保留一行状态(文件名在边框标题,右侧是 `已播放 / -剩余`)+ 波形(左声道在上、右声道在下的
+  三频段镜像;缩放单位是 frames/cell;分频点默认 200/4000Hz，可在 preference 调);底部
+  `browser : command = 2 : 1`,browser 内部再按 1 : 3 分栏(目录/歌单 | 曲目列表)。波形 backend
+  按 preference 的 `auto`/`kitty`/`sixel`/`braille` 选择(auto 为 kitty → sixel → braille;
+  三频段颜色也在 `profile/preference.toml`)。command
   上半是响应日志,下半输入带的顶线嵌入 `deck0 / deck1 / browser` 目标(`Tab` 循环;browser
   目前没有 CLI 前缀),目标文字与面板标题 `command` 左对齐
 - TUI 内选择器(`src/tui/picker.rs`,两个前端共用):`--tui` 下 `F2` 选 MIDI 端口、`F3` 选映射

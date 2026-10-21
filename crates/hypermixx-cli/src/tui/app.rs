@@ -16,16 +16,19 @@ use hypermixx_core::{Backend, BeatGrid, Command, CommandResponse, DeckState, Key
 use crate::command::{Slots, UiEvent};
 use crate::notices::NoticeTx;
 use crate::response::{self, LogLine};
+use crate::preference::WaveformSettings;
 use crate::tui::browser::Browser;
+use crate::tui::waveform_view::WaveformView;
 use crate::tui::completer::{self, Completion, Ctx};
 use crate::tui::picker::{FilePicker, PortList};
 
-/// Waveform zoom bounds, in frames per braille dot. 256 frames is ~5.8ms, the finest bucket the
-/// peak pyramid holds; 65536 is ~1.5s per dot (a very wide overview).
-pub const MIN_FRAMES_PER_DOT: f64 = 256.0;
-pub const MAX_FRAMES_PER_DOT: f64 = 65_536.0;
-/// Default visible span: 1024 frames/dot over ~400 dots is roughly ten seconds.
-pub const DEFAULT_FRAMES_PER_DOT: f64 = 1_024.0;
+/// Waveform zoom bounds, in frames per terminal cell. 512 frames is ~11.6ms per cell (the finest
+/// the peak pyramid resolves), 131072 is ~3s per cell (a very wide overview). Keeping the unit
+/// backend-independent means switching braille ↔ image keeps the same visible span.
+pub const MIN_FRAMES_PER_CELL: f64 = 512.0;
+pub const MAX_FRAMES_PER_CELL: f64 = 131_072.0;
+/// Default visible span: 2048 frames/cell over ~120 cells is roughly five seconds.
+pub const DEFAULT_FRAMES_PER_CELL: f64 = 2_048.0;
 /// Keep the debug log bounded; this is a terminal, not a log file.
 const LOG_CAP: usize = 500;
 /// Candidates shown in the completion popup.
@@ -113,10 +116,14 @@ pub struct App {
     pub waveforms: Vec<Option<Arc<hypermixx_library::Waveform>>>,
     pub grids: Vec<Option<BeatGrid>>,
 
-    /// Shared zoom, in frames per braille dot. Both decks read this so they stay comparable.
-    pub frames_per_dot: f64,
-    /// Last waveform width in braille dots, so `fit` knows the viewport.
-    pub wave_width_dots: usize,
+    /// Shared zoom, in frames per terminal cell. Both decks read this so they stay comparable.
+    pub frames_per_cell: f64,
+    /// Last waveform width in cells, so `fit` knows the viewport.
+    pub wave_width_cells: usize,
+    /// Waveform preferences (renderer, colours, image refresh target).
+    pub waveform: WaveformSettings,
+    /// The selected waveform transport (braille / kitty / sixel) and its per-deck image state.
+    pub waveform_view: WaveformView,
 
     pub log: VecDeque<LogLine>,
     /// Lines scrolled up from the bottom (0 = following).
@@ -207,8 +214,10 @@ impl App {
             titles: vec![None; decks],
             waveforms: vec![None; decks],
             grids: vec![None; decks],
-            frames_per_dot: DEFAULT_FRAMES_PER_DOT,
-            wave_width_dots: 200,
+            frames_per_cell: DEFAULT_FRAMES_PER_CELL,
+            wave_width_cells: 200,
+            waveform: WaveformSettings::default(),
+            waveform_view: WaveformView::new(WaveformSettings::default(), decks),
             log: VecDeque::new(),
             log_offset: 0,
             command: Vec::new(),
@@ -350,10 +359,16 @@ impl App {
         };
         let tx = self.waveform_tx.clone();
         let index = deck_id as usize;
+        let low_hz = f32::from(self.waveform.low_hz);
+        let high_hz = f32::from(self.waveform.high_hz);
         std::thread::Builder::new()
             .name(format!("hypermixx-waveform-{deck_id}"))
             .spawn(move || {
-                let waveform = Arc::new(hypermixx_library::Waveform::build(source.as_ref()));
+                let waveform = Arc::new(hypermixx_library::Waveform::build_with_crossovers(
+                    source.as_ref(),
+                    low_hz,
+                    high_hz,
+                ));
                 let _ = tx.send((index, waveform));
             })
             .ok();
@@ -422,11 +437,11 @@ impl App {
     }
 
     pub fn zoom_in(&mut self) {
-        self.frames_per_dot = (self.frames_per_dot / 2.0).max(MIN_FRAMES_PER_DOT);
+        self.frames_per_cell = (self.frames_per_cell / 2.0).max(MIN_FRAMES_PER_CELL);
     }
 
     pub fn zoom_out(&mut self) {
-        self.frames_per_dot = (self.frames_per_dot * 2.0).min(MAX_FRAMES_PER_DOT);
+        self.frames_per_cell = (self.frames_per_cell * 2.0).min(MAX_FRAMES_PER_CELL);
     }
 
     /// Fits the longest loaded track into the current viewport. A no-op until a track is loaded.
@@ -437,11 +452,11 @@ impl App {
             .map(|state| state.total_frames)
             .max()
             .unwrap_or(0);
-        if longest == 0 || self.wave_width_dots == 0 {
+        if longest == 0 || self.wave_width_cells == 0 {
             return;
         }
-        self.frames_per_dot = (longest as f64 / self.wave_width_dots as f64)
-            .clamp(MIN_FRAMES_PER_DOT, MAX_FRAMES_PER_DOT);
+        self.frames_per_cell = (longest as f64 / self.wave_width_cells as f64)
+            .clamp(MIN_FRAMES_PER_CELL, MAX_FRAMES_PER_CELL);
     }
 
     pub fn log_scroll(&mut self, delta: isize) {
