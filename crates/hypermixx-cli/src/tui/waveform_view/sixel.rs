@@ -14,7 +14,7 @@ use super::raster::{Palette, Raster, PALETTE_LEN};
 /// Build the complete escape sequence placed in the first cell of the image area.
 pub fn sequence(raster: &Raster, palette: &Palette, area: Rect) -> String {
     let mut out = String::with_capacity(raster.indices.len() / 2 + 512);
-    clear_area(&mut out, area);
+    super::clear_cells(&mut out, area);
 
     // `P0;0;0` = default aspect/mode; `q` enters sixel mode.
     out.push_str("\x1bP0;0;0q");
@@ -34,19 +34,17 @@ pub fn sequence(raster: &Raster, palette: &Palette, area: Rect) -> String {
 
     let bands = raster.height.div_ceil(6);
     for band in 0..bands {
+        // One pass per band collects which palette entries occur; scanning once per colour was
+        // eight times the work for the same answer.
+        let mut present = 0u8;
+        for y in band * 6..((band + 1) * 6).min(raster.height) {
+            for x in 0..raster.width {
+                let index = raster.indices[(y as usize) * (raster.width as usize) + x as usize];
+                present |= 1u8 << index;
+            }
+        }
         for color in 0..PALETTE_LEN {
-            // A colour with no pixels in this band needs no cursor movement: the previous pass
-            // ended with `$`, so the next one still starts at the left edge.
-            let present = (0..raster.width).any(|x| {
-                (0..6).any(|bit| {
-                    let y = band * 6 + bit;
-                    y < raster.height
-                        && usize::from(
-                            raster.indices[(y as usize) * (raster.width as usize) + x as usize],
-                        ) == color
-                })
-            });
-            if !present {
+            if present & (1u8 << color) == 0 {
                 continue;
             }
             write!(out, "#{color}").expect("writing to a String cannot fail");
@@ -96,21 +94,6 @@ fn push_run(out: &mut String, mask: u8, count: usize) {
             out.push(ch);
         }
     }
-}
-
-fn clear_area(out: &mut String, area: Rect) {
-    out.push_str("\x1b[0m\x1b7");
-    for row in 0..area.height {
-        write!(
-            out,
-            "\x1b[{};{}H\x1b[{}X",
-            area.y + row + 1,
-            area.x + 1,
-            area.width
-        )
-        .expect("writing to a String cannot fail");
-    }
-    out.push_str("\x1b8");
 }
 
 #[cfg(test)]

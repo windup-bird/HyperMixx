@@ -48,6 +48,8 @@ toml = "0.8"
 # `all-widgets` would drag in the calendar/time stack we never draw.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = "0.29"
+# Process CPU/RSS for the TUI header: cross-platform without hand-written /proc and Win32 FFI.
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
 # Display width for column/title truncation. ratatui already pulls it in; making it direct lets
 # the browser and deck titles keep CJK filenames aligned.
 unicode-width = "0.2"

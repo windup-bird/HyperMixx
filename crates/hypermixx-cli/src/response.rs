@@ -5,7 +5,7 @@
 //! the TUI pushes it into its scrollback.
 
 use hypermixx_audio::fx::fader_amp;
-use hypermixx_core::{CommandResponse, DeckState, OutputStatus, Stem, StemStatus, SAMPLE_RATE};
+use hypermixx_core::{CommandResponse, DeckState, OutputStatus, Stem, StemStatus};
 
 /// How a line should be presented. `Error` lines already carry the `error: ` prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,17 +40,21 @@ impl LogLine {
 
 /// Renders a [`CommandResponse`]. `Ok` is deliberately silent — it is the ack for a command whose
 /// own effect is visible elsewhere, so echoing it would only add noise.
-pub fn format_response(response: &CommandResponse) -> Vec<LogLine> {
+pub fn format_response(response: &CommandResponse, sample_rate: u32) -> Vec<LogLine> {
     match response {
         CommandResponse::Loaded {
             deck_id,
             total_frames,
         } => vec![LogLine::info(format!(
             "deck{deck_id} loaded: {total_frames} frames ({})",
-            time(*total_frames)
+            time(*total_frames, sample_rate)
         ))],
-        CommandResponse::State(state) => vec![LogLine::info(deck_line(state))],
-        CommandResponse::States(states) => states.iter().map(deck_line).map(LogLine::info).collect(),
+        CommandResponse::State(state) => vec![LogLine::info(deck_line(state, sample_rate))],
+        CommandResponse::States(states) => states
+            .iter()
+            .map(|state| deck_line(state, sample_rate))
+            .map(LogLine::info)
+            .collect(),
         CommandResponse::Stems(state) => stem_report(state).into_iter().map(LogLine::info).collect(),
         CommandResponse::FxAdded {
             chain,
@@ -131,7 +135,7 @@ pub fn bpm_label(state: &DeckState) -> String {
 }
 
 /// One deck's transport line, the shared shape behind both front-ends' deck readouts.
-pub fn deck_line(state: &DeckState) -> String {
+pub fn deck_line(state: &DeckState, sample_rate: u32) -> String {
     let transport = if state.total_frames == 0 {
         "empty"
     } else if state.playing {
@@ -142,14 +146,14 @@ pub fn deck_line(state: &DeckState) -> String {
     let duration = if state.total_frames == 0 {
         "-".to_owned()
     } else {
-        time(state.total_frames)
+        time(state.total_frames, sample_rate)
     };
     let tempo = bpm_label(state);
     let key = state.key.as_deref().unwrap_or("--");
     let mut line = format!(
         "deck{}  {transport:<7} {} / {duration}  [{}/{}]  {tempo}  {key}  keylock {}",
         state.deck_id,
-        time(state.current_frame),
+        time(state.current_frame, sample_rate),
         state.current_frame,
         state.total_frames,
         state.keylock.label(),
@@ -302,7 +306,7 @@ pub fn help_text(decks: usize) -> String {
                                play from / return to / set the cue point (bare `cue` = smart);
                                `hold` = the press edge of a held cue button: cue the playhead when
                                paused, then play from the cue point
-  [deck] jump <frame>          seek to a frame (1 second = {SAMPLE_RATE} frames)
+  [deck] jump <frame>          seek to a frame (1 second = the engine rate in frames)
   [deck] beatjump <beats>      seek by whole beats, keeping the phase
   [deck] tempo <ratio>         set the tempo (1.0 = unity, 0.5 = half speed)
   [deck] tempofader <-1..1>    pitch fader position (tempo = 1 + position × range)
@@ -420,9 +424,9 @@ effect kinds and their parameters:",
     text
 }
 
-/// Frames -> `m:ss.mmm` at the engine rate.
-pub fn time(frames: u64) -> String {
-    let millis = frames as f64 * 1000.0 / SAMPLE_RATE as f64;
+/// Frames -> `m:ss.mmm` at the given engine rate.
+pub fn time(frames: u64, sample_rate: u32) -> String {
+    let millis = frames as f64 * 1000.0 / sample_rate.max(1) as f64;
     let minutes = (millis / 60_000.0) as u64;
     let seconds = (millis / 1000.0) as u64 % 60;
     let remainder = (millis % 1000.0) as u32;
@@ -460,7 +464,7 @@ mod tests {
     }
 
     use super::*;
-    use hypermixx_core::{OutputStatus, KeylockMode, StemStatus};
+    use hypermixx_core::{OutputStatus, KeylockMode, StemStatus, SAMPLE_RATE};
 
     /// A fully idle deck: nothing to report, so no badge.
     fn idle() -> DeckState {
@@ -501,8 +505,8 @@ mod tests {
         state.playing_rate = 1.11; // nudge present; must be ignored
         let now = current_bpm(&state).expect("a grid deck has a current BPM");
         assert!((now - 122.0 * 1.05).abs() < 1e-3, "got {now}");
-        assert!(!deck_line(&state).contains("1.11"), "playing_rate leaked into the line");
-        assert!(deck_line(&state).contains("122.0 BPM → 128.1 BPM"), "{}", deck_line(&state));
+        assert!(!deck_line(&state, SAMPLE_RATE).contains("1.11"), "playing_rate leaked into the line");
+        assert!(deck_line(&state, SAMPLE_RATE).contains("122.0 BPM → 128.1 BPM"), "{}", deck_line(&state, SAMPLE_RATE));
         // No grid means no current BPM to show.
         state.bpm_at_frame = 0.0;
         assert_eq!(current_bpm(&state), None);
@@ -513,7 +517,7 @@ mod tests {
         assert_eq!(sync_badge(&idle()), None);
         // …so an ordinary `state` line is exactly as short as it was before sync existed, which
         // is what keeps phase_probe.sh's `deck[01][^[]*\[[0-9]+` match working.
-        assert!(deck_line(&idle()).ends_with("122.0 BPM  --  keylock on"), "{}", deck_line(&idle()));
+        assert!(deck_line(&idle(), SAMPLE_RATE).ends_with("122.0 BPM  --  keylock on"), "{}", deck_line(&idle(), SAMPLE_RATE));
     }
 
     #[test]
@@ -565,12 +569,19 @@ mod tests {
     }
 
     #[test]
+    fn time_uses_the_rate_the_frames_were_rendered_at() {
+        assert_eq!(time(44_100, 44_100), "0:01.000");
+        assert_eq!(time(48_000, 48_000), "0:01.000");
+        assert_eq!(time(48_000, 44_100), "0:01.088");
+    }
+
+    #[test]
     fn the_badge_rides_after_the_position_so_parsers_still_see_it() {
         let mut state = idle();
         state.sync_mode = "phaselock".to_owned();
         state.group_bpm = 122.0;
         state.sync_leader = Some(0);
-        let line = deck_line(&state);
+        let line = deck_line(&state, SAMPLE_RATE);
         let position = line.find("[0/1000]").expect("position bracket must survive");
         let badge = line.find("sync phaselock").expect("badge must be rendered");
         assert!(badge > position, "the badge must come after `[current/total]`: {line}");

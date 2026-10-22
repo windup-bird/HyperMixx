@@ -26,6 +26,7 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         live_source,
         ..
     } = session;
+    let sample_rate = live.audio.sample_rate;
     let response_rx = pipeline.response_rx().clone();
     let dispatcher = command::Dispatcher::new(command_tx.clone(), notice_tx);
     dispatcher.with_topology(topology);
@@ -36,7 +37,8 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     let print_slots = dispatcher.slots();
     std::thread::scope(|scope| {
         // The printer owns its receiver clones so it can outlive this function's borrows.
-        let printer = scope.spawn(move || print_loop(response_rx, notice_rx, print_slots));
+        let printer =
+            scope.spawn(move || print_loop(response_rx, notice_rx, print_slots, sample_rate));
 
         let stdin = io::stdin();
         let mut stdin = stdin.lock();
@@ -69,6 +71,7 @@ fn print_loop(
     response_rx: Receiver<CommandResponse>,
     notice_rx: Receiver<LogLine>,
     slots: Slots,
+    sample_rate: u32,
 ) {
     let mut notices_open = true;
     loop {
@@ -77,7 +80,7 @@ fn print_loop(
                 recv(response_rx) -> message => match message {
                     Ok(response) => {
                         slots.record(&response);
-                        print_lines(&response::format_response(&response));
+                        print_lines(&response::format_response(&response, sample_rate));
                     }
                     Err(_) => break,
                 },
@@ -89,7 +92,7 @@ fn print_loop(
             }
         } else if let Ok(response) = response_rx.recv() {
             slots.record(&response);
-            print_lines(&response::format_response(&response));
+            print_lines(&response::format_response(&response, sample_rate));
         } else {
             break;
         }

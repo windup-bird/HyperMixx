@@ -9,7 +9,7 @@
 # tmux/screen auto falls back to braille because passthrough is not enabled yet.
 backend = "auto"
 #
-# Target refresh for the image backends (10..240). Braille follows the 60Hz UI tick; sixel is
+# Target refresh for the image backends (10..60). Braille follows the 60Hz UI tick; sixel is
 # capped at 30Hz, kitty can use the full value.
 # refresh_hz = 60
 #
@@ -19,8 +19,8 @@ backend = "auto"
 #
 # Band crossovers in Hz. Low is below low_hz, mid between the two, high above high_hz. Raising
 # high_hz (2k → 4k) keeps the white high band out of the body; lower it if you want more white.
-# low_hz = 200
-# high_hz = 4000
+low_hz = 250
+high_hz = 4000
 #
 # The three band colours, `#rrggbb` or `#rgb`. The left channel is mirrored above the centre line,
 # the right channel below it.

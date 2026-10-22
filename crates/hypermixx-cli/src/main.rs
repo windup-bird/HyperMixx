@@ -9,6 +9,7 @@ mod command;
 mod midi;
 mod notices;
 mod preference;
+mod procmon;
 mod repl;
 mod profile;
 mod response;

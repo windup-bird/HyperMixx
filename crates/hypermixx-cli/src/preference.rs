@@ -140,10 +140,10 @@ fn parse_waveform(
             },
             "refresh_hz" => match value.as_integer() {
                 Some(hz) => {
-                    let clamped = hz.clamp(10, 240) as u16;
+                    let clamped = hz.clamp(10, 60) as u16;
                     if hz != i64::from(clamped) {
                         notes.push(format!(
-                            "waveform.refresh_hz clamped from {hz} to {clamped} (10..=240)"
+                            "waveform.refresh_hz clamped from {hz} to {clamped} (10..=60)"
                         ));
                     }
                     waveform.refresh_hz = clamped;
@@ -295,7 +295,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(preference.waveform.backend, WaveformBackend::Auto);
-        assert_eq!(preference.waveform.refresh_hz, 240);
+        assert_eq!(preference.waveform.refresh_hz, 60);
         assert_eq!(preference.waveform.colors.low, Color::Blue);
         assert!(notes.iter().any(|note| note.contains("backend")));
         assert!(notes.iter().any(|note| note.contains("refresh_hz")));

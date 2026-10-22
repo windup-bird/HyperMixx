@@ -15,7 +15,9 @@ mod kitty;
 mod raster;
 mod sixel;
 
+use std::fmt::Write;
 use std::num::NonZeroU16;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -50,6 +52,45 @@ const MAX_IMAGE_PIXELS: u32 = 1_500_000;
 /// and recovers from a terminal/modal that cleared the placement behind our back.
 const IMAGE_REFRESH_HEAL: Duration = Duration::from_secs(1);
 const UNIT_WIDTH: CellDiffOption = CellDiffOption::ForcedWidth(NonZeroU16::new(1).unwrap());
+/// Kitty image ids are 32-bit and app-local. A fresh id on every rebuild lets the old image stay
+/// visible until the replacement has been transmitted and placed.
+static NEXT_IMAGE_ID: AtomicU32 = AtomicU32::new(0x484D_0001);
+static NEXT_PLACEMENT_ID: AtomicU32 = AtomicU32::new(1);
+
+fn next_image_id() -> u32 {
+    NEXT_IMAGE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn next_placement_id() -> u32 {
+    NEXT_PLACEMENT_ID.fetch_add(1, Ordering::Relaxed).max(1)
+}
+
+/// A cheap fingerprint of the beat grid. `Option<BeatGrid>` lives inline, so a pointer is not a
+/// content identity; the first two beats plus the average tempo are enough to notice an analysis
+/// change without hashing every beat.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GridKey {
+    first: u64,
+    second: u64,
+    bpm_bits: u32,
+}
+
+impl GridKey {
+    fn of(grid: Option<&BeatGrid>) -> Self {
+        grid.map_or(
+            Self {
+                first: 0,
+                second: 0,
+                bpm_bits: 0,
+            },
+            |grid| Self {
+                first: grid.frame_at_beat(0),
+                second: grid.frame_at_beat(1),
+                bpm_bits: grid.average_bpm().to_bits(),
+            },
+        )
+    }
+}
 
 /// Everything that determines the image content. When it is unchanged (paused, same zoom, same
 /// track), the existing placement stays and no raster/encode work happens.
@@ -60,9 +101,7 @@ struct FrameKey {
     pixel_width: u32,
     pixel_height: u32,
     waveform: usize,
-    grid_first: u64,
-    grid_second: u64,
-    grid_bpm_bits: u32,
+    grid: GridKey,
 }
 
 /// What a Kitty strip was rendered from. A change in any of these invalidates the image.
@@ -74,9 +113,7 @@ struct StripKey {
     cell_width: u16,
     cell_height: u16,
     waveform: usize,
-    grid_first: u64,
-    grid_second: u64,
-    grid_bpm_bits: u32,
+    grid: GridKey,
 }
 
 /// A wide, native-resolution image transmitted once. Frames show a source rectangle of it.
@@ -89,8 +126,8 @@ struct KittyStrip {
     margin: u32,
 }
 
-/// One deck's image state: the Kitty image id is stable for the deck's lifetime, so every refresh
-/// replaces the image instead of leaking a new one.
+/// One deck's image state. Kitty rotates to a new image id on each strip rebuild; Sixel uses
+/// `key` to decide whether the cached content is still current.
 struct DeckImage {
     id: u32,
     placement: u32,
@@ -100,6 +137,9 @@ struct DeckImage {
     /// Kitty's cached strip, if one has been transmitted.
     strip: Option<KittyStrip>,
     last_playhead: Option<u64>,
+    /// The superseded image is deleted on the next placement, after the replacement has had one
+    /// frame to become visible.
+    pending_delete: Option<u32>,
 }
 
 /// The renderer selected at startup plus per-deck image bookkeeping.
@@ -118,13 +158,14 @@ impl WaveformView {
             backend: Backend::Braille,
             cell: CellPx::default(),
             decks: (0..decks)
-                .map(|index| DeckImage {
-                    id: 0x484D_0001 + index as u32,
-                    placement: 1,
+                .map(|_index| DeckImage {
+                    id: next_image_id(),
+                    placement: next_placement_id(),
                     last: None,
                     key: None,
                     strip: None,
                     last_playhead: None,
+                    pending_delete: None,
                 })
                 .collect(),
         }
@@ -217,9 +258,7 @@ impl WaveformView {
             cell_width: self.cell.width,
             cell_height: self.cell.height,
             waveform: waveform.map_or(0, |waveform| Arc::as_ptr(waveform) as usize),
-            grid_first: grid.map_or(0, |grid| grid.frame_at_beat(0)),
-            grid_second: grid.map_or(0, |grid| grid.frame_at_beat(1)),
-            grid_bpm_bits: grid.map_or(0, |grid| grid.average_bpm().to_bits()),
+            grid: GridKey::of(grid),
         };
 
         let mut rebuild = state
@@ -248,21 +287,18 @@ impl WaveformView {
         let hz = self.settings.refresh_hz.max(1);
         let interval = Duration::from_secs_f64(1.0 / f64::from(hz));
         let tolerance = Duration::from_millis(8);
-        let due = state
-            .last
-            .is_none_or(|last| last.elapsed() >= interval.saturating_sub(tolerance));
-        if !rebuild
-            && !due
+        let due = state.pending_delete.is_some()
+            || state
+                .last
+                .is_none_or(|last| last.elapsed() >= interval.saturating_sub(tolerance));
+        // A paused deck does not need a placement every tick. Re-place once a second anyway, so a
+        // terminal/modal that dropped the image heals without waiting for playback.
+        let static_frame = state.pending_delete.is_none()
             && state.last_playhead == Some(playhead_bits)
             && state
                 .last
-                .is_some_and(|last| last.elapsed() < IMAGE_REFRESH_HEAL)
-        {
-            skip_area(frame, area);
-            draw_playhead_overlay(frame, area);
-            return;
-        }
-        if !rebuild && !due {
+                .is_some_and(|last| last.elapsed() < IMAGE_REFRESH_HEAL);
+        if !rebuild && (!due || static_frame) {
             skip_area(frame, area);
             draw_playhead_overlay(frame, area);
             return;
@@ -292,14 +328,32 @@ impl WaveformView {
                 width: viewport_width,
                 height: viewport_height,
             };
-            let sequence = kitty::transmit(
-                &image,
-                &palette,
-                state.id,
+            // Transmit under a fresh id first, then place it, then delete the old image. Replacing
+            // an image in place would blank the deck while this payload is still arriving.
+            let old_id = state.strip.is_some().then_some(state.id);
+            let new_id = next_image_id();
+            // A fresh placement id means the old placement is not replaced while the new image is
+            // still being decoded; the old image is deleted one frame later. IDs are global so two
+            // decks can never collide.
+            state.placement = next_placement_id();
+            let mut sequence = String::new();
+            if old_id.is_none() {
+                clear_cells(&mut sequence, area);
+            }
+            sequence.push_str(&kitty::transmit(&image, &palette, new_id));
+            sequence.push_str(&kitty::place(
+                new_id,
                 state.placement,
                 area,
                 source,
-            );
+            ));
+            // Free the image from the *previous* rebuild now; keep the immediately superseded one
+            // for one more frame so the terminal has definitely rendered the replacement.
+            if let Some(old) = state.pending_delete.take() {
+                sequence.push_str(&kitty::delete(old));
+            }
+            state.pending_delete = old_id;
+            state.id = new_id;
             state.strip = Some(KittyStrip {
                 key: strip_key,
                 start_frame,
@@ -311,7 +365,7 @@ impl WaveformView {
             let strip = state.strip.as_ref().expect("a strip exists when not rebuilding");
             let max_offset = strip.width.saturating_sub(viewport_width);
             let offset = offset.min(max_offset);
-            kitty::place(
+            let mut sequence = kitty::place(
                 state.id,
                 state.placement,
                 area,
@@ -321,7 +375,11 @@ impl WaveformView {
                     width: viewport_width,
                     height: viewport_height,
                 },
-            )
+            );
+            if let Some(old) = state.pending_delete.take() {
+                sequence.push_str(&kitty::delete(old));
+            }
+            sequence
         };
 
         skip_area(frame, area);
@@ -353,9 +411,7 @@ impl WaveformView {
             pixel_width,
             pixel_height,
             waveform: waveform.map_or(0, |waveform| Arc::as_ptr(waveform) as usize),
-            grid_first: grid.map_or(0, |grid| grid.frame_at_beat(0)),
-            grid_second: grid.map_or(0, |grid| grid.frame_at_beat(1)),
-            grid_bpm_bits: grid.map_or(0, |grid| grid.average_bpm().to_bits()),
+            grid: GridKey::of(grid),
         };
         if state.key == Some(key)
             && state
@@ -408,6 +464,23 @@ impl WaveformView {
         state.last = Some(Instant::now());
         state.key = Some(key);
     }
+}
+
+/// Erase the character cells of `area` without moving the final cursor away from its origin. Shared
+/// by both image transports; only the first image uses it, because clearing later would blink.
+fn clear_cells(out: &mut String, area: Rect) {
+    out.push_str("\x1b[0m\x1b7");
+    for row in 0..area.height {
+        write!(
+            out,
+            "\x1b[{};{}H\x1b[{}X",
+            area.y + row + 1,
+            area.x + 1,
+            area.width
+        )
+        .expect("writing to a String cannot fail");
+    }
+    out.push_str("\x1b8");
 }
 
 /// Marks the whole image rectangle as owned by the terminal-side image. The first cell is
@@ -684,10 +757,60 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer();
         let image = buffer.cell((0, 0)).expect("image cell");
-        assert!(image.symbol().contains("a=T"), "{}", image.symbol());
+        assert!(image.symbol().contains("a=t"), "{}", image.symbol());
+        assert!(image.symbol().contains("a=p"), "{}", image.symbol());
         assert!(image.symbol().contains("f=32"));
         let playhead = buffer.cell((20, 0)).expect("playhead cell");
         assert_eq!(playhead.symbol(), "│");
+    }
+
+    #[test]
+    fn a_kitty_rebuild_transmits_before_replacing_the_old_image() {
+        let mut view = WaveformView::new(settings(WaveformBackend::Kitty), 1);
+        view.backend = Backend::Kitty;
+        view.cell = CellPx {
+            width: 8,
+            height: 16,
+        };
+        let backend = ratatui::backend::TestBackend::new(40, 6);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut draw = |terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>, frames_per_cell| {
+            terminal
+                .draw(|frame| {
+                    view.render(
+                        frame,
+                        0,
+                        Rect::new(0, 0, 40, 4),
+                        None,
+                        None,
+                        0.0,
+                        frames_per_cell,
+                    );
+                })
+                .unwrap();
+            terminal.backend().buffer().cell((0, 0)).unwrap().symbol().to_owned()
+        };
+        let first = draw(&mut terminal, 2048.0);
+        assert!(first.contains("a=t") && first.contains("a=p"));
+        assert!(first.starts_with("\x1b[0m\x1b7"), "first image clears text");
+        let second = draw(&mut terminal, 1024.0);
+        assert!(second.contains("a=t") && second.contains("a=p"));
+        assert!(
+            !second.contains("a=d,d=I"),
+            "the superseded image survives at least the rebuild frame: {second}"
+        );
+        assert!(
+            !second.starts_with("\x1b[0m\x1b7"),
+            "a rebuild must not clear the deck before the new image arrives: {second}"
+        );
+        let transmit = second.find("a=t").unwrap();
+        let place = second.find("a=p").unwrap();
+        assert!(transmit < place, "transmit → place");
+        let third = draw(&mut terminal, 1024.0);
+        assert!(third.contains("a=p") && third.contains("a=d,d=I"));
+        let place = third.find("a=p").unwrap();
+        let delete = third.find("a=d").unwrap();
+        assert!(place < delete, "the old image is deleted after the new placement");
     }
 
     #[test]
@@ -749,13 +872,21 @@ mod tests {
             height: 112,
         };
         let start = Instant::now();
+        let mut raster_ms = 0.0f64;
+        let mut encode_ms = 0.0f64;
         for _ in 0..rounds.min(6) {
+            let t0 = Instant::now();
             let image = raster::rasterize(Some(&waveform), None, 128.0, 2048.0 / 8.0, 2832, 112, false);
-            let _ = kitty::transmit(&image, &palette, 1, 1, Rect::new(0, 0, 118, 7), source);
+            raster_ms += t0.elapsed().as_secs_f64() * 1000.0;
+            let t1 = Instant::now();
+            let _ = kitty::transmit(&image, &palette, 1);
+            encode_ms += t1.elapsed().as_secs_f64() * 1000.0;
         }
         println!(
-            "kitty strip rebuild: {:.3} ms",
-            start.elapsed().as_secs_f64() * 1000.0 / f64::from(rounds.min(6))
+            "kitty strip rebuild: {:.3} ms (raster {:.3} + transmit {:.3})",
+            start.elapsed().as_secs_f64() * 1000.0 / f64::from(rounds.min(6)),
+            raster_ms / f64::from(rounds.min(6)),
+            encode_ms / f64::from(rounds.min(6))
         );
         let start = Instant::now();
         for _ in 0..rounds {

@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::{AudioPipeline, Meters};
@@ -17,6 +17,7 @@ use crate::command::{Slots, UiEvent};
 use crate::notices::NoticeTx;
 use crate::response::{self, LogLine};
 use crate::preference::WaveformSettings;
+use crate::procmon::ProcessMonitor;
 use crate::tui::browser::Browser;
 use crate::tui::waveform_view::WaveformView;
 use crate::tui::completer::{self, Completion, Ctx};
@@ -140,10 +141,14 @@ pub struct App {
     pub fx_slots: Slots,
 
     pub pending_states: usize,
-    pub state_sent: Option<Instant>,
-    pub state_latency: Duration,
     pub meters: Option<Meters>,
-    pub ui_frame_ms: f32,
+    /// Exponential moving averages for the header: UI draw cost and measured frame rate.
+    pub ui_draw_ms: f32,
+    pub ui_fps: f32,
+    /// Start of the previous draw, for the frame-rate average.
+    pub last_draw_at: Option<Instant>,
+    /// This process's CPU/RSS, sampled once a second.
+    pub process: ProcessMonitor,
     pub quit: bool,
 
     /// A modal picker, if one is open.
@@ -227,10 +232,11 @@ impl App {
             history_pos: None,
             fx_slots,
             pending_states: 0,
-            state_sent: None,
-            state_latency: Duration::ZERO,
             meters: None,
-            ui_frame_ms: 0.0,
+            ui_draw_ms: 0.0,
+            ui_fps: 60.0,
+            last_draw_at: None,
+            process: ProcessMonitor::new(),
             quit: false,
             overlay: None,
             midi: None,
@@ -312,15 +318,13 @@ impl App {
     /// Applies an engine response. Deck states update silently (they are on every poll); everything
     /// else is echoed to the log, exactly as the REPL would print it.
     pub fn on_response(&mut self, response: &CommandResponse, pipeline: &AudioPipeline) {
+        let sample_rate = self.sample_rate;
         match response {
             CommandResponse::States(states) => {
                 for state in states {
                     self.set_state(state);
                 }
                 self.pending_states = self.pending_states.saturating_sub(1);
-                if let Some(sent) = self.state_sent.take() {
-                    self.state_latency = sent.elapsed();
-                }
             }
             CommandResponse::State(state) => self.set_state(state),
             CommandResponse::Loaded {
@@ -331,17 +335,17 @@ impl App {
                     state.total_frames = *total_frames;
                 }
                 self.spawn_waveform(*deck_id, pipeline);
-                self.push_lines(response::format_response(response));
+                self.push_lines(response::format_response(response, sample_rate));
             }
             CommandResponse::FxListed { .. } => {
                 self.fx_slots.record(response);
-                self.push_lines(response::format_response(response));
+                self.push_lines(response::format_response(response, sample_rate));
             }
             CommandResponse::FxAdded { .. } => {
                 self.fx_slots.record(response);
-                self.push_lines(response::format_response(response));
+                self.push_lines(response::format_response(response, sample_rate));
             }
-            _ => self.push_lines(response::format_response(response)),
+            _ => self.push_lines(response::format_response(response, sample_rate)),
         }
     }
 
@@ -361,13 +365,15 @@ impl App {
         let index = deck_id as usize;
         let low_hz = f32::from(self.waveform.low_hz);
         let high_hz = f32::from(self.waveform.high_hz);
+        let sample_rate = self.sample_rate;
         std::thread::Builder::new()
             .name(format!("hypermixx-waveform-{deck_id}"))
             .spawn(move || {
-                let waveform = Arc::new(hypermixx_library::Waveform::build_with_crossovers(
+                let waveform = Arc::new(hypermixx_library::Waveform::build_with_crossovers_at(
                     source.as_ref(),
                     low_hz,
                     high_hz,
+                    sample_rate,
                 ));
                 let _ = tx.send((index, waveform));
             })

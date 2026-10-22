@@ -61,6 +61,14 @@ pub fn resolve(requested: WaveformBackend) -> (Backend, Option<String>) {
     if backend == Backend::Braille {
         return (backend, None);
     }
+    // Kitty and Ghostty do not implement sixel. If sixel was forced there, use the graphics
+    // protocol the terminal actually has rather than drawing an image it will ignore.
+    if backend == Backend::Sixel && kitty_only() {
+        return (
+            Backend::Kitty,
+            Some("this terminal does not implement sixel; using kitty graphics".to_owned()),
+        );
+    }
     if tmux {
         return (
             Backend::Braille,
@@ -94,6 +102,18 @@ pub fn cell_px() -> CellPx {
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// Terminals that implement Kitty graphics but not sixel. WezTerm is deliberately excluded: it
+/// supports sixel too, so an explicit sixel request there is honoured.
+fn kitty_only() -> bool {
+    env("KITTY_WINDOW_ID").is_some()
+        || env("GHOSTTY_RESOURCES_DIR").is_some()
+        || env("KONSOLE_VERSION").is_some()
+        || env("TERM").is_some_and(|term| term.contains("kitty"))
+        || env("TERM_PROGRAM").is_some_and(|program| {
+            matches!(program.as_str(), "kitty" | "ghostty")
+        })
 }
 
 fn kitty_hint() -> bool {
@@ -130,7 +150,15 @@ mod tests {
         // ordinarily neither.
         if env("TMUX").is_none() && env("STY").is_none() && env("TERM").as_deref() != Some("dumb") {
             assert_eq!(resolve(WaveformBackend::Kitty).0, Backend::Kitty);
-            assert_eq!(resolve(WaveformBackend::Sixel).0, Backend::Sixel);
+            let (backend, note) = resolve(WaveformBackend::Sixel);
+            if kitty_only() {
+                // Kitty/Ghostty have graphics but no sixel; an explicit sixel request must not
+                // leave a blank deck.
+                assert_eq!(backend, Backend::Kitty);
+                assert!(note.is_some_and(|note| note.contains("sixel")));
+            } else {
+                assert_eq!(backend, Backend::Sixel);
+            }
         }
     }
 

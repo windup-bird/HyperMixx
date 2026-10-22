@@ -92,7 +92,18 @@ impl Waveform {
     /// As [`build`](Self::build) with the two band crossovers spelled out. The UI reads them from
     /// `preference.toml`; the defaults are the shipping choice.
     pub fn build_with_crossovers(source: &dyn Source, low_hz: f32, high_hz: f32) -> Self {
-        let level0 = analyse(source, BASE_BUCKET, low_hz, high_hz);
+        Self::build_with_crossovers_at(source, low_hz, high_hz, hypermixx_core::SAMPLE_RATE)
+    }
+
+    /// As [`build_with_crossovers`](Self::build_with_crossovers) for a source already resampled to
+    /// a live engine rate other than the default.
+    pub fn build_with_crossovers_at(
+        source: &dyn Source,
+        low_hz: f32,
+        high_hz: f32,
+        sample_rate: u32,
+    ) -> Self {
+        let level0 = analyse(source, BASE_BUCKET, low_hz, high_hz, sample_rate);
         Self::from_level0(level0, BASE_BUCKET, source.total_frames())
     }
 
@@ -113,7 +124,13 @@ impl Waveform {
         low_hz: f32,
         high_hz: f32,
     ) -> Self {
-        let level0 = analyse(source, bucket_frames.max(1), low_hz, high_hz);
+        let level0 = analyse(
+            source,
+            bucket_frames.max(1),
+            low_hz,
+            high_hz,
+            hypermixx_core::SAMPLE_RATE,
+        );
         Self::from_level0(level0, bucket_frames.max(1), source.total_frames())
     }
 
@@ -238,6 +255,7 @@ fn analyse(
     bucket_frames: u64,
     low_hz: f32,
     high_hz: f32,
+    sample_rate: u32,
 ) -> Vec<StereoPeaks> {
     let total = source.total_frames();
     let capacity = (total / bucket_frames) as usize + 1;
@@ -246,8 +264,8 @@ fn analyse(
     // One-pole coefficients and per-channel state: `mid_lp` is the high crossover low-pass,
     // `low_lp` the low one. Keeping two states is the only extra work stereo costs over the old
     // mono scan.
-    let low_a = pole(low_hz);
-    let high_a = pole(high_hz);
+    let low_a = pole(low_hz, sample_rate);
+    let high_a = pole(high_hz, sample_rate);
     let mut low_lp = [0.0f32; CHANNELS];
     let mut mid_lp = [0.0f32; CHANNELS];
 
@@ -295,8 +313,8 @@ fn quantise(value: f32) -> u8 {
 }
 
 /// One-pole low-pass coefficient `a = 1 - exp(-2*pi*fc/fs)`.
-fn pole(hz: f32) -> f32 {
-    let fs = hypermixx_core::SAMPLE_RATE as f32;
+fn pole(hz: f32, sample_rate: u32) -> f32 {
+    let fs = sample_rate.max(1) as f32;
     (1.0 - (-std::f32::consts::TAU * hz / fs).exp()).clamp(0.0, 1.0)
 }
 

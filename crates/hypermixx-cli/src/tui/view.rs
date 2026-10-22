@@ -61,7 +61,8 @@ fn render_top(frame: &mut Frame, area: Rect, app: &App) {
     let overruns = app.meters.map_or(0, |meters| meters.overruns);
     let ring_ms = app.ring_frames as f64 * 1000.0 / f64::from(app.sample_rate);
 
-    let mut spans = vec![
+    let white = Style::default().fg(Color::White);
+    let spans = vec![
         Span::styled(
             format!(" HYPERMIXX {} ", app.version),
             Style::default()
@@ -69,22 +70,36 @@ fn render_top(frame: &mut Frame, area: Rect, app: &App) {
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(" {}Hz ", app.sample_rate)),
-        Span::raw(format!(" {} decks ", app.decks)),
-        Span::raw(format!(" ring {ring_ms:.0}ms ")),
-        Span::raw(format!(" out {} ", db(peak))),
-        Span::raw(format!(" cue {} ", db(cue))),
+        Span::styled(format!(" {}Hz ", app.sample_rate), white),
+        Span::styled(
+            format!(" ui {:.1}ms {:.0}fps ", app.ui_draw_ms, app.ui_fps),
+            white,
+        ),
+        Span::styled(
+            format!(" cpu {} ", cpu_label(app.process.cpu_percent())),
+            white,
+        ),
+        Span::styled(format!(" mem {} ", mem_label(app.process.memory_bytes())), white),
+        Span::styled(format!(" ring {ring_ms:.0}ms "), white),
+        Span::styled(format!(" out {} ", db(peak)), white),
+        Span::styled(format!(" cue {} ", db(cue)), white),
+        Span::styled(format!(" drop {overruns} "), white),
     ];
-    let dropped = if overruns > 0 {
-        Color::Red
-    } else {
-        Color::DarkGray
-    };
-    spans.push(Span::styled(
-        format!(" drop {overruns} "),
-        Style::default().fg(dropped),
-    ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn cpu_label(cpu: Option<f32>) -> String {
+    cpu.map_or_else(|| "--".to_owned(), |percent| format!("{percent:.1}%"))
+}
+
+fn mem_label(bytes: Option<u64>) -> String {
+    match bytes {
+        None => "--".to_owned(),
+        Some(bytes) if bytes >= 1 << 30 => {
+            format!("{:.2}G", bytes as f64 / f64::from(1 << 30))
+        }
+        Some(bytes) => format!("{:.0}M", bytes as f64 / f64::from(1 << 20)),
+    }
 }
 
 fn db(peak: f32) -> String {
@@ -153,7 +168,7 @@ fn render_deck_info(frame: &mut Frame, area: Rect, app: &App, index: usize) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let clock = deck_clock(&app.states[index]);
+    let clock = deck_clock(&app.states[index], app.sample_rate);
     let clock_width = text::width(&clock).min(area.width as usize) as u16;
     let columns =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(clock_width)]).split(area);
@@ -174,7 +189,7 @@ fn render_deck_info(frame: &mut Frame, area: Rect, app: &App, index: usize) {
 }
 
 /// `played / remaining`. Total duration is deliberately absent: the two numbers already imply it.
-fn deck_clock(state: &DeckState) -> String {
+fn deck_clock(state: &DeckState, sample_rate: u32) -> String {
     let glyph = if state.total_frames == 0 {
         "·"
     } else if state.playing {
@@ -185,8 +200,11 @@ fn deck_clock(state: &DeckState) -> String {
     if state.total_frames == 0 {
         return format!("{glyph} --:--.--- / --:--.--- ");
     }
-    let elapsed = time(state.current_frame.min(state.total_frames));
-    let remaining = time(state.total_frames.saturating_sub(state.current_frame));
+    let elapsed = time(state.current_frame.min(state.total_frames), sample_rate);
+    let remaining = time(
+        state.total_frames.saturating_sub(state.current_frame),
+        sample_rate,
+    );
     format!("{glyph} {elapsed} / -{remaining} ")
 }
 
@@ -608,13 +626,55 @@ mod tests {
     }
 
     #[test]
-    fn header_hides_the_analysis_backend_and_ui_timings() {
+    fn header_hides_the_analysis_backend_and_poll_but_shows_ui() {
         let mut app = test_app();
         let buffer = render_buffer(&mut app);
         let row = row_text(&buffer, 0);
         assert!(!row.contains("Auto"), "analysis backend leaked into the header: {row}");
         assert!(!row.contains("poll"), "poll latency leaked into the header: {row}");
-        assert!(!row.contains(" ui "), "render timing leaked into the header: {row}");
+        assert!(row.contains(" ui ") && row.contains("fps"), "UI timing missing: {row}");
+        assert!(row.contains(" cpu ") && row.contains(" mem "), "process metrics missing: {row}");
+    }
+
+    #[test]
+    fn process_metrics_are_compact() {
+        assert_eq!(cpu_label(Some(12.4)), "12.4%");
+        assert_eq!(cpu_label(None), "--");
+        assert_eq!(mem_label(Some(123 * 1024 * 1024)), "123M");
+        assert_eq!(mem_label(Some(3 << 30)), "3.00G");
+        assert_eq!(mem_label(None), "--");
+    }
+
+    #[test]
+    fn the_header_badge_is_cyan_and_the_rest_is_white() {
+        let mut app = test_app();
+        let buffer = render_buffer(&mut app);
+        let row = row_text(&buffer, 0);
+        assert!(!row.contains("decks"), "deck count still in the header: {row}");
+
+        let mut badge = false;
+        for x in 0..buffer.area.width {
+            let Some(cell) = buffer.cell((x, 0)) else {
+                continue;
+            };
+            if cell.bg == Color::Cyan {
+                assert_eq!(cell.fg, Color::Black, "badge text must be black on cyan");
+                badge = true;
+            } else if !cell.symbol().trim().is_empty() {
+                assert_eq!(cell.fg, Color::White, "header field is not white: {cell:?}");
+            }
+        }
+        assert!(badge, "the HYPERMIXX badge lost its cyan background");
+    }
+
+    #[test]
+    fn header_reports_ui_draw_cost_and_frame_rate() {
+        let mut app = test_app();
+        app.ui_draw_ms = 2.4;
+        app.ui_fps = 59.0;
+        let buffer = render_buffer(&mut app);
+        let row = row_text(&buffer, 0);
+        assert!(row.contains("ui 2.4ms 59fps"), "{row}");
     }
 
     #[test]
@@ -641,7 +701,11 @@ mod tests {
         );
 
         let row = row_text(&buffer, status_rows[0]);
-        let clock = format!("{} / -{}", time(50_000), time(50_000));
+        let clock = format!(
+            "{} / -{}",
+            time(50_000, app.sample_rate),
+            time(50_000, app.sample_rate)
+        );
         assert!(row.contains(&clock), "{row}");
         assert!(
             !row.contains("[50000/100000]"),

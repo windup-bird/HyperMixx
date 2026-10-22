@@ -33,9 +33,6 @@ use app::App;
 const TICK: Duration = Duration::from_millis(16);
 /// Ask for meters every sixth tick (~10Hz): enough for a readable meter, far from chatty.
 const METERS_EVERY: u64 = 6;
-/// Poll state every tick: the playhead is what the image transports animate, so 60Hz polling is
-/// what makes a 60Hz Kitty waveform actually move at 60Hz. Still one request outstanding.
-const STATE_EVERY: u64 = 1;
 
 /// Runs the TUI until the user quits. Restores the terminal and stops the engine on the way out.
 ///
@@ -62,12 +59,14 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     dispatcher.with_topology(topology);
     dispatcher.with_profile(profile);
     let ring_frames = live.audio.ring_frames;
+    let sample_rate = live.audio.sample_rate;
     dispatcher.with_live(live, live_source);
     // Prime every chain's slot list so `fx remove <name>` works from the first command.
     dispatcher.prime(decks, pipeline.response_rx());
     let mut app = App::new(decks, backend, notice_rx, event_rx, dispatcher.slots());
-    // The header reports the configured ring, not the compile-time default.
+    // The header reports the configured ring and rate, not the compile-time defaults.
     app.ring_frames = ring_frames;
+    app.sample_rate = sample_rate;
     match preference::load(&preference_path) {
         Ok((preference, notes)) => {
             app.waveform = preference.waveform;
@@ -125,6 +124,16 @@ fn preference_path(profile: Option<&str>) -> String {
         .into_owned()
 }
 
+/// A light exponential moving average: enough to keep the header from flickering on every frame,
+/// while still showing a strip-rebuild spike for a second or so.
+fn ema(previous: &mut f32, sample: f32) {
+    if *previous <= 0.0 {
+        *previous = sample;
+    } else {
+        *previous = *previous * 0.9 + sample * 0.1;
+    }
+}
+
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
@@ -134,9 +143,18 @@ fn event_loop(
     let mut next_tick = Instant::now() + TICK;
     let mut ticks: u64 = 0;
     while !app.quit {
+        let now = Instant::now();
+        if let Some(last) = app.last_draw_at {
+            let interval_ms = now.duration_since(last).as_secs_f32() * 1000.0;
+            ema(&mut app.ui_fps, 1000.0 / interval_ms.max(0.001));
+        }
+        app.last_draw_at = Some(now);
         let draw_start = Instant::now();
         terminal.draw(|frame| view::render(frame, app))?;
-        app.ui_frame_ms = draw_start.elapsed().as_secs_f32() * 1000.0;
+        ema(
+            &mut app.ui_draw_ms,
+            draw_start.elapsed().as_secs_f32() * 1000.0,
+        );
 
         // Engine responses. State answers update the deck readouts silently; the rest is logged.
         while let Ok(response) = pipeline.response_rx().try_recv() {
@@ -146,16 +164,16 @@ fn event_loop(
 
         ticks = ticks.wrapping_add(1);
         // One outstanding state request at a time: a stalled engine must not build a backlog.
-        if ticks.is_multiple_of(STATE_EVERY)
-            && app.pending_states == 0
-            && dispatcher.command_tx.send(Command::GetAllStates).is_ok()
-        {
+        // Polling every tick is what lets a 60Hz Kitty waveform move at 60Hz; the playhead is the
+        // value it animates.
+        if app.pending_states == 0 && dispatcher.command_tx.send(Command::GetAllStates).is_ok() {
             app.pending_states = 1;
-            app.state_sent = Some(Instant::now());
         }
         if ticks.is_multiple_of(METERS_EVERY) {
             app.meters = pipeline.meters();
         }
+        // Once a second; kept after the draw so a sysinfo read never sits in the input path.
+        app.process.refresh();
 
         // Handle input until the next tick, then redraw. Keys stay responsive between frames.
         loop {
