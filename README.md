@@ -104,9 +104,7 @@ cargo run -p hypermixx-cli -- --midi-guide          # learn 模式编辑映射�
 TUI 内尽量不用启动参数:`--tui` 下按 `F2` 选 MIDI 端口、`F3` 选映射文件；`load` 不带路径则弹出
 文件浏览器；`--midi-guide` 即使不跟路径也会在 TUI 里选端口与文件。波形左右声道上下镜像，三频段颜色、
 分频点（`low_hz`/`high_hz`，默认 200/4000Hz）、渲染 backend 与图像刷新率在 `profile/preference.toml` 配置：
-`auto` 按 kitty → sixel → braille 选择
-（Windows Terminal 1.22+ 走 sixel；tmux/screen 暂回 braille；Kitty/Ghostty 不支持 sixel，会回退 kitty），
-kitty 可 60Hz，sixel 上限 30Hz。
+`auto` 按 kitty → braille 选择（tmux/screen 暂回 braille）；kitty 可用 60Hz。
 
 `profile/` 放全部默认文件：`profile.toml`（用哪几个文件）、`mixer.toml`（拓扑）、`live.toml`（本机设置）、
 `midi.toml`（设备名 + 映射）、`preference.toml`（波形颜色/backend/刷新率），命名 profile 也放这里
@@ -121,6 +119,47 @@ kitty 可 60Hz，sixel 上限 30Hz。
 
 `./scripts/phase_probe.sh`: 6次beatjump测试相位差
 `./scripts/sync_phase.sh`: 同曲先后播放sync测稳态相位差
+
+## 曲库
+
+`library` 读取本地文件夹和 rekordbox / VirtualDJ / Serato 的 USB 导出，缓存到
+`$HYPERMIXX_CACHE/library/library.sqlite3`（默认 `.cache/library/`）。U 盘只读，不写回。
+
+```toml
+# profile/preference.toml
+[library]
+local = ["rkb", "serato", "vdj"]   # 本机用户目录里的库
+usb   = ["rkb", "serato", "vdj"]   # 插拔 U 盘时自动挂载并发现的库
+folders = ["./mp3"]                # 普通文件夹源
+```
+
+```text
+browser refresh                       # 增量重扫已配置来源
+browser list                          # 来源和 id
+browser tracks <list-id>              # list 内容
+browser show <location-id>            # 单曲详情
+```
+
+未出现在 `local` / `usb` / `folders` 里的来源不会扫描，也不会显示。同一个 U 盘的
+rekordbox / VirtualDJ / Serato 会作为三个不同 library 出现。USB 插拔由后台 watcher
+轮询 `/sys/block`，未挂载时调用 `udisksctl mount --no-user-interaction`。
+
+- rekordbox：优先 `exportLibrary.db`（SQLCipher），没有时回退 `export.pdb`；ANLZ 的
+  `PQTZ`/`PCO2` 导入 beatgrid 和 hot cue。
+- VirtualDJ：`database.xml` + `vdj-export/vdj-list.m3u`，有 ANLZ 时一并导入。
+- Serato：`database V2` + `Subcrates/*.crate`，cue/grid 从 ID3 `GEOB` 读取。
+- 同一音频按内容哈希合并；路径只属于 location。
+- RB 的 ANLZ 时间保留原始值，并在 cue/grid 行记录 `offset_ms`。实测以 RB/VDJ 为 0 时，
+  Serato tag 晚约 16.5ms，因此默认 `serato_offset_ms = -16.5`。
+  加载时先减掉解码器 gapless 起点（MP3 样本 25.0567ms），再加可配置的微调，最后换算到帧。
+- 默认 RB 口令是公开常量；需要覆盖时设 `HYPERMIXX_REKORDBOX_KEY`。
+- `profile/preference.toml` 的 `[library] local|usb|folders` 决定启动时扫描/显示哪些来源。
+  `decoder_start_ms`、`grid_offset_ms` 以及 `rkb_mp3_offset_ms` / `serato_offset_ms` /
+  `vdj_offset_ms` 控制导入网格的时间补偿。`[display] key = "camelot"`（默认）可改为 `"classic"`。
+
+TUI：`Tab` 到 browser 后，`↑/↓` 选择、`→/Enter` 打开（最低一级进入 tracks）、`←/Esc` 返回；
+track 上 `Enter`/`load [deck]` 加载，`analyse` 分析并缓存；鼠标双击 track 弹出 deck0/deck1 选择。
+MIDI 可用 `browser.up/down/open/exit/load/refresh`，`hotcue set|trigger|clear <1..8>` 控制 hot cue。
 
 ## Stem Separate
 

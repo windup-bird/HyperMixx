@@ -182,7 +182,14 @@ impl AudioPipeline {
                 };
                 mixer.set_keylock_window(tuning.keylock);
                 let _ = boot_tx.send(Ok(()));
-                Self::producer_loop(mixer, SyncGroup::default(), cmd_rx, query_rx, resp_tx, sample_rate);
+                Self::producer_loop(
+                    mixer,
+                    SyncGroup::default(),
+                    cmd_rx,
+                    query_rx,
+                    resp_tx,
+                    sample_rate,
+                );
             })
             .map_err(|err| PipelineError::Thread(err.to_string()))?;
 
@@ -205,9 +212,7 @@ impl AudioPipeline {
 
     /// The command entry point. Clone it into whichever thread asks for things.
     pub fn command_tx(&self) -> Sender<Command> {
-        self.cmd_tx
-            .clone()
-            .expect("the pipeline is shutting down")
+        self.cmd_tx.clone().expect("the pipeline is shutting down")
     }
 
     pub fn response_rx(&self) -> &Receiver<CommandResponse> {
@@ -379,14 +384,14 @@ fn sleep_until_next(started: Instant, pace: Duration) {
 ///
 /// Transport commands go to the deck inside a channel; FX commands are the mixer's own business.
 /// `Quit` is handled by the loop, so it never reaches here.
-fn route(
-    mixer: &mut Mixer,
-    sync: &mut SyncGroup,
-    command: Command,
-) -> Option<CommandResponse> {
+fn route(mixer: &mut Mixer, sync: &mut SyncGroup, command: Command) -> Option<CommandResponse> {
     use Command::*;
     match command {
-        Load { deck_id, source, analysis } => {
+        Load {
+            deck_id,
+            source,
+            analysis,
+        } => {
             let total_frames = source.total_frames();
             // The fader range is a controller setting, not a track property: read it before the
             // channel borrow and carry it over, so loading a track does not reset the DJ's range.
@@ -410,7 +415,10 @@ fn route(
                 deck.set_analysis(analysis);
             }
             channel.replace_deck(deck);
-            Some(CommandResponse::Loaded { deck_id, total_frames })
+            Some(CommandResponse::Loaded {
+                deck_id,
+                total_frames,
+            })
         }
         // An explicit transport command takes the record out of the hand's control: see
         // `Deck::release_vinyl`.
@@ -427,9 +435,16 @@ fn route(
             deck.toggle_play()
         }),
         Cue { deck_id, op } => transport(mixer, deck_id, move |deck| deck.apply_cue(op)),
-        Jump { deck_id, target_frame } => {
-            transport(mixer, deck_id, move |deck| deck.jump(target_frame))
-        }
+        HotCue { deck_id, op } => transport(mixer, deck_id, move |deck| deck.apply_hot_cue(op)),
+        SetCues {
+            deck_id,
+            memory,
+            hot,
+        } => transport(mixer, deck_id, move |deck| deck.set_cues(memory, &hot)),
+        Jump {
+            deck_id,
+            target_frame,
+        } => transport(mixer, deck_id, move |deck| deck.jump(target_frame)),
         BeatJump { deck_id, beats } => transport(mixer, deck_id, move |deck| deck.beatjump(beats)),
         SetTempo { deck_id, tempo } => answered(sync.set_tempo(mixer, deck_id, tempo)),
         SetTempoFader { deck_id, position } => {
@@ -440,17 +455,14 @@ fn route(
         Nudge { deck_id, op } => answered(sync.nudge(mixer, deck_id, op)),
         Vinyl { deck_id, op } => transport(mixer, deck_id, move |deck| deck.apply_vinyl(op)),
         SetFader { target, value } => answered(mixer.set_fader(target, value)),
-        Loop { deck_id, op } => {
-            transport_result(mixer, deck_id, move |deck| deck.apply_loop(op))
-        }
+        Loop { deck_id, op } => transport_result(mixer, deck_id, move |deck| deck.apply_loop(op)),
         SetKeylock { deck_id, mode } => {
             transport(mixer, deck_id, move |deck| deck.set_keylock_mode(mode))
         }
         // The pitch axis is a placeholder: the value is remembered and reported, nothing more.
-        SetKey {
-            deck_id,
-            semitones,
-        } => transport(mixer, deck_id, move |deck| deck.set_key_shift(semitones)),
+        SetKey { deck_id, semitones } => {
+            transport(mixer, deck_id, move |deck| deck.set_key_shift(semitones))
+        }
         SetStems { deck_id, stems } => Some(match mixer.set_stems(deck_id, stems) {
             Ok(()) => CommandResponse::Ok,
             Err(err) => error(err),
@@ -509,7 +521,11 @@ fn route(
 
 /// Runs `apply` on a loaded deck; an empty deck is answered with an error rather than ignored, so a
 /// mistyped deck id is visible instead of silent.
-fn transport(mixer: &mut Mixer, deck_id: DeckId, apply: impl FnOnce(&mut Deck)) -> Option<CommandResponse> {
+fn transport(
+    mixer: &mut Mixer,
+    deck_id: DeckId,
+    apply: impl FnOnce(&mut Deck),
+) -> Option<CommandResponse> {
     transport_result(mixer, deck_id, |deck| {
         apply(deck);
         Ok(())
@@ -550,7 +566,7 @@ fn state_of(deck_id: DeckId, channel: &crate::mixer::Channel, sync: &SyncGroup) 
         total_frames: deck.total_frames(),
         bpm: deck.bpm(),
         bpm_at_frame: deck.bpm_at_frame() as f32,
-        key: deck.key().map(|key| key.traditional()),
+        key: deck.key().map(|key| key.camelot()),
         virtual_frame: deck.virtual_frame(),
         loop_range: deck
             .loop_range()
@@ -570,6 +586,7 @@ fn state_of(deck_id: DeckId, channel: &crate::mixer::Channel, sync: &SyncGroup) 
         sync_mode: sync.mode_label().to_owned(),
         group_bpm: sync.group_bpm as f32,
         cue_frame: deck.cue_point(),
+        hot_cues: deck.hot_cues(),
         vinyl: deck.vinyl_held(),
         keylock: deck.keylock_mode(),
         key_shift: deck.key_shift(),

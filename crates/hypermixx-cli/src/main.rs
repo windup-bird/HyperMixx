@@ -10,15 +10,19 @@ mod midi;
 mod notices;
 mod preference;
 mod procmon;
-mod repl;
 mod profile;
+mod repl;
 mod response;
 mod session;
 mod tui;
+mod usb;
+
+use std::sync::Arc;
 
 use crossbeam_channel::unbounded;
 use hypermixx_audio::{reference_toml, simple_dj, AudioPipeline, MixerConfig, DECK_COUNT};
 use hypermixx_core::{Backend, LiveConfig};
+use hypermixx_library::LibraryDb;
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -35,8 +39,7 @@ fn main() {
         // The guide can be told its port by the profile too, so mapping a controller does not need
         // the port repeated on the command line.
         let guide_port = args.midi.clone().or_else(|| {
-            read_profile(args.profile.as_deref())
-                .and_then(|profile| profile.midi.device)
+            read_profile(args.profile.as_deref()).and_then(|profile| profile.midi.device)
         });
         if let Err(err) = tui::guide::run(path, guide_port.as_deref(), decks) {
             eprintln!("error: {err}");
@@ -48,8 +51,14 @@ fn main() {
     // A profile names the topology and the live file. It is a pointer, not a third schema: the two
     // files keep their own validation, and an explicit `--config`/`--live` still wins over it.
     let (profile, profile_path) = read_profile_at(args.profile.as_deref());
-    let config_path = args.config.clone().or_else(|| profile.as_ref().and_then(|p| p.mixer.clone()));
-    let live_path = args.live.clone().or_else(|| profile.as_ref().and_then(|p| p.live.clone()));
+    let config_path = args
+        .config
+        .clone()
+        .or_else(|| profile.as_ref().and_then(|p| p.mixer.clone()));
+    let live_path = args
+        .live
+        .clone()
+        .or_else(|| profile.as_ref().and_then(|p| p.live.clone()));
     // MIDI comes from the profile too: naming a controller there is what makes `--profile dj` bring
     // up a whole rig rather than just a topology. Explicit flags still win.
     //
@@ -68,7 +77,10 @@ fn main() {
             Err(_) => profile::MidiSettings::default(),
         },
     };
-    let midi_port = args.midi.clone().or_else(|| midi_from_profile.device.clone());
+    let midi_port = args
+        .midi
+        .clone()
+        .or_else(|| midi_from_profile.device.clone());
     let midi_map = args
         .midi_map
         .clone()
@@ -139,6 +151,15 @@ fn main() {
     // Worker progress (decode, analysis) travels beside engine responses so neither front-end has
     // to print from a background thread.
     let (notice_tx, notice_rx) = unbounded();
+    // The library is a cache, not a reason to refuse to start: an unwritable cache disables the
+    // browser and leaves playback untouched.
+    let library = match LibraryDb::open_default() {
+        Ok(db) => Some(Arc::new(db)),
+        Err(err) => {
+            eprintln!("warning: library: {err}; browser disabled");
+            None
+        }
+    };
 
     // The TUI attaches MIDI itself (and can pick a port/map at runtime), so its session lives in
     // the app rather than here. The REPL has no picker, so its session is attached up front — a bad
@@ -158,6 +179,7 @@ fn main() {
                 live_source,
                 midi_port: midi_port.clone(),
                 midi_map,
+                library: library.clone(),
             },
         );
         return;
@@ -215,6 +237,7 @@ fn main() {
             live_source,
             midi_port: midi_port.clone(),
             midi_map,
+            library,
         },
     );
     drop(midi_session);
@@ -261,16 +284,16 @@ impl CliArgs {
                         Some("timestretch") => Backend::Timestretch,
                         Some("auto") | None => Backend::Auto,
                         Some(other) => {
-                            eprintln!("error: unknown backend `{other}` (auto|stratum|timestretch)");
+                            eprintln!(
+                                "error: unknown backend `{other}` (auto|stratum|timestretch)"
+                            );
                             std::process::exit(1);
                         }
                     };
                 }
                 "--profile" => {
                     args.profile = raw.next().or_else(|| {
-                        eprintln!(
-                            "error: --profile needs a name or a path (profile/<name>.toml)"
-                        );
+                        eprintln!("error: --profile needs a name or a path (profile/<name>.toml)");
                         std::process::exit(1);
                     });
                 }
@@ -288,7 +311,9 @@ impl CliArgs {
                 }
                 "--midi" => {
                     args.midi = raw.next().or_else(|| {
-                        eprintln!("error: --midi needs a port name or index (`midi ports` lists them)");
+                        eprintln!(
+                            "error: --midi needs a port name or index (`midi ports` lists them)"
+                        );
                         std::process::exit(1);
                     });
                 }
@@ -385,7 +410,10 @@ fn default_config() -> MixerConfig {
         Ok(text) => match MixerConfig::from_toml_str(&text) {
             Ok(cfg) => cfg,
             Err(err) => {
-                eprintln!("warning: {PATH}: {}; using the built-in topology", err.message());
+                eprintln!(
+                    "warning: {PATH}: {}; using the built-in topology",
+                    err.message()
+                );
                 simple_dj()
             }
         },

@@ -335,3 +335,37 @@ channel = 1
 id = 1
 deck = 1
 action = "cue"
+
+# Browser navigation is front-end-only (no deck target except `browser.load`, whose optional
+# `deck` field chooses the destination). Uncomment and adjust the notes to your controller.
+#
+# [[bind]]
+# type = "note"
+# channel = 0
+# id = 90
+# action = "browser.up"
+#
+# [[bind]]
+# type = "note"
+# channel = 0
+# id = 91
+# action = "browser.down"
+#
+# [[bind]]
+# type = "note"
+# channel = 0
+# id = 92
+# action = "browser.open"
+#
+# [[bind]]
+# type = "note"
+# channel = 0
+# id = 93
+# action = "browser.exit"
+#
+# [[bind]]
+# type = "note"
+# channel = 0
+# id = 94
+# deck = 0
+# action = "browser.load"

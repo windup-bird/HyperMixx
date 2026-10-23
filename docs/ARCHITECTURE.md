@@ -388,7 +388,7 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   只保留一行状态(文件名在边框标题,右侧是 `已播放 / -剩余`)+ 波形(左声道在上、右声道在下的
   三频段镜像;缩放单位是 frames/cell;分频点默认 200/4000Hz，可在 preference 调);底部
   `browser : command = 2 : 1`,browser 内部再按 1 : 3 分栏(目录/歌单 | 曲目列表)。波形 backend
-  按 preference 的 `auto`/`kitty`/`sixel`/`braille` 选择(auto 为 kitty → sixel → braille;
+  按 preference 的 `auto`/`kitty`/`braille` 选择(auto 为 kitty → braille;
   三频段颜色也在 `profile/preference.toml`)。command
   上半是响应日志,下半输入带的顶线嵌入 `deck0 / deck1 / browser` 目标(`Tab` 循环;browser
   目前没有 CLI 前缀),目标文字与面板标题 `command` 左对齐

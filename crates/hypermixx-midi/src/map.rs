@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use hypermixx_core::{DeckId, FaderTarget, FxChainId, PhaseMode, Stem};
+use hypermixx_core::{BrowserAction, DeckId, FaderTarget, FxChainId, HotCueOp, PhaseMode, Stem};
 use serde::{Deserialize, Serialize};
 
 /// A parse or validation failure. The message carries the TOML position when the error came from
@@ -33,7 +33,9 @@ pub struct MapError {
 
 impl MapError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into() }
+        Self {
+            message: message.into(),
+        }
     }
 
     pub fn message(&self) -> &str {
@@ -197,7 +199,9 @@ pub enum Action {
     /// Kept — and kept out of [`ACTIONS`], so the guide offers one cue row instead of two — for a
     /// button that should only *place* the cue point. `cue.smart` is the name a map uses for it.
     CueSmart,
-    BeatJump { beats: i64 },
+    BeatJump {
+        beats: i64,
+    },
     Fader(FaderTarget),
     /// Tempo fader: a bipolar position in `-1..=1`. The deck maps it to a rate under its own
     /// `temporange`, so the range is a deck setting, not a per-binding constant.
@@ -225,9 +229,17 @@ pub enum Action {
     Sync(SyncAction),
     Fx(FxAction),
     /// Latch one stem's mute (a button, so it flips rather than holding a value).
-    StemMute { stem: Stem },
+    StemMute {
+        stem: Stem,
+    },
     /// Latch one stem's solo membership.
-    StemSolo { stem: Stem },
+    StemSolo {
+        stem: Stem,
+    },
+    /// Browser navigation/load. Consumed by the front-end, never sent to the engine.
+    Browser(BrowserAction),
+    /// One hot-cue slot operation.
+    HotCue(HotCueOp),
 }
 
 impl Action {
@@ -290,11 +302,26 @@ pub enum SyncAction {
 /// has asked the engine for each chain, never written into the file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FxAction {
-    On { chain: FxChainId, fx: String },
-    Off { chain: FxChainId, fx: String },
-    Toggle { chain: FxChainId, fx: String },
-    Pad { chain: FxChainId, fx: String },
-    Trigger { chain: FxChainId, fx: String },
+    On {
+        chain: FxChainId,
+        fx: String,
+    },
+    Off {
+        chain: FxChainId,
+        fx: String,
+    },
+    Toggle {
+        chain: FxChainId,
+        fx: String,
+    },
+    Pad {
+        chain: FxChainId,
+        fx: String,
+    },
+    Trigger {
+        chain: FxChainId,
+        fx: String,
+    },
     Param {
         chain: FxChainId,
         fx: String,
@@ -423,7 +450,11 @@ impl Map {
 
     /// An empty map (no bindings), for a fresh guide session.
     pub fn empty() -> Self {
-        Self { meta: None, binds: Vec::new(), fx_slots: HashMap::new() }
+        Self {
+            meta: None,
+            binds: Vec::new(),
+            fx_slots: HashMap::new(),
+        }
     }
 
     /// Records that `name` is slot `index` in `chain`. Called by the CLI after `ListFx`.
@@ -449,8 +480,9 @@ fn compile(raw: &RawBinding) -> Result<BindingSpec, String> {
         EventKind::Note | EventKind::Bend => RelMode::Abs,
     };
     if raw.reverse == Some(true) && mode == RelMode::Abs {
-        return Err("`reverse` is only meaningful for a relative `mode` (rel1 | rel2 | rel3)"
-            .to_owned());
+        return Err(
+            "`reverse` is only meaningful for a relative `mode` (rel1 | rel2 | rel3)".to_owned(),
+        );
     }
     let bipolar = action.is_bipolar();
     // FX params default to the effect's own 0..1 domain; faders use their target's domain.
@@ -534,6 +566,30 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
             deck("play")?;
             Ok(Action::Play)
         }
+        ["hotcue", what, slot] => {
+            deck("hotcue")?;
+            let slot = slot
+                .parse::<u8>()
+                .ok()
+                .filter(|slot| (1..=hypermixx_core::HOT_CUE_SLOTS as u8).contains(slot))
+                .ok_or_else(|| "hotcue slot must be 1..=8".to_owned())?
+                - 1;
+            Ok(Action::HotCue(match *what {
+                "set" => HotCueOp::Set(slot),
+                "trigger" | "play" => HotCueOp::Trigger(slot),
+                "clear" => HotCueOp::Clear(slot),
+                other => return Err(format!("unknown hotcue action `{other}`")),
+            }))
+        }
+        ["browser", what] => Ok(Action::Browser(match *what {
+            "up" => BrowserAction::Up,
+            "down" => BrowserAction::Down,
+            "open" => BrowserAction::Open,
+            "exit" => BrowserAction::Exit,
+            "refresh" => BrowserAction::Refresh,
+            "load" => BrowserAction::Load { deck: raw.deck },
+            other => return Err(format!("unknown browser action `{other}`")),
+        })),
         ["cue"] => {
             deck("cue")?;
             Ok(Action::Cue)
@@ -569,8 +625,8 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
             if !magnitude.is_finite() || magnitude < 1.0 {
                 return Err("a beatjump needs at least one beat".to_owned());
             }
-            let negative = from_line.map(|beats| beats < 0.0).unwrap_or(false)
-                || original.ends_with('-');
+            let negative =
+                from_line.map(|beats| beats < 0.0).unwrap_or(false) || original.ends_with('-');
             let beats = magnitude.round() as i64;
             Ok(Action::BeatJump {
                 beats: if negative { -beats } else { beats },
@@ -661,9 +717,15 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
             deck("sync")?;
             let (mode, seconds) = phase_args(rest)?;
             Ok(Action::Sync(if *phase == "phase" {
-                SyncAction::Phase { mode, t_seconds: seconds }
+                SyncAction::Phase {
+                    mode,
+                    t_seconds: seconds,
+                }
             } else {
-                SyncAction::PhaseLock { mode, t_seconds: seconds }
+                SyncAction::PhaseLock {
+                    mode,
+                    t_seconds: seconds,
+                }
             }))
         }
         // `<stem> fx …` / `master fx …` / `d1 fx …`: the action names its chain, the way a session
@@ -875,11 +937,14 @@ param = "value"
         let map = Map::from_toml_str(SAMPLE).unwrap();
         assert_eq!(map.meta.as_ref().unwrap().name.as_deref(), Some("unit"));
         assert_eq!(map.binds.len(), 4);
+        assert_eq!(map.binds[0].action, Action::Fader(FaderTarget::Flow(0)));
         assert_eq!(
-            map.binds[0].action,
-            Action::Fader(FaderTarget::Flow(0))
+            map.binds[1].action,
+            Action::Nudge {
+                delta: 0.05,
+                seconds: None
+            }
         );
-        assert_eq!(map.binds[1].action, Action::Nudge { delta: 0.05, seconds: None });
         assert_eq!(map.binds[1].kind, EventKind::Note);
         assert_eq!(map.binds[2].action, Action::Loop(LoopAction::Beats(8)));
         assert_eq!(
@@ -900,15 +965,11 @@ param = "value"
     #[test]
     fn fx_chains_can_address_one_stems_chain() {
         let bind = |action: &str, extra: &str| -> Action {
-            let text = format!(
-                "[[bind]]\ntype = \"note\"\nid = 1\n{extra}action = \"{action}\"\n"
-            );
+            let text = format!("[[bind]]\ntype = \"note\"\nid = 1\n{extra}action = \"{action}\"\n");
             Map::from_toml_str(&text).unwrap().binds[0].action.clone()
         };
         let bind_err = |action: &str, extra: &str| -> String {
-            let text = format!(
-                "[[bind]]\ntype = \"note\"\nid = 1\n{extra}action = \"{action}\"\n"
-            );
+            let text = format!("[[bind]]\ntype = \"note\"\nid = 1\n{extra}action = \"{action}\"\n");
             Map::from_toml_str(&text).unwrap_err().message().to_owned()
         };
         let on = |deck, stem| {
@@ -920,7 +981,10 @@ param = "value"
 
         // A bare stem name in `chain`, with the deck from the binding.
         assert_eq!(
-            bind("fx toggle", "deck = 1\nchain = \"vocals\"\nfx = \"filter\"\n"),
+            bind(
+                "fx toggle",
+                "deck = 1\nchain = \"vocals\"\nfx = \"filter\"\n"
+            ),
             on(1, Stem::Vocals)
         );
         // Spelled out, so a binding can address another deck's stem too.
@@ -959,7 +1023,10 @@ param = "value"
                 "deck = 0\nfx = \"filter\"\nparam = \"value\"\n"
             ),
             Action::Fx(FxAction::Param {
-                chain: FxChainId::Stem { deck: 0, stem: Stem::Vocals },
+                chain: FxChainId::Stem {
+                    deck: 0,
+                    stem: Stem::Vocals
+                },
                 fx: "filter".to_owned(),
                 param: "value".to_owned(),
             })
@@ -971,7 +1038,10 @@ param = "value"
         let err = bind_err("vocals fx toggle", "fx = \"filter\"\n");
         assert!(err.contains("deck"), "{err}");
         let err = bind_err("fx toggle", "chain = \"guitar\"\nfx = \"filter\"\n");
-        assert!(err.contains("unknown chain") && err.contains("guitar"), "{err}");
+        assert!(
+            err.contains("unknown chain") && err.contains("guitar"),
+            "{err}"
+        );
         let err = bind_err("fx toggle", "chain = \"vocals\"\nfx = \"filter\"\n");
         assert!(!err.is_empty());
     }
@@ -997,12 +1067,26 @@ param = "value"
             Map::from_toml_str(&text).unwrap().binds[0].action.clone()
         };
         assert_eq!(bind("beatjump -8", ""), Action::BeatJump { beats: -8 });
-        assert_eq!(bind("beatjump", "step = 4\n"), Action::BeatJump { beats: 4 });
+        assert_eq!(
+            bind("beatjump", "step = 4\n"),
+            Action::BeatJump { beats: 4 }
+        );
         // The legacy minus name still means "backwards", with the magnitude from `step`.
-        assert_eq!(bind("beatjump-", "step = 3\n"), Action::BeatJump { beats: -3 });
+        assert_eq!(
+            bind("beatjump-", "step = 3\n"),
+            Action::BeatJump { beats: -3 }
+        );
         assert_eq!(bind("loop 8", ""), Action::Loop(LoopAction::Beats(8)));
-        assert_eq!(bind("loop", ""), Action::Loop(LoopAction::Beats(4)), "the button default");
-        assert_eq!(bind("loop 8", "beats = 2\n"), Action::Loop(LoopAction::Beats(8)), "the line wins");
+        assert_eq!(
+            bind("loop", ""),
+            Action::Loop(LoopAction::Beats(4)),
+            "the button default"
+        );
+        assert_eq!(
+            bind("loop 8", "beats = 2\n"),
+            Action::Loop(LoopAction::Beats(8)),
+            "the line wins"
+        );
         assert_eq!(
             bind("sync phase linear 0.5", ""),
             Action::Sync(SyncAction::Phase {
@@ -1012,23 +1096,49 @@ param = "value"
         );
         assert_eq!(
             bind("sync phase", ""),
-            Action::Sync(SyncAction::Phase { mode: PhaseMode::Pid, t_seconds: None })
+            Action::Sync(SyncAction::Phase {
+                mode: PhaseMode::Pid,
+                t_seconds: None
+            })
         );
         assert_eq!(
             bind("sync set-leader", ""),
             Action::Sync(SyncAction::Leader)
         );
-        assert_eq!(bind("vinyl 441", ""), Action::Vinyl { frames_per_tick: 441.0 });
+        assert_eq!(
+            bind("vinyl 441", ""),
+            Action::Vinyl {
+                frames_per_tick: 441.0
+            }
+        );
         assert_eq!(
             bind("nudge 0.05 0.5", ""),
-            Action::Nudge { delta: 0.05, seconds: Some(0.5) }
+            Action::Nudge {
+                delta: 0.05,
+                seconds: Some(0.5)
+            }
         );
-        assert_eq!(bind("nudge", "step = 0.2\n"), Action::Nudge { delta: 0.2, seconds: None });
-        assert_eq!(bind("vocals mute", ""), Action::StemMute { stem: Stem::Vocals });
-        assert_eq!(bind("drums solo", ""), Action::StemSolo { stem: Stem::Drums });
+        assert_eq!(
+            bind("nudge", "step = 0.2\n"),
+            Action::Nudge {
+                delta: 0.2,
+                seconds: None
+            }
+        );
+        assert_eq!(
+            bind("vocals mute", ""),
+            Action::StemMute { stem: Stem::Vocals }
+        );
+        assert_eq!(
+            bind("drums solo", ""),
+            Action::StemSolo { stem: Stem::Drums }
+        );
         assert_eq!(
             bind("bass fader", ""),
-            Action::Fader(FaderTarget::Stem { deck: 1, stem: Stem::Bass })
+            Action::Fader(FaderTarget::Stem {
+                deck: 1,
+                stem: Stem::Bass
+            })
         );
         assert_eq!(bind("fader gain", ""), Action::Fader(FaderTarget::Gain(1)));
 
@@ -1039,7 +1149,10 @@ param = "value"
         // A linear phase sync without a duration cannot converge, so it is refused rather than
         // silently turning into a PI controller.
         let bad = "[[bind]]\ntype = \"note\"\nid = 1\ndeck = 0\naction = \"sync phase linear\"\n";
-        assert!(Map::from_toml_str(bad).unwrap_err().message().contains("duration"));
+        assert!(Map::from_toml_str(bad)
+            .unwrap_err()
+            .message()
+            .contains("duration"));
     }
 
     #[test]
@@ -1061,7 +1174,11 @@ id = 7
 action = "fader.volume"
 "#;
         let err = Map::from_toml_str(bad_action).unwrap_err();
-        assert!(err.message().contains("unknown action"), "{}", err.message());
+        assert!(
+            err.message().contains("unknown action"),
+            "{}",
+            err.message()
+        );
     }
 
     /// `reverse` flips a relative encoder and is refused where it would mean nothing.
@@ -1124,10 +1241,10 @@ action = "fader.flow"
             .binds
             .iter()
             .any(|bind| matches!(bind.action, Action::StemMute { .. })));
-        assert!(map.binds.iter().any(|bind| matches!(
-            bind.action,
-            Action::Fader(FaderTarget::Stem { .. })
-        )));
+        assert!(map
+            .binds
+            .iter()
+            .any(|bind| matches!(bind.action, Action::Fader(FaderTarget::Stem { .. }))));
     }
 
     /// The stem actions are spelled `<family>.<stem>.<verb>`, and a wrong stem names the valid ones
@@ -1135,9 +1252,7 @@ action = "fader.flow"
     #[test]
     fn stem_actions_parse_and_name_their_stem() {
         let map = |action: &str, deck: &str| -> Result<Action, String> {
-            let text = format!(
-                "[[bind]]\ntype = \"note\"\nid = 1\n{deck}action = \"{action}\"\n"
-            );
+            let text = format!("[[bind]]\ntype = \"note\"\nid = 1\n{deck}action = \"{action}\"\n");
             Map::from_toml_str(&text)
                 .map(|parsed| parsed.binds[0].action.clone())
                 // Keep the parser's `bind \`…\`: ` prefix: assertions use `contains`.
@@ -1152,29 +1267,37 @@ action = "fader.flow"
         );
         assert_eq!(
             map("stem.vocals.mute", "deck = 0\n").unwrap(),
-            Action::StemMute {
-                stem: Stem::Vocals
-            }
+            Action::StemMute { stem: Stem::Vocals }
         );
         assert_eq!(
             map("stem.drums.solo", "deck = 0\n").unwrap(),
-            Action::StemSolo {
-                stem: Stem::Drums
-            }
+            Action::StemSolo { stem: Stem::Drums }
         );
         // A stem action is deck-scoped like any other.
         let err = map("stem.vocals.mute", "").unwrap_err();
         assert!(err.contains("needs a `deck`"), "{err}");
         // A bad stem lists what it could have been.
         let err = map("stem.guitar.mute", "deck = 0\n").unwrap_err();
-        assert!(err.contains("vocals") && err.contains("unknown stem"), "{err}");
+        assert!(
+            err.contains("vocals") && err.contains("unknown stem"),
+            "{err}"
+        );
         // A bad verb is not silently accepted, and the message points at the list.
         let err = map("stem.vocals.solo_only", "deck = 0\n").unwrap_err();
-        assert!(err.contains("unknown action") && err.contains("vocals solo_only"), "{err}");
+        assert!(
+            err.contains("unknown action") && err.contains("vocals solo_only"),
+            "{err}"
+        );
         // Every stem name the engine has is addressable, on both families.
         for stem in Stem::ALL {
-            assert!(map(&format!("fader.stem.{stem}"), "deck = 0\n").is_ok(), "{stem}");
-            assert!(map(&format!("stem.{stem}.mute"), "deck = 0\n").is_ok(), "{stem}");
+            assert!(
+                map(&format!("fader.stem.{stem}"), "deck = 0\n").is_ok(),
+                "{stem}"
+            );
+            assert!(
+                map(&format!("stem.{stem}.mute"), "deck = 0\n").is_ok(),
+                "{stem}"
+            );
         }
     }
 
@@ -1187,7 +1310,11 @@ id = 7
 action = "play"
 "#;
         let err = Map::from_toml_str(no_deck).unwrap_err();
-        assert!(err.message().contains("needs a `deck`"), "{}", err.message());
+        assert!(
+            err.message().contains("needs a `deck`"),
+            "{}",
+            err.message()
+        );
     }
 
     #[test]
@@ -1261,7 +1388,11 @@ action = "play"
         for spec in ACTIONS {
             let count = targets.iter().filter(|t| t.action == spec.name).count();
             let expected = if spec.deck { decks } else { 1 };
-            assert_eq!(count, expected, "action `{}` listed {count} times", spec.name);
+            assert_eq!(
+                count, expected,
+                "action `{}` listed {count} times",
+                spec.name
+            );
         }
         // Every registry entry is accepted by the parser (given the fields it needs) and every
         // listed name is either accepted or requires parameters.
@@ -1273,7 +1404,12 @@ action = "play"
             if needs_deck {
                 toml.push_str("deck = 0\n");
             }
-            toml.push_str(&format!("action = \"{}\"\n", spec.name));
+            let action = if spec.name == "hotcue" {
+                "hotcue trigger 1"
+            } else {
+                spec.name
+            };
+            toml.push_str(&format!("action = \"{action}\"\n"));
             if needs_beats {
                 toml.push_str("beats = 4\n");
             }
@@ -1285,7 +1421,12 @@ action = "play"
                 }
             }
             let parsed = Map::from_toml_str(&toml);
-            assert!(parsed.is_ok(), "registry action `{}` rejected: {:?}", spec.name, parsed.err());
+            assert!(
+                parsed.is_ok(),
+                "registry action `{}` rejected: {:?}",
+                spec.name,
+                parsed.err()
+            );
         }
     }
 

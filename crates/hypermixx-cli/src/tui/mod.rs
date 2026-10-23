@@ -52,29 +52,37 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         live_source,
         midi_port,
         midi_map,
+        library,
     } = session;
     let preference_path = preference_path(profile.as_deref());
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
-    let dispatcher = Dispatcher::new(command_tx.clone(), notice_tx).tap_events(event_tx);
+    let mut dispatcher = Dispatcher::new(command_tx.clone(), notice_tx).tap_events(event_tx);
     dispatcher.with_topology(topology);
     dispatcher.with_profile(profile);
     let ring_frames = live.audio.ring_frames;
     let sample_rate = live.audio.sample_rate;
     dispatcher.with_live(live, live_source);
+    dispatcher.with_library(library.clone());
     // Prime every chain's slot list so `fx remove <name>` works from the first command.
     dispatcher.prime(decks, pipeline.response_rx());
     let mut app = App::new(decks, backend, notice_rx, event_rx, dispatcher.slots());
+    app.library = library;
     // The header reports the configured ring and rate, not the compile-time defaults.
     app.ring_frames = ring_frames;
     app.sample_rate = sample_rate;
     match preference::load(&preference_path) {
         Ok((preference, notes)) => {
             app.waveform = preference.waveform;
+            app.key_format = preference.display.key_format;
             for note in notes {
                 app.push_log(LogLine::info(format!("[preference] {note}")));
             }
+            app.sync_library(&preference.library);
         }
-        Err(err) => app.push_log(LogLine::error(format!("preference: {err}"))),
+        Err(err) => {
+            app.push_log(LogLine::error(format!("preference: {err}")));
+            app.reload_browser();
+        }
     }
     app.midi_map = (!midi_map.is_empty()).then_some(midi_map);
     if let Some(port) = midi_port {
@@ -89,9 +97,11 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
             return;
         }
     };
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
     // Detection needs the terminal's cell size, so it runs after `try_init` and before the first
     // draw. A failed guess falls back to braille, never to a broken screen.
-    let (waveform_view, note) = crate::tui::waveform_view::WaveformView::detect(app.waveform, app.decks);
+    let (waveform_view, note) =
+        crate::tui::waveform_view::WaveformView::detect(app.waveform, app.decks);
     app.waveform_view = waveform_view;
     app.push_log(LogLine::info(format!(
         "[waveform] renderer {}",
@@ -101,6 +111,7 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         app.push_log(LogLine::info(format!("[waveform] {note}")));
     }
     let outcome = event_loop(&mut terminal, &mut app, pipeline, &dispatcher);
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
 
     // However the loop ended, stop the engine so the producer joins. Report a terminal failure on
@@ -161,6 +172,9 @@ fn event_loop(
             app.on_response(&response, pipeline);
         }
         app.drain();
+        for action in app.drain_browser_actions() {
+            input::apply_browser_action(app, action, dispatcher);
+        }
 
         ticks = ticks.wrapping_add(1);
         // One outstanding state request at a time: a stalled engine must not build a backlog.
@@ -182,10 +196,12 @@ fn event_loop(
                 break;
             }
             if event::poll(next_tick - now)? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind != KeyEventKind::Release {
+                match event::read()? {
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
                         input::handle(app, key, dispatcher, pipeline);
                     }
+                    Event::Mouse(mouse) => input::handle_mouse(app, mouse, dispatcher),
+                    _ => {}
                 }
             } else {
                 break;

@@ -5,7 +5,7 @@
 //! the TUI pushes it into its scrollback.
 
 use hypermixx_audio::fx::fader_amp;
-use hypermixx_core::{CommandResponse, DeckState, OutputStatus, Stem, StemStatus};
+use hypermixx_core::{BeatGrid, CommandResponse, DeckState, OutputStatus, Stem, StemStatus};
 
 /// How a line should be presented. `Error` lines already carry the `error: ` prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,12 +55,10 @@ pub fn format_response(response: &CommandResponse, sample_rate: u32) -> Vec<LogL
             .map(|state| deck_line(state, sample_rate))
             .map(LogLine::info)
             .collect(),
-        CommandResponse::Stems(state) => stem_report(state).into_iter().map(LogLine::info).collect(),
-        CommandResponse::FxAdded {
-            chain,
-            index,
-            kind,
-        } => vec![LogLine::info(format!(
+        CommandResponse::Stems(state) => {
+            stem_report(state).into_iter().map(LogLine::info).collect()
+        }
+        CommandResponse::FxAdded { chain, index, kind } => vec![LogLine::info(format!(
             "{} fx[{index}] {kind} added",
             chain.label()
         ))],
@@ -83,7 +81,9 @@ pub fn format_response(response: &CommandResponse, sample_rate: u32) -> Vec<LogL
             }
             out
         }
-        CommandResponse::Outputs(outputs) => outputs.iter().map(output_line).map(LogLine::info).collect(),
+        CommandResponse::Outputs(outputs) => {
+            outputs.iter().map(output_line).map(LogLine::info).collect()
+        }
         CommandResponse::Ok => Vec::new(),
         CommandResponse::Error(message) => vec![LogLine::error(message.clone())],
     }
@@ -163,15 +163,16 @@ pub fn deck_line(state: &DeckState, sample_rate: u32) -> String {
     }
     // Loop furniture, when there is any: the engaged range, a pending manual in point, and the
     // slip clock whenever it has drifted away from what is being heard.
-    if let Some((in_frame, out_frame)) = state.loop_range {
-        line.push_str(&format!("  loop [{in_frame}-{out_frame}]"));
+    if state.loop_range.is_some() {
+        if let Some(length) = loop_length(state, None, sample_rate) {
+            line.push_str(&format!("  loop {length}"));
+        }
     }
     if let Some(armed) = state.loop_in_armed {
         line.push_str(&format!("  in armed@{armed}"));
     }
-    if let Some(badge) = sync_badge(state) {
-        line.push_str(&format!("  {badge}"));
-    }
+    line.push_str("  ");
+    line.push_str(sync_label(state));
     if state.virtual_frame != state.current_frame {
         line.push_str(&format!("  slip {}", state.virtual_frame));
     }
@@ -179,6 +180,30 @@ pub fn deck_line(state: &DeckState, sample_rate: u32) -> String {
         line.push_str(&format!("  {stems}"));
     }
     line
+}
+
+/// The loop's length: a bare beat count when a grid is available, otherwise a clock duration.
+pub fn loop_length(
+    state: &DeckState,
+    grid: Option<&BeatGrid>,
+    sample_rate: u32,
+) -> Option<String> {
+    let (in_frame, out_frame) = state.loop_range?;
+    let frames = out_frame.checked_sub(in_frame)?;
+    if frames == 0 {
+        return None;
+    }
+    if let Some(grid) = grid {
+        let bpm = grid.bpm_at_frame(in_frame);
+        if bpm > 0.0 {
+            let beats = frames as f64 * f64::from(bpm) / (f64::from(sample_rate) * 60.0);
+            if (beats - beats.round()).abs() < 0.02 {
+                return Some(format!("{}", beats.round() as u64));
+            }
+            return Some(format!("{beats:.2}"));
+        }
+    }
+    Some(time(frames, sample_rate))
 }
 
 /// The per-stem summary that rides a deck line once stems are live: one letter per stem, its level,
@@ -264,35 +289,14 @@ pub fn stem_report(state: &DeckState) -> Vec<String> {
 /// The sync/nudge tail of a deck line: its shared-tempo mode, the group BPM, who it tracks, the
 /// running phase correction and any bend. `None` for a deck with nothing to report, so an idle
 /// `state` line stays exactly as short as it always was (and `phase_probe.sh`'s parsing is unchanged).
-pub fn sync_badge(state: &DeckState) -> Option<String> {
-    // A hand on the platter belongs with the transport, and it is the one state where "paused" is
-    // not the whole story — so it shows even on an otherwise badge-free deck.
-    if state.vinyl {
-        return Some("vinyl".to_owned());
+pub fn sync_label(state: &DeckState) -> &'static str {
+    if state.sync_mode == "free" {
+        "sync off"
+    } else if state.sync_leader.is_some() {
+        "sync follower"
+    } else {
+        "sync leader"
     }
-    if state.group_bpm <= 0.0 && state.nudgerate.abs() < 1e-4 && state.sync_leader.is_none() {
-        return None;
-    }
-    let mut parts = vec![format!("sync {}", state.sync_mode)];
-    if state.group_bpm > 0.0 {
-        parts.push(format!("{:.1} BPM", state.group_bpm));
-    }
-    if let Some(leader) = state.sync_leader {
-        parts.push(format!("← deck{leader}"));
-    }
-    if let Some(align) = &state.align {
-        parts.push(format!("phase {align}"));
-    }
-    if state.nudge.abs() > 1e-4 {
-        parts.push(format!("nudge {:+.3}", state.nudge));
-    }
-    if state.nudgerate.abs() > 1e-4 && state.nudge.abs() < 1e-4 {
-        parts.push(format!("pll {:+.3}", state.nudgerate));
-    }
-    if state.lock {
-        parts.push("locked".to_owned());
-    }
-    Some(parts.join("  "))
 }
 
 /// The root command list.
@@ -306,6 +310,8 @@ pub fn help_text(decks: usize) -> String {
                                play from / return to / set the cue point (bare `cue` = smart);
                                `hold` = the press edge of a held cue button: cue the playhead when
                                paused, then play from the cue point
+  [deck] hotcue set|trigger|clear <1..8>
+                               one hot-cue slot (A..H); trigger keeps the transport state
   [deck] jump <frame>          seek to a frame (1 second = the engine rate in frames)
   [deck] beatjump <beats>      seek by whole beats, keeping the phase
   [deck] tempo <ratio>         set the tempo (1.0 = unity, 0.5 = half speed)
@@ -348,16 +354,21 @@ pub fn help_text(decks: usize) -> String {
   output list|refresh          output destinations and their bindings
   live show|reload [<file>]    this machine's settings (engine rate, ring, stem defaults)
   profile show|reload [<name>] which files this session runs with; reload switches them
+  browser list                 configured sources and their ids
+  browser refresh [<id>]       rescan one source, or every configured source
+  browser tracks <list-id>     show one list's tracks
+  browser show <location-id>   inspect one track
   state                        show every deck
   midi ports                   list MIDI input ports (open one at launch with --midi)
   zoom in|out|fit              waveform zoom (UI only)
   quit                         exit
 
 In the TUI: `load` with no path opens a file picker; F2 picks a MIDI port and F3 the map file.
+With the browser target only `browser ...` commands are accepted. Arrows navigate the Miller
+columns; Enter on a list opens it, Enter on a track opens the deck chooser, Esc goes back.
 
 A leading `deck0` / `0` selects a deck, `master` the summed output. Without one the command
-follows the focused deck (TUI: `Tab` cycles the command target deck0 → deck1 → browser; the
-browser has no command prefix yet).
+follows the focused deck (TUI: `Tab` cycles the command target deck0 → deck1 → browser).
 startup flags: --config <file> (custom topology), --profile <name|file> (which files to use),
                --print-config (reference TOML), --live <file> (engine rate, ring, stem defaults),
                --backend auto|stratum|timestretch, --tui (terminal UI),
@@ -464,7 +475,7 @@ mod tests {
     }
 
     use super::*;
-    use hypermixx_core::{OutputStatus, KeylockMode, StemStatus, SAMPLE_RATE};
+    use hypermixx_core::{KeylockMode, OutputStatus, StemStatus, SAMPLE_RATE};
 
     /// A fully idle deck: nothing to report, so no badge.
     fn idle() -> DeckState {
@@ -492,6 +503,7 @@ mod tests {
             sync_mode: "free".to_owned(),
             group_bpm: 0.0,
             cue_frame: 0,
+            hot_cues: [None; hypermixx_core::HOT_CUE_SLOTS],
             keylock: KeylockMode::On,
             key_shift: 0,
             stems: StemStatus::default(),
@@ -505,67 +517,56 @@ mod tests {
         state.playing_rate = 1.11; // nudge present; must be ignored
         let now = current_bpm(&state).expect("a grid deck has a current BPM");
         assert!((now - 122.0 * 1.05).abs() < 1e-3, "got {now}");
-        assert!(!deck_line(&state, SAMPLE_RATE).contains("1.11"), "playing_rate leaked into the line");
-        assert!(deck_line(&state, SAMPLE_RATE).contains("122.0 BPM → 128.1 BPM"), "{}", deck_line(&state, SAMPLE_RATE));
+        assert!(
+            !deck_line(&state, SAMPLE_RATE).contains("1.11"),
+            "playing_rate leaked into the line"
+        );
+        assert!(
+            deck_line(&state, SAMPLE_RATE).contains("122.0 BPM → 128.1 BPM"),
+            "{}",
+            deck_line(&state, SAMPLE_RATE)
+        );
         // No grid means no current BPM to show.
         state.bpm_at_frame = 0.0;
         assert_eq!(current_bpm(&state), None);
     }
 
     #[test]
-    fn an_idle_deck_reports_nothing() {
-        assert_eq!(sync_badge(&idle()), None);
-        // …so an ordinary `state` line is exactly as short as it was before sync existed, which
-        // is what keeps phase_probe.sh's `deck[01][^[]*\[[0-9]+` match working.
-        assert!(deck_line(&idle(), SAMPLE_RATE).ends_with("122.0 BPM  --  keylock on"), "{}", deck_line(&idle(), SAMPLE_RATE));
-    }
+    fn sync_is_only_leader_follower_or_off() {
+        let idle = idle();
+        assert_eq!(sync_label(&idle), "sync off");
 
-    #[test]
-    fn a_locked_pair_reports_its_group() {
-        let mut state = idle();
-        state.sync_mode = "tempolock".to_owned();
-        state.group_bpm = 122.0;
-        state.lock = true;
-        let badge = sync_badge(&state).expect("a locked deck must show its group");
-        assert!(badge.contains("sync tempolock"), "{badge}");
-        assert!(badge.contains("122.0 BPM"), "{badge}");
-        assert!(badge.contains("locked"), "{badge}");
-    }
+        let mut leader = idle.clone();
+        leader.sync_mode = "tempolock".to_owned();
+        leader.group_bpm = 122.0;
+        leader.lock = true;
+        assert_eq!(sync_label(&leader), "sync leader");
 
-    #[test]
-    fn a_follower_names_its_leader_and_the_leader_names_nobody() {
-        let mut follower = idle();
+        let mut follower = idle.clone();
         follower.sync_mode = "phaselock".to_owned();
-        follower.group_bpm = 128.0;
-        follower.lock = true;
-        follower.align = Some("pid".to_owned());
         follower.sync_leader = Some(0);
-        let badge = sync_badge(&follower).unwrap();
-        assert!(badge.contains("← deck0"), "{badge}");
-        assert!(badge.contains("phase pid"), "{badge}");
+        assert_eq!(sync_label(&follower), "sync follower");
 
-        // The leader tracks nobody: the engine filters `leader == deck_id`, and the badge must
-        // not claim otherwise (a wrong arrow here reads as "deck0 follows itself").
-        let mut leader = follower.clone();
-        leader.sync_leader = None;
-        let badge = sync_badge(&leader).unwrap();
-        assert!(!badge.contains("← deck"), "{badge}");
-    }
-
-    #[test]
-    fn a_bend_is_reported_apart_from_the_controller() {
-        let mut bent = idle();
+        // Nudges and phase correction detail belong in the engine, not the sync label.
+        let mut bent = idle.clone();
         bent.nudge = 0.04;
         bent.nudgerate = 0.04;
-        let badge = sync_badge(&bent).unwrap();
-        assert!(badge.contains("nudge +0.040"), "{badge}");
-        assert!(!badge.contains("pll"), "a bend must not also read as a controller: {badge}");
+        assert_eq!(sync_label(&bent), "sync off");
+    }
 
-        let mut corrected = idle();
-        corrected.nudgerate = 0.02; // phase correction only, no nudge
-        let badge = sync_badge(&corrected).unwrap();
-        assert!(badge.contains("pll +0.020"), "{badge}");
-        assert!(!badge.contains("nudge"), "{badge}");
+    #[test]
+    fn loop_length_is_beats_with_a_grid_and_time_without_one() {
+        let mut state = idle();
+        state.loop_range = Some((11_025, 55_125));
+        let grid = BeatGrid::from_constant_bpm(120.0, 0, 441_000, SAMPLE_RATE);
+        assert_eq!(
+            loop_length(&state, Some(&grid), SAMPLE_RATE).as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            loop_length(&state, None, SAMPLE_RATE).as_deref(),
+            Some("0:01.000")
+        );
     }
 
     #[test]
@@ -582,8 +583,13 @@ mod tests {
         state.group_bpm = 122.0;
         state.sync_leader = Some(0);
         let line = deck_line(&state, SAMPLE_RATE);
-        let position = line.find("[0/1000]").expect("position bracket must survive");
-        let badge = line.find("sync phaselock").expect("badge must be rendered");
-        assert!(badge > position, "the badge must come after `[current/total]`: {line}");
+        let position = line
+            .find("[0/1000]")
+            .expect("position bracket must survive");
+        let badge = line.find("sync follower").expect("badge must be rendered");
+        assert!(
+            badge > position,
+            "the badge must come after `[current/total]`: {line}"
+        );
     }
 }

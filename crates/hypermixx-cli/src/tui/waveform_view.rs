@@ -1,19 +1,17 @@
 //! The waveform view and its three transports.
 //!
 //! Braille is the always-available renderer: one dot column per peak column, left channel above the
-//! centre line and right below it. Kitty and Sixel draw the same view through a pixel rasteriser;
-//! they differ only in how the pixels leave the process. The playhead is pinned to the horizontal
-//! centre and the viewport is recomputed from the current playback frame every tick.
+//! centre line and right below it. Kitty draws the same view through a pixel rasteriser. The
+//! playhead is pinned to the horizontal centre and the viewport is recomputed from the current
+//! playback frame every tick.
 //!
 //! Kitty renders a wide, native-resolution strip once and then moves a source rectangle of it with
-//! `a=p`; edges therefore land 1:1 on terminal pixels instead of being scaled. Sixel cannot scale
-//! or reuse an image, so it redraws at the terminal's real cell size at a 30Hz cap. Both fall back
-//! to braille whenever detection is unconvincing.
+//! `a=p`; edges therefore land 1:1 on terminal pixels instead of being scaled. It falls back to
+//! braille whenever detection is unconvincing.
 
 mod detect;
 mod kitty;
 mod raster;
-mod sixel;
 
 use std::fmt::Write;
 use std::num::NonZeroU16;
@@ -21,7 +19,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hypermixx_core::BeatGrid;
+use hypermixx_core::{BeatGrid, DeckState, HOT_CUE_SLOTS};
 use hypermixx_library::Waveform;
 use ratatui::buffer::CellDiffOption;
 use ratatui::layout::Rect;
@@ -36,18 +34,24 @@ pub use detect::{Backend, CellPx};
 
 const PLAYHEAD_COLOR: Color = Color::Red;
 const CENTER_COLOR: Color = Color::DarkGray;
-/// Beat lines are dim so they read as a grid, not as audio; bar starts (every 4th) are slightly
-/// brighter.
-const BEAT_COLOR: Color = Color::Rgb(60, 60, 60);
-const BAR_COLOR: Color = Color::Rgb(96, 96, 96);
+/// Beat lines sit clearly above the loop wash; bar starts (every 4th) are brighter still.
+const BEAT_COLOR: Color = Color::Rgb(110, 110, 110);
+const BAR_COLOR: Color = Color::Rgb(160, 160, 160);
+const LOOP_BG_COLOR: Color = Color::Rgb(70, 70, 70);
+const MEMORY_COLOR: Color = Color::White;
+const HOT_CUE_COLORS: [Color; HOT_CUE_SLOTS] = [
+    Color::Rgb(255, 72, 72),
+    Color::Rgb(255, 160, 64),
+    Color::Rgb(255, 232, 64),
+    Color::Rgb(80, 255, 96),
+    Color::Rgb(64, 240, 240),
+    Color::Rgb(80, 160, 255),
+    Color::Rgb(200, 96, 255),
+    Color::Rgb(255, 96, 200),
+];
 /// More than this many beat lines in one view means we are zoomed far out; stop drawing rather than
 /// spend the frame on the grid.
 const MAX_BEATS: usize = 512;
-/// Image backends never go past this. A 30Hz sixel is already a large stream; kitty can do 60.
-const SIXEL_MAX_HZ: u16 = 30;
-/// Sixel cannot scale, so an unusually large deck rectangle would make the encoder the frame.
-/// Above this many pixels the view keeps braille rather than risking the 30Hz budget.
-const MAX_IMAGE_PIXELS: u32 = 1_500_000;
 /// Even an unchanged image is re-sent once a second. That is cheap (it is only a few kilobytes)
 /// and recovers from a terminal/modal that cleared the placement behind our back.
 const IMAGE_REFRESH_HEAL: Duration = Duration::from_secs(1);
@@ -92,18 +96,6 @@ impl GridKey {
     }
 }
 
-/// Everything that determines the image content. When it is unchanged (paused, same zoom, same
-/// track), the existing placement stays and no raster/encode work happens.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct FrameKey {
-    playhead_bits: u64,
-    frames_per_cell_bits: u64,
-    pixel_width: u32,
-    pixel_height: u32,
-    waveform: usize,
-    grid: GridKey,
-}
-
 /// What a Kitty strip was rendered from. A change in any of these invalidates the image.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct StripKey {
@@ -114,6 +106,7 @@ struct StripKey {
     cell_height: u16,
     waveform: usize,
     grid: GridKey,
+    overlay: raster::Overlay,
 }
 
 /// A wide, native-resolution image transmitted once. Frames show a source rectangle of it.
@@ -126,14 +119,11 @@ struct KittyStrip {
     margin: u32,
 }
 
-/// One deck's image state. Kitty rotates to a new image id on each strip rebuild; Sixel uses
-/// `key` to decide whether the cached content is still current.
+/// One deck's image state. Kitty rotates to a new image id on each strip rebuild.
 struct DeckImage {
     id: u32,
     placement: u32,
     last: Option<Instant>,
-    /// Sixel content key (Kitty uses the strip state instead).
-    key: Option<FrameKey>,
     /// Kitty's cached strip, if one has been transmitted.
     strip: Option<KittyStrip>,
     last_playhead: Option<u64>,
@@ -162,7 +152,6 @@ impl WaveformView {
                     id: next_image_id(),
                     placement: next_placement_id(),
                     last: None,
-                    key: None,
                     strip: None,
                     last_playhead: None,
                     pending_delete: None,
@@ -197,12 +186,14 @@ impl WaveformView {
         area: Rect,
         waveform: Option<&Arc<Waveform>>,
         grid: Option<&BeatGrid>,
-        playhead_frame: f64,
+        state: &DeckState,
         frames_per_cell: f64,
     ) {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        let overlay = overlay_of(state);
+        let playhead_frame = state.current_frame as f64;
         match self.backend {
             Backend::Braille => render_braille(
                 frame,
@@ -212,13 +203,18 @@ impl WaveformView {
                 playhead_frame,
                 frames_per_cell,
                 self.settings.colors,
+                &overlay,
             ),
-            Backend::Kitty => {
-                self.render_kitty(frame, deck, area, waveform, grid, playhead_frame, frames_per_cell)
-            }
-            Backend::Sixel => {
-                self.render_sixel(frame, deck, area, waveform, grid, playhead_frame, frames_per_cell)
-            }
+            Backend::Kitty => self.render_kitty(
+                frame,
+                deck,
+                area,
+                waveform,
+                grid,
+                playhead_frame,
+                frames_per_cell,
+                &overlay,
+            ),
         }
     }
 
@@ -232,6 +228,7 @@ impl WaveformView {
         grid: Option<&BeatGrid>,
         playhead_frame: f64,
         frames_per_cell: f64,
+        overlay: &raster::Overlay,
     ) {
         let Some(state) = self.decks.get_mut(deck) else {
             return;
@@ -247,6 +244,7 @@ impl WaveformView {
                 playhead_frame,
                 frames_per_cell,
                 self.settings.colors,
+                overlay,
             );
             return;
         }
@@ -259,6 +257,7 @@ impl WaveformView {
             cell_height: self.cell.height,
             waveform: waveform.map_or(0, |waveform| Arc::as_ptr(waveform) as usize),
             grid: GridKey::of(grid),
+            overlay: *overlay,
         };
 
         let mut rebuild = state
@@ -313,7 +312,7 @@ impl WaveformView {
             let start_frame = playhead_frame.max(0.0)
                 - (f64::from(margin) + f64::from(viewport_width) / 2.0) * frames_per_pixel;
             let virtual_playhead = start_frame + f64::from(strip_width) / 2.0 * frames_per_pixel;
-            let image = raster::rasterize(
+            let image = raster::rasterize_with(
                 waveform.map(AsRef::as_ref),
                 grid,
                 virtual_playhead,
@@ -321,6 +320,7 @@ impl WaveformView {
                 strip_width,
                 viewport_height,
                 false,
+                overlay,
             );
             let source = kitty::SourceRect {
                 x: margin,
@@ -389,85 +389,18 @@ impl WaveformView {
         state.last_playhead = Some(playhead_bits);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn render_sixel(
-        &mut self,
-        frame: &mut Frame,
-        deck: usize,
-        area: Rect,
-        waveform: Option<&Arc<Waveform>>,
-        grid: Option<&BeatGrid>,
-        playhead_frame: f64,
-        frames_per_cell: f64,
-    ) {
-        let Some(state) = self.decks.get_mut(deck) else {
-            return;
-        };
-        let pixel_width = u32::from(area.width).saturating_mul(u32::from(self.cell.width));
-        let pixel_height = u32::from(area.height).saturating_mul(u32::from(self.cell.height));
-        let key = FrameKey {
-            playhead_bits: playhead_frame.max(0.0).to_bits(),
-            frames_per_cell_bits: frames_per_cell.to_bits(),
-            pixel_width,
-            pixel_height,
-            waveform: waveform.map_or(0, |waveform| Arc::as_ptr(waveform) as usize),
-            grid: GridKey::of(grid),
-        };
-        if state.key == Some(key)
-            && state
-                .last
-                .is_some_and(|last| last.elapsed() < IMAGE_REFRESH_HEAL)
-        {
-            skip_area(frame, area);
-            return;
-        }
-        let hz = self.settings.refresh_hz.clamp(1, SIXEL_MAX_HZ);
-        let interval = Duration::from_secs_f64(1.0 / f64::from(hz));
-        let tolerance = Duration::from_millis(8);
-        let due = state
-            .last
-            .is_none_or(|last| last.elapsed() >= interval.saturating_sub(tolerance));
-        if !due {
-            skip_area(frame, area);
-            return;
-        }
-        if pixel_width == 0
-            || pixel_height == 0
-            || pixel_width.saturating_mul(pixel_height) > MAX_IMAGE_PIXELS
-        {
-            render_braille(
-                frame,
-                area,
-                waveform,
-                grid,
-                playhead_frame,
-                frames_per_cell,
-                self.settings.colors,
-            );
-            return;
-        }
+}
 
-        let frames_per_pixel = (frames_per_cell / f64::from(self.cell.width)).max(1.0);
-        let palette = raster::Palette::from_colors(self.settings.colors);
-        let image = raster::rasterize(
-            waveform.map(AsRef::as_ref),
-            grid,
-            playhead_frame,
-            frames_per_pixel,
-            pixel_width,
-            pixel_height,
-            true,
-        );
-        let sequence = sixel::sequence(&image, &palette, area);
-        skip_area(frame, area);
-        set_image_cell(frame, area, &sequence);
-        state.last = Some(Instant::now());
-        state.key = Some(key);
+fn overlay_of(state: &DeckState) -> raster::Overlay {
+    raster::Overlay {
+        loop_range: state.loop_range,
+        memory_cue: (state.cue_frame > 0).then_some(state.cue_frame),
+        hot_cues: state.hot_cues.map(|cue| cue.map(|cue| cue.frame)),
     }
 }
 
-/// Erase the character cells of `area` without moving the final cursor away from its origin. Shared
-/// by both image transports; only the first image uses it, because clearing later would blink.
+/// Erase the character cells of `area` without moving the final cursor away from its origin. Only
+/// the first image uses it, because clearing later would blink.
 fn clear_cells(out: &mut String, area: Rect) {
     out.push_str("\x1b[0m\x1b7");
     for row in 0..area.height {
@@ -529,6 +462,7 @@ fn render_braille(
     playhead_frame: f64,
     frames_per_cell: f64,
     colors: WaveformColors,
+    overlay: &raster::Overlay,
 ) {
     let dots_x = f64::from(area.width) * 2.0;
     let dots_y = f64::from(area.height) * 4.0;
@@ -576,6 +510,7 @@ fn render_braille(
                     colors,
                 );
             }
+            draw_cue_lines(ctx, overlay, playhead, frames_per_dot, center_x, dots_x, dots_y);
             ctx.draw(&CanvasLine::new(
                 center_x,
                 0.0,
@@ -585,6 +520,65 @@ fn render_braille(
             ));
         });
     frame.render_widget(canvas, area);
+    paint_loop_bg(frame, area, playhead_frame, frames_per_cell, overlay.loop_range);
+}
+
+fn draw_cue_lines(
+    ctx: &mut Context,
+    overlay: &raster::Overlay,
+    playhead: f64,
+    frames_per_dot: f64,
+    center_x: f64,
+    dots_x: f64,
+    dots_y: f64,
+) {
+    let draw = |ctx: &mut Context, frame: u64, color: Color| {
+        let x = center_x + (frame as f64 - playhead) / frames_per_dot;
+        if (0.0..=dots_x).contains(&x) {
+            ctx.draw(&CanvasLine::new(x, 0.0, x, dots_y, color));
+            // A second dot column makes cues visibly thicker than the one-dot grid.
+            if x + 1.0 <= dots_x {
+                ctx.draw(&CanvasLine::new(x + 1.0, 0.0, x + 1.0, dots_y, color));
+            }
+        }
+    };
+    if let Some(frame) = overlay.memory_cue {
+        draw(ctx, frame, MEMORY_COLOR);
+    }
+    for (slot, frame) in overlay.hot_cues.iter().enumerate() {
+        if let Some(frame) = frame {
+            draw(ctx, *frame, HOT_CUE_COLORS[slot]);
+        }
+    }
+}
+
+/// Paint the loop range as a bright wash behind the braille glyphs. Doing it after the canvas keeps
+/// the waveform and cue glyphs intact while changing only their background.
+fn paint_loop_bg(
+    frame: &mut Frame,
+    area: Rect,
+    playhead: f64,
+    frames_per_cell: f64,
+    loop_range: Option<(u64, u64)>,
+) {
+    let Some((in_frame, out_frame)) = loop_range else {
+        return;
+    };
+    if area.width == 0 || frames_per_cell <= 0.0 {
+        return;
+    }
+    let start = playhead - f64::from(area.width) / 2.0 * frames_per_cell;
+    let first = ((in_frame as f64 - start) / frames_per_cell).floor() as i64;
+    let last = ((out_frame as f64 - start) / frames_per_cell).ceil() as i64;
+    let buffer = frame.buffer_mut();
+    for column in first.max(0)..last.min(i64::from(area.width)) {
+        let x = area.x + column as u16;
+        for y in area.top()..area.bottom() {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                cell.set_bg(LOOP_BG_COLOR);
+            }
+        }
+    }
 }
 
 /// Per braille column, the left channel above the centre and the right channel below it. Each band
@@ -689,7 +683,40 @@ fn draw_beats(
 mod tests {
     use super::*;
     use crate::preference::{WaveformBackend, WaveformColors};
+    use hypermixx_core::{HOT_CUE_SLOTS, KeylockMode, StemStatus};
     use hypermixx_library::{BandPeaks, StereoPeaks};
+
+    fn deck_state(frame: u64) -> DeckState {
+        DeckState {
+            deck_id: 0,
+            current_frame: frame,
+            playing: true,
+            total_frames: 1_000_000,
+            bpm: 122.0,
+            bpm_at_frame: 122.0,
+            key: None,
+            virtual_frame: frame,
+            loop_range: None,
+            loop_in_armed: None,
+            tempo: 1.0,
+            tempo_fader: 0.0,
+            tempo_range: 0.1,
+            nudgerate: 0.0,
+            playing_rate: 1.0,
+            lock: false,
+            align: None,
+            nudge: 0.0,
+            sync_leader: None,
+            sync_mode: "free".to_owned(),
+            group_bpm: 0.0,
+            cue_frame: 0,
+            hot_cues: [None; HOT_CUE_SLOTS],
+            vinyl: false,
+            keylock: KeylockMode::On,
+            key_shift: 0,
+            stems: StemStatus::default(),
+        }
+    }
 
     fn settings(backend: WaveformBackend) -> WaveformSettings {
         WaveformSettings {
@@ -750,7 +777,7 @@ mod tests {
                     Rect::new(0, 0, 40, 4),
                     Some(&Arc::new(waveform)),
                     None,
-                    128.0,
+                    &deck_state(128),
                     2048.0,
                 );
             })
@@ -783,7 +810,7 @@ mod tests {
                         Rect::new(0, 0, 40, 4),
                         None,
                         None,
-                        0.0,
+                        &deck_state(0),
                         frames_per_cell,
                     );
                 })
@@ -811,35 +838,6 @@ mod tests {
         let place = third.find("a=p").unwrap();
         let delete = third.find("a=d").unwrap();
         assert!(place < delete, "the old image is deleted after the new placement");
-    }
-
-    #[test]
-    fn the_sixel_path_puts_a_sixel_payload_in_the_first_cell() {
-        let mut view = WaveformView::new(settings(WaveformBackend::Sixel), 1);
-        view.backend = Backend::Sixel;
-        view.cell = CellPx {
-            width: 8,
-            height: 16,
-        };
-        let backend = ratatui::backend::TestBackend::new(40, 6);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                view.render(
-                    frame,
-                    0,
-                    Rect::new(0, 0, 40, 4),
-                    None,
-                    None,
-                    0.0,
-                    2048.0,
-                );
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let image = buffer.cell((0, 0)).expect("image cell");
-        assert!(image.symbol().contains("\x1bP0;0;0q"), "{}", image.symbol());
-        assert!(image.symbol().contains("\"1;1;320;64"));
     }
 
     /// Rough per-frame cost of the two image paths. Ignored by default; run with
@@ -897,12 +895,6 @@ mod tests {
             start.elapsed().as_secs_f64() * 1000.0 / f64::from(rounds)
         );
 
-        let start = Instant::now();
-        for _ in 0..rounds {
-            let image = raster::rasterize(Some(&waveform), None, 128.0, 2048.0 / 8.0, 944, 112, true);
-            let _ = sixel::sequence(&image, &palette, Rect::new(0, 0, 118, 7));
-        }
-        println!("sixel: {:.3} ms/frame", start.elapsed().as_secs_f64() * 1000.0 / f64::from(rounds));
     }
 
     #[test]

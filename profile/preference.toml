@@ -5,16 +5,16 @@
 # default is used, so a typo never stops the music.
 #
 [waveform]
-# Renderer: auto (kitty -> sixel -> braille), or force one. Detection is environment-based; under
+# Renderer: auto (kitty -> braille), or force one. Detection is environment-based; under
 # tmux/screen auto falls back to braille because passthrough is not enabled yet.
 backend = "auto"
 #
-# Target refresh for the image backends (10..60). Braille follows the 60Hz UI tick; sixel is
-# capped at 30Hz, kitty can use the full value.
+# Target refresh for the image backend (10..60). Braille follows the 60Hz UI tick; kitty can use
+# the full value.
 # refresh_hz = 60
 #
 # Terminal cell size in pixels. crossterm cannot report this on every platform (Windows returns 0),
-# and sixel cannot scale, so set it when the image does not fill the deck. Accepts "8x16" or [8, 16].
+# so set it when the image does not fill the deck. Accepts "8x16" or [8, 16].
 # cell = "8x16"
 #
 # Band crossovers in Hz. Low is below low_hz, mid between the two, high above high_hz. Raising
@@ -27,3 +27,26 @@ high_hz = 4000
 # low = "#0000ff"
 # mid = "#00ff00"
 # high = "#ffffff"
+
+# Library sources. A category that is absent or empty is neither scanned nor displayed.
+# local: formats found in local user locations (`~/Music`, `~/.VirtualDJ`, ...)
+# usb: formats found on automatically discovered/mounted removable media
+# folders: plain folders to index
+[library]
+local = []
+usb = ["rkb", "serato", "vdj"]
+folders = ["./mp3"]
+
+# Imported-grid calibration. `decoder_start_ms` is the gapless trim at the start of a decoded file:
+# "auto" probes each file (MP3 sample: 25.0567 ms); a number overrides it, 0 disables the fix.
+decoder_start_ms = "auto"
+# Extra correction after source offset and decoder trim; positive moves the grid later.
+grid_offset_ms = 0.0
+# Validated sample: RB and VDJ align at 0; Serato's tag clock is 16.5 ms later.
+rkb_mp3_offset_ms = 0.0
+serato_offset_ms = -16.5
+vdj_offset_ms = 0.0
+
+# Key notation. `camelot` (default) shows 8A/8B; `classic` shows Am/C.
+[display]
+key = "camelot"

@@ -74,6 +74,89 @@ impl Key {
     pub fn both(&self) -> (String, String) {
         (self.traditional(), self.camelot())
     }
+
+    /// Parses a key as written in a tag or a DJ library: `"Am"`, `"A minor"`, `"F#"`,
+    /// `"8A"`, `"08B"`. Unknown text yields `None` rather than a guessed key.
+    pub fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        if let Some(key) = parse_camelot(text) {
+            return Some(key);
+        }
+        parse_traditional(text)
+    }
+}
+
+fn parse_camelot(text: &str) -> Option<Key> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let letter = bytes[bytes.len() - 1].to_ascii_uppercase();
+    if letter != b'A' && letter != b'B' {
+        return None;
+    }
+    let number: u8 = text[..text.len() - 1].trim().parse().ok()?;
+    if !(1..=12).contains(&number) {
+        return None;
+    }
+    // Camelot majors walk the circle of fifths from C = 8B; minors share the relative major's
+    // number, three semitones below the major tonic.
+    let major_pc = (i32::from(number) - 8) * 7;
+    let major_pc = major_pc.rem_euclid(12) as u8;
+    let (pc, mode) = if letter == b'B' {
+        (major_pc, KeyMode::Major)
+    } else {
+        (
+            (i32::from(major_pc) - 3).rem_euclid(12) as u8,
+            KeyMode::Minor,
+        )
+    };
+    Some(Key {
+        pc,
+        mode,
+        confidence: 1.0,
+    })
+}
+
+fn parse_traditional(text: &str) -> Option<Key> {
+    let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let lower = compact.to_ascii_lowercase();
+    let (root, mode) = if let Some(root) = lower.strip_suffix("minor") {
+        (root, KeyMode::Minor)
+    } else if let Some(root) = lower.strip_suffix("min") {
+        (root, KeyMode::Minor)
+    } else if let Some(root) = lower.strip_suffix('m') {
+        (root, KeyMode::Minor)
+    } else if let Some(root) = lower.strip_suffix("major") {
+        (root, KeyMode::Major)
+    } else if let Some(root) = lower.strip_suffix("maj") {
+        (root, KeyMode::Major)
+    } else {
+        (lower.as_str(), KeyMode::Major)
+    };
+    let pc = match root {
+        "c" => 0,
+        "c#" | "db" => 1,
+        "d" => 2,
+        "d#" | "eb" => 3,
+        "e" => 4,
+        "f" => 5,
+        "f#" | "gb" => 6,
+        "g" => 7,
+        "g#" | "ab" => 8,
+        "a" => 9,
+        "a#" | "bb" => 10,
+        "b" | "cb" => 11,
+        _ => return None,
+    };
+    Some(Key {
+        pc,
+        mode,
+        confidence: 1.0,
+    })
 }
 
 #[cfg(test)]
@@ -111,5 +194,17 @@ mod tests {
         let a = key(9, KeyMode::Minor);
         assert_eq!(a.format(KeyFormat::Camelot), a.camelot());
         assert_eq!(a.both(), ("Am".into(), "8A".into()));
+    }
+
+    #[test]
+    fn parses_traditional_and_camelot_text() {
+        assert_eq!(Key::parse("Am"), Some(key(9, KeyMode::Minor)));
+        assert_eq!(Key::parse("A minor"), Some(key(9, KeyMode::Minor)));
+        assert_eq!(Key::parse("F#"), Some(key(6, KeyMode::Major)));
+        assert_eq!(Key::parse("Bbm"), Some(key(10, KeyMode::Minor)));
+        assert_eq!(Key::parse("8A"), Some(key(9, KeyMode::Minor)));
+        assert_eq!(Key::parse("08B"), Some(key(0, KeyMode::Major)));
+        assert_eq!(Key::parse("12A"), Some(key(1, KeyMode::Minor)));
+        assert_eq!(Key::parse("not-a-key"), None);
     }
 }

@@ -22,9 +22,7 @@ pub mod ports;
 pub mod translate;
 
 pub use guide::{describe, event_label, BindStatus, Candidate, Guide, GuideStep};
-pub use map::{
-    manifest, Action, ActionSpec, BindingSpec, Map, MapError, Meta, Target, ACTIONS,
-};
+pub use map::{manifest, Action, ActionSpec, BindingSpec, Map, MapError, Meta, Target, ACTIONS};
 pub use msg::{Decoder, Event};
 pub use ports::{list_ports, Input, PortInfo, Received};
-pub use translate::{translate, MergeBuffer, MergeKey, TranslateState};
+pub use translate::{translate, translate_split, MergeBuffer, MergeKey, TranslateState};

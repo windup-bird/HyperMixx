@@ -7,6 +7,16 @@ use crate::stem::StemStatus;
 /// and the producer can index its fixed deck array directly.
 pub type DeckId = u8;
 
+/// Slots the engine exposes for hot cues. The front-end may import fewer; unused slots stay empty.
+pub const HOT_CUE_SLOTS: usize = 8;
+
+/// One hot cue slot. `frame` is a source-frame position, like [`DeckState::cue_frame`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HotCue {
+    pub slot: u8,
+    pub frame: u64,
+}
+
 /// One deck's transport, as observed by the producer thread.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DeckState {
@@ -22,7 +32,7 @@ pub struct DeckState {
     /// it is actually playing. Deliberately not derived from `playing_rate` — a nudge or a phase
     /// correction is a transient, not a tempo.
     pub bpm_at_frame: f32,
-    /// Detected key name (e.g. `"Am"`), or `None` without analysis.
+    /// Detected key name, Camelot by default (e.g. `"8A"`), or `None` without analysis.
     pub key: Option<String>,
     /// The slip clock: the position playback would be at with no loop, advanced monotonically
     /// while a loop wraps around underneath it. Equals `current_frame` when no loop is engaged.
@@ -58,6 +68,8 @@ pub struct DeckState {
     pub group_bpm: f32,
     /// The cue point in source frames. Defaults to the loaded origin (0); `cue set` moves it.
     pub cue_frame: u64,
+    /// Imported or user-set hot cues, indexed by slot. Empty slots are `None`.
+    pub hot_cues: [Option<HotCue>; HOT_CUE_SLOTS],
     /// Whether a hand is on the platter (`vinyl` touch). While it is, the deck is paused and a wheel
     /// turn moves the playhead instead of bending the tempo.
     pub vinyl: bool,

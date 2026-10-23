@@ -16,12 +16,13 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::fx::FxKind;
 use hypermixx_audio::{AudioPipeline, Command, SAMPLE_RATE};
-use hypermixx_media::ChunkedStreams;
 use hypermixx_core::{
-    Backend, CommandResponse, CueOp, FxChainId, FxSlotRef, KeylockMode, LiveConfig, LoopEditOp,
-    LoopOp, LoopQuantum, NudgeOp, OutputOp, PhaseMode, Shared, Stem, StemOp, StemPreset, SyncOp,
-    TrackAnalysis, VinylOp,
+    Backend, CommandResponse, CueOp, FxChainId, FxSlotRef, HotCueOp, KeylockMode, LiveConfig,
+    LoopEditOp, LoopOp, LoopQuantum, NudgeOp, OutputOp, PhaseMode, Shared, Stem, StemOp,
+    StemPreset, SyncOp, TrackAnalysis, VinylOp,
 };
+use hypermixx_library::LibraryDb;
+use hypermixx_media::ChunkedStreams;
 
 use crate::notices::{self, NoticeTx};
 use crate::response::{fx_help_text, help_text};
@@ -42,7 +43,10 @@ pub enum UiEvent {
     /// A file was decoded and is about to be installed into `deck_id`.
     Loaded { deck_id: u8, path: String },
     /// A compiled analysis became available (bpm hint at load, or `analyse`).
-    Grid { deck_id: u8, analysis: TrackAnalysis },
+    Grid {
+        deck_id: u8,
+        analysis: TrackAnalysis,
+    },
 }
 
 /// The slot kinds of every chain.
@@ -74,11 +78,7 @@ impl SlotBook {
                     );
                 }
             }
-            CommandResponse::FxAdded {
-                chain,
-                index,
-                kind,
-            } => {
+            CommandResponse::FxAdded { chain, index, kind } => {
                 if let Ok(mut book) = self.slots.lock() {
                     let entry = book.entry(chain.label()).or_default();
                     if *index <= entry.len() {
@@ -95,17 +95,15 @@ impl SlotBook {
         if let Ok(index) = token.parse::<usize>() {
             return Ok(index);
         }
-        let book = self.slots.lock().map_err(|_| "slot book poisoned".to_owned())?;
+        let book = self
+            .slots
+            .lock()
+            .map_err(|_| "slot book poisoned".to_owned())?;
         match book.get(chain) {
             Some(kinds) => kinds
                 .iter()
                 .position(|kind| kind.eq_ignore_ascii_case(token))
-                .ok_or_else(|| {
-                    format!(
-                        "no `{token}` in {chain}; slots are {}",
-                        list_kinds(kinds)
-                    )
-                }),
+                .ok_or_else(|| format!("no `{token}` in {chain}; slots are {}", list_kinds(kinds))),
             None => Err(format!("{chain} has no known slots")),
         }
     }
@@ -163,6 +161,8 @@ pub struct Dispatcher {
     /// here long enough to be worth cancelling (~80 s), and the flag is observed between model
     /// windows — so a cancel lands within one window, not instantly.
     separations: Cancellations,
+    /// The library cache, when `main` could open it. `library ...` commands are front-end-owned.
+    library: Option<Arc<LibraryDb>>,
 }
 
 /// The separations a front-end has running. A plain `Mutex<HashMap>`: it is touched twice per job,
@@ -181,7 +181,17 @@ impl Dispatcher {
             live: Arc::new(Mutex::new(LiveConfig::default())),
             slots: Arc::new(SlotBook::default()),
             separations: Arc::new(Mutex::new(HashMap::new())),
+            library: None,
         }
+    }
+
+    /// Attaches the library cache for the `library` command family.
+    pub fn with_library(&mut self, library: Option<Arc<LibraryDb>>) {
+        self.library = library;
+    }
+
+    pub fn library(&self) -> Option<&Arc<LibraryDb>> {
+        self.library.as_ref()
     }
 
     /// Also forwards front-end events (deck name, compiled grid) to `events`.
@@ -307,6 +317,7 @@ pub fn dispatch(
     let command_tx = &dispatcher.command_tx;
 
     match verb {
+        "browser" => browser_command(&mut words, dispatcher),
         "load" => {
             let deck_id = match deck_only(target) {
                 Ok(id) => id,
@@ -337,9 +348,14 @@ pub fn dispatch(
             Action::Continue
         }
         "stem" => stem_family(&mut words, target, dispatcher, pipeline),
-        "play" => forward(target, command_tx, |deck_id| Command::TogglePlay { deck_id }),
+        "play" => forward(target, command_tx, |deck_id| Command::TogglePlay {
+            deck_id,
+        }),
         "cue" => with_deck(target, "cue", |deck_id| {
             cue_command(&mut words, deck_id, command_tx)
+        }),
+        "hotcue" => with_deck(target, "hotcue", |deck_id| {
+            hotcue_command(&mut words, deck_id, command_tx)
         }),
         "jump" => with_deck(target, "jump", |deck_id| {
             match words.next().map(str::parse::<u64>) {
@@ -484,7 +500,13 @@ fn fader_command<'a>(
             }
         }
     };
-    send(command_tx, Command::SetFader { target: target_fader, value })
+    send(
+        command_tx,
+        Command::SetFader {
+            target: target_fader,
+            value,
+        },
+    )
 }
 
 /// The shipped default topology, under `./profile/`. Also what a run without `--config` reads.
@@ -527,7 +549,11 @@ fn spawn_model_pull(
             match hypermixx_stems::ensure_model(spec, None, &progress) {
                 Ok(path) => notices::info(
                     &notices_tx,
-                    format!("[model] {}: verified and cached at {}", spec.name, path.display()),
+                    format!(
+                        "[model] {}: verified and cached at {}",
+                        spec.name,
+                        path.display()
+                    ),
                 ),
                 Err(err) => notices::error(&notices_tx, format!("[model] {}: {err}", spec.name)),
             }
@@ -543,7 +569,13 @@ fn spawn_model_pull(
 /// so a typo in a table name is still reported as an unknown model instead of a missing file.
 fn model_choice(
     token: &str,
-) -> Result<(&'static hypermixx_stems::ModelSpec, Option<std::path::PathBuf>), String> {
+) -> Result<
+    (
+        &'static hypermixx_stems::ModelSpec,
+        Option<std::path::PathBuf>,
+    ),
+    String,
+> {
     let looks_like_a_path = token.ends_with(".onnx") || token.contains('/');
     if looks_like_a_path {
         let path = std::path::PathBuf::from(token);
@@ -654,7 +686,9 @@ fn profile_command<'a>(
                 Err(err) => Action::Failed(err),
             }
         }
-        other => Action::Failed(format!("unknown profile subcommand `{other}` (show|reload)")),
+        other => Action::Failed(format!(
+            "unknown profile subcommand `{other}` (show|reload)"
+        )),
     }
 }
 
@@ -665,10 +699,7 @@ fn profile_report(dispatcher: &Dispatcher) -> String {
         None => "profile: none (folder defaults; `--profile <name>` reads profile/<name>.toml)"
             .to_owned(),
     };
-    text.push_str(&format!(
-        "\n  topology: {}",
-        dispatcher.topology_path()
-    ));
+    text.push_str(&format!("\n  topology: {}", dispatcher.topology_path()));
     text.push_str(&format!("\n  live:     {}", dispatcher.live_path()));
     let live = dispatcher.live();
     text.push_str(&format!(
@@ -682,7 +713,11 @@ fn profile_report(dispatcher: &Dispatcher) -> String {
         } else {
             live.stems.threads.to_string()
         },
-        if live.stems.low_memory { "low" } else { "max-speed" },
+        if live.stems.low_memory {
+            "low"
+        } else {
+            "max-speed"
+        },
     ));
     text.push_str("\n  MIDI is attached at launch, so a switch takes effect on the next one.");
     text
@@ -694,10 +729,7 @@ fn profile_report(dispatcher: &Dispatcher) -> String {
 /// re-reads the file and says so rather than pretending a running engine can change its clock. The
 /// stem defaults it carries do apply to the next separation, which is why a reload is worth doing
 /// even mid-session.
-fn live_command<'a>(
-    words: &mut impl Iterator<Item = &'a str>,
-    dispatcher: &Dispatcher,
-) -> Action {
+fn live_command<'a>(words: &mut impl Iterator<Item = &'a str>, dispatcher: &Dispatcher) -> Action {
     let Some(sub) = words.next() else {
         return Action::Message(live_report(&dispatcher.live(), None));
     };
@@ -751,10 +783,7 @@ fn live_report(live: &LiveConfig, path: Option<&str>) -> String {
 /// out of the audio crate, and the engine never needs to know where a user keeps configs. Undefined
 /// keys take their defaults, exactly as at startup, so a partial file is a partial topology rather
 /// than a patch over the running one.
-fn mixer_command<'a>(
-    words: &mut impl Iterator<Item = &'a str>,
-    dispatcher: &Dispatcher,
-) -> Action {
+fn mixer_command<'a>(words: &mut impl Iterator<Item = &'a str>, dispatcher: &Dispatcher) -> Action {
     let Some(sub) = words.next() else {
         return Action::Message("usage: mixer reload [<file>]".into());
     };
@@ -765,10 +794,7 @@ fn mixer_command<'a>(
                 .map(str::to_owned)
                 .unwrap_or_else(|| dispatcher.topology_path());
             match std::fs::read_to_string(&path) {
-                Ok(text) => send(
-                    &dispatcher.command_tx,
-                    Command::MixerReload { text },
-                ),
+                Ok(text) => send(&dispatcher.command_tx, Command::MixerReload { text }),
                 Err(err) => Action::Failed(format!("{path}: {err}")),
             }
         }
@@ -788,7 +814,9 @@ fn output_command<'a>(
         Some("list") | Some("ls") | None => OutputOp::List,
         Some("refresh") | Some("reload") | Some("reopen") => OutputOp::Refresh,
         Some(other) => {
-            return Action::Failed(format!("unknown output subcommand `{other}` (list|refresh)"))
+            return Action::Failed(format!(
+                "unknown output subcommand `{other}` (list|refresh)"
+            ))
         }
     };
     send(command_tx, Command::Output { op })
@@ -867,7 +895,9 @@ fn phase_mode<'a>(
         return Err(usage);
     };
     let Some(mode) = PhaseMode::parse(token) else {
-        return Err(format!("unknown phase mode `{token}` — instant|linear|pid\n{usage}"));
+        return Err(format!(
+            "unknown phase mode `{token}` — instant|linear|pid\n{usage}"
+        ));
     };
     let t_seconds = match words.next() {
         Some(raw) => match raw.parse::<f64>() {
@@ -890,6 +920,41 @@ fn phase_mode<'a>(
 /// The `cue` family. A bare `cue` is the smart gesture — the deck decides between "back to the
 /// cue point and pause" and "set the cue point here" from its own transport, so the front-end
 /// never has to guess. The explicit subcommands are for a held button (MIDI press/release).
+/// `hotcue set|trigger|clear <1..8>` — the slot number is one-based in the CLI, zero-based in the
+/// engine, matching DJ hardware labels A..H.
+fn hotcue_command<'a>(
+    words: &mut impl Iterator<Item = &'a str>,
+    deck_id: u8,
+    command_tx: &Sender<Command>,
+) -> Action {
+    let Some(verb) = words.next() else {
+        return Action::Failed("usage: hotcue set|trigger|clear <1..8>".into());
+    };
+    let Some(raw) = words.next() else {
+        return Action::Failed("usage: hotcue set|trigger|clear <1..8>".into());
+    };
+    let slot = match raw.parse::<u8>() {
+        Ok(slot) if (1..=hypermixx_core::HOT_CUE_SLOTS as u8).contains(&slot) => slot - 1,
+        _ => {
+            return Action::Failed(format!(
+                "hotcue slot must be 1..={}",
+                hypermixx_core::HOT_CUE_SLOTS
+            ))
+        }
+    };
+    let op = match verb {
+        "set" => HotCueOp::Set(slot),
+        "trigger" | "play" => HotCueOp::Trigger(slot),
+        "clear" => HotCueOp::Clear(slot),
+        other => {
+            return Action::Failed(format!(
+                "unknown hotcue command `{other}` (set | trigger | clear)"
+            ))
+        }
+    };
+    send(command_tx, Command::HotCue { deck_id, op })
+}
+
 fn cue_command<'a>(
     words: &mut impl Iterator<Item = &'a str>,
     deck_id: u8,
@@ -1102,7 +1167,12 @@ fn fx<'a>(
                 Ok(index) => index,
                 Err(e) => return Action::Failed(e),
             };
-            send(command_tx, Command::ToggleFx { slot: FxSlotRef { chain, index } })
+            send(
+                command_tx,
+                Command::ToggleFx {
+                    slot: FxSlotRef { chain, index },
+                },
+            )
         }
         "set" => {
             let index = match resolve_slot(words.next(), chain, dispatcher) {
@@ -1172,14 +1242,16 @@ fn fx<'a>(
             }
         }
         "help" | "h" => Action::Message(fx_help_text()),
-        other => Action::Failed(format!(
-            "unknown fx subcommand `{other}` — try `fx help`"
-        )),
+        other => Action::Failed(format!("unknown fx subcommand `{other}` — try `fx help`")),
     }
 }
 
 /// Resolves an fx slot argument: a bare index, or an effect name from the slot book.
-fn resolve_slot(raw: Option<&str>, chain: FxChainId, dispatcher: &Dispatcher) -> Result<usize, String> {
+fn resolve_slot(
+    raw: Option<&str>,
+    chain: FxChainId,
+    dispatcher: &Dispatcher,
+) -> Result<usize, String> {
     let Some(raw) = raw else {
         return Err("missing slot: an index or an effect name (see `fx list`)".into());
     };
@@ -1222,7 +1294,11 @@ fn with_deck(target: Target, verb: &str, apply: impl FnOnce(u8) -> Action) -> Ac
 }
 
 /// Builds and sends a no-argument deck command.
-fn forward(target: Target, command_tx: &Sender<Command>, build: impl FnOnce(u8) -> Command) -> Action {
+fn forward(
+    target: Target,
+    command_tx: &Sender<Command>,
+    build: impl FnOnce(u8) -> Command,
+) -> Action {
     match deck_only(target) {
         Ok(deck_id) => send(command_tx, build(deck_id)),
         Err(_) => Action::Failed("that command needs a deck, not `master`".into()),
@@ -1335,7 +1411,9 @@ fn stem_family<'a>(
             let Some(source) = pipeline.deck_source(deck_id) else {
                 return Action::Failed(format!("deck {deck_id} holds no track to separate"));
             };
-            spawn_separate(deck_id, source, options, runtime, spec, local_file, dispatcher);
+            spawn_separate(
+                deck_id, source, options, runtime, spec, local_file, dispatcher,
+            );
             Action::Continue
         }
         "status" => send(command_tx, Command::GetStemState { deck_id }),
@@ -1376,7 +1454,9 @@ fn stem_family<'a>(
                     )),
                 }
             }
-            Some(other) => Action::Failed(format!("unknown stem model subcommand `{other}` (list|pull)")),
+            Some(other) => Action::Failed(format!(
+                "unknown stem model subcommand `{other}` (list|pull)"
+            )),
         },
         "cache" => {
             // `stem cache prune [--keep <n>]` / `stem cache clear`; a bare `stem cache` reports.
@@ -1442,7 +1522,10 @@ fn stem_family<'a>(
                     op: StemOp::Preset(preset),
                 },
             ),
-            None => Action::Failed(format!("unknown stem command `{other}`\n{}", stem_help_text())),
+            None => Action::Failed(format!(
+                "unknown stem command `{other}`\n{}",
+                stem_help_text()
+            )),
         },
     }
 }
@@ -1749,7 +1832,8 @@ impl hypermixx_stems::StemBlockSink for DeckSink<'_> {
             );
             return false;
         }
-        let buffers: Vec<Arc<Vec<f32>>> = blocks.iter().map(|block| Arc::new(block.clone())).collect();
+        let buffers: Vec<Arc<Vec<f32>>> =
+            blocks.iter().map(|block| Arc::new(block.clone())).collect();
         if let Err(err) = self.growing.append(start_frame, buffers) {
             notices::error(
                 self.notices_tx,
@@ -1778,7 +1862,6 @@ impl hypermixx_stems::StemBlockSink for DeckSink<'_> {
     }
 }
 
-
 /// Prunes the stem cache and reports what went, in the same shape as `stem cache`.
 fn cache_prune(keep: usize) -> Action {
     match hypermixx_stems::prune_cache(keep) {
@@ -1800,8 +1883,141 @@ fn stem_help_text() -> String {
     crate::response::stem_help_text()
 }
 
+/// The `browser` family for the line REPL. The TUI intercepts navigation/analysis before this
+/// point (it owns the selection), but the read-only inspection commands are useful from both.
+fn browser_command(words: &mut std::str::SplitWhitespace<'_>, dispatcher: &Dispatcher) -> Action {
+    let Some(db) = dispatcher.library().cloned() else {
+        return Action::Failed("browser: no database (see the startup warning)".into());
+    };
+    let Some(subcommand) = words.next() else {
+        return Action::Failed(
+            "usage: browser list | refresh [id] | show <location> | tracks <list>".into(),
+        );
+    };
+    match subcommand {
+        "list" => match db.sources() {
+            Ok(sources) if sources.is_empty() => {
+                Action::Message("browser: no configured sources".into())
+            }
+            Ok(sources) => {
+                let mut lines = Vec::new();
+                for source in sources {
+                    let lists = db.root_playlists(source.id).map(|l| l.len()).unwrap_or(0);
+                    let scanned = source
+                        .last_scan_at
+                        .map(|time| time.to_string())
+                        .unwrap_or_else(|| "never".to_owned());
+                    lines.push(format!(
+                        "{} [{}] {} — {lists} root list(s), last scan {scanned}",
+                        source.id,
+                        source.kind.label(),
+                        source.root.display()
+                    ));
+                }
+                Action::Message(lines.join("\n"))
+            }
+            Err(err) => Action::Failed(format!("browser list: {err}")),
+        },
+        "refresh" => {
+            let ids = match words.next() {
+                Some(raw) => match raw.parse::<i64>() {
+                    Ok(id) => vec![id],
+                    Err(_) => return Action::Failed("browser refresh: id must be a number".into()),
+                },
+                None => match db.sources() {
+                    Ok(sources) => sources.iter().map(|source| source.id).collect(),
+                    Err(err) => return Action::Failed(format!("browser refresh: {err}")),
+                },
+            };
+            let mut lines = Vec::new();
+            for id in ids {
+                match db.scan_source(id, &mut |_| {}) {
+                    Ok(stats) => lines.push(format!("source {id}: {}", stats.summary())),
+                    Err(err) => lines.push(format!("source {id}: {err}")),
+                }
+            }
+            if lines.is_empty() {
+                Action::Message("browser: no configured sources".into())
+            } else {
+                Action::Message(lines.join("\n"))
+            }
+        }
+        "show" => {
+            let Some(raw) = words.next() else {
+                return Action::Failed("usage: browser show <location-id>".into());
+            };
+            let id = match raw.parse::<i64>() {
+                Ok(id) => id,
+                Err(_) => return Action::Failed("browser show: id must be a number".into()),
+            };
+            match db.track_load(id) {
+                Ok(Some(track)) => {
+                    let bpm = track
+                        .bpm
+                        .map(|bpm| format!("{bpm:.2} BPM"))
+                        .unwrap_or_else(|| "BPM --".to_owned());
+                    let key = track
+                        .key
+                        .map(|key| format!("{} ({})", key.traditional(), key.camelot()))
+                        .unwrap_or_else(|| "key --".to_owned());
+                    Action::Message(format!(
+                        "{}\n  {} — {}\n  {bpm}, {key}\n  {}",
+                        track.title,
+                        track.artist.as_deref().unwrap_or("unknown artist"),
+                        track.album.as_deref().unwrap_or("unknown album"),
+                        track.path.display()
+                    ))
+                }
+                Ok(None) => Action::Failed(format!("browser show: no location {id}")),
+                Err(err) => Action::Failed(format!("browser show: {err}")),
+            }
+        }
+        "tracks" => {
+            let Some(raw) = words.next() else {
+                return Action::Failed("usage: browser tracks <playlist-id>".into());
+            };
+            let id = match raw.parse::<i64>() {
+                Ok(id) => id,
+                Err(_) => return Action::Failed("browser tracks: id must be a number".into()),
+            };
+            match db.tracks_in_playlist(id) {
+                Ok(tracks) if tracks.is_empty() => {
+                    Action::Message(format!("browser: list {id} has no tracks"))
+                }
+                Ok(tracks) => Action::Message(
+                    tracks
+                        .iter()
+                        .map(|track| format!("[{}] {}", track.location_id, track.title))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                Err(err) => Action::Failed(format!("browser tracks: {err}")),
+            }
+        }
+        "up" | "down" | "open" | "exit" | "load" | "analyse" | "analyze" => {
+            Action::Message("browser navigation is available in the TUI".into())
+        }
+        other => Action::Failed(format!(
+            "unknown browser command `{other}` (list | refresh | show | tracks)"
+        )),
+    }
+}
+
 /// Decodes on a worker thread, then hands the pipeline a ready source (+ optional constant grid).
 pub(crate) fn spawn_load(deck_id: u8, path: String, bpm: Option<f32>, dispatcher: &Dispatcher) {
+    spawn_load_with(deck_id, path, bpm, None, None, dispatcher);
+}
+
+/// As [`spawn_load`], but with an analysis already read from the library cache. The grid is scaled
+/// to the engine rate if the cached analysis was produced under another live setting.
+pub(crate) fn spawn_load_with(
+    deck_id: u8,
+    path: String,
+    bpm: Option<f32>,
+    analysis: Option<TrackAnalysis>,
+    cues: Option<hypermixx_library::LoadedCues>,
+    dispatcher: &Dispatcher,
+) {
     let command_tx = dispatcher.command_tx.clone();
     let notices_tx = dispatcher.notices.clone();
     let events = dispatcher.events.clone();
@@ -1810,43 +2026,120 @@ pub(crate) fn spawn_load(deck_id: u8, path: String, bpm: Option<f32>, dispatcher
     let sample_rate = dispatcher.live().audio.sample_rate;
     // Decoding a long track takes seconds; say so immediately so the user does not think the
     // command was ignored.
-    notices::info(&notices_tx, format!("[load] deck{deck_id}: decoding {path}..."));
+    notices::info(
+        &notices_tx,
+        format!("[load] deck{deck_id}: decoding {path}..."),
+    );
     std::thread::Builder::new()
         .name(format!("hypermixx-load-{deck_id}"))
-        .spawn(move || match hypermixx_media::decode_file_at(&path, sample_rate) {
-            Ok(decoded) => {
-                let total_frames = decoded.total_frames;
-                let analysis = bpm.filter(|b| *b > 0.0).map(|bpm| {
-                    TrackAnalysis::from_grid(
-                        hypermixx_core::BeatGrid::from_constant_bpm(
-                            bpm,
-                            0,
-                            total_frames,
-                            sample_rate,
-                        ),
-                        bpm,
-                    )
-                });
-                if let Some(tap) = &events {
-                    let _ = tap.send(UiEvent::Loaded {
-                        deck_id,
-                        path: path.clone(),
-                    });
-                    if let Some(analysis) = &analysis {
-                        let _ = tap.send(UiEvent::Grid {
+        .spawn(
+            move || match hypermixx_media::decode_file_at(&path, sample_rate) {
+                Ok(decoded) => {
+                    let total_frames = decoded.total_frames;
+                    let analysis = analysis
+                        .map(|analysis| analysis_at_rate(analysis, sample_rate))
+                        .or_else(|| {
+                            bpm.filter(|b| *b > 0.0).map(|bpm| {
+                                TrackAnalysis::from_grid(
+                                    hypermixx_core::BeatGrid::from_constant_bpm(
+                                        bpm,
+                                        0,
+                                        total_frames,
+                                        sample_rate,
+                                    ),
+                                    bpm,
+                                )
+                            })
+                        });
+                    if let Some(tap) = &events {
+                        let _ = tap.send(UiEvent::Loaded {
                             deck_id,
-                            analysis: analysis.clone(),
+                            path: path.clone(),
+                        });
+                        if let Some(analysis) = &analysis {
+                            let _ = tap.send(UiEvent::Grid {
+                                deck_id,
+                                analysis: analysis.clone(),
+                            });
+                        }
+                    }
+                    let source: Shared = Arc::new(hypermixx_media::PcmPool::from_decoded(decoded));
+                    let _ = command_tx.send(Command::Load {
+                        deck_id,
+                        source,
+                        analysis,
+                    });
+                    if let Some(cues) = cues {
+                        let _ = command_tx.send(Command::SetCues {
+                            deck_id,
+                            memory: cues.memory,
+                            hot: cues.hot,
                         });
                     }
                 }
-                let source: Shared = Arc::new(hypermixx_media::PcmPool::from_decoded(decoded));
-                let _ = command_tx.send(Command::Load {
-                    deck_id,
-                    source,
-                    analysis,
-                });
+                Err(err) => notices::error(&notices_tx, format!("deck {deck_id}, {path}: {err}")),
+            },
+        )
+        .ok();
+}
+
+/// Rescales cached beat positions when the live engine rate differs from the analysis rate.
+fn analysis_at_rate(mut analysis: TrackAnalysis, sample_rate: u32) -> TrackAnalysis {
+    let old_rate = analysis.beatgrid.sample_rate;
+    if old_rate != 0 && old_rate != sample_rate {
+        for frame in &mut analysis.beatgrid.beat_frames {
+            *frame = (*frame as u128 * sample_rate as u128 / old_rate as u128) as u64;
+        }
+        analysis.beatgrid.sample_rate = sample_rate;
+    }
+    analysis
+}
+
+/// Analyses one library track in the background and writes the result to the cache. The deck does
+/// not need to be loaded: this is the browser's `analyse`.
+pub(crate) fn spawn_analyse_track(
+    track: hypermixx_library::TrackLoad,
+    db: Arc<LibraryDb>,
+    backend: Backend,
+    dispatcher: &Dispatcher,
+) {
+    let notices_tx = dispatcher.notices.clone();
+    let sample_rate = dispatcher.live().audio.sample_rate;
+    notices::info(
+        &notices_tx,
+        format!("[analyse] {}: running {backend:?}...", track.title),
+    );
+    std::thread::Builder::new()
+        .name("hypermixx-library-analyse".to_owned())
+        .spawn(move || {
+            let path = track.path.display().to_string();
+            let decoded = match hypermixx_media::decode_file_at(&path, sample_rate) {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    notices::error(&notices_tx, format!("[analyse] {path}: {err}"));
+                    return;
+                }
+            };
+            let source: Shared = Arc::new(hypermixx_media::PcmPool::from_decoded(decoded));
+            match hypermixx_library::analyser::analyze(source, sample_rate, backend) {
+                Ok(analysis) => {
+                    let bpm = analysis.bpm();
+                    let key = analysis
+                        .key
+                        .map(|key| key.traditional())
+                        .unwrap_or_else(|| "--".into());
+                    if let Err(err) = db.save_analysis(track.track_id, &analysis) {
+                        notices::error(&notices_tx, format!("[analyse] cache: {err}"));
+                    }
+                    notices::info(
+                        &notices_tx,
+                        format!("[analyse] {}: {bpm:.1} BPM, {key}", track.title),
+                    );
+                }
+                Err(err) => {
+                    notices::error(&notices_tx, format!("[analyse] {}: {err}", track.title))
+                }
             }
-            Err(err) => notices::error(&notices_tx, format!("deck {deck_id}, {path}: {err}")),
         })
         .ok();
 }
@@ -1862,7 +2155,10 @@ fn spawn_analyse(deck_id: u8, source: Shared, backend: Backend, dispatcher: &Dis
     std::thread::Builder::new()
         .name(format!("hypermixx-analyse-{deck_id}"))
         .spawn(move || {
-            notices::info(&notices_tx, format!("[analyse] deck{deck_id}: running {backend:?}..."));
+            notices::info(
+                &notices_tx,
+                format!("[analyse] deck{deck_id}: running {backend:?}..."),
+            );
             match hypermixx_library::analyser::analyze(source, sample_rate, backend) {
                 Ok(analysis) => {
                     let bpm = analysis.bpm();
@@ -1870,7 +2166,10 @@ fn spawn_analyse(deck_id: u8, source: Shared, backend: Backend, dispatcher: &Dis
                         .key
                         .map(|k| k.traditional())
                         .unwrap_or_else(|| "--".into());
-                    notices::info(&notices_tx, format!("[analyse] deck{deck_id}: {bpm:.1} BPM, {key}"));
+                    notices::info(
+                        &notices_tx,
+                        format!("[analyse] deck{deck_id}: {bpm:.1} BPM, {key}"),
+                    );
                     if let Some(tap) = &events {
                         let _ = tap.send(UiEvent::Grid {
                             deck_id,
@@ -1908,13 +2207,25 @@ mod tests {
             other => panic!("expected SetFader, got {other:?}"),
         };
 
-        assert!(matches!(parse("flow -0.5", Target::Deck(1)), Action::Continue));
+        assert!(matches!(
+            parse("flow -0.5", Target::Deck(1)),
+            Action::Continue
+        ));
         expect(FaderTarget::Flow(1), -0.5);
-        assert!(matches!(parse("deck 0.25", Target::Deck(1)), Action::Continue));
+        assert!(matches!(
+            parse("deck 0.25", Target::Deck(1)),
+            Action::Continue
+        ));
         expect(FaderTarget::Deck(1), 0.25);
-        assert!(matches!(parse("gain 1.0", Target::Deck(0)), Action::Continue));
+        assert!(matches!(
+            parse("gain 1.0", Target::Deck(0)),
+            Action::Continue
+        ));
         expect(FaderTarget::Gain(0), 1.0);
-        assert!(matches!(parse("cuesend 0.9", Target::Deck(0)), Action::Continue));
+        assert!(matches!(
+            parse("cuesend 0.9", Target::Deck(0)),
+            Action::Continue
+        ));
         expect(FaderTarget::CueSend(0), 0.9);
         // The shared stages ignore the target: they are one physical control.
         for (line, expected) in [
@@ -1922,15 +2233,30 @@ mod tests {
             ("master 0.1", FaderTarget::Master),
             ("cue -0.2", FaderTarget::Cue),
         ] {
-            assert!(matches!(parse(line, Target::Master), Action::Continue), "{line}");
-            expect(expected, line.split_whitespace().nth(1).unwrap().parse().unwrap());
+            assert!(
+                matches!(parse(line, Target::Master), Action::Continue),
+                "{line}"
+            );
+            expect(
+                expected,
+                line.split_whitespace().nth(1).unwrap().parse().unwrap(),
+            );
         }
 
         // A stage that needs a channel refuses `master` rather than silently addressing deck 0.
-        assert!(matches!(parse("flow 0.1", Target::Master), Action::Failed(_)));
+        assert!(matches!(
+            parse("flow 0.1", Target::Master),
+            Action::Failed(_)
+        ));
         // A mistyped stage or value is the user's mistake, reported before the engine sees it.
-        assert!(matches!(parse("volume 0.1", Target::Deck(0)), Action::Failed(_)));
-        assert!(matches!(parse("gain loud", Target::Deck(0)), Action::Failed(_)));
+        assert!(matches!(
+            parse("volume 0.1", Target::Deck(0)),
+            Action::Failed(_)
+        ));
+        assert!(matches!(
+            parse("gain loud", Target::Deck(0)),
+            Action::Failed(_)
+        ));
         assert!(matches!(parse("gain", Target::Deck(0)), Action::Failed(_)));
     }
 
@@ -1942,8 +2268,15 @@ mod tests {
         std::fs::write(&path, "[audio]\nsample_rate = 48000\nring_frames = 99\n").unwrap();
         let (live, notes) = read_live_config(&path.to_string_lossy()).unwrap();
         assert_eq!(live.audio.sample_rate, 48_000, "a named value is honoured");
-        assert_eq!(live.audio.ring_frames, hypermixx_core::live::MIN_RING_FRAMES, "clamped");
-        assert!(!notes.is_empty(), "and the clamp is reported rather than silent");
+        assert_eq!(
+            live.audio.ring_frames,
+            hypermixx_core::live::MIN_RING_FRAMES,
+            "clamped"
+        );
+        assert!(
+            !notes.is_empty(),
+            "and the clamp is reported rather than silent"
+        );
         let _ = std::fs::remove_file(&path);
 
         // A typo is a failure, not a silent default: running at another rate than the file says is
@@ -1957,7 +2290,10 @@ mod tests {
         // The shipped file parses and is sane.
         let shipped = format!("{}/../../profile/live.toml", env!("CARGO_MANIFEST_DIR"));
         let (live, notes) = read_live_config(&shipped).expect("the shipped live file parses");
-        assert!(notes.is_empty(), "the shipped file needs no clamping: {notes:?}");
+        assert!(
+            notes.is_empty(),
+            "the shipped file needs no clamping: {notes:?}"
+        );
         assert_eq!(live.audio.sample_rate, hypermixx_core::SAMPLE_RATE);
         assert!(
             matches!(live.stems.provider.as_str(), "cpu" | "cuda" | "gpu"),
@@ -1985,7 +2321,10 @@ mod tests {
         }
         // A path that is not there is a failure; a mistyped subcommand too.
         assert!(matches!(
-            live_command(&mut "reload /nonexistent/live.toml".split_whitespace(), &dispatcher),
+            live_command(
+                &mut "reload /nonexistent/live.toml".split_whitespace(),
+                &dispatcher
+            ),
             Action::Failed(_)
         ));
         assert!(matches!(
@@ -2043,6 +2382,7 @@ mod tests {
                 // (`fx set <slot> <param> <value>`) while a controller's value is the message, so the
                 // action names the parameter only. Same addressing, same parameter name.
                 "fx param" => "fx set eq low 0.5",
+                "hotcue" => "hotcue trigger 1",
                 _ => return None,
             })
         };
@@ -2053,18 +2393,24 @@ mod tests {
             outputs: vec![],
             ..hypermixx_audio::simple_dj()
         };
-        let pipeline = hypermixx_audio::AudioPipeline::start(cfg).expect("a headless engine starts");
+        let pipeline =
+            hypermixx_audio::AudioPipeline::start(cfg).expect("a headless engine starts");
         let (notice_tx, _notice_rx) = unbounded();
         let dispatcher = Dispatcher::new(pipeline.command_tx(), notice_tx);
         // `fx …` addresses slots by *name*, which needs the chain lists the front-end normally
         // primes at startup.
         dispatcher.prime(1, pipeline.response_rx());
         for spec in hypermixx_core::ACTIONS {
+            // Browser actions are consumed by the TUI/MIDI layer, not the engine command line.
+            if spec.name.starts_with("browser ") {
+                continue;
+            }
             let Some(line) = counterpart(spec.name) else {
                 panic!("no session counterpart for `{}`", spec.name);
             };
             let full = format!("deck0 {line}");
-            if let Action::Failed(message) = dispatch(&full, &dispatcher, &pipeline, Backend::Auto, 2, 0)
+            if let Action::Failed(message) =
+                dispatch(&full, &dispatcher, &pipeline, Backend::Auto, 2, 0)
             {
                 panic!("`{full}` failed: {message}");
             }
@@ -2096,7 +2442,10 @@ mod tests {
             }
         }
         // With no profile the report says so rather than looking broken.
-        let bare = Dispatcher::new(crossbeam_channel::unbounded().0, crossbeam_channel::unbounded().0);
+        let bare = Dispatcher::new(
+            crossbeam_channel::unbounded().0,
+            crossbeam_channel::unbounded().0,
+        );
         match profile_command(&mut "".split_whitespace(), &bare) {
             Action::Message(text) => assert!(text.contains("none"), "{text}"),
             other => panic!("expected a report, got {other:?}"),
@@ -2121,7 +2470,10 @@ mod tests {
             Command::MixerReload { text } => assert!(text.contains("center"), "{text}"),
             other => panic!("expected MixerReload, got {other:?}"),
         }
-        assert_eq!(dispatcher.profile_path().as_deref(), Some(profile_file.to_string_lossy().as_ref()));
+        assert_eq!(
+            dispatcher.profile_path().as_deref(),
+            Some(profile_file.to_string_lossy().as_ref())
+        );
         // The report follows the switch: the topology slot is the one the session is *running*, not
         // the one it started with (a stale slot would make `profile show` lie).
         assert_eq!(
@@ -2138,7 +2490,10 @@ mod tests {
         match profile_command(&mut line.split_whitespace(), &dispatcher) {
             Action::Message(text) => {
                 assert!(text.contains(crate::profile::DEFAULT_MIXER), "{text}");
-                assert!(text.contains("topology:"), "a failure is reported, not hidden: {text}");
+                assert!(
+                    text.contains("topology:"),
+                    "a failure is reported, not hidden: {text}"
+                );
             }
             other => panic!("expected a report, got {other:?}"),
         }
@@ -2152,7 +2507,10 @@ mod tests {
 
         // A profile that is not there is a failure, and a mistyped subcommand too.
         assert!(matches!(
-            profile_command(&mut "reload /nonexistent/p.toml".split_whitespace(), &dispatcher),
+            profile_command(
+                &mut "reload /nonexistent/p.toml".split_whitespace(),
+                &dispatcher
+            ),
             Action::Failed(_)
         ));
         assert!(matches!(
@@ -2169,14 +2527,20 @@ mod tests {
         let (tx, _rx) = unbounded();
         let dispatcher = Dispatcher::new(tx, crossbeam_channel::unbounded().0);
         // No subcommand is a usage message, not a silent no-op.
-        assert!(matches!(mixer_command(&mut "".split_whitespace(), &dispatcher), Action::Message(_)));
+        assert!(matches!(
+            mixer_command(&mut "".split_whitespace(), &dispatcher),
+            Action::Message(_)
+        ));
         assert!(matches!(
             mixer_command(&mut "nope".split_whitespace(), &dispatcher),
             Action::Failed(_)
         ));
         // A path that does not exist is the front-end's failure, reported as such.
         assert!(matches!(
-            mixer_command(&mut "reload /nonexistent/mixer.toml".split_whitespace(), &dispatcher),
+            mixer_command(
+                &mut "reload /nonexistent/mixer.toml".split_whitespace(),
+                &dispatcher
+            ),
             Action::Failed(_)
         ));
         // And the file's text travels as-is.
@@ -2202,7 +2566,10 @@ mod tests {
         let (tx, rx) = unbounded();
         for (line, expected) in [("list", OutputOp::List), ("refresh", OutputOp::Refresh)] {
             let mut words = line.split_whitespace();
-            assert!(matches!(output_command(&mut words, &tx), Action::Continue), "{line}");
+            assert!(
+                matches!(output_command(&mut words, &tx), Action::Continue),
+                "{line}"
+            );
             match rx.recv().unwrap() {
                 Command::Output { op } => assert_eq!(op, expected),
                 other => panic!("expected Output, got {other:?}"),

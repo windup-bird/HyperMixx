@@ -11,7 +11,7 @@ mod decoder;
 mod pool;
 
 pub use chunked::{ChunkedStreams, DEFAULT_FADE_FRAMES};
-pub use decoder::{decode_file, decode_file_at, DecodedAudio};
+pub use decoder::{decode_file, decode_file_at, decoder_start_ms, DecodedAudio};
 pub use pool::PcmPool;
 
 // The `Source` trait is defined in `core` (the shared protocol) but re-exported here so media

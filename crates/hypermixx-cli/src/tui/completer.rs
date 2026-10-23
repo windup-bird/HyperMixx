@@ -41,8 +41,14 @@ const VERBS: &[(&str, &str)] = &[
     ("load", "decode a file"),
     ("analyse", "run the analyser"),
     ("play", "toggle play/pause"),
-    ("cue", "cue button: press plays from the cue, press again returns to it"),
-    ("vinyl", "platter: touch pauses, turn scrubs, release resumes"),
+    (
+        "cue",
+        "cue button: press plays from the cue, press again returns to it",
+    ),
+    (
+        "vinyl",
+        "platter: touch pauses, turn scrubs, release resumes",
+    ),
     ("jump", "seek to frame"),
     ("beatjump", "seek by beats"),
     ("tempo", "set the tempo"),
@@ -53,12 +59,19 @@ const VERBS: &[(&str, &str)] = &[
     ("loop", "loop family"),
     ("sync", "beat-sync against the other deck"),
     ("nudge", "temporary rate bend"),
-    ("fader", "channel/master/cue levels (flow|deck|gain|cuesend|cross|master|cue)"),
+    (
+        "fader",
+        "channel/master/cue levels (flow|deck|gain|cuesend|cross|master|cue)",
+    ),
     ("fx", "effect chain commands"),
     ("stem", "stem separation and per-stem control"),
     ("output", "output destinations and their bindings"),
-    ("live", "machine settings: engine rate, ring sizes, stem defaults"),
+    (
+        "live",
+        "machine settings: engine rate, ring sizes, stem defaults",
+    ),
     ("profile", "which files this session runs with; switch them"),
+    ("browser", "sources: list / refresh / tracks / show"),
     ("state", "show decks"),
     ("zoom", "waveform zoom"),
     ("help", "list commands"),
@@ -195,6 +208,27 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
                 Vec::new()
             }
         }
+        "browser" => {
+            if rest.len() == 1 {
+                pairs(
+                    &[
+                        ("up", "selection up"),
+                        ("down", "selection down"),
+                        ("open", "open the selected list"),
+                        ("exit", "go up / leave tracks"),
+                        ("load", "choose a deck for the selected track"),
+                        ("refresh", "rescan configured sources"),
+                        ("list", "show configured sources"),
+                        ("tracks", "list a list's tracks"),
+                        ("show", "show one track"),
+                        ("analyse", "analyse the selected track"),
+                    ],
+                    partial,
+                )
+            } else {
+                Vec::new()
+            }
+        }
         "load" => {
             if rest.len() == 1 {
                 path_candidates(partial)
@@ -209,6 +243,20 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
                         ("touch", "hand on the platter (pauses)"),
                         ("release", "let go (resumes if the touch paused it)"),
                         ("turn", "turn the wheel by N ticks"),
+                    ],
+                    partial,
+                )
+            } else {
+                Vec::new()
+            }
+        }
+        "hotcue" => {
+            if rest.len() == 1 {
+                pairs(
+                    &[
+                        ("set", "store the current frame in a slot"),
+                        ("trigger", "jump to a slot"),
+                        ("clear", "remove a slot"),
                     ],
                     partial,
                 )
@@ -297,7 +345,11 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
         "nudge" => {
             if rest.len() == 1 {
                 pairs(
-                    &[("off", "release the bend"), ("0.04", "4% fast"), ("-0.04", "4% slow")],
+                    &[
+                        ("off", "release the bend"),
+                        ("0.04", "4% fast"),
+                        ("-0.04", "4% slow"),
+                    ],
                     partial,
                 )
             } else {
@@ -307,7 +359,14 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
         "fx" => fx_candidates(&rest[1..], partial, &chain, ctx),
         "zoom" => {
             if rest.len() == 1 {
-                pairs(&[("in", "zoom in"), ("out", "zoom out"), ("fit", "fit the track")], partial)
+                pairs(
+                    &[
+                        ("in", "zoom in"),
+                        ("out", "zoom out"),
+                        ("fit", "fit the track"),
+                    ],
+                    partial,
+                )
             } else {
                 Vec::new()
             }
@@ -323,11 +382,9 @@ fn fx_candidates(rel: &[String], partial: &str, chain: &str, ctx: &Ctx) -> Vec<C
     let kinds = ctx.slots.get(chain).map(Vec::as_slice).unwrap_or(&[]);
     match (sub.as_str(), rel.len()) {
         ("add", 1) => fx_kinds(partial),
-        ("remove" | "rm", 1)
-        | ("on" | "off", 1)
-        | ("trigger", 1)
-        | ("set", 1)
-        | ("pad", 1) => slot_candidates(kinds, partial),
+        ("remove" | "rm", 1) | ("on" | "off", 1) | ("trigger", 1) | ("set", 1) | ("pad", 1) => {
+            slot_candidates(kinds, partial)
+        }
         ("set", 2) => slot_param_candidates(kinds, &rel[1], partial),
         ("pad", 2) => pairs(&[("press", ""), ("release", "")], partial),
         _ => Vec::new(),
@@ -429,7 +486,11 @@ fn path_candidates(partial: &str) -> Vec<Candidate> {
         let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
         out.push(Candidate {
             text: format!("{dir}{name}{}", if is_dir { "/" } else { "" }),
-            hint: if is_dir { "dir".to_owned() } else { String::new() },
+            hint: if is_dir {
+                "dir".to_owned()
+            } else {
+                String::new()
+            },
         });
         if out.len() >= 200 {
             break;
@@ -543,10 +604,7 @@ mod tests {
     #[test]
     fn keylock_names_need_no_deck() {
         let fixture = Fixture::new();
-        assert_eq!(
-            fixture.complete("keylock ", 8),
-            vec!["on", "off"]
-        );
+        assert_eq!(fixture.complete("keylock ", 8), vec!["on", "off"]);
     }
 
     #[test]

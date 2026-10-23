@@ -20,9 +20,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use hypermixx_core::{Command, CommandResponse, FxChainId};
+use hypermixx_core::{BrowserAction, Command, CommandResponse, FxChainId};
 use hypermixx_midi::map::Action;
-use hypermixx_midi::{ports, translate, Input, Map, MergeBuffer, Received, TranslateState};
+use hypermixx_midi::{ports, translate_split, Input, Map, MergeBuffer, Received, TranslateState};
 
 use crate::notices::{self, NoticeTx};
 
@@ -66,13 +66,18 @@ pub fn read_map(map_path: &str) -> Result<Map, String> {
 ///
 /// A bad port or a failed thread spawn is a clean error: the caller exits without a half-wired MIDI
 /// layer.
-pub fn attach(port: &str, map: Map, command_tx: Sender<Command>) -> Result<MidiSession, String> {
+pub fn attach(
+    port: &str,
+    map: Map,
+    command_tx: Sender<Command>,
+    browser_tx: Option<Sender<BrowserAction>>,
+) -> Result<MidiSession, String> {
     let (received_tx, received_rx) = crossbeam_channel::unbounded();
     let input = ports::open(port, received_tx).map_err(|err| format!("midi: {err}"))?;
     let translator_command_tx = command_tx.clone();
     let translator = std::thread::Builder::new()
         .name("midi-translate".to_owned())
-        .spawn(move || pump(received_rx, map, translator_command_tx))
+        .spawn(move || pump(received_rx, map, translator_command_tx, browser_tx))
         .map_err(|err| format!("midi thread: {err}"))?;
     Ok(MidiSession {
         input: Some(input),
@@ -95,7 +100,7 @@ pub fn attach_file(
     let mut map = read_map(map_path)?;
     let unresolved = resolve_via_engine(&mut map, decks, &command_tx, responses);
     report_unresolved(notices, unresolved);
-    let session = attach(port, map, command_tx)?;
+    let session = attach(port, map, command_tx, None)?;
     notices::info(
         notices,
         format!("[midi] listening on `{port}` (map {map_path})"),
@@ -106,7 +111,10 @@ pub fn attach_file(
 /// Reports unresolved FX bindings as info lines (they are disabled, not fatal).
 pub fn report_unresolved(notices: &NoticeTx, unresolved: Vec<String>) {
     for name in unresolved {
-        notices::info(notices, format!("[midi] no FX slot `{name}` (binding disabled)"));
+        notices::info(
+            notices,
+            format!("[midi] no FX slot `{name}` (binding disabled)"),
+        );
     }
 }
 
@@ -115,15 +123,26 @@ pub fn report_unresolved(notices: &NoticeTx, unresolved: Vec<String>) {
 /// The elapsed-time check (rather than a bare blocking timeout) is what keeps a sustained event
 /// stream from starving the flush: if events arrive faster than the timeout, the loop still flushes
 /// once a millisecond has passed.
-fn pump(received: Receiver<Received>, map: Map, command_tx: Sender<Command>) {
+fn pump(
+    received: Receiver<Received>,
+    map: Map,
+    command_tx: Sender<Command>,
+    browser_tx: Option<Sender<BrowserAction>>,
+) {
     let mut state = TranslateState::new(&map);
     let mut merge = MergeBuffer::new();
     let mut last_flush = Instant::now();
     loop {
         match received.recv_timeout(FLUSH_EVERY) {
             Ok(received) => {
-                for command in translate(&map, &received.event, &mut state) {
+                let (commands, browser) = translate_split(&map, &received.event, &mut state);
+                for command in commands {
                     merge.push(command);
+                }
+                if let Some(browser_tx) = &browser_tx {
+                    for action in browser {
+                        let _ = browser_tx.send(action);
+                    }
                 }
                 if last_flush.elapsed() >= FLUSH_EVERY {
                     flush(&mut merge, &command_tx);
@@ -211,7 +230,11 @@ pub fn resolve_via_engine(
         table
             .iter()
             .find(|(candidate, _)| *candidate == chain)
-            .and_then(|(_, kinds)| kinds.iter().position(|kind| kind.eq_ignore_ascii_case(name)))
+            .and_then(|(_, kinds)| {
+                kinds
+                    .iter()
+                    .position(|kind| kind.eq_ignore_ascii_case(name))
+            })
     })
 }
 
@@ -239,7 +262,7 @@ action = "fader.flow"
         .unwrap();
         let (received_tx, received_rx) = crossbeam_channel::unbounded();
         let (command_tx, command_rx) = crossbeam_channel::unbounded();
-        let translator = std::thread::spawn(move || pump(received_rx, map, command_tx));
+        let translator = std::thread::spawn(move || pump(received_rx, map, command_tx, None));
 
         let at = SystemTime::now();
         // Centre takes over unity, then full deflection: the sweep must arrive as one final value.

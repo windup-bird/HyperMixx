@@ -15,14 +15,15 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use hypermixx_core::{DeckState, Stem};
+use hypermixx_core::{BeatGrid, DeckState, Key, Stem};
 
-use crate::response::{bpm_label, sync_badge, time, Level, LogLine};
+use crate::response::{bpm_label, loop_length, sync_label, time, Level, LogLine};
 use crate::tui::app::{App, Overlay, Target, COMPLETION_ROWS};
 use crate::tui::{browser, picker, text};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    app.screen = area;
 
     // Both decks together are capped at half the terminal. The browser/command band takes the
     // rest, which is what keeps a tall track list possible without starving the waveforms.
@@ -51,8 +52,52 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Overlay::Files { picker, .. } => {
                 picker::render_file_picker(frame, frame.area(), picker)
             }
+            Overlay::LoadTarget { x, y, selected } => {
+                render_load_target(frame, frame.area(), *x, *y, *selected, app.decks)
+            }
         }
     }
+}
+
+/// A two-row deck chooser anchored near a double-clicked track.
+pub(crate) fn load_target_rect(area: Rect, x: u16, y: u16, decks: usize) -> Rect {
+    let width = 18.min(area.width);
+    let height = (decks as u16 + 2).min(area.height);
+    let left = x.min(area.width.saturating_sub(width));
+    let top = y.min(area.height.saturating_sub(height));
+    Rect::new(left, top, width, height)
+}
+
+fn render_load_target(
+    frame: &mut Frame,
+    area: Rect,
+    x: u16,
+    y: u16,
+    selected: usize,
+    decks: usize,
+) {
+    let popup = load_target_rect(area, x, y, decks);
+    if popup.width < 4 || popup.height < 3 {
+        return;
+    }
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered().title(" load ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let lines: Vec<Line> = (0..decks)
+        .map(|deck| {
+            let style = if deck == selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::styled(format!(" deck{deck} "), style)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 fn render_top(frame: &mut Frame, area: Rect, app: &App) {
@@ -79,7 +124,10 @@ fn render_top(frame: &mut Frame, area: Rect, app: &App) {
             format!(" cpu {} ", cpu_label(app.process.cpu_percent())),
             white,
         ),
-        Span::styled(format!(" mem {} ", mem_label(app.process.memory_bytes())), white),
+        Span::styled(
+            format!(" mem {} ", mem_label(app.process.memory_bytes())),
+            white,
+        ),
         Span::styled(format!(" ring {ring_ms:.0}ms "), white),
         Span::styled(format!(" out {} ", db(peak)), white),
         Span::styled(format!(" cue {} ", db(cue)), white),
@@ -156,7 +204,7 @@ fn render_deck(frame: &mut Frame, area: Rect, app: &mut App, index: usize) {
             wave_area,
             waveforms[index].as_ref(),
             grids[index].as_ref(),
-            states[index].current_frame as f64,
+            &states[index],
             *frames_per_cell,
         );
     }
@@ -216,14 +264,14 @@ fn deck_status_line(app: &App, index: usize, width: u16) -> Line<'static> {
     let state = &app.states[index];
     let mut parts: Vec<(usize, Vec<Span<'static>>)> = Vec::new();
 
-    parts.push(part(vec![Span::styled(
-        bpm_label(state),
-        Style::default().add_modifier(Modifier::BOLD),
-    )]));
-    parts.push(part(vec![Span::styled(
-        state.key.clone().unwrap_or_else(|| "--".to_owned()),
-        Style::default().fg(Color::Cyan),
-    )]));
+    parts.push(part(vec![Span::raw(bpm_label(state))]));
+    let key = state
+        .key
+        .as_deref()
+        .and_then(Key::parse)
+        .map(|key| key.format(app.key_format))
+        .unwrap_or_else(|| "--".to_owned());
+    parts.push(part(vec![Span::raw(key)]));
     parts.push(part(vec![Span::raw(format!(
         "tempo {:.3} (±{:.0}%)",
         state.tempo,
@@ -233,51 +281,41 @@ fn deck_status_line(app: &App, index: usize, width: u16) -> Line<'static> {
         "keylock {}",
         state.keylock.label()
     ))]));
-    if let Some(badge) = sync_badge(state) {
-        parts.push(part(vec![Span::styled(
-            badge,
-            Style::default().fg(Color::Yellow),
-        )]));
-    }
-    if let Some(loop_text) = loop_badge(state) {
+    let sync = sync_label(state);
+    let sync_style = if sync == "sync off" {
+        Style::default()
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    parts.push(part(vec![Span::styled(sync, sync_style)]));
+    if let Some(loop_text) = loop_badge(state, app.grids[index].as_ref(), app.sample_rate) {
         parts.push(part(vec![Span::styled(
             loop_text,
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(Color::Cyan),
         )]));
     }
     if state.stems.ready {
         let mut spans = Vec::new();
         for stem in Stem::ALL {
-            let (marker, style) = if state.stems.is_soloed(stem) {
-                (
-                    'S',
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )
+            let marker = if state.stems.is_soloed(stem) {
+                'S'
             } else if state.stems.mute[stem.index()] {
-                ('M', Style::default().fg(Color::DarkGray))
+                'M'
             } else {
-                (' ', Style::default().fg(Color::Green))
+                ' '
             };
-            spans.push(Span::styled(
-                format!(
-                    "{}{:+.1}{marker} ",
-                    stem.name().chars().next().unwrap().to_ascii_uppercase(),
-                    state.stems.level[stem.index()]
-                ),
-                style,
-            ));
+            spans.push(Span::raw(format!(
+                "{}{:+.1}{marker} ",
+                stem.name().chars().next().unwrap().to_ascii_uppercase(),
+                state.stems.level[stem.index()]
+            )));
         }
         parts.push(part(spans));
     }
     if let Some(grid) = app.grids[index].as_ref().filter(|grid| !grid.is_empty()) {
         let beat = grid.floor_beat(state.current_frame) as f64
             + f64::from(grid.phase(state.current_frame));
-        parts.push(part(vec![Span::styled(
-            format!("beat {beat:.1}"),
-            Style::default().fg(Color::DarkGray),
-        )]));
+        parts.push(part(vec![Span::raw(format!("beat {beat:.1}"))]));
     }
 
     let mut spans = Vec::new();
@@ -304,10 +342,16 @@ fn part(spans: Vec<Span<'static>>) -> (usize, Vec<Span<'static>>) {
     (width, spans)
 }
 
-fn loop_badge(state: &DeckState) -> Option<String> {
+fn loop_badge(
+    state: &DeckState,
+    grid: Option<&BeatGrid>,
+    sample_rate: u32,
+) -> Option<String> {
     let mut parts = Vec::new();
-    if let Some((in_frame, out_frame)) = state.loop_range {
-        parts.push(format!("loop [{in_frame}-{out_frame}]"));
+    if state.loop_range.is_some() {
+        if let Some(length) = loop_length(state, grid, sample_rate) {
+            parts.push(format!("loop {length}"));
+        }
     }
     if let Some(armed) = state.loop_in_armed {
         parts.push(format!("in armed@{armed}"));
@@ -319,7 +363,7 @@ fn render_bottom(frame: &mut Frame, area: Rect, app: &mut App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let browser_width = (area.width as u32 * 2 / 3) as u16;
+    let browser_width = (area.width as u32 * 3 / 4) as u16;
     let browser_area = Rect::new(area.x, area.y, browser_width, area.height);
     let command_area = Rect::new(
         area.x + browser_width,
@@ -330,37 +374,50 @@ fn render_bottom(frame: &mut Frame, area: Rect, app: &mut App) {
     browser::render(
         frame,
         browser_area,
-        &app.browser,
+        &mut app.browser,
         app.target == Target::Browser,
     );
     render_command(frame, command_area, app);
 }
 
-fn render_response(frame: &mut Frame, area: Rect, app: &App) {
+fn render_response(frame: &mut Frame, area: Rect, app: &mut App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let height = area.height as usize;
-    let bottom = app.log.len().saturating_sub(app.log_offset);
-    let start = bottom.saturating_sub(height);
-    let lines: Vec<Line> = app
-        .log
-        .iter()
-        .skip(start)
-        .take(height)
-        .map(log_line)
-        .collect();
-    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    let width = area.width as usize;
+    // Only wrap enough lines to fill the viewport plus the scroll offset. The log is capped, but
+    // wrapping all of it on every 60Hz tick is unnecessary work.
+    let target = height.saturating_add(app.log_offset);
+    let mut visual: Vec<Line> = Vec::new();
+    for line in app.log.iter().rev() {
+        let style = log_style(line);
+        for part in text::wrap_to_width(&line.text, width).into_iter().rev() {
+            visual.push(Line::styled(part, style));
+            if visual.len() >= target {
+                break;
+            }
+        }
+        if visual.len() >= target {
+            break;
+        }
+    }
+    visual.reverse();
+    if visual.len() < target {
+        app.log_offset = visual.len().saturating_sub(height).min(app.log_offset);
+    }
+    visual.truncate(height);
+    frame.render_widget(Paragraph::new(Text::from(visual)), area);
 }
 
-fn log_line(line: &LogLine) -> Line<'static> {
+fn log_style(line: &LogLine) -> Style {
     match line.level {
-        Level::Error => Line::styled(line.text.clone(), Style::default().fg(Color::Red)),
-        Level::Info => Line::raw(line.text.clone()),
+        Level::Error => Style::default().fg(Color::Red),
+        Level::Info => Style::default(),
     }
 }
 
-fn render_command(frame: &mut Frame, area: Rect, app: &App) {
+fn render_command(frame: &mut Frame, area: Rect, app: &mut App) {
     if area.width < 2 || area.height < 2 {
         return;
     }
@@ -630,10 +687,22 @@ mod tests {
         let mut app = test_app();
         let buffer = render_buffer(&mut app);
         let row = row_text(&buffer, 0);
-        assert!(!row.contains("Auto"), "analysis backend leaked into the header: {row}");
-        assert!(!row.contains("poll"), "poll latency leaked into the header: {row}");
-        assert!(row.contains(" ui ") && row.contains("fps"), "UI timing missing: {row}");
-        assert!(row.contains(" cpu ") && row.contains(" mem "), "process metrics missing: {row}");
+        assert!(
+            !row.contains("Auto"),
+            "analysis backend leaked into the header: {row}"
+        );
+        assert!(
+            !row.contains("poll"),
+            "poll latency leaked into the header: {row}"
+        );
+        assert!(
+            row.contains(" ui ") && row.contains("fps"),
+            "UI timing missing: {row}"
+        );
+        assert!(
+            row.contains(" cpu ") && row.contains(" mem "),
+            "process metrics missing: {row}"
+        );
     }
 
     #[test]
@@ -650,7 +719,10 @@ mod tests {
         let mut app = test_app();
         let buffer = render_buffer(&mut app);
         let row = row_text(&buffer, 0);
-        assert!(!row.contains("decks"), "deck count still in the header: {row}");
+        assert!(
+            !row.contains("decks"),
+            "deck count still in the header: {row}"
+        );
 
         let mut badge = false;
         for x in 0..buffer.area.width {
@@ -732,7 +804,7 @@ mod tests {
     fn the_browser_divider_follows_the_focused_border() {
         let mut app = test_app();
         let buffer = render_buffer(&mut app);
-        let row = find_row(&buffer, "folders/playlists");
+        let row = find_row(&buffer, "(empty)");
         let text = row_text(&buffer, row);
         let mut bars = text
             .match_indices('│')
@@ -755,14 +827,34 @@ mod tests {
     }
 
     #[test]
-    fn browser_and_command_are_split_two_to_one() {
+    fn a_long_response_line_wraps_and_still_scrolls() {
+        let mut app = test_app();
+        app.log.clear();
+        app.push_log(LogLine::info("x".repeat(200)));
+        let buffer = render_buffer(&mut app);
+        let rows = (0..buffer.area.height)
+            .filter(|y| row_text(&buffer, *y).contains("xxxxxxxx"))
+            .count();
+        assert!(rows > 1, "long response should occupy several rows");
+        app.log_offset = 3;
+        let _ = render_buffer(&mut app);
+        assert!(app.log_offset < 200);
+    }
+
+    #[test]
+    fn browser_and_command_are_split_three_to_one() {
         let mut app = test_app();
         let buffer = render_buffer(&mut app);
-        let row = find_row(&buffer, "browser");
+        let row = (0..buffer.area.height)
+            .find(|y| {
+                let text = row_text(&buffer, *y);
+                text.contains("browser") && text.contains("command")
+            })
+            .expect("a row with both panel titles");
         let text = row_text(&buffer, row);
         let browser_x = column_of(&text, "browser");
         let command_x = column_of(&text, "command");
-        let boundary = buffer.area.width * 2 / 3;
+        let boundary = buffer.area.width * 3 / 4;
         assert!(
             browser_x < boundary,
             "browser starts left of {boundary}: {text}"
@@ -900,6 +992,21 @@ mod tests {
                 .any(|ch| (0x2800..=0x28FF).contains(&(ch as u32)))
         });
         assert!(has_braille, "waveform drew no braille");
+    }
+
+    #[test]
+    fn deck_key_uses_the_configured_notation() {
+        let mut app = test_app();
+        app.states[0].key = Some("8A".to_owned());
+        app.key_format = hypermixx_core::KeyFormat::Camelot;
+        let buffer = render_buffer(&mut app);
+        let text: String = (0..buffer.area.height).map(|y| row_text(&buffer, y)).collect();
+        assert!(text.contains("8A"), "camelot missing: {text}");
+
+        app.key_format = hypermixx_core::KeyFormat::Traditional;
+        let buffer = render_buffer(&mut app);
+        let text: String = (0..buffer.area.height).map(|y| row_text(&buffer, y)).collect();
+        assert!(text.contains("Am"), "classic missing: {text}");
     }
 
     #[test]

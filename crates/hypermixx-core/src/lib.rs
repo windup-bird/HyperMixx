@@ -6,6 +6,7 @@
 pub mod action;
 pub mod analysis;
 pub mod beatgrid;
+pub mod browser;
 pub mod command;
 pub mod deck;
 pub mod key;
@@ -17,11 +18,12 @@ pub mod stem;
 pub use action::{ActionSpec, ArgSpec, ACTIONS};
 pub use analysis::TrackAnalysis;
 pub use beatgrid::BeatGrid;
+pub use browser::BrowserAction;
 pub use command::{
     Backend, Command, CommandResponse, CueOp, FaderTarget, FxChainId, FxSlotRef, FxSlotStatus,
-    KeylockMode, LoopEditOp, LoopOp, LoopQuantum, NudgeOp, PhaseMode, SyncOp, VinylOp,
+    HotCueOp, KeylockMode, LoopEditOp, LoopOp, LoopQuantum, NudgeOp, PhaseMode, SyncOp, VinylOp,
 };
-pub use deck::{DeckId, DeckState};
+pub use deck::{DeckId, DeckState, HotCue, HOT_CUE_SLOTS};
 pub use key::{Key, KeyFormat, KeyMode};
 pub use live::{AudioSettings, KeylockSettings, LiveConfig, StemSettings};
 pub use output::{OutputOp, OutputRole, OutputState, OutputStatus};

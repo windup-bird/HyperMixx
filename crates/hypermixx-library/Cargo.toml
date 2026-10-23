@@ -10,3 +10,11 @@ hypermixx-core = { path = "../hypermixx-core" }
 hypermixx-media = { path = "../hypermixx-media" }
 stratum-dsp = { git = "https://github.com/HLLMR/stratum-dsp.git", rev = "758e0b6" }
 serde = { version = "1", features = ["derive"] }
+symphonia = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
+sha2 = "0.10"
+walkdir = "2.5"
+serde_json = "1"
+quick-xml = "0.41"
+base64 = "0.23"
+rekordbox-pdb = "0.1.0"

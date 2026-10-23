@@ -17,16 +17,16 @@ use std::sync::Arc;
 use crate::flow::EngineProfile;
 use arc_swap::ArcSwapOption;
 use hypermixx_core::{
-    CueOp, Key, KeylockMode, KeylockSettings, LoopEditOp, LoopOp, LoopQuantum, Source,
-    TrackAnalysis, VinylOp,
+    CueOp, HotCue, HotCueOp, Key, KeylockMode, KeylockSettings, LoopEditOp, LoopOp, LoopQuantum,
+    Source, TrackAnalysis, VinylOp, HOT_CUE_SLOTS,
 };
 
 use super::jump::{resolve, Seek};
-use super::Scratch;
 use super::loop_::{
     beat_shift, beats_after, provisional_range, quantize_offset, quantize_to_beat, LoopRange,
 };
 use super::sync::{PhaseAlign, Playhead, SyncCtx, DEFAULT_TEMPO_RANGE, MAX_RATE, MIN_RATE};
+use super::Scratch;
 use crate::flow::{Direction, Playing};
 use crate::fx::FxContext;
 use crate::mixer::Bus;
@@ -106,6 +106,7 @@ pub struct Deck {
     /// The cue point in source frames; `cue play`/`cue back` land here. Defaults to the loaded
     /// origin (0), reset whenever a fresh deck is built for a load.
     cue_frame: u64,
+    hot_cues: [Option<HotCue>; HOT_CUE_SLOTS],
     /// Whether a `Button` cue gesture is between its press and its release edges. Owned by the deck
     /// so a front-end with no release edge (a typed command) can still perform the whole gesture —
     /// and so it cannot drift from the transport it belongs to.
@@ -155,8 +156,9 @@ impl Deck {
         // four already-separated stems is describing a deck whose mix is unavailable.
         let original = Arc::clone(&sources[0]);
         let keylock = KeylockSettings::default();
-        let playing = Playing::with_profile(sources.clone(), 0, 1.0, EngineProfile::Keylock(keylock))
-            .expect("stretch engine config is statically valid");
+        let playing =
+            Playing::with_profile(sources.clone(), 0, 1.0, EngineProfile::Keylock(keylock))
+                .expect("stretch engine config is statically valid");
         Self {
             original,
             sources,
@@ -173,6 +175,7 @@ impl Deck {
             profile: EngineProfile::Keylock(keylock),
             keylock,
             cue_frame: 0,
+            hot_cues: [None; HOT_CUE_SLOTS],
             cue_held: false,
             vinyl_held: false,
             vinyl_resume: false,
@@ -209,6 +212,47 @@ impl Deck {
     /// The cue point in source frames.
     pub fn cue_point(&self) -> u64 {
         self.cue_frame
+    }
+
+    /// The imported/user-set hot cues, indexed by slot.
+    pub fn hot_cues(&self) -> [Option<HotCue>; HOT_CUE_SLOTS] {
+        self.hot_cues
+    }
+
+    /// Replaces the cue set, normally right after a load. Invalid slots are ignored.
+    pub fn set_cues(&mut self, memory: Option<u64>, hot: &[HotCue]) {
+        if let Some(frame) = memory {
+            self.cue_frame = frame.min(self.total_frames());
+        }
+        self.hot_cues = [None; HOT_CUE_SLOTS];
+        for cue in hot {
+            if (cue.slot as usize) < HOT_CUE_SLOTS {
+                self.hot_cues[cue.slot as usize] = Some(*cue);
+            }
+        }
+    }
+
+    /// Sets, triggers, or clears one hot cue. Triggering keeps the current transport state, so a
+    /// hot cue while playing keeps playing and a hot cue while paused stays paused.
+    pub fn apply_hot_cue(&mut self, op: HotCueOp) {
+        match op {
+            HotCueOp::Set(slot) => {
+                let frame = self.current_frame();
+                if let Some(cue) = self.hot_cues.get_mut(slot as usize) {
+                    *cue = Some(HotCue { slot, frame });
+                }
+            }
+            HotCueOp::Trigger(slot) => {
+                if let Some(Some(cue)) = self.hot_cues.get(slot as usize) {
+                    self.jump(cue.frame);
+                }
+            }
+            HotCueOp::Clear(slot) => {
+                if let Some(cue) = self.hot_cues.get_mut(slot as usize) {
+                    *cue = None;
+                }
+            }
+        }
     }
 
     /// Runs one cue command. `Smart`, `Hold` and `Button` resolve against the deck's own transport
@@ -278,10 +322,7 @@ impl Deck {
                     self.vinyl_rate = 0.0;
                     self.vinyl_moved = false;
                     self.vinyl_held = true;
-                    self.scratch = Some(Scratch::new(
-                        self.sources.clone(),
-                        self.vinyl_frame,
-                    ));
+                    self.scratch = Some(Scratch::new(self.sources.clone(), self.vinyl_frame));
 
                     if !self.vinyl_slip {
                         // Normal scratch pauses the keylock voice; the scratch reader is audible.
@@ -321,7 +362,10 @@ impl Deck {
                     self.vinyl_frame = self.shift_position(self.vinyl_frame, frames as i64);
                     self.vinyl_moved = true;
                 } else {
-                    self.bend_nudge(Self::VINYL_BEND * f64::from(ticks), Self::VINYL_BEND_SECONDS);
+                    self.bend_nudge(
+                        Self::VINYL_BEND * f64::from(ticks),
+                        Self::VINYL_BEND_SECONDS,
+                    );
                 }
             }
         }
@@ -364,8 +408,7 @@ impl Deck {
     /// stationary held platter is silent — the groove is not moving, and a frozen grain would only
     /// buzz.
     fn renders_audio(&self) -> bool {
-        self.is_playing()
-            || (self.vinyl_held && (self.vinyl_moved || self.vinyl_rate.abs() > 1e-4))
+        self.is_playing() || (self.vinyl_held && (self.vinyl_moved || self.vinyl_rate.abs() > 1e-4))
     }
 
     /// The press edge of a held cue button: while playing it is a back cue (the transport was
@@ -757,8 +800,10 @@ impl Deck {
             // into a signed rate; when they stop, the target is zero and the rate decays instead
             // of cutting to silence on the next block.
             let target = if self.vinyl_moved {
-                (self.vinyl_delta / crate::BLOCK_SIZE as f64)
-                    .clamp(-super::scratch::MAX_SCRATCH_RATE, super::scratch::MAX_SCRATCH_RATE)
+                (self.vinyl_delta / crate::BLOCK_SIZE as f64).clamp(
+                    -super::scratch::MAX_SCRATCH_RATE,
+                    super::scratch::MAX_SCRATCH_RATE,
+                )
             } else {
                 0.0
             };
@@ -1476,7 +1521,11 @@ mod tests {
         assert_eq!(deck.keylock_window(), window);
         deck.set_keylock_mode(KeylockMode::Off);
         deck.set_keylock_mode(KeylockMode::On);
-        assert_eq!(deck.keylock_window(), window, "tape must not forget the window");
+        assert_eq!(
+            deck.keylock_window(),
+            window,
+            "tape must not forget the window"
+        );
         assert_eq!(deck.keylock_mode(), KeylockMode::On);
     }
 
@@ -1564,7 +1613,10 @@ mod tests {
             (forward - 882).abs() < 120,
             "two ticks forward should integrate to ~882, got {forward}"
         );
-        assert!(audible_blocks > 2, "the rate must decay over several blocks");
+        assert!(
+            audible_blocks > 2,
+            "the rate must decay over several blocks"
+        );
 
         // Backwards goes behind where it was.
         let turned = deck.current_frame();
@@ -1686,7 +1738,10 @@ mod tests {
         deck.slip_vinyl().expect("arm slip vinyl");
         deck.apply_vinyl(VinylOp::Touch);
         assert!(deck.vinyl_held());
-        assert!(deck.scratch.is_some(), "slip vinyl uses the signed Tape reader");
+        assert!(
+            deck.scratch.is_some(),
+            "slip vinyl uses the signed Tape reader"
+        );
         assert!(deck.shadow.is_none());
         let before = deck.virtual_frame();
 
@@ -2182,6 +2237,39 @@ mod tests {
             "back to the original phase: expected ~{back}, got {}",
             deck.current_frame()
         );
+    }
+
+    #[test]
+    fn hot_cues_can_be_seeded_set_triggered_and_cleared() {
+        let mut deck = tape_deck(pool(crate::SAMPLE_RATE as u64 * 10));
+        let mut out = vec![0.0f32; 256 * CHANNELS];
+        deck.set_cues(
+            Some(500),
+            &[HotCue {
+                slot: 1,
+                frame: 2_000,
+            }],
+        );
+        assert_eq!(deck.cue_point(), 500);
+        assert_eq!(
+            deck.hot_cues()[1],
+            Some(HotCue {
+                slot: 1,
+                frame: 2_000
+            })
+        );
+
+        deck.jump(4_000);
+        settle_at(&mut deck, &mut out, 4_000);
+        deck.apply_hot_cue(HotCueOp::Set(0));
+        assert!(deck.hot_cues()[0].is_some());
+
+        deck.apply_hot_cue(HotCueOp::Trigger(1));
+        settle_at(&mut deck, &mut out, 2_000);
+        assert!(deck.current_frame() >= 2_000);
+
+        deck.apply_hot_cue(HotCueOp::Clear(1));
+        assert_eq!(deck.hot_cues()[1], None);
     }
 
     // ---------------------------------------------------------------------------- loop tests

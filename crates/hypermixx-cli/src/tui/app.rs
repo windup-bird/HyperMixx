@@ -4,24 +4,31 @@
 //! loop feeds it. Nothing here draws or touches a device, which is what keeps the renderer and the
 //! input mapping testable without a terminal.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::{AudioPipeline, Meters};
-use hypermixx_core::{Backend, BeatGrid, Command, CommandResponse, DeckState, KeylockMode, StemStatus};
+use hypermixx_core::{
+    Backend, BeatGrid, BrowserAction, Command, CommandResponse, DeckState, KeyFormat, KeylockMode,
+    StemStatus,
+};
+use hypermixx_library::{
+    detect_source_kinds, ImportCalibration, LibraryDb, Source, SourceKind, SourceOrigin,
+};
 
 use crate::command::{Slots, UiEvent};
 use crate::notices::NoticeTx;
-use crate::response::{self, LogLine};
-use crate::preference::WaveformSettings;
+use crate::preference::{LibrarySettings, WaveformSettings};
 use crate::procmon::ProcessMonitor;
+use crate::response::{self, LogLine};
 use crate::tui::browser::Browser;
-use crate::tui::waveform_view::WaveformView;
 use crate::tui::completer::{self, Completion, Ctx};
 use crate::tui::picker::{FilePicker, PortList};
+use crate::tui::waveform_view::WaveformView;
+use crate::usb::{self, UsbEvent};
 
 /// Waveform zoom bounds, in frames per terminal cell. 512 frames is ~11.6ms per cell (the finest
 /// the peak pyramid resolves), 131072 is ~3s per cell (a very wide overview). Keeping the unit
@@ -86,6 +93,8 @@ pub enum Overlay {
         picker: FilePicker,
         purpose: FilePurpose,
     },
+    /// The small deck chooser opened by double-clicking a track.
+    LoadTarget { x: u16, y: u16, selected: usize },
 }
 
 /// What the file picker's choice means.
@@ -108,8 +117,22 @@ pub struct App {
     pub focused: usize,
     /// The command-line target: one deck, or the (still prefix-less) browser.
     pub target: Target,
-    /// The browser pane: layout/state only until folder scanning lands.
+    /// The browser pane: Miller columns plus the current list's tracks.
     pub browser: Browser,
+    /// How keys are rendered across the TUI.
+    pub key_format: KeyFormat,
+    /// The library cache. `None` when startup could not open it; the browser then stays empty.
+    pub library: Option<Arc<LibraryDb>>,
+    /// Sources the configured preference categories allow. Everything else stays in the cache but
+    /// is not shown or scanned.
+    pub allowed_sources: HashSet<i64>,
+    /// Formats enabled for USB auto-discovery.
+    usb_formats: Vec<SourceKind>,
+    usb_rx: Option<Receiver<UsbEvent>>,
+    /// `None` probes each file; a fixed value overrides the decoder start trim.
+    pub decoder_start_ms: Option<f64>,
+    /// Extra imported-grid/cue correction, positive = later.
+    pub grid_offset_ms: f64,
 
     pub states: Vec<DeckState>,
     /// File name per deck (from the load tap), for the deck header.
@@ -123,7 +146,7 @@ pub struct App {
     pub wave_width_cells: usize,
     /// Waveform preferences (renderer, colours, image refresh target).
     pub waveform: WaveformSettings,
-    /// The selected waveform transport (braille / kitty / sixel) and its per-deck image state.
+    /// The selected waveform transport (braille / kitty) and its per-deck image state.
     pub waveform_view: WaveformView,
 
     pub log: VecDeque<LogLine>,
@@ -151,6 +174,8 @@ pub struct App {
     pub process: ProcessMonitor,
     pub quit: bool,
 
+    /// The last terminal area, for mouse hit testing of popups.
+    pub screen: ratatui::layout::Rect,
     /// A modal picker, if one is open.
     pub overlay: Option<Overlay>,
     /// The live MIDI input, when connected; dropping the app closes the port.
@@ -162,6 +187,9 @@ pub struct App {
 
     notice_rx: Receiver<LogLine>,
     event_rx: Receiver<UiEvent>,
+    /// Browser actions from MIDI (up/down/open/exit/load/refresh).
+    pub browser_tx: Sender<BrowserAction>,
+    browser_rx: Receiver<BrowserAction>,
     waveform_tx: Sender<(usize, Arc<hypermixx_library::Waveform>)>,
     waveform_rx: Receiver<(usize, Arc<hypermixx_library::Waveform>)>,
 }
@@ -176,7 +204,8 @@ impl App {
     ) -> Self {
         let decks = decks.max(1);
         let (waveform_tx, waveform_rx) = crossbeam_channel::unbounded();
-        let browser = Browser::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let (browser_tx, browser_rx) = crossbeam_channel::unbounded();
+        let browser = Browser::new();
         Self {
             version: crate::VERSION,
             backend,
@@ -186,6 +215,13 @@ impl App {
             focused: 0,
             target: Target::Deck(0),
             browser,
+            key_format: KeyFormat::Camelot,
+            library: None,
+            allowed_sources: HashSet::new(),
+            usb_formats: Vec::new(),
+            usb_rx: None,
+            decoder_start_ms: None,
+            grid_offset_ms: 0.0,
             states: (0..decks)
                 .map(|index| DeckState {
                     deck_id: index as u8,
@@ -210,6 +246,7 @@ impl App {
                     sync_mode: "free".to_owned(),
                     group_bpm: 0.0,
                     cue_frame: 0,
+                    hot_cues: [None; hypermixx_core::HOT_CUE_SLOTS],
                     vinyl: false,
                     keylock: KeylockMode::On,
                     key_shift: 0,
@@ -238,12 +275,15 @@ impl App {
             last_draw_at: None,
             process: ProcessMonitor::new(),
             quit: false,
+            screen: ratatui::layout::Rect::default(),
             overlay: None,
             midi: None,
             midi_port: None,
             midi_map: None,
             notice_rx,
             event_rx,
+            browser_tx,
+            browser_rx,
             waveform_tx,
             waveform_rx,
         }
@@ -279,11 +319,10 @@ impl App {
             }
         };
         let slots = self.fx_slots.clone();
-        let unresolved = crate::midi::resolve_with(&mut map, |chain, fx| {
-            slots.resolve(&chain.label(), fx).ok()
-        });
+        let unresolved =
+            crate::midi::resolve_with(&mut map, |chain, fx| slots.resolve(&chain.label(), fx).ok());
         crate::midi::report_unresolved(notices, unresolved);
-        match crate::midi::attach(&port, map, command_tx) {
+        match crate::midi::attach(&port, map, command_tx, Some(self.browser_tx.clone())) {
             Ok(session) => {
                 // Replacing the old session closes its port before the new one is held.
                 self.midi = Some(session);
@@ -312,6 +351,162 @@ impl App {
     pub fn push_lines(&mut self, lines: impl IntoIterator<Item = LogLine>) {
         for line in lines {
             self.push_log(line);
+        }
+    }
+
+    /// Rebuilds the browser from the cache after a scan or a source change.
+    pub fn reload_browser(&mut self) {
+        let Some(db) = self.library.clone() else {
+            self.browser = Browser::new();
+            return;
+        };
+        match db.sources() {
+            Ok(sources) => {
+                let visible: Vec<Source> = sources
+                    .into_iter()
+                    .filter(|source| {
+                        self.allowed_sources.contains(&source.id) && source.root.is_dir()
+                    })
+                    .collect();
+                match Browser::load_sources(&db, visible) {
+                    Ok(mut browser) => {
+                        browser.key_format = self.key_format;
+                        self.browser = browser;
+                    }
+                    Err(err) => self.push_log(LogLine::error(format!("library: {err}"))),
+                }
+            }
+            Err(err) => self.push_log(LogLine::error(format!("library: {err}"))),
+        }
+    }
+
+    /// Drains browser actions queued by MIDI. The caller executes them with the dispatcher.
+    pub fn drain_browser_actions(&mut self) -> Vec<BrowserAction> {
+        let mut actions = Vec::new();
+        while let Ok(action) = self.browser_rx.try_recv() {
+            actions.push(action);
+        }
+        actions
+    }
+
+    /// Applies the configured source categories: explicit folders, local user libraries, and the
+    /// watcher for USB media. Sources outside these categories are neither scanned nor displayed.
+    pub fn sync_library(&mut self, settings: &LibrarySettings) {
+        let Some(db) = self.library.clone() else {
+            return;
+        };
+        self.allowed_sources.clear();
+        self.decoder_start_ms = settings.decoder_start_ms;
+        self.grid_offset_ms = settings.grid_offset_ms;
+        db.set_import_calibration(ImportCalibration {
+            rkb_mp3_offset_ms: settings.rkb_mp3_offset_ms,
+            serato_offset_ms: settings.serato_offset_ms,
+            vdj_offset_ms: settings.vdj_offset_ms,
+        });
+
+        for folder in &settings.folders {
+            match db.add_folder_source(folder, None) {
+                Ok(source) => self.adopt_source(&db, source),
+                Err(err) => self.push_log(LogLine::error(format!("[library] {folder}: {err}"))),
+            }
+        }
+        for kind in settings.local_kinds() {
+            for root in local_roots(kind) {
+                if !detect_source_kinds(&root).contains(&kind) {
+                    continue;
+                }
+                match db.add_source(kind, &root, None) {
+                    Ok(source) => self.adopt_source(&db, source),
+                    Err(err) => self.push_log(LogLine::error(format!(
+                        "[library] {}: {err}",
+                        root.display()
+                    ))),
+                }
+            }
+        }
+        self.start_usb_watcher(settings.usb_kinds());
+        self.reload_browser();
+    }
+
+    fn adopt_source(&mut self, db: &Arc<LibraryDb>, source: Source) {
+        self.allowed_sources.insert(source.id);
+        match db.scan_source(source.id, &mut |_| {}) {
+            Ok(stats) => self.push_log(LogLine::info(format!(
+                "[library] {} [{}]: {}",
+                source.name,
+                source.kind.label(),
+                stats.summary()
+            ))),
+            Err(err) => self.push_log(LogLine::error(format!(
+                "[library] {}: {err}",
+                source.name
+            ))),
+        }
+    }
+
+    fn start_usb_watcher(&mut self, formats: Vec<SourceKind>) {
+        if formats.is_empty() || self.usb_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let spawned = std::thread::Builder::new()
+            .name("hypermixx-usb".to_owned())
+            .spawn(move || usb::watch(tx))
+            .is_ok();
+        if spawned {
+            self.usb_formats = formats;
+            self.usb_rx = Some(rx);
+            self.push_log(LogLine::info("[library] watching removable media"));
+        } else {
+            self.push_log(LogLine::error("[library] could not start USB watcher"));
+        }
+    }
+
+    fn handle_usb_event(&mut self, event: UsbEvent) -> bool {
+        let Some(db) = self.library.clone() else {
+            return false;
+        };
+        match event {
+            UsbEvent::Mounted(root) => {
+                let present = detect_source_kinds(&root);
+                let mut adopted = false;
+                for kind in self.usb_formats.clone() {
+                    if !present.contains(&kind) {
+                        continue;
+                    }
+                    match db.add_source_with_origin(kind, SourceOrigin::Usb, &root, None) {
+                        Ok(source) => {
+                            adopted = true;
+                            self.adopt_source(&db, source);
+                        }
+                        Err(err) => self.push_log(LogLine::error(format!(
+                            "[library] {}: {err}",
+                            root.display()
+                        ))),
+                    }
+                }
+                if adopted {
+                    self.reload_browser();
+                }
+                adopted
+            }
+            UsbEvent::Unmounted(root) => {
+                let ids: Vec<i64> = db
+                    .sources()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|source| source.root == root)
+                    .map(|source| source.id)
+                    .collect();
+                let mut changed = false;
+                for id in ids {
+                    changed |= self.allowed_sources.remove(&id);
+                }
+                if changed {
+                    self.reload_browser();
+                }
+                changed
+            }
         }
     }
 
@@ -410,6 +605,15 @@ impl App {
             }
             changed = true;
         }
+        let mut usb_events = Vec::new();
+        if let Some(rx) = &self.usb_rx {
+            while let Ok(event) = rx.try_recv() {
+                usb_events.push(event);
+            }
+        }
+        for event in usb_events {
+            changed |= self.handle_usb_event(event);
+        }
         changed
     }
 
@@ -466,8 +670,9 @@ impl App {
     }
 
     pub fn log_scroll(&mut self, delta: isize) {
-        let max = self.log.len().saturating_sub(1) as isize;
-        self.log_offset = (self.log_offset as isize + delta).clamp(0, max) as usize;
+        // The response pane wraps lines, so its real height is known only at render time. Keep the
+        // requested visual-line offset here; the renderer clamps it to the wrapped total.
+        self.log_offset = (self.log_offset as isize + delta).max(0) as usize;
     }
 
     /// Clears the command line and closes any popup. The input box is always focused, so this is
@@ -607,5 +812,86 @@ impl App {
             self.cursor = self.command.len();
         }
         self.completion = None;
+    }
+}
+
+fn local_roots(kind: SourceKind) -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let mut roots = match kind {
+        SourceKind::Rekordbox => vec![
+            home.join(".config/rekordbox"),
+            home.join("rekordbox"),
+            home.join("Music"),
+        ],
+        SourceKind::Serato => vec![home.join("Music"), home.clone()],
+        _ => vec![
+            home.join(".VirtualDJ"),
+            home.join("VirtualDJ"),
+            home.join("Music"),
+            home.clone(),
+        ],
+    };
+    roots.dedup();
+    roots
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::preference::LibrarySettings;
+    use hypermixx_core::Backend;
+
+    fn wav() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36u32 + 400).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&8_000u32.to_le_bytes());
+        bytes.extend_from_slice(&16_000u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&400u32.to_le_bytes());
+        bytes.resize(44 + 400, 0);
+        bytes
+    }
+
+    #[test]
+    fn only_configured_sources_reach_the_browser() {
+        let dir = std::env::temp_dir().join(format!(
+            "hypermixx-app-library-{}-{}",
+            std::process::id(),
+            hypermixx_library::library::db::unix_now()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let configured = dir.join("configured");
+        let hidden = dir.join("hidden");
+        std::fs::create_dir_all(&configured).unwrap();
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(configured.join("a.wav"), wav()).unwrap();
+        std::fs::write(hidden.join("b.wav"), wav()).unwrap();
+
+        let db = Arc::new(LibraryDb::open(dir.join("library.sqlite3")).unwrap());
+        db.add_folder_source(&hidden, Some("Hidden")).unwrap();
+        let (_notice_tx, notice_rx) = crossbeam_channel::unbounded();
+        let (_event_tx, event_rx) = crossbeam_channel::unbounded();
+        let mut app = App::new(1, Backend::Auto, notice_rx, event_rx, Default::default());
+        app.library = Some(db);
+        let settings = LibrarySettings {
+            folders: vec![configured.display().to_string()],
+            ..Default::default()
+        };
+        app.sync_library(&settings);
+        assert_eq!(app.browser.columns[0].entries.len(), 1);
+        assert_eq!(
+            app.browser.columns[0].entries[0].label(),
+            configured.file_name().unwrap().to_string_lossy()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

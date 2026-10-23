@@ -117,6 +117,46 @@ pub fn decode_file_at(path: &str, target_rate: u32) -> Result<DecodedAudio, Box<
     })
 }
 
+/// The number of milliseconds the decoder skips at the start of a file when gapless playback is
+/// enabled. Imported ANLZ/Serato timestamps use the container timeline; decoded frame 0 starts
+/// after this delay. A value of 0.0 means the two timelines coincide.
+pub fn decoder_start_ms(path: &str) -> Result<f64, Box<dyn Error>> {
+    let file = File::open(path)?;
+    let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe().format(
+        &hint,
+        mss,
+        &FormatOptions {
+            enable_gapless: true,
+            ..Default::default()
+        },
+        &MetadataOptions::default(),
+    )?;
+    let params = probed
+        .format
+        .tracks()
+        .iter()
+        .map(|track| &track.codec_params)
+        .find(|params| params.sample_rate.is_some())
+        .ok_or("no audio stream")?;
+    let rate = params.sample_rate.unwrap_or(SAMPLE_RATE);
+    let delay = params.delay.unwrap_or(0);
+    let mut millis = f64::from(delay) * 1000.0 / f64::from(rate);
+    if millis == 0.0 {
+        if let (Some(time_base), start_ts) = (params.time_base, params.start_ts) {
+            if start_ts > 0 {
+                let time = time_base.calc_time(start_ts);
+                millis = time.seconds as f64 * 1000.0 + time.frac * 1000.0;
+            }
+        }
+    }
+    Ok(millis)
+}
+
 /// Down/upper-mixes interleaved PCM to stereo. Sources with more than 2 channels keep L/R only.
 fn into_stereo(pcm: Vec<f32>, channels: usize) -> Vec<f32> {
     let channels = channels.max(1);

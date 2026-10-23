@@ -5,6 +5,7 @@
 //! must be executable by the pipeline's producer thread with no further I/O.
 
 use crate::analysis::TrackAnalysis;
+use crate::deck::HotCue;
 use crate::deck::{DeckId, DeckState};
 use crate::output::{OutputOp, OutputStatus};
 use crate::source::Shared;
@@ -258,6 +259,14 @@ pub enum VinylOp {
 /// One `cue` command. The cue point defaults to frame 0 (the loaded origin) and `Set` can move
 /// it; `Smart` folds the two-button DJ gesture into one command that the *engine* resolves, so a
 /// front-end never has to guess the deck's transport from a possibly-stale state snapshot.
+/// One hot-cue operation. Slots are 0-based; invalid slots are ignored by the deck.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HotCueOp {
+    Set(u8),
+    Trigger(u8),
+    Clear(u8),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CueOp {
     /// Jump to the cue point, then play. Unconditional: it neither moves the cue point nor asks the
@@ -388,6 +397,17 @@ pub enum Command {
     Cue {
         deck_id: DeckId,
         op: CueOp,
+    },
+    /// The hot-cue family: set, trigger, or clear one slot.
+    HotCue {
+        deck_id: DeckId,
+        op: HotCueOp,
+    },
+    /// Seeds the deck with imported memory/hot cues, normally immediately after `Load`.
+    SetCues {
+        deck_id: DeckId,
+        memory: Option<u64>,
+        hot: Vec<HotCue>,
     },
     /// A DJ wheel: platter touch, release, or a turn.
     Vinyl {
@@ -601,6 +621,21 @@ impl std::fmt::Debug for Command {
                 .debug_struct("Cue")
                 .field("deck_id", deck_id)
                 .field("op", op)
+                .finish(),
+            Command::HotCue { deck_id, op } => f
+                .debug_struct("HotCue")
+                .field("deck_id", deck_id)
+                .field("op", op)
+                .finish(),
+            Command::SetCues {
+                deck_id,
+                memory,
+                hot,
+            } => f
+                .debug_struct("SetCues")
+                .field("deck_id", deck_id)
+                .field("memory", memory)
+                .field("hot", &hot.len())
                 .finish(),
             Command::Vinyl { deck_id, op } => f
                 .debug_struct("Vinyl")

@@ -12,7 +12,6 @@ use crate::preference::WaveformBackend;
 pub enum Backend {
     Braille,
     Kitty,
-    Sixel,
 }
 
 impl Backend {
@@ -20,7 +19,6 @@ impl Backend {
         match self {
             Self::Braille => "braille",
             Self::Kitty => "kitty",
-            Self::Sixel => "sixel",
         }
     }
 }
@@ -47,12 +45,9 @@ pub fn resolve(requested: WaveformBackend) -> (Backend, Option<String>) {
     let backend = match requested {
         WaveformBackend::Braille => Backend::Braille,
         WaveformBackend::Kitty => Backend::Kitty,
-        WaveformBackend::Sixel => Backend::Sixel,
         WaveformBackend::Auto => {
             if kitty_hint() {
                 Backend::Kitty
-            } else if sixel_hint() {
-                Backend::Sixel
             } else {
                 Backend::Braille
             }
@@ -60,14 +55,6 @@ pub fn resolve(requested: WaveformBackend) -> (Backend, Option<String>) {
     };
     if backend == Backend::Braille {
         return (backend, None);
-    }
-    // Kitty and Ghostty do not implement sixel. If sixel was forced there, use the graphics
-    // protocol the terminal actually has rather than drawing an image it will ignore.
-    if backend == Backend::Sixel && kitty_only() {
-        return (
-            Backend::Kitty,
-            Some("this terminal does not implement sixel; using kitty graphics".to_owned()),
-        );
     }
     if tmux {
         return (
@@ -104,18 +91,6 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-/// Terminals that implement Kitty graphics but not sixel. WezTerm is deliberately excluded: it
-/// supports sixel too, so an explicit sixel request there is honoured.
-fn kitty_only() -> bool {
-    env("KITTY_WINDOW_ID").is_some()
-        || env("GHOSTTY_RESOURCES_DIR").is_some()
-        || env("KONSOLE_VERSION").is_some()
-        || env("TERM").is_some_and(|term| term.contains("kitty"))
-        || env("TERM_PROGRAM").is_some_and(|program| {
-            matches!(program.as_str(), "kitty" | "ghostty")
-        })
-}
-
 fn kitty_hint() -> bool {
     env("KITTY_WINDOW_ID").is_some()
         || env("GHOSTTY_RESOURCES_DIR").is_some()
@@ -130,15 +105,6 @@ fn kitty_hint() -> bool {
         || env("KONSOLE_VERSION").is_some()
 }
 
-fn sixel_hint() -> bool {
-    // Windows Terminal 1.22+ carries sixel through ConPTY. WezTerm also supports it, but Kitty is
-    // preferred above so it only reaches here when the Kitty hint failed.
-    env("WT_SESSION").is_some()
-        || env("TERM").is_some_and(|term| {
-            term.contains("sixel") || term.contains("foot") || term.contains("mlterm")
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,19 +112,10 @@ mod tests {
     #[test]
     fn explicit_choices_are_honoured() {
         assert_eq!(resolve(WaveformBackend::Braille).0, Backend::Braille);
-        // These depend only on the request unless tmux/dumb is set; the test environment is
+        // This depends only on the request unless tmux/dumb is set; the test environment is
         // ordinarily neither.
         if env("TMUX").is_none() && env("STY").is_none() && env("TERM").as_deref() != Some("dumb") {
             assert_eq!(resolve(WaveformBackend::Kitty).0, Backend::Kitty);
-            let (backend, note) = resolve(WaveformBackend::Sixel);
-            if kitty_only() {
-                // Kitty/Ghostty have graphics but no sixel; an explicit sixel request must not
-                // leave a blank deck.
-                assert_eq!(backend, Backend::Kitty);
-                assert!(note.is_some_and(|note| note.contains("sixel")));
-            } else {
-                assert_eq!(backend, Backend::Sixel);
-            }
         }
     }
 

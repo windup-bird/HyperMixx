@@ -4,12 +4,16 @@
 //! through a typed command. The only keys this layer owns are editing/navigation plus `Tab` to
 //! cycle the command target (deck0 / deck1 / … / browser). `Ctrl+C` still quits outright.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::time::{Duration, Instant};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use hypermixx_audio::AudioPipeline;
+use hypermixx_core::BrowserAction;
 
 use crate::command::{self, Action, Dispatcher};
 use crate::response::LogLine;
-use crate::tui::app::{App, FilePurpose, Overlay};
+use crate::tui::app::{App, FilePurpose, Overlay, Target};
+use crate::tui::browser::Focus;
 use crate::tui::picker::{FilePicker, PortList};
 
 /// Extensions the `load` picker offers (the decoder's supported containers/audio).
@@ -42,12 +46,22 @@ pub fn handle(app: &mut App, key: KeyEvent, dispatcher: &Dispatcher, pipeline: &
         }
         KeyCode::F(3) => {
             app.overlay = Some(Overlay::Files {
-                picker: FilePicker::new(Some(std::path::Path::new(DEFAULT_MAP)), &["toml"], "midi map"),
+                picker: FilePicker::new(
+                    Some(std::path::Path::new(DEFAULT_MAP)),
+                    &["toml"],
+                    "midi map",
+                ),
                 purpose: FilePurpose::MidiMap,
             });
             return;
         }
         _ => {}
+    }
+
+    // When the browser owns the target and the command line is empty, the arrows are browser
+    // navigation rather than history/cursor movement.
+    if app.target == Target::Browser && app.command.is_empty() && handle_browser_key(app, key) {
+        return;
     }
 
     let popup = app.completion.is_some();
@@ -115,6 +129,76 @@ pub fn handle(app: &mut App, key: KeyEvent, dispatcher: &Dispatcher, pipeline: &
     }
 }
 
+/// Mouse handling for the browser: single-click selects, double-click on a track opens the deck
+/// chooser, double-click on a list opens it.
+pub fn handle_mouse(app: &mut App, mouse: MouseEvent, dispatcher: &Dispatcher) {
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return;
+    }
+    if let Some(Overlay::LoadTarget { x, y, .. }) = &app.overlay {
+        let popup = crate::tui::view::load_target_rect(app.screen, *x, *y, app.decks);
+        if mouse.column >= popup.x
+            && mouse.column < popup.x + popup.width
+            && mouse.row > popup.y
+            && mouse.row < popup.y + popup.height.saturating_sub(1)
+        {
+            let deck = (mouse.row - popup.y - 1) as usize;
+            if deck < app.decks {
+                app.overlay = None;
+                load_browser_track(app, dispatcher, deck);
+            }
+        } else {
+            app.overlay = None;
+        }
+        return;
+    }
+    if app.overlay.is_some() {
+        return;
+    }
+    let Some(db) = app.library.clone() else {
+        return;
+    };
+    let (x, y) = (mouse.column, mouse.row);
+    if let Some(row) = app.browser.hit_track(x, y) {
+        app.browser.track_selected = row;
+        app.browser.focus = Focus::Tracks;
+        let now = Instant::now();
+        let double = matches!(
+            app.browser.last_track_click,
+            Some((last, at)) if last == row && now.duration_since(at) < Duration::from_millis(400)
+        );
+        app.browser.last_track_click = Some((row, now));
+        if double {
+            app.overlay = Some(Overlay::LoadTarget {
+                x,
+                y,
+                selected: app.default_deck(),
+            });
+        }
+        return;
+    }
+    if let Some((column, row)) = app.browser.hit_column(x, y) {
+        let is_last = column + 1 == app.browser.columns.len();
+        let now = Instant::now();
+        let double = matches!(
+            app.browser.last_track_click,
+            Some((last, at)) if last == usize::MAX - row && now.duration_since(at) < Duration::from_millis(400)
+        );
+        app.browser.last_track_click = Some((usize::MAX - row, now));
+        if let Err(err) = app.browser.select(column, row, &db) {
+            app.push_log(LogLine::error(format!("library: {err}")));
+        }
+        if is_last && double {
+            if let Err(err) = app.browser.open(&db) {
+                app.push_log(LogLine::error(format!("library: {err}")));
+            } else if app.browser.focus() == Focus::Tracks {
+                // Double-clicking the last list enters its tracks; a second double-click on a
+                // track then opens the deck chooser.
+            }
+        }
+    }
+}
+
 /// Sends the buffer as a command line and logs the echo, exactly like the REPL prompt.
 fn submit(app: &mut App, dispatcher: &Dispatcher, pipeline: &AudioPipeline) {
     let line = app.command_string();
@@ -130,7 +214,13 @@ fn submit(app: &mut App, dispatcher: &Dispatcher, pipeline: &AudioPipeline) {
     } else {
         format!("{prefix}> {line}")
     }));
-    if apply_ui_command(app, &line) {
+    if apply_ui_command(app, &line, dispatcher) {
+        return;
+    }
+    if app.target == Target::Browser {
+        app.push_log(LogLine::error(
+            "browser target only accepts `browser ...` commands",
+        ));
         return;
     }
     let deck = app.default_deck();
@@ -151,8 +241,12 @@ fn submit(app: &mut App, dispatcher: &Dispatcher, pipeline: &AudioPipeline) {
 }
 
 /// UI-only commands the engine has no concept of. Handled here so they never reach the pipeline.
-fn apply_ui_command(app: &mut App, line: &str) -> bool {
+fn apply_ui_command(app: &mut App, line: &str, dispatcher: &Dispatcher) -> bool {
     let mut words = line.split_whitespace();
+    if line == "browser" || line.starts_with("browser ") {
+        apply_browser_command(app, line, dispatcher);
+        return true;
+    }
     if words.next() == Some("zoom") {
         match words.next() {
             Some("in") => app.zoom_in(),
@@ -162,14 +256,339 @@ fn apply_ui_command(app: &mut App, line: &str) -> bool {
         return true;
     }
     // A bare `load` (no path) opens the file picker instead of failing on a missing argument.
-    if let Some(deck) = bare_load_deck(line, app.decks, app.default_deck()) {
-        app.overlay = Some(Overlay::Files {
-            picker: FilePicker::new(None, AUDIO_EXTENSIONS, "load track"),
-            purpose: FilePurpose::Load { deck },
-        });
-        return true;
+    // Under the browser target only `browser ...` is accepted, so this stays a deck-target action.
+    if app.target != Target::Browser {
+        if let Some(deck) = bare_load_deck(line, app.decks, app.default_deck()) {
+            app.overlay = Some(Overlay::Files {
+                picker: FilePicker::new(None, AUDIO_EXTENSIONS, "load track"),
+                purpose: FilePurpose::Load { deck },
+            });
+            return true;
+        }
     }
     false
+}
+
+/// Executes a browser action from MIDI. The arrow/Enter map is the same one the keyboard uses.
+pub(crate) fn apply_browser_action(app: &mut App, action: BrowserAction, dispatcher: &Dispatcher) {
+    let Some(db) = app.library.clone() else {
+        app.push_log(LogLine::error("library: no database"));
+        return;
+    };
+    match action {
+        BrowserAction::Load { deck } => {
+            load_browser_track(
+                app,
+                dispatcher,
+                deck.map_or(app.default_deck(), usize::from),
+            );
+        }
+        BrowserAction::Refresh => {
+            let allowed = app.allowed_sources.clone();
+            match db.sources() {
+                Ok(sources) => {
+                    for source in sources
+                        .into_iter()
+                        .filter(|source| allowed.contains(&source.id))
+                    {
+                        match db.scan_source(source.id, &mut |_| {}) {
+                            Ok(stats) => app.push_log(LogLine::info(format!(
+                                "[library] {}: {}",
+                                source.name,
+                                stats.summary()
+                            ))),
+                            Err(err) => app.push_log(LogLine::error(format!(
+                                "[library] {}: {err}",
+                                source.name
+                            ))),
+                        }
+                    }
+                }
+                Err(err) => app.push_log(LogLine::error(format!("library: {err}"))),
+            }
+            app.reload_browser();
+        }
+        BrowserAction::Up => {
+            if let Err(err) = app.browser.move_selection(-1, &db) {
+                app.push_log(LogLine::error(format!("library: {err}")));
+            }
+        }
+        BrowserAction::Down => {
+            if let Err(err) = app.browser.move_selection(1, &db) {
+                app.push_log(LogLine::error(format!("library: {err}")));
+            }
+        }
+        BrowserAction::Open => {
+            if app.browser.focus() == Focus::Tracks {
+                open_load_popup(app, app.default_deck());
+            } else if let Err(err) = app.browser.open(&db) {
+                app.push_log(LogLine::error(format!("library: {err}")));
+            }
+        }
+        BrowserAction::Exit => {
+            if let Err(err) = app.browser.back(&db) {
+                app.push_log(LogLine::error(format!("library: {err}")));
+            }
+        }
+    }
+}
+
+/// The `browser ...` command family in the TUI. Navigation and the deck chooser are UI state, so
+/// they never reach the engine dispatcher.
+fn apply_browser_command(app: &mut App, line: &str, dispatcher: &Dispatcher) {
+    let mut words = line.split_whitespace();
+    let _ = words.next();
+    let Some(subcommand) = words.next() else {
+        app.push_log(LogLine::info(
+            "browser: list | refresh | tracks <id> | show <id> | up | down | open | exit | load | analyse",
+        ));
+        return;
+    };
+    let Some(db) = app.library.clone() else {
+        app.push_log(LogLine::error("library: no database"));
+        return;
+    };
+    match subcommand {
+        "up" => {
+            if let Err(err) = app.browser.move_selection(-1, &db) {
+                app.push_log(LogLine::error(format!("library: {err}")));
+            }
+        }
+        "down" => {
+            if let Err(err) = app.browser.move_selection(1, &db) {
+                app.push_log(LogLine::error(format!("library: {err}")));
+            }
+        }
+        "open" => {
+            if app.browser.focus() == Focus::Tracks {
+                open_load_popup(app, app.default_deck());
+            } else if let Err(err) = app.browser.open(&db) {
+                app.push_log(LogLine::error(format!("library: {err}")));
+            }
+        }
+        "exit" => {
+            if let Err(err) = app.browser.back(&db) {
+                app.push_log(LogLine::error(format!("library: {err}")));
+            }
+        }
+        "load" => {
+            let deck = match words.next() {
+                Some(raw) => match deck_word(raw, app.decks) {
+                    Some(deck) => deck,
+                    None => {
+                        app.push_log(LogLine::error(format!(
+                            "browser load: `{raw}` is not a deck (0..{})",
+                            app.decks.saturating_sub(1)
+                        )));
+                        return;
+                    }
+                },
+                None => app.default_deck(),
+            };
+            open_load_popup(app, deck);
+        }
+        "analyse" | "analyze" => analyse_browser_track(app, dispatcher),
+        "refresh" => {
+            let allowed = app.allowed_sources.clone();
+            let mut count = 0;
+            match db.sources() {
+                Ok(sources) => {
+                    for source in sources.into_iter().filter(|source| allowed.contains(&source.id)) {
+                        match db.scan_source(source.id, &mut |_| {}) {
+                            Ok(stats) => {
+                                count += 1;
+                                app.push_log(LogLine::info(format!(
+                                    "[library] {}: {}",
+                                    source.name,
+                                    stats.summary()
+                                )));
+                            }
+                            Err(err) => app.push_log(LogLine::error(format!(
+                                "[library] {}: {err}",
+                                source.name
+                            ))),
+                        }
+                    }
+                }
+                Err(err) => app.push_log(LogLine::error(format!("library: {err}"))),
+            }
+            if count == 0 {
+                app.push_log(LogLine::info("browser: no configured sources"));
+            }
+            app.reload_browser();
+        }
+        "list" => match db.sources() {
+            Ok(sources) => {
+                let allowed = &app.allowed_sources;
+                let visible: Vec<_> = sources
+                    .into_iter()
+                    .filter(|source| allowed.contains(&source.id))
+                    .collect();
+                if visible.is_empty() {
+                    app.push_log(LogLine::info("browser: no configured sources"));
+                }
+                for source in visible {
+                    let lists = db.root_playlists(source.id).map(|l| l.len()).unwrap_or(0);
+                    app.push_log(LogLine::info(format!(
+                        "{} [{}] {} — {lists} root list(s)",
+                        source.id,
+                        source.kind.label(),
+                        source.root.display()
+                    )));
+                }
+            }
+            Err(err) => app.push_log(LogLine::error(format!("browser list: {err}"))),
+        },
+        "tracks" => {
+            let Some(raw) = words.next() else {
+                app.push_log(LogLine::error("usage: browser tracks <list-id>"));
+                return;
+            };
+            let Ok(id) = raw.parse::<i64>() else {
+                app.push_log(LogLine::error("browser tracks: id must be a number"));
+                return;
+            };
+            match db.tracks_in_playlist(id) {
+                Ok(tracks) if tracks.is_empty() => {
+                    app.push_log(LogLine::info(format!("browser: list {id} has no tracks")))
+                }
+                Ok(tracks) => {
+                    for track in tracks {
+                        app.push_log(LogLine::info(format!(
+                            "[{}] {}",
+                            track.location_id, track.title
+                        )));
+                    }
+                }
+                Err(err) => app.push_log(LogLine::error(format!("browser tracks: {err}"))),
+            }
+        }
+        "show" => {
+            let Some(raw) = words.next() else {
+                app.push_log(LogLine::error("usage: browser show <location-id>"));
+                return;
+            };
+            let Ok(id) = raw.parse::<i64>() else {
+                app.push_log(LogLine::error("browser show: id must be a number"));
+                return;
+            };
+            match db.track_load(id) {
+                Ok(Some(track)) => {
+                    let bpm = track
+                        .bpm
+                        .map(|bpm| format!("{bpm:.2} BPM"))
+                        .unwrap_or_else(|| "BPM --".to_owned());
+                    let key = track
+                        .key
+                        .map(|key| format!("{} ({})", key.traditional(), key.camelot()))
+                        .unwrap_or_else(|| "key --".to_owned());
+                    app.push_log(LogLine::info(format!(
+                        "{} — {} — {bpm}, {key} — {}",
+                        track.title,
+                        track.artist.as_deref().unwrap_or("unknown artist"),
+                        track.path.display()
+                    )));
+                }
+                Ok(None) => app.push_log(LogLine::error(format!("browser show: no location {id}"))),
+                Err(err) => app.push_log(LogLine::error(format!("browser show: {err}"))),
+            }
+        }
+        other => app.push_log(LogLine::error(format!(
+            "unknown browser command `{other}` (list | refresh | tracks | show | up | down | open | exit | load | analyse)"
+        ))),
+    }
+}
+
+/// Arrow/Enter/Esc while the browser target owns an empty command line. Returns true when the key
+/// was consumed, so the command-line editor never sees it.
+fn handle_browser_key(app: &mut App, key: KeyEvent) -> bool {
+    let Some(db) = app.library.clone() else {
+        return false;
+    };
+    let result = match key.code {
+        KeyCode::Up => app.browser.move_selection(-1, &db),
+        KeyCode::Down => app.browser.move_selection(1, &db),
+        KeyCode::Left | KeyCode::Esc => app.browser.back(&db),
+        KeyCode::Right => app.browser.open(&db),
+        KeyCode::Enter => {
+            if app.browser.focus() == Focus::Tracks {
+                open_load_popup(app, app.default_deck());
+                return true;
+            }
+            app.browser.open(&db)
+        }
+        _ => return false,
+    };
+    if let Err(err) = result {
+        app.push_log(LogLine::error(format!("library: {err}")));
+    }
+    true
+}
+
+/// Opens the two-row deck chooser for the highlighted track. Enter on a track and `browser load`
+/// both land here; the chooser itself is mouse-clickable.
+fn open_load_popup(app: &mut App, deck: usize) {
+    if app.browser.selected_track().is_none() {
+        app.push_log(LogLine::info("library: no track selected"));
+        return;
+    }
+    let (x, y) = app.browser.track_anchor();
+    app.overlay = Some(Overlay::LoadTarget {
+        x,
+        y,
+        selected: deck.min(app.decks.saturating_sub(1)),
+    });
+}
+
+/// Loads the highlighted track into `deck`, preferring a cached analysis over the tag's BPM hint.
+fn load_browser_track(app: &mut App, dispatcher: &Dispatcher, deck: usize) {
+    let Some(track) = app.browser.selected_track() else {
+        app.push_log(LogLine::info("library: no track selected"));
+        return;
+    };
+    let path = track.path.display().to_string();
+    let bpm = track.bpm;
+    let title = track.title.clone();
+    let track_id = track.track_id;
+    let location_id = track.location_id;
+    let sample_rate = dispatcher.live().audio.sample_rate;
+    let decoder_start_ms = app
+        .decoder_start_ms
+        .unwrap_or_else(|| hypermixx_media::decoder_start_ms(&path).unwrap_or(0.0));
+    let grid_offset_ms = app.grid_offset_ms;
+    let (analysis, cues) = match app.library.as_ref() {
+        Some(db) => (
+            db.imported_analysis(location_id, sample_rate, decoder_start_ms, grid_offset_ms)
+                .ok()
+                .flatten()
+                .or_else(|| db.load_analysis(track_id).ok().flatten()),
+            db.loaded_cues(location_id, sample_rate, decoder_start_ms, grid_offset_ms)
+                .ok(),
+        ),
+        None => (None, None),
+    };
+    app.push_log(LogLine::info(format!("library: loading {title}")));
+    command::spawn_load_with(deck as u8, path, bpm, analysis, cues, dispatcher);
+}
+
+/// Runs the analyser on the highlighted track and stores the result in the library cache.
+fn analyse_browser_track(app: &mut App, dispatcher: &Dispatcher) {
+    let Some(track) = app.browser.selected_track() else {
+        app.push_log(LogLine::info("library: no track selected"));
+        return;
+    };
+    let location_id = track.location_id;
+    let Some(db) = app.library.clone() else {
+        app.push_log(LogLine::error("library: no database"));
+        return;
+    };
+    match db.track_load(location_id) {
+        Ok(Some(load)) => command::spawn_analyse_track(load, db, app.backend, dispatcher),
+        Ok(None) => app.push_log(LogLine::error(format!(
+            "library: no location {location_id}"
+        ))),
+        Err(err) => app.push_log(LogLine::error(format!("library: {err}"))),
+    }
 }
 
 /// Recognises `<deck> load` with no further words. Returns the deck to load into.
@@ -239,7 +658,10 @@ fn handle_overlay(app: &mut App, key: KeyEvent, dispatcher: &Dispatcher) {
             },
             _ => app.overlay = Some(Overlay::Ports { list }),
         },
-        Overlay::Files { mut picker, purpose } => match key.code {
+        Overlay::Files {
+            mut picker,
+            purpose,
+        } => match key.code {
             KeyCode::Esc => {}
             KeyCode::Up => {
                 picker.move_selection(-1);
@@ -262,16 +684,26 @@ fn handle_overlay(app: &mut App, key: KeyEvent, dispatcher: &Dispatcher) {
                         }
                         FilePurpose::MidiMap => {
                             app.midi_map = Some(path);
-                            app.connect_midi(
-                                dispatcher.command_tx.clone(),
-                                &dispatcher.notices,
-                            );
+                            app.connect_midi(dispatcher.command_tx.clone(), &dispatcher.notices);
                         }
                     }
                 }
                 None => app.overlay = Some(Overlay::Files { picker, purpose }),
             },
             _ => app.overlay = Some(Overlay::Files { picker, purpose }),
+        },
+        Overlay::LoadTarget { x, y, mut selected } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                selected = selected.saturating_sub(1);
+                app.overlay = Some(Overlay::LoadTarget { x, y, selected });
+            }
+            KeyCode::Down => {
+                selected = (selected + 1).min(app.decks.saturating_sub(1));
+                app.overlay = Some(Overlay::LoadTarget { x, y, selected });
+            }
+            KeyCode::Enter => load_browser_track(app, dispatcher, selected),
+            _ => app.overlay = Some(Overlay::LoadTarget { x, y, selected }),
         },
     }
 }

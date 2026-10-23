@@ -24,14 +24,16 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         profile,
         live,
         live_source,
+        library,
         ..
     } = session;
     let sample_rate = live.audio.sample_rate;
     let response_rx = pipeline.response_rx().clone();
-    let dispatcher = command::Dispatcher::new(command_tx.clone(), notice_tx);
+    let mut dispatcher = command::Dispatcher::new(command_tx.clone(), notice_tx);
     dispatcher.with_topology(topology);
     dispatcher.with_profile(profile);
     dispatcher.with_live(live, live_source);
+    dispatcher.with_library(library);
     // Prime every chain's slot list so `fx remove <name>` works from the first command.
     dispatcher.prime(decks, pipeline.response_rx());
     let print_slots = dispatcher.slots();

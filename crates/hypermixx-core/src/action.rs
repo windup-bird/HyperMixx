@@ -37,7 +37,11 @@ pub struct ActionSpec {
 }
 
 const fn arg(name: &'static str, required: bool, values: &'static str) -> ArgSpec {
-    ArgSpec { name, required, values }
+    ArgSpec {
+        name,
+        required,
+        values,
+    }
 }
 
 /// Every verb the engine's front-ends can drive, in the order a guide should list them.
@@ -65,6 +69,16 @@ pub const ACTIONS: &[ActionSpec] = &[
         momentary: true,
         args: &[arg("frames_per_tick", false, "frames")],
         doc: "platter: a note is the touch, a relative CC is the wheel",
+    },
+    ActionSpec {
+        name: "hotcue",
+        deck: true,
+        momentary: false,
+        args: &[
+            arg("set|trigger|clear", true, "the operation"),
+            arg("slot", true, "1..8 (A..H)"),
+        ],
+        doc: "set, trigger, or clear one hot-cue slot",
     },
     ActionSpec {
         name: "beatjump",
@@ -299,6 +313,48 @@ pub const ACTIONS: &[ActionSpec] = &[
         args: &[],
         doc: "drive one parameter (`chain` + `fx` + `param` fields)",
     },
+    ActionSpec {
+        name: "browser up",
+        deck: false,
+        momentary: false,
+        args: &[],
+        doc: "move the browser selection up",
+    },
+    ActionSpec {
+        name: "browser down",
+        deck: false,
+        momentary: false,
+        args: &[],
+        doc: "move the browser selection down",
+    },
+    ActionSpec {
+        name: "browser open",
+        deck: false,
+        momentary: false,
+        args: &[],
+        doc: "open the selected list / enter the track pane",
+    },
+    ActionSpec {
+        name: "browser exit",
+        deck: false,
+        momentary: false,
+        args: &[],
+        doc: "leave the track pane / go up one list",
+    },
+    ActionSpec {
+        name: "browser load",
+        deck: false,
+        momentary: false,
+        args: &[],
+        doc: "load the selected track (optional binding `deck`)",
+    },
+    ActionSpec {
+        name: "browser refresh",
+        deck: false,
+        momentary: false,
+        args: &[],
+        doc: "rescan library sources",
+    },
 ];
 
 /// The canonical name of an action, resolving the **legacy** dot-spelled names a pre-unification
@@ -324,7 +380,8 @@ pub fn canonical(name: &str) -> Option<String> {
     if let Some((head, rest)) = name.split_once(char::is_whitespace) {
         // A stem line: `<stem> fader | mute | solo`, for any of the four stems (`vocals mute` is in
         // the registry as the guide's spelling; `drums mute` is the same verb).
-        if matches!(rest.trim(), "fader" | "mute" | "solo") && crate::stem::Stem::parse(head).is_some()
+        if matches!(rest.trim(), "fader" | "mute" | "solo")
+            && crate::stem::Stem::parse(head).is_some()
         {
             return Some(name.to_owned());
         }
@@ -376,6 +433,12 @@ pub fn canonical(name: &str) -> Option<String> {
         "fx.pad" => "fx pad".to_owned(),
         "fx.trigger" => "fx trigger".to_owned(),
         "fx.param" => "fx param".to_owned(),
+        "browser.up" => "browser up".to_owned(),
+        "browser.down" => "browser down".to_owned(),
+        "browser.open" => "browser open".to_owned(),
+        "browser.exit" => "browser exit".to_owned(),
+        "browser.load" => "browser load".to_owned(),
+        "browser.refresh" => "browser refresh".to_owned(),
         other => {
             if let Some(beats) = other.strip_prefix("loop.beat") {
                 let beats = beats.trim();

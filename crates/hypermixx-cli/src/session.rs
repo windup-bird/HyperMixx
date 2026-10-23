@@ -4,10 +4,13 @@
 //! simply has no use for the MIDI fields — it attaches its input before the session starts), and
 //! because a new setting should be one field here rather than a tenth parameter in two places.
 
+use std::sync::Arc;
+
 use crossbeam_channel::{Receiver, Sender};
 
 use hypermixx_audio::Command;
 use hypermixx_core::{Backend, LiveConfig};
+use hypermixx_library::LibraryDb;
 
 use crate::notices::NoticeTx;
 use crate::response::LogLine;
@@ -31,4 +34,6 @@ pub struct Session {
     /// `--midi` / `--midi-map`, for the front-end that can pick them at runtime.
     pub midi_port: Option<String>,
     pub midi_map: String,
+    /// The library cache, opened once by `main` and shared by both front-ends.
+    pub library: Option<Arc<LibraryDb>>,
 }

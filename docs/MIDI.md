@@ -93,6 +93,7 @@ value  = min + shaped × (max − min)
 | `cue` | 是 | 按住式 cue 键（note）：按下 = cue，松开 = 归位 |
 | `vinyl [frames_per_tick]` | 是 | 唱盘：note = 贴盘/松手，相对 CC = 转轮（缺省 1323 帧/tick） |
 | `beatjump [beats]` | 是 | 按整拍 seek，保持相位（可正可负；缺省量取 `step`） |
+| `hotcue set\|trigger\|clear <slot>` | 是 | 1..8（A..H）的 hot cue；trigger 保持当前播放状态 |
 | `fader flow` | 是 | 通道级电平（装了 stems 就写全部四路） |
 | `<stem> fader` | 是 | 单路 stem 电平（`<stem>` = drums \| bass \| other \| vocals） |
 | `<stem> mute` | 是 | latch 该 stem 的静音 |
@@ -119,6 +120,13 @@ value  = min + shaped × (max − min)
 | `fx pad` | 否 | 按住 = engaged，松开恢复原状态 |
 | `fx trigger` | 否 | 触发一次性动作 |
 | `fx param` | 否 | 写 `chain` + `fx` + `param`（这是 `fx set` 的连续形式：值来自控制器） |
+| `browser up` / `browser down` | 否 | 浏览器选择上/下 |
+| `browser open` / `browser exit` | 否 | 进入下一级/进入 tracks；返回上一级 |
+| `browser load` | 否 | 加载当前 track；binding 的 `deck` 可选 |
+| `browser refresh` | 否 | 重新扫描所有曲库来源 |
+
+`browser *` 不会进入引擎：`translate_split` 把它们交给前端（TUI 的浏览器），其余 action 仍走
+`Command`。REPL 没有浏览器状态，因此忽略这些动作。
 
 `fx toggle` 与其他 FX 动作一样由**引擎**翻状态（`Command::ToggleFx`），前端不留镜像 —— 否则任何别的
 路径改了槽位状态，镜像就错了。

@@ -6,8 +6,8 @@
 //! [`MergeBuffer`] coalesces the floods a fast fader sweep produces.
 
 use hypermixx_core::{
-    Command, CueOp, DeckId, FaderTarget, FxSlotRef, LoopEditOp, LoopOp, NudgeOp, StemOp,
-    SyncOp, VinylOp,
+    BrowserAction, Command, CueOp, DeckId, FaderTarget, FxSlotRef, LoopEditOp, LoopOp, NudgeOp,
+    StemOp, SyncOp, VinylOp,
 };
 
 use crate::map::{
@@ -107,7 +107,18 @@ fn default_norm(action: &Action) -> f32 {
 /// Translates one event into zero or more commands. Pure with respect to the map; only `state`
 /// changes.
 pub fn translate(map: &Map, event: &Event, state: &mut TranslateState) -> Vec<Command> {
+    translate_split(map, event, state).0
+}
+
+/// Like [`translate`], but also returns the browser actions for the front-end. The engine-bound
+/// commands are the first element; the second is empty for an ordinary DJ controller.
+pub fn translate_split(
+    map: &Map,
+    event: &Event,
+    state: &mut TranslateState,
+) -> (Vec<Command>, Vec<BrowserAction>) {
     let mut out = Vec::new();
+    let mut browser = Vec::new();
     match *event {
         Event::ControlChange {
             channel,
@@ -119,7 +130,7 @@ pub fn translate(map: &Map, event: &Event, state: &mut TranslateState) -> Vec<Co
                     continue;
                 }
                 let state = &mut state.binds[index];
-                let mut binding = BindingOut::new(spec, state, map, &mut out);
+                let mut binding = BindingOut::new(spec, state, map, &mut out, &mut browser);
                 binding.on_control(value);
             }
         }
@@ -137,7 +148,7 @@ pub fn translate(map: &Map, event: &Event, state: &mut TranslateState) -> Vec<Co
                     continue;
                 }
                 state.held = true;
-                let mut binding = BindingOut::new(spec, state, map, &mut out);
+                let mut binding = BindingOut::new(spec, state, map, &mut out, &mut browser);
                 binding.press();
             }
         }
@@ -151,7 +162,7 @@ pub fn translate(map: &Map, event: &Event, state: &mut TranslateState) -> Vec<Co
                     continue;
                 }
                 state.held = false;
-                let mut binding = BindingOut::new(spec, state, map, &mut out);
+                let mut binding = BindingOut::new(spec, state, map, &mut out, &mut browser);
                 binding.release();
             }
         }
@@ -164,14 +175,14 @@ pub fn translate(map: &Map, event: &Event, state: &mut TranslateState) -> Vec<Co
                     continue;
                 }
                 let state = &mut state.binds[index];
-                let mut binding = BindingOut::new(spec, state, map, &mut out);
+                let mut binding = BindingOut::new(spec, state, map, &mut out, &mut browser);
                 if binding.accepts(norm) {
                     binding.emit_continuous(norm);
                 }
             }
         }
     }
-    out
+    (out, browser)
 }
 
 /// Applies one binding's action against one event, then writes into the output vector. Kept as a
@@ -181,6 +192,7 @@ struct BindingOut<'a> {
     state: &'a mut BindState,
     map: &'a Map,
     out: &'a mut Vec<Command>,
+    browser: &'a mut Vec<BrowserAction>,
 }
 
 impl<'a> BindingOut<'a> {
@@ -189,12 +201,14 @@ impl<'a> BindingOut<'a> {
         state: &'a mut BindState,
         map: &'a Map,
         out: &'a mut Vec<Command>,
+        browser: &'a mut Vec<BrowserAction>,
     ) -> Self {
         Self {
             spec,
             state,
             map,
             out,
+            browser,
         }
     }
 
@@ -216,7 +230,9 @@ impl<'a> BindingOut<'a> {
             // (platter held) or bends (nobody on it) — the mapping cannot know, and must not guess.
             if let Action::Vinyl { frames_per_tick } = self.spec.action.clone() {
                 if delta != 0 {
-                    let Some(deck_id) = self.spec.deck else { return };
+                    let Some(deck_id) = self.spec.deck else {
+                        return;
+                    };
                     self.out.push(Command::Vinyl {
                         deck_id,
                         op: VinylOp::Turn {
@@ -227,9 +243,15 @@ impl<'a> BindingOut<'a> {
                 }
                 return;
             }
-            if let Action::Nudge { delta: step, seconds } = self.spec.action.clone() {
+            if let Action::Nudge {
+                delta: step,
+                seconds,
+            } = self.spec.action.clone()
+            {
                 if delta != 0 {
-                    let Some(deck_id) = self.spec.deck else { return };
+                    let Some(deck_id) = self.spec.deck else {
+                        return;
+                    };
                     // `Bend`, not `Start`: each message *adds* to the bend (so turning faster bends
                     // harder, up to the engine's clamp) instead of re-stating it (which would only
                     // make it last longer). The magnitude is the tick count, so an encoder that
@@ -337,6 +359,7 @@ impl<'a> BindingOut<'a> {
                 deck_id: deck,
                 op: CueOp::Smart,
             }),
+            Action::HotCue(op) => self.out.push(Command::HotCue { deck_id: deck, op }),
             // Latching, so the engine flips its own state rather than the mapping holding one.
             Action::StemMute { stem } => self.out.push(Command::Stem {
                 deck_id: deck,
@@ -367,8 +390,10 @@ impl<'a> BindingOut<'a> {
     }
 
     fn press_deckless(&mut self) {
-        if let Action::Fx(action) = self.spec.action.clone() {
-            self.fx_press(action);
+        match self.spec.action.clone() {
+            Action::Fx(action) => self.fx_press(action),
+            Action::Browser(action) => self.browser.push(action),
+            _ => {}
         }
     }
 
@@ -592,8 +617,8 @@ impl MergeBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::{DEFAULT_NUDGE_STEP, DEFAULT_VINYL_FRAMES_PER_TICK};
     use crate::map::Map;
+    use crate::map::{DEFAULT_NUDGE_STEP, DEFAULT_VINYL_FRAMES_PER_TICK};
     use hypermixx_core::Stem;
 
     fn map(toml: &str) -> Map {
@@ -633,6 +658,29 @@ mod tests {
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn browser_bindings_are_ui_actions_not_engine_commands() {
+        let map = map(r#"
+[[bind]]
+type = "note"
+id = 60
+action = "browser.up"
+
+[[bind]]
+type = "note"
+id = 61
+deck = 1
+action = "browser.load"
+"#);
+        let mut state = TranslateState::new(&map);
+        let (commands, browser) = translate_split(&map, &note(0, 60, true), &mut state);
+        assert!(commands.is_empty());
+        assert_eq!(browser, vec![BrowserAction::Up]);
+        let (commands, browser) = translate_split(&map, &note(0, 61, true), &mut state);
+        assert!(commands.is_empty());
+        assert_eq!(browser, vec![BrowserAction::Load { deck: Some(1) }]);
     }
 
     #[test]
@@ -806,7 +854,10 @@ action = "tempofader"
         // is +2/64 of the travel.
         let commands = translate(&map, &cc(0, 10, 1), &mut state);
         match &commands[0] {
-            Command::SetTempoFader { deck_id: 0, position } => {
+            Command::SetTempoFader {
+                deck_id: 0,
+                position,
+            } => {
                 assert!(close(*position, 2.0 / 64.0), "position {position}");
             }
             other => panic!("expected SetTempoFader, got {other:?}"),
@@ -814,7 +865,9 @@ action = "tempofader"
         // One detent down brings it back to centre.
         let commands = translate(&map, &cc(0, 10, 127), &mut state);
         match &commands[0] {
-            Command::SetTempoFader { position, .. } => assert!(close(*position, 0.0), "position {position}"),
+            Command::SetTempoFader { position, .. } => {
+                assert!(close(*position, 0.0), "position {position}")
+            }
             other => panic!("expected SetTempoFader, got {other:?}"),
         }
     }
@@ -836,9 +889,17 @@ action = "tempofader"
             (RelMode::Rel2, 1, 1),
             (RelMode::Rel3, 127, -1),
         ] {
-            assert_eq!(relative_delta(mode, value, true), -plain, "{mode:?} {value}");
+            assert_eq!(
+                relative_delta(mode, value, true),
+                -plain,
+                "{mode:?} {value}"
+            );
         }
-        assert_eq!(relative_delta(RelMode::Rel1, 64, true), 0, "zero stays zero");
+        assert_eq!(
+            relative_delta(RelMode::Rel1, 64, true),
+            0,
+            "zero stays zero"
+        );
     }
 
     /// A wheel is a *direction*, not a position: one tick clockwise bends forward, one tick the
@@ -907,7 +968,10 @@ step = 0.05
         ));
         assert!(matches!(
             translate(&map, &cc(0, 22, 0), &mut state).as_slice(),
-            [Command::Nudge { op: NudgeOp::Stop, .. }]
+            [Command::Nudge {
+                op: NudgeOp::Stop,
+                ..
+            }]
         ));
     }
 
@@ -942,11 +1006,17 @@ step = 1323
         // The platter sensor: press = a hand on the record, release = letting go.
         assert!(matches!(
             translate(&map, &note(0, 80, true), &mut state).as_slice(),
-            [Command::Vinyl { op: VinylOp::Touch, .. }]
+            [Command::Vinyl {
+                op: VinylOp::Touch,
+                ..
+            }]
         ));
         assert!(matches!(
             translate(&map, &note(0, 80, false), &mut state).as_slice(),
-            [Command::Vinyl { op: VinylOp::Release, .. }]
+            [Command::Vinyl {
+                op: VinylOp::Release,
+                ..
+            }]
         ));
         // The wheel: one tick each way, in ticks (the deck converts, because only the deck knows
         // whether the platter is held).
@@ -1003,7 +1073,8 @@ deck = 0
 action = "cue.smart"
 "#);
         let mut state = TranslateState::new(&map);
-        let edge = |state: &mut TranslateState, key, down| translate(&map, &note(0, key, down), state);
+        let edge =
+            |state: &mut TranslateState, key, down| translate(&map, &note(0, key, down), state);
 
         // A plain nudge is momentary: press bends, release lets go.
         assert!(matches!(
@@ -1012,7 +1083,10 @@ action = "cue.smart"
         ));
         assert!(matches!(
             edge(&mut state, 60, false).as_slice(),
-            [Command::Nudge { op: NudgeOp::Stop, .. }]
+            [Command::Nudge {
+                op: NudgeOp::Stop,
+                ..
+            }]
         ));
         // A timed nudge releases itself; the note-up edge must be silent.
         assert!(matches!(
@@ -1024,16 +1098,25 @@ action = "cue.smart"
         // and plays; up returns to the cue point and pauses.
         assert!(matches!(
             edge(&mut state, 62, true).as_slice(),
-            [Command::Cue { op: CueOp::Hold, .. }]
+            [Command::Cue {
+                op: CueOp::Hold,
+                ..
+            }]
         ));
         assert!(matches!(
             edge(&mut state, 62, false).as_slice(),
-            [Command::Cue { op: CueOp::Back, .. }]
+            [Command::Cue {
+                op: CueOp::Back,
+                ..
+            }]
         ));
         // A smart cue fires once; its release is silent.
         assert!(matches!(
             edge(&mut state, 63, true).as_slice(),
-            [Command::Cue { op: CueOp::Smart, .. }]
+            [Command::Cue {
+                op: CueOp::Smart,
+                ..
+            }]
         ));
         assert!(edge(&mut state, 63, false).is_empty());
     }
@@ -1218,7 +1301,13 @@ action = "play"
         // Order is preserved and the fader carries its final value.
         let (_, value) = fader(&flushed[0]).unwrap();
         assert!(close(value, 0.9), "value {value}");
-        assert!(matches!(flushed[1], Command::SetFader { target: FaderTarget::Flow(1), .. }));
+        assert!(matches!(
+            flushed[1],
+            Command::SetFader {
+                target: FaderTarget::Flow(1),
+                ..
+            }
+        ));
         assert!(matches!(flushed[2], Command::Play { deck_id: 0 }));
         assert!(buffer.is_empty());
     }

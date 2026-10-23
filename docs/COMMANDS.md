@@ -68,7 +68,11 @@ cargo run -p hypermixx-cli -- [flags]
 ```
 [deck] load <path> [bpm]    后台解码装载；bpm > 0 则建常网格、跳过分析
 [deck] analyse              后台跑分析器并发布网格（analyze 同义）
+[deck] hotcue set|trigger|clear <1..8>
+                            设置 / 跳到 / 清除一个 hot cue（A..H）；trigger 保持播放/暂停状态
 ```
+
+从曲库加载时，导入的 beatgrid 和 memory/hot cue 会随后一起写入 deck；`hotcue` 可以继续改它们。
 
 - `load` 的 `bpm` 非数字 → 前端直接报 `bpm must be a number`。
 - TUI 里 `load` **不带路径**会弹文件浏览器（支持 mp3/wav/flac/ogg/m4a 等）。
@@ -76,6 +80,40 @@ cargo run -p hypermixx-cli -- [flags]
   `[analyse] deck0: 122.0 BPM, 8A`。
 - 装载是后台线程，立即回 `[load] deck0: decoding …`；完成回
   `deck0 loaded: 18462369 frames (7:00.648)`。
+
+### 3.1b 曲库
+
+```text
+browser refresh [source-id]           增量重扫已配置来源（TUI 只扫当前配置）
+browser list                          来源 id、根目录、根 list 数、上次扫描时间
+browser tracks <list-id>              list 里的 track（方括号是 location id）
+browser show <location-id>            title / artist / album / BPM / key / 路径
+browser up|down|open|exit|load         TUI 浏览器导航/加载
+browser analyse                       分析当前选中的 track
+```
+
+来源由 `profile/preference.toml` 的 `[library]` 决定：
+
+```toml
+[library]
+local = ["rkb", "serato", "vdj"]
+usb = ["rkb", "serato", "vdj"]
+folders = ["./mp3"]
+```
+
+未配置的类别不扫描、不显示；USB 自动发现并挂载，同一个 U 盘的多种导出是多个 library。
+
+- 数据库在 `$HYPERMIXX_CACHE/library/library.sqlite3`（默认 `.cache/library/`），是**可重建缓存**。
+- U 盘只读：rekordbox 的 `exportLibrary.db` 会先复制 `.db/-wal/-shm` 再打开；没有它时回退
+  `export.pdb`。Serato 从 `database V2` + crate + 音频 ID3 `GEOB` 读取。
+- 加载时优先使用导入 grid，其次本地 `analyse` 缓存，最后才用标签 BPM。
+- 导入网格会减去解码器 gapless 起点（MP3 样本 25.0567ms），再应用 `grid_offset_ms` 微调；
+  RB / Serato / VirtualDJ 的来源偏移和这两个值都在 `[library]` 配置；样本 USB 的默认是
+  RB 0、Serato -16.5、VDJ 0。
+- key 默认 Camelot；`profile/preference.toml` 的 `[display] key = "camelot" | "classic"` 切换。
+- TUI 里 `Tab` 到 browser：`↑/↓` 选择，`→/Enter` 打开（最低一级进入 tracks），`←/Esc` 返回；
+  `load [deck]` 加载，`analyse` 分析选中 track；鼠标单击选择，双击 track 弹 deck0/deck1 选择。
+- 默认 rekordbox 口令是公开常量；覆盖用 `HYPERMIXX_REKORDBOX_KEY`。
 
 ### 3.2 走带
 
