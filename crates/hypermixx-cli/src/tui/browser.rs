@@ -457,7 +457,7 @@ fn render_column(
     let mut blocks: Vec<Vec<(bool, String, String)>> = Vec::with_capacity(column.entries.len());
     for entry in &column.entries {
         let icon = entry.icon();
-        let prefix = format!(" {icon} ");
+        let prefix = format!("{icon} ");
         let indent = " ".repeat(text::width(&prefix));
         let budget = width.saturating_sub(text::width(&prefix)).max(1);
         let label = entry.label();
