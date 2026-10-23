@@ -165,20 +165,12 @@ MIDI 可用 `browser.up/down/open/exit/load/refresh`，`hotcue set|trigger|clear
 
 `stem separate` 把当前曲目离线分离成[drums/bass/other/vocals]，pcm缓存在`./.cache/stems/...`（工作目录下的 `.cache`，可用 `HYPERMIXX_CACHE` 覆盖）。
 
-使用`--features cuda`构建并在cli使用`stem separate --gpu`可以用cudnn加速。
-
-
-## Vinyl
-
-目前仅简单实现；负速度仍不支持（scratch 走 Tape 路径）。
-
 ## todo
 
 1. midi control: nearly done
 2. better stem/stemfx
 3. network streamming
 4. better analysis
-5. better vinyl
 
 ## 许可证
 
