@@ -1,0 +1,71 @@
+# One channel strip. The FX names assume the shipped topology's per-deck `eq` + `filter` chain;
+# an unresolved name disables that one row rather than the whole unit.
+[[preset]]
+name = "mixer"
+start = "default"
+
+[[preset.slot]]
+slot = "fader"
+shape = "Knob"
+[[preset.slot]]
+slot = "gain"
+shape = "Knob"
+[[preset.slot]]
+slot = "low"
+shape = "Knob"
+[[preset.slot]]
+slot = "mid"
+shape = "Knob"
+[[preset.slot]]
+slot = "high"
+shape = "Knob"
+[[preset.slot]]
+slot = "filter"
+shape = "BipolKnob"
+[[preset.slot]]
+slot = "cue"
+shape = "Button"
+[[preset.slot]]
+slot = "load"
+shape = "Button"
+
+[[preset.mode]]
+name = "default"
+[[preset.mode.bind]]
+slot = "fader"
+action = "fader flow"
+[[preset.mode.bind]]
+slot = "gain"
+action = "fader gain"
+[[preset.mode.bind]]
+slot = "low"
+action = "fx param"
+fx = "eq"
+param = "low"
+min = -1.0
+max = 1.0
+[[preset.mode.bind]]
+slot = "mid"
+action = "fx param"
+fx = "eq"
+param = "mid"
+min = -1.0
+max = 1.0
+[[preset.mode.bind]]
+slot = "high"
+action = "fx param"
+fx = "eq"
+param = "high"
+min = -1.0
+max = 1.0
+[[preset.mode.bind]]
+slot = "filter"
+action = "fx param"
+fx = "filter"
+param = "value"
+[[preset.mode.bind]]
+slot = "cue"
+action = "fader cuesend toggle"
+[[preset.mode.bind]]
+slot = "load"
+action = "browser load"

@@ -481,6 +481,16 @@ pub enum Command {
         deck_id: DeckId,
         mode: KeylockMode,
     },
+    /// Flips a deck's keylock profile in the engine, so a single pad is a latch and a front-end
+    /// never has to keep a stale mirror of the deck's state.
+    ToggleKeylock {
+        deck_id: DeckId,
+    },
+    /// Flips one channel's cue send between off (`0`) and full (`1`). The engine owns the value
+    /// because the `fader cuesend` path can change it too.
+    ToggleCueSend {
+        deck_id: DeckId,
+    },
     /// Sets the pitch shift in semitones. A **placeholder**: the streaming time-stretch engine has
     /// no pitch axis yet, so the deck stores the value and reports it, but nothing audibly moves.
     SetKey {
@@ -694,6 +704,14 @@ impl std::fmt::Debug for Command {
                 .debug_struct("SetKeylock")
                 .field("deck_id", deck_id)
                 .field("mode", mode)
+                .finish(),
+            Command::ToggleKeylock { deck_id } => f
+                .debug_struct("ToggleKeylock")
+                .field("deck_id", deck_id)
+                .finish(),
+            Command::ToggleCueSend { deck_id } => f
+                .debug_struct("ToggleCueSend")
+                .field("deck_id", deck_id)
                 .finish(),
             Command::SetKey { deck_id, semitones } => f
                 .debug_struct("SetKey")

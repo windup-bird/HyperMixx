@@ -360,6 +360,7 @@ pub fn help_text(decks: usize) -> String {
   browser show <location-id>   inspect one track
   state                        show every deck
   midi ports                   list MIDI input ports (open one at launch with --midi)
+  midi mode [unit [mode|next]] list units, or switch one unit's active mode
   zoom in|out|fit              waveform zoom (UI only)
   quit                         exit
 
@@ -372,8 +373,8 @@ follows the focused deck (TUI: `Tab` cycles the command target deck0 â†’ deck1 â
 startup flags: --config <file> (custom topology), --profile <name|file> (which files to use),
                --print-config (reference TOML), --live <file> (engine rate, ring, stem defaults),
                --backend auto|stratum|timestretch, --tui (terminal UI),
-               --midi <port> [--midi-map <file>] (MIDI input; default map midi-map.toml),
-               --midi-guide [<file>] [--midi <port>] [--decks <n>] (learn-mode map editor)",
+               --midi <port> [--midi-map <file>] (MIDI input; a map's [meta].device can supply the port),
+               --midi-guide [<file>] [--midi <port>] [--decks <n>] (unit map guide)",
         decks - 1
     )
 }

@@ -480,6 +480,12 @@ impl Channel {
         self.cue_send.set(if level.is_finite() { level.clamp(0.0, 1.0) } else { 0.0 });
     }
 
+    /// Flips the cue send: off becomes full, anything audible becomes off. Used by the latch pad
+    /// action; reading the engine's own target keeps it consistent with the `fader cuesend` path.
+    pub fn toggle_cue_send(&self) {
+        self.set_cue_send(if self.cue_send.target() > 0.5 { 0.0 } else { 1.0 });
+    }
+
     /// The last block's cue copy. Only meaningful after [`Channel::process`].
     pub fn cue(&self) -> &Bus {
         &self.cue
@@ -1525,4 +1531,18 @@ mod tests {
         channel.process(&ctx());
         assert!(channel.peak().is_finite());
     }
+    #[test]
+    fn the_cue_send_latch_flips_between_off_and_full() {
+        let channel = channel_with(
+            ChannelConfig { cue_send: 1.0, ..Default::default() },
+            vec![FxChain::new()],
+            FxChain::new(),
+        );
+        assert!(channel.cue_send.target() > 0.5, "the channel starts audible in the cue");
+        channel.toggle_cue_send();
+        assert!(channel.cue_send.target() < 0.5, "the first press mutes it");
+        channel.toggle_cue_send();
+        assert!(channel.cue_send.target() > 0.5, "the next press restores it");
+    }
+
 }

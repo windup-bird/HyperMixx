@@ -10,5 +10,7 @@ midi = "midi.toml"
 # Or point at something else entirely:
 # mixer = "../sets/club.toml"
 
+# `midi` points at a map file; its `[meta].device` names the input port.
+
 # Reserved (see profile/preference.toml).
 [preference]

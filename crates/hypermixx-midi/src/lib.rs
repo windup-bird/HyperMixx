@@ -5,24 +5,32 @@
 //! `midir` for port I/O, nothing else. That keeps its logic pure and testable without hardware:
 //!
 //! ```text
-//! bytes ──msg::Decoder──► Event ──translate::translate──► Vec<Command> ──MergeBuffer──► command_tx
+//! bytes ──msg::Decoder──► Event ──router::Router──► Vec<Command> ──MergeBuffer──► command_tx
 //!                                  ▲
-//!                          map::Map (TOML) + TranslateState
+//!                          map::Map (units + presets) + Router state
 //! ```
 //!
 //! - [`msg`] parses the byte stream (NoteOn/Off, CC, PitchBend; drops clock/sysex).
-//! - [`map`] is the TOML mapping file plus the action registry the guide generates from.
-//! - [`translate`] is the pure event → command function with soft-takeover and relative encoders.
+//! - [`map`] is the TOML mapping file: units, slots, selectors and mode tables.
+//! - [`preset`] holds built-in slot layouts and default mode tables; user files may replace them.
+//! - [`router`] owns the active mode per unit and routes each endpoint to its slot.
+//! - [`translate`] applies one binding (soft-takeover, relative encoders, press/release edges).
 //! - [`ports`] enumerates and opens `midir` inputs, forwarding [`msg::Event`]s.
 
 pub mod guide;
 pub mod map;
 pub mod msg;
 pub mod ports;
+pub mod preset;
+pub mod router;
 pub mod translate;
 
-pub use guide::{describe, event_label, BindStatus, Candidate, Guide, GuideStep};
+pub use guide::{
+    Button, Candidate, Guide, GuideStep, GuideView, Row, RowKind, Stage, TreeButton, TreeNode,
+    TreeNodeKind, TreeView,
+};
 pub use map::{manifest, Action, ActionSpec, BindingSpec, Map, MapError, Meta, Target, ACTIONS};
 pub use msg::{Decoder, Event};
 pub use ports::{list_ports, Input, PortInfo, Received};
-pub use translate::{translate, translate_split, MergeBuffer, MergeKey, TranslateState};
+pub use router::{Feed, Router, RouterCommand, RouterState, UnitModeState};
+pub use translate::{apply, default_norm, BindState, MergeBuffer, MergeKey};

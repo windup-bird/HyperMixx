@@ -1,0 +1,31 @@
+[[preset]]
+name = "transport"
+start = "default"
+
+[[preset.slot]]
+slot = "play"
+shape = "Button"
+[[preset.slot]]
+slot = "cue"
+shape = "Button"
+[[preset.slot]]
+slot = "sync"
+shape = "Button"
+[[preset.slot]]
+slot = "keylock"
+shape = "Button"
+
+[[preset.mode]]
+name = "default"
+[[preset.mode.bind]]
+slot = "play"
+action = "play"
+[[preset.mode.bind]]
+slot = "cue"
+action = "cue"
+[[preset.mode.bind]]
+slot = "sync"
+action = "sync phase"
+[[preset.mode.bind]]
+slot = "keylock"
+action = "keylock toggle"

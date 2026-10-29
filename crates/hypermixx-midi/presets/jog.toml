@@ -1,0 +1,13 @@
+[[preset]]
+name = "jog"
+start = "default"
+
+[[preset.slot]]
+slot = "jog"
+shape = "JogWheel"
+
+[[preset.mode]]
+name = "default"
+[[preset.mode.bind]]
+slot = "jog"
+action = "vinyl"

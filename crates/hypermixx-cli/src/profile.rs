@@ -37,32 +37,6 @@ pub struct MidiSettings {
     pub map: Option<String>,
 }
 
-impl MidiSettings {
-    /// Reads a `[midi]`-shaped table. Used both for the inline form in a profile and for a
-    /// `profile/midi.toml`.
-    fn from_table(table: &toml::value::Table, dir: &Path) -> Result<(Self, Vec<String>), String> {
-        let mut settings = Self::default();
-        let mut notes = Vec::new();
-        for (key, value) in table {
-            match key.as_str() {
-                "device" | "port" => {
-                    settings.device = string_value(key, value)?.filter(|name| !name.is_empty());
-                }
-                "map" | "file" => {
-                    let path = string_value(key, value)?;
-                    settings.map = path.map(|path| resolve_against(dir, &path));
-                }
-                other => return Err(format!("unknown midi key `{other}` (device | map)")),
-            }
-        }
-        // A `map` with no `device` would never be read: say so rather than letting it look wired.
-        if settings.device.is_none() && settings.map.is_some() {
-            notes.push("`map` is set but no `device`, so no MIDI input is opened".to_owned());
-        }
-        Ok((settings, notes))
-    }
-}
-
 /// What a profile names.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Profile {
@@ -78,8 +52,8 @@ impl Profile {
     /// Parses a profile found in `dir`. Unknown sections and non-string paths are errors — a profile
     /// that quietly ignored `[mixr]` would run the default topology while looking like it had not.
     ///
-    /// `midi` may be a **path** (to a `profile/midi.toml`-shaped file) or a **table** (the same keys
-    /// inline); both are read here so the two spellings cannot drift.
+    /// `midi` is a **path** to a map file. The device lives in that map's `[meta].device`; there is
+    /// no second settings shape to keep in step.
     pub fn from_toml_str(text: &str, dir: &Path) -> Result<(Self, Vec<String>), String> {
         let value: toml::Value = toml::from_str(text).map_err(|err| err.to_string())?;
         let table = value
@@ -98,12 +72,13 @@ impl Profile {
                         profile.midi = settings;
                         notes.extend(midi_notes);
                     }
-                    toml::Value::Table(table) => {
-                        let (settings, midi_notes) = MidiSettings::from_table(table, dir)?;
-                        profile.midi = settings;
-                        notes.extend(midi_notes);
+                    toml::Value::Table(_) => {
+                        return Err(
+                            "inline `[midi]` is no longer supported; point `midi` at a map file                              (the device lives in that file's `[meta].device`)"
+                                .to_owned(),
+                        )
                     }
-                    _ => return Err("`midi` must be a file path or a table".to_owned()),
+                    _ => return Err("`midi` must be a map file path".to_owned()),
                 },
                 "preference" => {
                     // Reserved. An empty table is exactly what an unimplemented section looks like.
@@ -137,31 +112,38 @@ pub fn load(path: &str) -> Result<(Profile, Vec<String>), String> {
     Profile::from_toml_str(&text, &dir).map_err(|err| format!("{path}: {err}"))
 }
 
-/// Reads a `profile/midi.toml`-shaped file.
+/// Reads a `profile/midi.toml`-shaped map file.
 ///
-/// It is normally a table of `device` / `map`, but a **mapping file** is accepted directly as
-/// well: `[[bind]]` + optional `[meta]` is detected, validated with the same parser `--midi-map`
-/// uses, and wired as the map with no device (the operator passes `--midi <port>` or picks one in
-/// the TUI). That lets a guide session save straight to `profile/midi.toml`.
+/// There is exactly one shape: a map file (`[[unit]]`, optional `[meta]`). The device is
+/// `[meta].device`; `--midi` still overrides it. The old two-part settings table (`device` +
+/// `map`) is refused with a migration message rather than silently ignored.
 pub fn load_midi(path: &str) -> Result<(MidiSettings, Vec<String>), String> {
     let text = std::fs::read_to_string(path).map_err(|err| format!("{path}: {err}"))?;
     let value: toml::Value = toml::from_str(&text).map_err(|err| format!("{path}: {err}"))?;
     let table = value
         .as_table()
-        .ok_or_else(|| format!("{path}: a midi file is a table of settings"))?;
-    if table.contains_key("bind") {
-        hypermixx_midi::Map::from_toml_str(&text)
-            .map_err(|err| format!("{path}: {err}"))?;
-        return Ok((
-            MidiSettings {
-                device: None,
-                map: Some(path.to_owned()),
-            },
-            vec!["`map` is set but no `device`, so no MIDI input is opened until `--midi` or F2"
-                .to_owned()],
+        .ok_or_else(|| format!("{path}: a midi file must be a map table"))?;
+    if table.contains_key("device") || table.contains_key("map") {
+        return Err(format!(
+            "{path}: the old two-part midi file is no longer supported; keep one map file and put              the port in `[meta].device`"
         ));
     }
-    MidiSettings::from_table(table, &parent_dir(path)).map_err(|err| format!("{path}: {err}"))
+    let map = hypermixx_midi::Map::from_toml_str_at(&text, &parent_dir(path))
+        .map_err(|err| format!("{path}: {err}"))?;
+    let device = map.meta.as_ref().and_then(|meta| meta.device.clone());
+    let mut notes = Vec::new();
+    if device.is_none() {
+        notes.push(
+            "`[meta].device` is not set; no MIDI input is opened until `--midi` or F2".to_owned(),
+        );
+    }
+    Ok((
+        MidiSettings {
+            device,
+            map: Some(path.to_owned()),
+        },
+        notes,
+    ))
 }
 
 /// Where `--profile <arg>` points: a bare name is a file in the `profile/` folder, anything that
@@ -252,28 +234,27 @@ mod tests {
     }
 
     #[test]
-    fn midi_is_either_a_file_or_an_inline_table() {
-        // Inline.
-        let (profile, notes) = parse(
-            r#"
-            [midi]
-            device = "DDJ-400"
-            map = "../midi-map.toml"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(profile.midi.device.as_deref(), Some("DDJ-400"));
-        assert_eq!(profile.midi.map.as_deref(), Some("profile/../midi-map.toml"));
-        assert!(notes.is_empty());
+    fn midi_is_a_map_file_only() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let map = root.join(DEFAULT_MIDI);
+        let text = format!("midi = \"{}\"\n", map.display());
+        let (profile, notes) = parse(&text).unwrap();
+        assert_eq!(profile.midi.device, None, "the shipped map names no device");
+        assert!(
+            profile
+                .midi
+                .map
+                .as_deref()
+                .is_some_and(|path| path.ends_with("profile/midi.toml"))
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("device")),
+            "the missing device is reported: {notes:?}"
+        );
 
-        // A map with no device would never be read, and says so.
-        let (profile, notes) = parse("[midi]\nmap = \"m.toml\"\n").unwrap();
-        assert_eq!(profile.midi.device, None);
-        assert_eq!(notes.len(), 1, "{notes:?}");
-
-        // `port` is the spelling `--midi`'s help uses, so it is accepted too.
-        let (profile, _) = parse("[midi]\nport = \"2\"\n").unwrap();
-        assert_eq!(profile.midi.device.as_deref(), Some("2"), "an index is a device name here");
+        // The old inline settings table is refused with a migration message.
+        let error = parse("[midi]\ndevice = \"DDJ-400\"\nmap = \"m.toml\"\n").unwrap_err();
+        assert!(error.contains("inline") && error.contains("map file"), "{error}");
     }
 
     #[test]
@@ -301,7 +282,9 @@ mod tests {
         // A section header where a path belongs gets a message about the spelling, not about types.
         let err = parse("[mixer]\nfile = \"x\"\n").unwrap_err();
         assert!(err.contains("mixer") && err.contains("section"), "{err}");
-        assert!(parse("[midi]\nportt = \"1\"\n").unwrap_err().contains("portt"));
+        assert!(parse("[midi]\nportt = \"1\"\n")
+            .unwrap_err()
+            .contains("inline"));
         assert!(parse("midi = 3\n").unwrap_err().contains("midi"));
     }
 
@@ -322,10 +305,8 @@ mod tests {
         let (profile, notes) =
             load(&profile_path.to_string_lossy()).expect("the shipped profile parses");
         assert!(
-            notes
-                .iter()
-                .all(|note| note.contains("map") && note.contains("device")),
-            "the only note is that the map needs a port: {notes:?}"
+            notes.iter().all(|note| note.contains("device")),
+            "the only note is that the map names no port: {notes:?}"
         );
         assert_eq!(profile.midi.device, None, "no controller is assumed");
         assert!(
@@ -349,11 +330,48 @@ mod tests {
         let (named, notes) =
             load(&root.join("profile/example.toml").to_string_lossy()).expect("parses");
         assert!(
-            notes
-                .iter()
-                .all(|note| note.contains("map") && note.contains("device")),
+            notes.iter().all(|note| note.contains("device")),
             "{notes:?}"
         );
         assert!(Path::new(&named.mixer.expect("names a mixer")).exists());
     }
+    #[test]
+    fn a_map_file_carries_its_device_and_old_shapes_are_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "hypermixx-midi-profile-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("midi.toml");
+        std::fs::write(
+            &path,
+            r#"
+[meta]
+device = "DDJ-400"
+
+[[unit]]
+id = "u"
+deck = 1
+[[unit.mode]]
+name = "m"
+"#,
+        )
+        .unwrap();
+        let (settings, notes) = load_midi(&path.display().to_string()).unwrap();
+        assert_eq!(settings.device.as_deref(), Some("DDJ-400"));
+        assert!(settings.map.is_some());
+        assert!(notes.is_empty());
+
+        std::fs::write(
+            &path,
+            r#"device = "DDJ-400"
+map = "m.toml"
+"#,
+        )
+        .unwrap();
+        let error = load_midi(&path.display().to_string()).unwrap_err();
+        assert!(error.contains("two-part"), "{error}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
 }

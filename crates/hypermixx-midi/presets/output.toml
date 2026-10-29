@@ -1,0 +1,20 @@
+[[preset]]
+name = "output"
+global = true
+start = "default"
+
+[[preset.slot]]
+slot = "master"
+shape = "Knob"
+[[preset.slot]]
+slot = "cue"
+shape = "Knob"
+
+[[preset.mode]]
+name = "default"
+[[preset.mode.bind]]
+slot = "master"
+action = "fader master"
+[[preset.mode.bind]]
+slot = "cue"
+action = "fader cue"

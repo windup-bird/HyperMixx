@@ -473,6 +473,16 @@ impl Deck {
         self.set_profile(profile);
     }
 
+    /// Flips keylock in the engine. A single pad maps to this so the front-end never has to infer
+    /// the current profile from a state snapshot.
+    pub fn toggle_keylock(&mut self) {
+        let next = match self.keylock_mode() {
+            KeylockMode::On => KeylockMode::Off,
+            KeylockMode::Off => KeylockMode::On,
+        };
+        self.set_keylock_mode(next);
+    }
+
     pub fn is_playing(&self) -> bool {
         self.playing_flag.load(Ordering::Relaxed)
     }
@@ -3109,4 +3119,14 @@ mod tests {
         }
         assert!(deck.shadow.as_ref().is_some_and(|s| s.slip));
     }
+    #[test]
+    fn keylock_toggles_between_on_and_off() {
+        let mut deck = Deck::new(pool(44_100));
+        assert_eq!(deck.keylock_mode(), KeylockMode::On);
+        deck.toggle_keylock();
+        assert_eq!(deck.keylock_mode(), KeylockMode::Off);
+        deck.toggle_keylock();
+        assert_eq!(deck.keylock_mode(), KeylockMode::On);
+    }
+
 }

@@ -23,6 +23,7 @@ use hypermixx_core::{
 };
 use hypermixx_library::LibraryDb;
 use hypermixx_media::ChunkedStreams;
+use hypermixx_midi::{RouterCommand, RouterState};
 
 use crate::notices::{self, NoticeTx};
 use crate::response::{fx_help_text, help_text};
@@ -163,6 +164,10 @@ pub struct Dispatcher {
     separations: Cancellations,
     /// The library cache, when `main` could open it. `library ...` commands are front-end-owned.
     library: Option<Arc<LibraryDb>>,
+    /// The live MIDI router's command channel, set by whichever front-end attached an input.
+    midi_control: Arc<Mutex<Option<Sender<RouterCommand>>>>,
+    /// The router's latest mode snapshot, read by `midi mode` and the TUI header.
+    midi_state: Arc<Mutex<Option<Arc<Mutex<RouterState>>>>>,
 }
 
 /// The separations a front-end has running. A plain `Mutex<HashMap>`: it is touched twice per job,
@@ -182,7 +187,36 @@ impl Dispatcher {
             slots: Arc::new(SlotBook::default()),
             separations: Arc::new(Mutex::new(HashMap::new())),
             library: None,
+            midi_control: Arc::new(Mutex::new(None)),
+            midi_state: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Installs the live MIDI router's channels. Called after `attach` succeeds; a later attach
+    /// replaces them, which is what an F2/F3 reconnect does.
+    pub fn set_midi(&self, control: Sender<RouterCommand>, state: Arc<Mutex<RouterState>>) {
+        if let Ok(mut slot) = self.midi_control.lock() {
+            *slot = Some(control);
+        }
+        if let Ok(mut slot) = self.midi_state.lock() {
+            *slot = Some(state);
+        }
+    }
+
+    /// The MIDI mode sender, if an input is attached.
+    pub fn midi_control(&self) -> Option<Sender<RouterCommand>> {
+        self.midi_control
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    /// The current MIDI mode snapshot, if an input is attached.
+    pub fn midi_state(&self) -> Option<Arc<Mutex<RouterState>>> {
+        self.midi_state
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 
     /// Attaches the library cache for the `library` command family.
@@ -397,11 +431,13 @@ pub fn dispatch(
                 _ => Action::Failed("usage: [deck] temporange <0..1> (0.1 = ±10%)".into()),
             }
         }),
-        "keylock" => with_deck(target, "keylock", |deck_id| {
-            match words.next().and_then(KeylockMode::parse) {
+        "keylock" => with_deck(target, "keylock", |deck_id| match words.next() {
+            Some("toggle") => send(command_tx, Command::ToggleKeylock { deck_id }),
+            Some(token) => match KeylockMode::parse(token) {
                 Some(mode) => send(command_tx, Command::SetKeylock { deck_id, mode }),
-                None => Action::Failed("usage: [deck] keylock on|off".into()),
-            }
+                None => Action::Failed("usage: [deck] keylock on|off|toggle".into()),
+            },
+            None => Action::Failed("usage: [deck] keylock on|off|toggle".into()),
         }),
         "key" => with_deck(target, "key", |deck_id| {
             match words.next().map(str::parse::<i32>) {
@@ -447,7 +483,7 @@ pub fn dispatch(
         "mixer" => mixer_command(&mut words, dispatcher),
         "live" => live_command(&mut words, dispatcher),
         "profile" => profile_command(&mut words, dispatcher),
-        "midi" => midi_command(&mut words),
+        "midi" => midi_command(&mut words, dispatcher),
         "help" | "h" | "?" => Action::Message(help_text(decks)),
         "quit" | "exit" => Action::Quit,
         other => Action::Failed(format!("unknown command `{other}` — `help` lists them")),
@@ -473,6 +509,15 @@ fn fader_command<'a>(
     let Some(raw) = words.next() else {
         return Action::Failed(usage.into());
     };
+    // `fader cuesend toggle` is the one latch in the fader family: a per-channel cue listen
+    // button, not a position. The engine flips it so the value cannot disagree with the knob.
+    if matches!(stage, "cuesend" | "cue_send") && raw.eq_ignore_ascii_case("toggle") {
+        let deck_id = match deck_only(target) {
+            Ok(deck_id) => deck_id,
+            Err(_) => return Action::Failed("`fader cuesend toggle` needs a deck".into()),
+        };
+        return send(command_tx, Command::ToggleCueSend { deck_id });
+    }
     let value = match raw.parse::<f32>() {
         Ok(value) if value.is_finite() => value,
         _ => return Action::Failed(format!("the position must be a number, got `{raw}`")),
@@ -822,9 +867,12 @@ fn output_command<'a>(
     send(command_tx, Command::Output { op })
 }
 
-/// The `midi` family. Only port listing lands here: opening an input happens at launch
-/// (`--midi`), because a mapping is wired to the running engine once, not toggled mid-session.
-fn midi_command<'a>(words: &mut impl Iterator<Item = &'a str>) -> Action {
+/// The `midi` family: port listing and the live unit-mode controls. Opening an input still happens
+/// at launch (or F2), because a mapping is wired to the running engine once.
+fn midi_command<'a>(
+    words: &mut impl Iterator<Item = &'a str>,
+    dispatcher: &Dispatcher,
+) -> Action {
     match words.next() {
         Some("ports") | Some("list") => match hypermixx_midi::list_ports() {
             Ok(ports) if ports.is_empty() => Action::Message("midi: no input ports".into()),
@@ -837,7 +885,79 @@ fn midi_command<'a>(words: &mut impl Iterator<Item = &'a str>) -> Action {
             }
             Err(err) => Action::Failed(format!("midi: {err}")),
         },
-        _ => Action::Message("usage: midi ports".into()),
+        Some("mode") | Some("modes") => midi_mode(words, dispatcher),
+        _ => Action::Message("usage: midi ports | midi mode [unit [mode|next]]".into()),
+    }
+}
+
+/// `midi mode` lists every unit, `midi mode <unit>` shows one, and `midi mode <unit> <mode|next>`
+/// changes it. The router is the authority; the snapshot is only used for validation and listing.
+fn midi_mode<'a>(
+    words: &mut impl Iterator<Item = &'a str>,
+    dispatcher: &Dispatcher,
+) -> Action {
+    let Some(state) = dispatcher.midi_state() else {
+        return Action::Failed("midi: no input attached".into());
+    };
+    let snapshot = state
+        .lock()
+        .map(|snapshot| snapshot.clone())
+        .unwrap_or_default();
+    let Some(unit) = words.next() else {
+        if snapshot.units.is_empty() {
+            return Action::Message("midi: no units in the attached map".into());
+        }
+        let mut text = String::from("midi modes:");
+        for unit in &snapshot.units {
+            let deck = unit
+                .deck
+                .map_or_else(|| "global".to_owned(), |deck| format!("deck{deck}"));
+            text.push_str(&format!(
+                "\n  {}  [{deck}]  {}  ({})",
+                unit.id,
+                unit.current,
+                unit.modes.join(" | ")
+            ));
+        }
+        return Action::Message(text);
+    };
+    let Some(current) = snapshot.units.iter().find(|candidate| candidate.id == unit) else {
+        return Action::Failed(format!("midi: unknown unit `{unit}`"));
+    };
+    let Some(target) = words.next() else {
+        return Action::Message(format!(
+            "midi: {} -> {}  [{}]",
+            current.id,
+            current.current,
+            current.modes.join(" | ")
+        ));
+    };
+    let Some(control) = dispatcher.midi_control() else {
+        return Action::Failed("midi: no input attached".into());
+    };
+    let next = target.eq_ignore_ascii_case("next");
+    let command = if next {
+        RouterCommand::NextMode {
+            unit: unit.to_owned(),
+        }
+    } else {
+        if !current.modes.iter().any(|mode| mode == target) {
+            return Action::Failed(format!(
+                "midi: unit `{unit}` has no mode `{target}` (try: {})",
+                current.modes.join(" | ")
+            ));
+        }
+        RouterCommand::SetMode {
+            unit: unit.to_owned(),
+            mode: target.to_owned(),
+        }
+    };
+    match control.send(command) {
+        Ok(()) => Action::Message(format!(
+            "midi: {unit} -> {}",
+            if next { "next" } else { target }
+        )),
+        Err(_) => Action::Failed("midi: the input thread is not running".into()),
     }
 }
 
@@ -2263,6 +2383,60 @@ mod tests {
     /// The live file is TOML with this machine's settings; a typo is an error, a wild value is
     /// clamped, and the shipped file parses.
     #[test]
+    fn the_fader_cuesend_latch_parses_as_a_toggle() {
+        let (tx, rx) = unbounded();
+        let mut words = "cuesend toggle".split_whitespace();
+        assert!(matches!(
+            fader_command(&mut words, Target::Deck(1), &tx),
+            Action::Continue
+        ));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            Command::ToggleCueSend { deck_id: 1 }
+        ));
+    }
+
+    #[test]
+    fn midi_mode_lists_and_switches_units_through_the_dispatcher() {
+        let (command_tx, _command_rx) = unbounded();
+        let (notice_tx, _notice_rx) = unbounded();
+        let dispatcher = Dispatcher::new(command_tx, notice_tx);
+        let state = Arc::new(Mutex::new(hypermixx_midi::RouterState {
+            units: vec![hypermixx_midi::UnitModeState {
+                id: "deck0.pad".to_owned(),
+                deck: Some(0),
+                current: "hotcue".to_owned(),
+                modes: vec!["hotcue".to_owned(), "loop".to_owned()],
+            }],
+        }));
+        let (control_tx, control_rx) = unbounded();
+        dispatcher.set_midi(control_tx, state);
+
+        let mut words = "mode".split_whitespace();
+        let Action::Message(text) = midi_command(&mut words, &dispatcher) else {
+            panic!("`midi mode` should list units");
+        };
+        assert!(text.contains("deck0.pad"), "{text}");
+        assert!(text.contains("hotcue"), "{text}");
+
+        let mut words = "mode deck0.pad loop".split_whitespace();
+        assert!(matches!(
+            midi_command(&mut words, &dispatcher),
+            Action::Message(_)
+        ));
+        assert!(matches!(
+            control_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            RouterCommand::SetMode { unit, mode } if unit == "deck0.pad" && mode == "loop"
+        ));
+
+        let mut words = "mode deck0.pad missing".split_whitespace();
+        assert!(matches!(
+            midi_command(&mut words, &dispatcher),
+            Action::Failed(_)
+        ));
+    }
+
+    #[test]
     fn live_settings_parse_and_report() {
         let path = std::env::temp_dir().join("hypermixx-live-test.toml");
         std::fs::write(&path, "[audio]\nsample_rate = 48000\nring_frames = 99\n").unwrap();
@@ -2347,6 +2521,7 @@ mod tests {
                 "play" => "play",
                 "cue" => "cue",
                 "vinyl" => "vinyl",
+                "vinyl slip" => "vinyl slip",
                 "beatjump" => "beatjump 4",
                 "fader flow" => "fader flow -0.5",
                 "vocals fader" => "vocals fader -0.5",
@@ -2355,10 +2530,13 @@ mod tests {
                 "fader deck" => "fader deck -0.5",
                 "fader gain" => "fader gain 1.0",
                 "fader cuesend" => "fader cuesend 0.5",
+                "fader cuesend toggle" => "fader cuesend toggle",
                 "fader cross" => "fader cross -1.0",
                 "fader master" => "fader master 0",
                 "fader cue" => "fader cue 0",
                 "tempofader" => "tempofader 0.5",
+                "keylock" => "keylock on",
+                "key" => "key 1",
                 "nudge" => "nudge 0.04 0.5",
                 "loop in" => "loop in",
                 "loop out" => "loop out",
@@ -2414,6 +2592,17 @@ mod tests {
             {
                 panic!("`{full}` failed: {message}");
             }
+        }
+        // The keylock registry row takes `on|off|toggle`; the loop above only exercises `on`.
+        if let Action::Failed(message) = dispatch(
+            "deck0 keylock toggle",
+            &dispatcher,
+            &pipeline,
+            Backend::Auto,
+            2,
+            0,
+        ) {
+            panic!("`deck0 keylock toggle` failed: {message}");
         }
     }
 

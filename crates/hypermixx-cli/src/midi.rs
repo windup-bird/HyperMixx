@@ -4,25 +4,31 @@
 //!
 //! ```text
 //! midir callback (owned by hypermixx_midi::ports)
-//!   └─ Received ─► translator thread (this module) ─► MergeBuffer ─► command_tx
+//!   └─ Received ─► translator thread (this module) ─► Router ─► MergeBuffer ─► command_tx
+//!                       ▲
+//!                       └─ RouterCommand (mode changes from the UI)
 //! ```
 //!
-//! The translator is where the pure [`hypermixx_midi`] logic meets the live engine: it owns the
-//! [`TranslateState`] and coalesces a fast sweep's intermediate values before they reach the
-//! producer. Keeping it here means the midi crate stays engine-agnostic (it only knows `Command`),
-//! and the CLI owns thread lifetime.
+//! The translator is where the pure [`hypermixx_midi`] router meets the live engine: it owns the
+//! [`Router`], publishes mode snapshots for the TUI, and coalesces a fast sweep's intermediate
+//! values before they reach the producer. Keeping this here means the midi crate stays
+//! engine-agnostic (it only knows `Command`), and the CLI owns thread lifetime.
 //!
 //! FX bindings are resolved from *names* to slot indices before the translator starts, by asking
 //! the engine with `ListFx`. A binding whose slot cannot be found is skipped rather than sent as a
 //! bogus index.
 
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, Sender};
 use hypermixx_core::{BrowserAction, Command, CommandResponse, FxChainId};
 use hypermixx_midi::map::Action;
-use hypermixx_midi::{ports, translate_split, Input, Map, MergeBuffer, Received, TranslateState};
+use hypermixx_midi::{
+    ports, Input, Map, MergeBuffer, Received, Router, RouterCommand, RouterState,
+};
 
 use crate::notices::{self, NoticeTx};
 
@@ -42,6 +48,8 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct MidiSession {
     input: Option<Input>,
     translator: Option<JoinHandle<()>>,
+    control: Sender<RouterCommand>,
+    state: Arc<Mutex<RouterState>>,
 }
 
 impl Drop for MidiSession {
@@ -53,10 +61,28 @@ impl Drop for MidiSession {
     }
 }
 
+impl MidiSession {
+    /// A sender for mode changes. Cloned by the dispatcher so `midi mode` can reach the router.
+    pub fn control(&self) -> Sender<RouterCommand> {
+        self.control.clone()
+    }
+
+    /// The latest mode snapshot. The TUI reads it on every draw; a missing lock just means a
+    /// frame is skipped.
+    pub fn state(&self) -> Arc<Mutex<RouterState>> {
+        self.state.clone()
+    }
+}
+
 /// Reads and parses a map file. FX-name resolution is the caller's job (see [`resolve_with`]).
 pub fn read_map(map_path: &str) -> Result<Map, String> {
-    let text = std::fs::read_to_string(map_path).map_err(|err| format!("{map_path}: {err}"))?;
-    Map::from_toml_str(&text).map_err(|err| format!("{map_path}: {err}"))
+    let text =
+        std::fs::read_to_string(map_path).map_err(|err| format!("{map_path}: {err}"))?;
+    let base = Path::new(map_path)
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Map::from_toml_str_at(&text, base).map_err(|err| format!("{map_path}: {err}"))
 }
 
 /// Opens `port` and starts translating `map`.
@@ -73,15 +99,30 @@ pub fn attach(
     browser_tx: Option<Sender<BrowserAction>>,
 ) -> Result<MidiSession, String> {
     let (received_tx, received_rx) = crossbeam_channel::unbounded();
+    let (control_tx, control_rx) = crossbeam_channel::unbounded();
+    let router = Router::new(map);
+    let state = Arc::new(Mutex::new(router.snapshot()));
     let input = ports::open(port, received_tx).map_err(|err| format!("midi: {err}"))?;
     let translator_command_tx = command_tx.clone();
+    let translator_state = state.clone();
     let translator = std::thread::Builder::new()
         .name("midi-translate".to_owned())
-        .spawn(move || pump(received_rx, map, translator_command_tx, browser_tx))
+        .spawn(move || {
+            pump(
+                received_rx,
+                control_rx,
+                router,
+                translator_command_tx,
+                browser_tx,
+                translator_state,
+            )
+        })
         .map_err(|err| format!("midi thread: {err}"))?;
     Ok(MidiSession {
         input: Some(input),
         translator: Some(translator),
+        control: control_tx,
+        state,
     })
 }
 
@@ -118,46 +159,72 @@ pub fn report_unresolved(notices: &NoticeTx, unresolved: Vec<String>) {
     }
 }
 
-/// Drains events, translating them and flushing coalesced commands on a 1 ms cadence.
-///
-/// The elapsed-time check (rather than a bare blocking timeout) is what keeps a sustained event
-/// stream from starving the flush: if events arrive faster than the timeout, the loop still flushes
-/// once a millisecond has passed.
+/// Drains events and front-end commands, forwarding translated commands on a 1 ms cadence.
 fn pump(
     received: Receiver<Received>,
-    map: Map,
+    control: Receiver<RouterCommand>,
+    mut router: Router,
     command_tx: Sender<Command>,
     browser_tx: Option<Sender<BrowserAction>>,
+    state: Arc<Mutex<RouterState>>,
 ) {
-    let mut state = TranslateState::new(&map);
     let mut merge = MergeBuffer::new();
     let mut last_flush = Instant::now();
     loop {
-        match received.recv_timeout(FLUSH_EVERY) {
-            Ok(received) => {
-                let (commands, browser) = translate_split(&map, &received.event, &mut state);
-                for command in commands {
-                    merge.push(command);
-                }
-                if let Some(browser_tx) = &browser_tx {
-                    for action in browser {
-                        let _ = browser_tx.send(action);
+        crossbeam_channel::select! {
+            recv(received) -> message => match message {
+                Ok(received) => {
+                    let feed = router.feed(&received.event);
+                    for command in feed.commands {
+                        merge.push(command);
+                    }
+                    if let Some(browser_tx) = &browser_tx {
+                        for action in feed.browser {
+                            let _ = browser_tx.send(action);
+                        }
+                    }
+                    if feed.state_changed {
+                        publish(&state, &router);
+                    }
+                    if last_flush.elapsed() >= FLUSH_EVERY {
+                        flush(&mut merge, &command_tx);
+                        last_flush = Instant::now();
                     }
                 }
-                if last_flush.elapsed() >= FLUSH_EVERY {
+                Err(_) => {
+                    flush(&mut merge, &command_tx);
+                    return;
+                }
+            },
+            recv(control) -> message => match message {
+                Ok(command) => {
+                    let changed = router.command(command).unwrap_or(false);
+                    if changed {
+                        publish(&state, &router);
+                    }
+                    // A mode switch can change which target a held sweep belongs to; flush what
+                    // was already valid before the new mode's events arrive.
                     flush(&mut merge, &command_tx);
                     last_flush = Instant::now();
                 }
-            }
-            Err(RecvTimeoutError::Timeout) => {
+                // The dispatcher is gone (the front-end is shutting down). Leaving a disconnected
+                // channel in the select would spin; stop the translator.
+                Err(_) => {
+                    flush(&mut merge, &command_tx);
+                    return;
+                }
+            },
+            default(FLUSH_EVERY) => {
                 flush(&mut merge, &command_tx);
                 last_flush = Instant::now();
             }
-            Err(RecvTimeoutError::Disconnected) => {
-                flush(&mut merge, &command_tx);
-                return;
-            }
         }
+    }
+}
+
+fn publish(state: &Arc<Mutex<RouterState>>, router: &Router) {
+    if let Ok(mut slot) = state.lock() {
+        *slot = router.snapshot();
     }
 }
 
@@ -179,18 +246,20 @@ pub fn resolve_with(
     map: &mut Map,
     lookup: impl Fn(FxChainId, &str) -> Option<usize>,
 ) -> Vec<String> {
-    // Collect first so the immutable borrow of `map` ends before `resolve_fx` mutates it.
-    let wanted: Vec<(FxChainId, String)> = map
-        .binds
-        .iter()
-        .filter_map(|bind| match &bind.action {
-            Action::Fx(action) => {
-                let (chain, fx) = action.address();
-                Some((chain, fx.to_owned()))
+    let mut wanted: Vec<(FxChainId, String)> = Vec::new();
+    for unit in &map.units {
+        for mode in &unit.modes {
+            for bind in mode.binds.iter().flatten() {
+                if let Action::Fx(action) = &bind.action {
+                    let (chain, fx) = action.address();
+                    let pair = (chain, fx.to_owned());
+                    if !wanted.contains(&pair) {
+                        wanted.push(pair);
+                    }
+                }
             }
-            _ => None,
-        })
-        .collect();
+        }
+    }
     let mut unresolved = Vec::new();
     for (chain, name) in wanted {
         match lookup(chain, &name) {
@@ -244,75 +313,94 @@ mod tests {
     use hypermixx_midi::{Event, Received};
     use std::time::SystemTime;
 
-    /// The CLI's pump, fed synthetic events, must turn a bound CC into an engine command. This is
+    /// The CLI's pump, fed synthetic events, must turn a bound pad into an engine command. This is
     /// the seam the unit tests in `hypermixx-midi` cannot cover: the translator's thread, its
     /// coalescing cadence and the command channel.
     #[test]
-    fn the_translator_forwards_a_bound_cc_as_a_command() {
+    fn the_translator_forwards_a_bound_pad_as_a_command() {
         let map = Map::from_toml_str(
             r#"
-[[bind]]
-type = "cc"
-mode = "abs"
-id = 7
-deck = 0
-action = "fader.flow"
+[[unit]]
+id = "deck0.pad"
+deck = 1
+
+[[unit.control]]
+slot = "pad"
+type = "note"
+channel = 0
+id = 48
+
+[[unit.mode]]
+name = "m"
+[[unit.mode.bind]]
+slot = "pad"
+action = "play"
 "#,
         )
         .unwrap();
         let (received_tx, received_rx) = crossbeam_channel::unbounded();
+        let (_control_tx, control_rx) = crossbeam_channel::unbounded();
         let (command_tx, command_rx) = crossbeam_channel::unbounded();
-        let translator = std::thread::spawn(move || pump(received_rx, map, command_tx, None));
+        let router = Router::new(map);
+        let state = Arc::new(Mutex::new(router.snapshot()));
+        let translator = std::thread::spawn(move || {
+            pump(received_rx, control_rx, router, command_tx, None, state)
+        });
 
         let at = SystemTime::now();
-        // Centre takes over unity, then full deflection: the sweep must arrive as one final value.
-        for value in [64, 80, 100, 127] {
-            received_tx
-                .send(Received {
-                    at,
-                    event: Event::ControlChange {
-                        channel: 0,
-                        controller: 7,
-                        value,
-                    },
-                })
-                .unwrap();
-        }
+        received_tx
+            .send(Received {
+                at,
+                event: Event::NoteOn {
+                    channel: 0,
+                    key: 48,
+                    velocity: 100,
+                },
+            })
+            .unwrap();
 
         let command = command_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("the translator should flush a command");
-        match command {
-            Command::SetFader { value, .. } => {
-                assert!(value > 0.9, "expected the final value, got {value}")
-            }
-            other => panic!("expected SetFader, got {other:?}"),
-        }
+        assert!(matches!(command, Command::TogglePlay { deck_id: 0 }));
 
         // Dropping the event sender closes the channel; the translator must exit rather than hang.
         drop(received_tx);
         translator.join().unwrap();
     }
 
-    /// `resolve_with` is the engine-free path the TUI uses; it must fill names from a lookup and
-    /// report the ones it could not find.
+    /// `resolve_with` is the engine-free path the TUI uses; it must walk every mode's bindings, fill
+    /// names from a lookup and report the ones it could not find.
     #[test]
     fn resolve_with_fills_names_and_reports_misses() {
         let mut map = Map::from_toml_str(
             r#"
-[[bind]]
+[[unit]]
+id = "deck0.mixer"
+deck = 1
+
+[[unit.control]]
+slot = "low"
 type = "cc"
+channel = 0
 id = 20
-action = "fx.param"
-chain = "deck0"
+
+[[unit.control]]
+slot = "mid"
+type = "cc"
+channel = 0
+id = 21
+
+[[unit.mode]]
+name = "m"
+[[unit.mode.bind]]
+slot = "low"
+action = "fx param"
 fx = "filter"
 param = "value"
-
-[[bind]]
-type = "cc"
-id = 21
-action = "fx.param"
-chain = "master"
+[[unit.mode.bind]]
+slot = "mid"
+action = "fx param"
 fx = "missing"
 param = "value"
 "#,
@@ -323,6 +411,6 @@ param = "value"
             (candidate == chain && name == "filter").then_some(2)
         });
         assert_eq!(map.fx_slot(chain, "filter"), Some(2));
-        assert_eq!(unresolved, vec!["master/missing".to_owned()]);
+        assert_eq!(unresolved, vec!["deck0/missing".to_owned()]);
     }
 }

@@ -23,7 +23,7 @@ pub struct ArgSpec {
 /// One verb of the grammar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActionSpec {
-    /// The command line without its target, exactly as a `[[bind]]`'s `action` writes it.
+    /// The command line without its target, exactly as a unit mode binding's `action` writes it.
     pub name: &'static str,
     /// Whether the verb needs a target. `false` means it is global (`fader master`, `state`), or
     /// that it addresses something the line itself names.
@@ -69,6 +69,13 @@ pub const ACTIONS: &[ActionSpec] = &[
         momentary: true,
         args: &[arg("frames_per_tick", false, "frames")],
         doc: "platter: a note is the touch, a relative CC is the wheel",
+    },
+    ActionSpec {
+        name: "vinyl slip",
+        deck: true,
+        momentary: false,
+        args: &[],
+        doc: "arm the next platter touch as a slip scratch",
     },
     ActionSpec {
         name: "hotcue",
@@ -137,6 +144,13 @@ pub const ACTIONS: &[ActionSpec] = &[
         doc: "how much of the channel reaches the cue bus",
     },
     ActionSpec {
+        name: "fader cuesend toggle",
+        deck: true,
+        momentary: false,
+        args: &[],
+        doc: "latch one channel's cue send between off and full",
+    },
+    ActionSpec {
         name: "fader cross",
         deck: false,
         momentary: false,
@@ -163,6 +177,20 @@ pub const ACTIONS: &[ActionSpec] = &[
         momentary: false,
         args: &[],
         doc: "the pitch fader position (the deck applies its own range)",
+    },
+    ActionSpec {
+        name: "keylock",
+        deck: true,
+        momentary: false,
+        args: &[arg("on|off|toggle", false, "the keylock profile")],
+        doc: "switch keylock, or flip it",
+    },
+    ActionSpec {
+        name: "key",
+        deck: true,
+        momentary: false,
+        args: &[arg("semitones", true, "a signed whole number")],
+        doc: "pitch shift in semitones (placeholder)",
     },
     ActionSpec {
         name: "nudge",

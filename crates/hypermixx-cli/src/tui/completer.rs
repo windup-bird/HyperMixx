@@ -71,6 +71,7 @@ const VERBS: &[(&str, &str)] = &[
         "machine settings: engine rate, ring sizes, stem defaults",
     ),
     ("profile", "which files this session runs with; switch them"),
+    ("midi", "MIDI ports and live unit modes"),
     ("browser", "sources: list / refresh / tracks / show"),
     ("state", "show decks"),
     ("zoom", "waveform zoom"),
@@ -279,9 +280,22 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
                 Vec::new()
             }
         }
+        "midi" => {
+            if rest.len() == 1 {
+                pairs(
+                    &[
+                        ("ports", "list MIDI input ports"),
+                        ("mode", "list units or switch a unit's mode"),
+                    ],
+                    partial,
+                )
+            } else {
+                Vec::new()
+            }
+        }
         "keylock" => {
             if rest.len() == 1 {
-                pairs(&[("on", ""), ("off", "")], partial)
+                pairs(&[("on", ""), ("off", ""), ("toggle", "flip it")], partial)
             } else {
                 Vec::new()
             }
@@ -604,7 +618,7 @@ mod tests {
     #[test]
     fn keylock_names_need_no_deck() {
         let fixture = Fixture::new();
-        assert_eq!(fixture.complete("keylock ", 8), vec!["on", "off"]);
+        assert_eq!(fixture.complete("keylock ", 8), vec!["on", "off", "toggle"]);
     }
 
     #[test]

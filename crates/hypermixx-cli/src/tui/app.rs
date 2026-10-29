@@ -295,7 +295,12 @@ impl App {
     /// runs inside the UI thread, and reading the shared response channel here would swallow a
     /// `Loaded`/`States`/`Error` answer meant for the UI. On failure the reason is logged and the
     /// matching picker reopens so another choice can be made.
-    pub fn connect_midi(&mut self, command_tx: Sender<Command>, notices: &NoticeTx) {
+    pub fn connect_midi(
+        &mut self,
+        command_tx: Sender<Command>,
+        notices: &NoticeTx,
+        dispatcher: &crate::command::Dispatcher,
+    ) {
         let Some(port) = self.midi_port.clone() else {
             return;
         };
@@ -324,7 +329,9 @@ impl App {
         crate::midi::report_unresolved(notices, unresolved);
         match crate::midi::attach(&port, map, command_tx, Some(self.browser_tx.clone())) {
             Ok(session) => {
-                // Replacing the old session closes its port before the new one is held.
+                // The dispatcher is what `midi mode` talks through; install the new router's
+                // channels before replacing the old session (whose drop closes its port).
+                dispatcher.set_midi(session.control(), session.state());
                 self.midi = Some(session);
                 self.push_log(LogLine::info(format!(
                     "[midi] connected `{port}` ({map_path})"

@@ -459,6 +459,8 @@ fn route(mixer: &mut Mixer, sync: &mut SyncGroup, command: Command) -> Option<Co
         SetKeylock { deck_id, mode } => {
             transport(mixer, deck_id, move |deck| deck.set_keylock_mode(mode))
         }
+        ToggleKeylock { deck_id } => transport(mixer, deck_id, |deck| deck.toggle_keylock()),
+        ToggleCueSend { deck_id } => answered(mixer.toggle_cue_send(deck_id)),
         // The pitch axis is a placeholder: the value is remembered and reported, nothing more.
         SetKey { deck_id, semitones } => {
             transport(mixer, deck_id, move |deck| deck.set_key_shift(semitones))

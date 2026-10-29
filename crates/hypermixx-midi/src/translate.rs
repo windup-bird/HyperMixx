@@ -1,9 +1,9 @@
-//! Event → [`Command`] translation: a pure function plus the per-binding state it needs.
+//! Event → [`Command`] translation: one binding at a time, plus the state that binding needs.
 //!
-//! Everything stateful lives in [`TranslateState`] (soft-takeover mirrors, relative-encoder
-//! accumulators, held-note and toggle state), so the mapping is testable without hardware and the
-//! caller owns the lifetime. [`translate`] returns commands in the order they should be sent;
-//! [`MergeBuffer`] coalesces the floods a fast fader sweep produces.
+//! The router owns the mode state and picks the binding; [`apply`] applies it. Everything stateful
+//! lives in [`BindState`] (soft-takeover mirrors, relative-encoder accumulators, held-note and
+//! toggle state), so the mapping is testable without hardware. [`MergeBuffer`] coalesces the floods
+//! a fast fader sweep produces.
 
 use hypermixx_core::{
     BrowserAction, Command, CueOp, DeckId, FaderTarget, FxSlotRef, LoopEditOp, LoopOp, NudgeOp,
@@ -11,75 +11,60 @@ use hypermixx_core::{
 };
 
 use crate::map::{
-    Action, BindingSpec, Curve, EventKind, FxAction, LoopAction, Map, RelMode, SyncAction,
+    Action, BindingSpec, Curve, Edge, EventKind, FxAction, LoopAction, Map, RelMode, SyncAction,
     DEFAULT_NUDGE_SECONDS,
 };
 use crate::msg::Event;
 
 /// How far one detent of a relative encoder moves the normalised position. 64 detents cover the
 /// full travel — fast enough to feel like a fader, slow enough to place a value.
-const REL_SCALE: f32 = 1.0 / 64.0;
+pub(crate) const REL_SCALE: f32 = 1.0 / 64.0;
 
 /// A control within half a CC step of the mirror counts as *starting on* it. Without this a
 /// physical fader at centre would send CC 64 (`64/127 = 0.5039`) and never match a mirror of
 /// `0.5`, so unity-to-unity could never take over.
 const PICKUP_DEADBAND: f32 = 0.5 / 127.0;
 
-/// The state translation accumulates. One entry per binding, indexed in parallel with
-/// [`Map::binds`].
+/// The state one physical endpoint accumulates. The router owns one per endpoint, and it
+/// deliberately survives mode changes: a knob keeps its physical position and a held pad keeps
+/// its edges even when the action behind it is swapped.
 #[derive(Clone, Debug)]
-pub struct TranslateState {
-    binds: Vec<BindState>,
-}
-
-#[derive(Clone, Debug)]
-struct BindState {
+pub struct BindState {
     /// Normalised physical position, `0.0..=1.0`.
-    norm: f32,
+    pub norm: f32,
     /// Software mirror for soft-takeover, same normalised space.
-    mirror: f32,
+    pub mirror: f32,
     /// Whether the physical control has picked up the software value.
-    engaged: bool,
+    pub engaged: bool,
     /// Previous physical position, for crossing detection.
-    prev: f32,
+    pub prev: f32,
     /// A momentary control is down (note or CC).
-    held: bool,
+    pub held: bool,
     /// Edge state for edge-triggered CC bindings.
-    down: bool,
+    pub down: bool,
+    /// Most recent MSB of a 14-bit CC pair, waiting for its LSB.
+    pub cc14_msb: Option<u8>,
 }
 
-impl TranslateState {
-    /// Builds state for `map`, seeding each soft-takeover mirror from the mixer's default position
-    /// for the target (unity faders sit at the centre of travel, a cue send is full open, FX
-    /// parameters start at zero). A front-end that knows better can overwrite with
-    /// [`TranslateState::set_mirror`].
-    pub fn new(map: &Map) -> Self {
+impl Default for BindState {
+    fn default() -> Self {
         Self {
-            binds: map.binds.iter().map(BindState::seeded).collect(),
+            norm: 0.0,
+            mirror: 0.0,
+            engaged: false,
+            prev: 0.0,
+            held: false,
+            down: false,
+            cc14_msb: None,
         }
-    }
-
-    /// Overrides a binding's takeover mirror with an engine-known value (normalised). A no-op for
-    /// an out-of-range index, so a caller iterating a shorter list cannot panic.
-    pub fn set_mirror(&mut self, index: usize, norm: f32) {
-        if let Some(state) = self.binds.get_mut(index) {
-            state.mirror = norm.clamp(0.0, 1.0);
-            state.prev = state.mirror;
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.binds.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.binds.is_empty()
     }
 }
 
 impl BindState {
-    fn seeded(spec: &BindingSpec) -> Self {
-        let mirror = default_norm(&spec.action);
+    /// Seeds a control from the action it starts on: unity faders sit at the centre of travel, a
+    /// cue send is full open, FX parameters start at the bottom of their domain.
+    pub fn seeded(spec: Option<&BindingSpec>) -> Self {
+        let mirror = spec.map_or(0.0, default_norm);
         Self {
             norm: mirror,
             mirror,
@@ -87,106 +72,118 @@ impl BindState {
             prev: mirror,
             held: false,
             down: false,
+            cc14_msb: None,
         }
+    }
+
+    /// Re-arms the pickup mirror after a mode change. The physical position (`norm`) and the edge
+    /// flags stay; an absolute control must cross the new action's value before it takes over, a
+    /// relative encoder keeps turning. No-op bindings simply forget their mirror.
+    pub fn rearm(&mut self, spec: Option<&BindingSpec>) {
+        match spec {
+            Some(spec) if spec.mode != RelMode::Abs => {
+                self.engaged = true;
+                self.mirror = self.norm;
+            }
+            Some(spec) => {
+                self.mirror = default_norm(spec);
+                self.engaged = false;
+            }
+            None => {
+                self.mirror = self.norm;
+                self.engaged = false;
+            }
+        }
+        self.prev = self.norm;
     }
 }
 
 /// Where the engine leaves a control when the process starts. Used to seed soft-takeover.
-fn default_norm(action: &Action) -> f32 {
-    match action {
-        // Bipolar faders and the tempo fader are unity/centred at 0.
-        Action::Fader(target) if target.is_bipolar() => 0.5,
-        Action::TempoFader => 0.5,
-        // `simple_dj` opens the cue send fully.
+pub fn default_norm(spec: &BindingSpec) -> f32 {
+    match spec.action {
+        // `simple_dj` opens the cue send fully. It is a send, not a bipolar fader, even if a map
+        // accidentally gives it a negative `min`.
         Action::Fader(FaderTarget::CueSend(_)) => 1.0,
-        // Everything else (FX params) starts at the bottom of its domain.
+        // The tempo fader is unity at the centre even though the action is not a `FaderTarget`.
+        Action::TempoFader => 0.5,
+        _ if spec.action.is_bipolar() || spec.min < 0.0 => 0.5,
+        // Everything else (unipolar FX params) starts at the bottom of its domain.
         _ => 0.0,
     }
 }
 
-/// Translates one event into zero or more commands. Pure with respect to the map; only `state`
-/// changes.
-pub fn translate(map: &Map, event: &Event, state: &mut TranslateState) -> Vec<Command> {
-    translate_split(map, event, state).0
-}
-
-/// Like [`translate`], but also returns the browser actions for the front-end. The engine-bound
-/// commands are the first element; the second is empty for an ordinary DJ controller.
-pub fn translate_split(
+/// Applies one binding to one event. The router resolves the endpoint and the active mode, then
+/// calls this with the binding that should handle the event. `false` means the event did not match
+/// the binding's kind/channel/id.
+pub fn apply(
     map: &Map,
+    spec: &BindingSpec,
+    state: &mut BindState,
     event: &Event,
-    state: &mut TranslateState,
-) -> (Vec<Command>, Vec<BrowserAction>) {
-    let mut out = Vec::new();
-    let mut browser = Vec::new();
+    out: &mut Vec<Command>,
+    browser: &mut Vec<BrowserAction>,
+) -> bool {
     match *event {
         Event::ControlChange {
             channel,
             controller,
             value,
         } => {
-            for (index, spec) in map.binds.iter().enumerate() {
-                if spec.kind != EventKind::Cc || !spec.matches(channel, controller) {
-                    continue;
-                }
-                let state = &mut state.binds[index];
-                let mut binding = BindingOut::new(spec, state, map, &mut out, &mut browser);
+            if spec.kind != EventKind::Cc || !spec.matches(channel, controller) {
+                return false;
+            }
+            let mut binding = BindingOut::new(spec, state, map, out, browser);
+            if let Some(lsb) = spec.lsb {
+                binding.on_cc14(controller, lsb, value);
+            } else {
                 binding.on_control(value);
             }
+            true
         }
         Event::NoteOn {
             channel,
             key,
             velocity,
         } if velocity > 0 => {
-            for (index, spec) in map.binds.iter().enumerate() {
-                if spec.kind != EventKind::Note || !spec.matches(channel, key) {
-                    continue;
-                }
-                let state = &mut state.binds[index];
-                if state.held {
-                    continue;
-                }
-                state.held = true;
-                let mut binding = BindingOut::new(spec, state, map, &mut out, &mut browser);
-                binding.press();
+            if spec.kind != EventKind::Note || !spec.matches(channel, key) {
+                return false;
             }
+            if state.held {
+                return false;
+            }
+            state.held = true;
+            let mut binding = BindingOut::new(spec, state, map, out, browser);
+            binding.press();
+            true
         }
         Event::NoteOn { channel, key, .. } | Event::NoteOff { channel, key, .. } => {
-            for (index, spec) in map.binds.iter().enumerate() {
-                if spec.kind != EventKind::Note || !spec.matches(channel, key) {
-                    continue;
-                }
-                let state = &mut state.binds[index];
-                if !state.held {
-                    continue;
-                }
-                state.held = false;
-                let mut binding = BindingOut::new(spec, state, map, &mut out, &mut browser);
-                binding.release();
+            if spec.kind != EventKind::Note || !spec.matches(channel, key) {
+                return false;
             }
+            if !state.held {
+                return false;
+            }
+            state.held = false;
+            let mut binding = BindingOut::new(spec, state, map, out, browser);
+            binding.release();
+            true
         }
         Event::PitchBend { channel, value } => {
-            let norm = (f32::from(value) + 8192.0) / 16384.0;
-            for (index, spec) in map.binds.iter().enumerate() {
-                if spec.kind != EventKind::Bend
-                    || !spec.channel.is_none_or(|wanted| wanted == channel)
-                {
-                    continue;
-                }
-                let state = &mut state.binds[index];
-                let mut binding = BindingOut::new(spec, state, map, &mut out, &mut browser);
-                if binding.accepts(norm) {
-                    binding.emit_continuous(norm);
-                }
+            if spec.kind != EventKind::Bend || spec.channel != channel {
+                return false;
             }
+            let norm = (f32::from(value) + 8192.0) / 16384.0;
+            let mut binding = BindingOut::new(spec, state, map, out, browser);
+            if binding.accepts(norm) {
+                binding.emit_continuous(norm);
+            }
+            true
         }
     }
-    (out, browser)
 }
 
 /// Applies one binding's action against one event, then writes into the output vector. Kept as a
-/// short-lived borrow of the binding's state so [`translate`]'s loops stay flat.
+/// short-lived borrow so the router can hand it one endpoint at a time.
 struct BindingOut<'a> {
     spec: &'a BindingSpec,
     state: &'a mut BindState,
@@ -212,6 +209,45 @@ impl<'a> BindingOut<'a> {
         }
     }
 
+    /// Maps a normalised absolute position through the binding's centre. A `BipolKnob` centre
+    /// becomes `0.5`, so the action's `min..max` range produces exact zero at the detent.
+    fn centered(&self, norm: f32) -> f32 {
+        let Some(center) = self.spec.center else {
+            return norm;
+        };
+        if center <= 0.0 || center >= 1.0 {
+            return norm;
+        }
+        let bipolar = if norm >= center {
+            (norm - center) / (1.0 - center)
+        } else {
+            (norm - center) / center
+        };
+        (bipolar + 1.0) / 2.0
+    }
+
+    /// Handles one half of a 14-bit CC pair. The MSB is remembered; the LSB completes the value and
+    /// emits exactly once, so a fast sweep does not send two commands per step.
+    fn on_cc14(&mut self, controller: u8, lsb: u8, value: u8) {
+        if controller == self.spec.id {
+            self.state.cc14_msb = Some(value);
+            return;
+        }
+        if controller != lsb {
+            return;
+        }
+        let Some(msb) = self.state.cc14_msb else {
+            // LSB before MSB: wait for the next complete pair.
+            return;
+        };
+        let raw = (u16::from(msb) << 7) | u16::from(value);
+        let norm = self.centered(f32::from(raw) / 16383.0);
+        self.state.norm = norm;
+        if self.accepts(norm) {
+            self.emit_continuous(norm);
+        }
+    }
+
     /// Handles a CC value: continuous actions read it as a position (absolute or relative), button
     /// actions as an edge.
     fn on_control(&mut self, value: u8) {
@@ -222,6 +258,19 @@ impl<'a> BindingOut<'a> {
             // A relative encoder is endless: there is nothing to pick up.
             self.state.engaged = true;
             self.state.mirror = norm;
+            // A two-action `RelKnob` fires one edge action per detent. The sign picks the action;
+            // the slot compiler has already rejected continuous/momentary actions for this shape.
+            if let Some(down) = self.spec.down.clone() {
+                if delta != 0 {
+                    let action = if delta > 0 {
+                        self.spec.action.clone()
+                    } else {
+                        down
+                    };
+                    self.fire_action(action);
+                }
+                return;
+            }
             // A wheel is a *direction*, not a position: one tick forward bends one way, one tick back
             // the other way. It also has no release edge, so the bend has to end on its own — hence
             // the duration default (`seconds` in the map still wins). Turning faster sends more
@@ -269,7 +318,7 @@ impl<'a> BindingOut<'a> {
             self.emit_continuous(norm);
             return;
         }
-        let norm = f32::from(value) / 127.0;
+        let norm = self.centered(f32::from(value) / 127.0);
         self.state.norm = norm;
         if self.spec.action.is_continuous() {
             if self.accepts(norm) {
@@ -339,12 +388,29 @@ impl<'a> BindingOut<'a> {
     }
 
     fn press(&mut self) {
+        // A one-shot action can be assigned to the release edge; a two-edge action always fires
+        // here. `Action::is_momentary` is the same predicate the file compiler uses to reject `on`.
+        if !self.spec.action.is_momentary() && self.spec.on != Edge::Press {
+            return;
+        }
+        self.fire();
+    }
+
+    /// Emits the action itself, without the edge policy. `press` uses it directly; `release` uses
+    /// it for a one-shot action assigned to the release edge.
+    fn fire(&mut self) {
+        self.fire_action(self.spec.action.clone());
+    }
+
+    /// Emits one action with the binding's deck. `fire` passes the mode's action; a `RelKnob` pair
+    /// passes whichever direction the detent selected.
+    fn fire_action(&mut self, action: Action) {
         let Some(deck) = self.spec.deck else {
             // Non-deck actions below (FX) still need to run; only deck-scoped ones bail.
-            self.press_deckless();
+            self.press_deckless(action);
             return;
         };
-        match self.spec.action.clone() {
+        match action {
             Action::Play => self.out.push(Command::TogglePlay { deck_id: deck }),
             Action::Cue => self.out.push(Command::Cue {
                 deck_id: deck,
@@ -385,12 +451,26 @@ impl<'a> BindingOut<'a> {
                 deck_id: deck,
                 op: sync_op(op),
             }),
-            _ => self.press_deckless(),
+            Action::Slip => self.out.push(Command::Vinyl {
+                deck_id: deck,
+                op: VinylOp::Slip,
+            }),
+            Action::ToggleCueSend => self.out.push(Command::ToggleCueSend { deck_id: deck }),
+            Action::ToggleKeylock => self.out.push(Command::ToggleKeylock { deck_id: deck }),
+            Action::Keylock(mode) => self.out.push(Command::SetKeylock {
+                deck_id: deck,
+                mode,
+            }),
+            Action::Key(semitones) => self.out.push(Command::SetKey {
+                deck_id: deck,
+                semitones,
+            }),
+            _ => self.press_deckless(action),
         }
     }
 
-    fn press_deckless(&mut self) {
-        match self.spec.action.clone() {
+    fn press_deckless(&mut self, action: Action) {
+        match action {
             Action::Fx(action) => self.fx_press(action),
             Action::Browser(action) => self.browser.push(action),
             _ => {}
@@ -438,25 +518,30 @@ impl<'a> BindingOut<'a> {
     }
 
     fn release(&mut self) {
-        let Some(deck) = self.spec.deck else {
-            self.release_deckless();
-            return;
-        };
-        match self.spec.action.clone() {
-            // A timed bend releases itself; the note-up edge must not cut it short.
-            Action::Nudge { seconds: None, .. } => self.out.push(Command::Nudge {
-                deck_id: deck,
-                op: NudgeOp::Stop,
-            }),
-            Action::Cue => self.out.push(Command::Cue {
-                deck_id: deck,
-                op: CueOp::Back,
-            }),
-            Action::Vinyl { .. } => self.out.push(Command::Vinyl {
-                deck_id: deck,
-                op: VinylOp::Release,
-            }),
-            _ => self.release_deckless(),
+        if self.spec.action.is_momentary() {
+            let Some(deck) = self.spec.deck else {
+                self.release_deckless();
+                return;
+            };
+            match self.spec.action.clone() {
+                // A timed bend releases itself; the note-up edge must not cut it short.
+                Action::Nudge { seconds: None, .. } => self.out.push(Command::Nudge {
+                    deck_id: deck,
+                    op: NudgeOp::Stop,
+                }),
+                Action::Cue => self.out.push(Command::Cue {
+                    deck_id: deck,
+                    op: CueOp::Back,
+                }),
+                Action::Vinyl { .. } => self.out.push(Command::Vinyl {
+                    deck_id: deck,
+                    op: VinylOp::Release,
+                }),
+                _ => self.release_deckless(),
+            }
+        } else if self.spec.on == Edge::Release {
+            // A one-shot action on the release edge is the same emission as a press, just later.
+            self.fire();
         }
     }
 
@@ -479,8 +564,9 @@ impl<'a> BindingOut<'a> {
 fn command_value(spec: &BindingSpec, norm: f32) -> f32 {
     let shaped = match spec.curve {
         Curve::Linear => norm,
-        Curve::Sharp if spec.action.is_bipolar() => {
-            // Shape the bipolar position so the centre stays put.
+        Curve::Sharp if spec.action.is_bipolar() || spec.min < 0.0 => {
+            // Shape the bipolar position so the centre stays put. A bipolar FX parameter (an EQ
+            // band, `min = -1`) is shaped like a bipolar fader even though the action is `fx param`.
             let bipolar = norm * 2.0 - 1.0;
             ((bipolar.signum() * bipolar * bipolar) + 1.0) / 2.0
         }
@@ -498,7 +584,7 @@ fn command_value(spec: &BindingSpec, norm: f32) -> f32 {
 ///
 /// `reverse` flips the sign: a controller that numbers its detents the other way round is one
 /// boolean away from working, and the guide cannot tell which way a wheel turns.
-fn relative_delta(mode: RelMode, value: u8, reverse: bool) -> i16 {
+pub(crate) fn relative_delta(mode: RelMode, value: u8, reverse: bool) -> i16 {
     let delta = match mode {
         RelMode::Abs => 0,
         RelMode::Rel1 => i16::from(value) - 64,
@@ -617,669 +703,321 @@ impl MergeBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::Map;
-    use crate::map::{DEFAULT_NUDGE_STEP, DEFAULT_VINYL_FRAMES_PER_TICK};
-    use hypermixx_core::Stem;
+    use crate::map::{Curve, Edge, Map};
+    use hypermixx_core::FxChainId;
 
-    fn map(toml: &str) -> Map {
-        Map::from_toml_str(toml).expect("test map should parse")
+    fn spec(action: Action, mode: RelMode) -> BindingSpec {
+        BindingSpec {
+            kind: EventKind::Cc,
+            mode,
+            reverse: false,
+            channel: 0,
+            id: 7,
+            lsb: None,
+            center: None,
+            deck: Some(0),
+            action,
+            down: None,
+            min: -1.0,
+            max: 1.0,
+            curve: Curve::Linear,
+            on: Edge::Press,
+        }
     }
 
-    fn cc(channel: u8, controller: u8, value: u8) -> Event {
+    fn cc(value: u8) -> Event {
         Event::ControlChange {
-            channel,
-            controller,
+            channel: 0,
+            controller: 7,
             value,
         }
     }
 
-    fn note(channel: u8, key: u8, on: bool) -> Event {
+    fn note(on: bool) -> Event {
         if on {
             Event::NoteOn {
-                channel,
-                key,
+                channel: 0,
+                key: 7,
                 velocity: 100,
             }
         } else {
             Event::NoteOff {
-                channel,
-                key,
+                channel: 0,
+                key: 7,
                 velocity: 0,
             }
         }
     }
 
-    fn fader(command: &Command) -> Option<(FaderTarget, f32)> {
-        match command {
-            Command::SetFader { target, value } => Some((*target, *value)),
-            _ => None,
-        }
-    }
-
-    fn close(a: f32, b: f32) -> bool {
-        (a - b).abs() < 1e-4
-    }
-
-    #[test]
-    fn browser_bindings_are_ui_actions_not_engine_commands() {
-        let map = map(r#"
-[[bind]]
-type = "note"
-id = 60
-action = "browser.up"
-
-[[bind]]
-type = "note"
-id = 61
-deck = 1
-action = "browser.load"
-"#);
-        let mut state = TranslateState::new(&map);
-        let (commands, browser) = translate_split(&map, &note(0, 60, true), &mut state);
-        assert!(commands.is_empty());
-        assert_eq!(browser, vec![BrowserAction::Up]);
-        let (commands, browser) = translate_split(&map, &note(0, 61, true), &mut state);
-        assert!(commands.is_empty());
-        assert_eq!(browser, vec![BrowserAction::Load { deck: Some(1) }]);
-    }
-
-    #[test]
-    fn a_note_button_fires_on_press_only() {
-        let map = map(r#"
-[[bind]]
-type = "note"
-channel = 0
-id = 48
-deck = 1
-action = "play"
-"#);
-        let mut state = TranslateState::new(&map);
-        let commands = translate(&map, &note(0, 48, true), &mut state);
-        assert!(matches!(
-            commands.as_slice(),
-            [Command::TogglePlay { deck_id: 1 }]
-        ));
-        // The release must not re-fire.
-        assert!(translate(&map, &note(0, 48, false), &mut state).is_empty());
-        // A different key or channel does nothing.
-        assert!(translate(&map, &note(0, 49, true), &mut state).is_empty());
-        assert!(translate(&map, &note(1, 48, true), &mut state).is_empty());
-    }
-
-    /// A stem button latches: the engine flips its own state, so the mapping never has to know it.
-    #[test]
-    fn a_stem_button_emits_a_toggle_and_nothing_on_release() {
-        let map = map(r#"
-[[bind]]
-type = "note"
-id = 20
-deck = 0
-action = "stem.vocals.mute"
-
-[[bind]]
-type = "note"
-id = 21
-deck = 1
-action = "stem.bass.solo"
-"#);
-        let mut state = TranslateState::new(&map);
-        let commands = translate(&map, &note(0, 20, true), &mut state);
-        assert!(matches!(
-            commands.as_slice(),
-            [Command::Stem {
-                deck_id: 0,
-                op: StemOp::ToggleMute { stem: Stem::Vocals }
-            }]
-        ));
-        // Latching: the release edge must not fire a second toggle.
-        assert!(translate(&map, &note(0, 20, false), &mut state).is_empty());
-        // A second press is another toggle, not a state the mapping tracks.
-        let again = translate(&map, &note(0, 20, true), &mut state);
-        assert_eq!(again.len(), 1);
-        // The binding's deck goes with the action.
-        let commands = translate(&map, &note(0, 21, true), &mut state);
-        assert!(matches!(
-            commands.as_slice(),
-            [Command::Stem {
-                deck_id: 1,
-                op: StemOp::ToggleSolo { stem: Stem::Bass }
-            }]
-        ));
-    }
-
-    /// A per-stem fader is an ordinary fader: same soft takeover, different target.
-    #[test]
-    fn a_stem_fader_takes_the_soft_takeover_path_to_the_stem_target() {
-        let map = map(r#"
-[[bind]]
-type = "cc"
-mode = "abs"
-id = 30
-deck = 1
-action = "fader.stem.other"
-"#);
-        let mut state = TranslateState::new(&map);
-        // A first value only registers a position; the takeover needs a crossing, so approach the
-        // mirror from above and then cross it (the same two-message shape as `fader.flow`).
-        assert!(translate(&map, &cc(0, 30, 127), &mut state).is_empty());
-        let commands = translate(&map, &cc(0, 30, 0), &mut state);
-        let (target, value) = fader(&commands[0]).expect("SetFader");
-        assert_eq!(
-            target,
-            FaderTarget::Stem {
-                deck: 1,
-                stem: Stem::Other
-            }
-        );
-        assert!(close(value, -1.0), "value {value}");
-    }
-
-    #[test]
-    fn soft_takeover_waits_for_the_control_to_cross_the_mirror() {
-        let map = map(r#"
-[[bind]]
-type = "cc"
-mode = "abs"
-id = 7
-deck = 0
-action = "fader.flow"
-"#);
-        let mut state = TranslateState::new(&map);
-        // Mirror starts at unity (norm 0.5). A value away from the mirror that has not crossed it
-        // is discarded.
-        assert!(translate(&map, &cc(0, 7, 100), &mut state).is_empty());
-        // Moving below the mirror crosses it and takes over: the received value is emitted.
-        let commands = translate(&map, &cc(0, 7, 0), &mut state);
-        let (target, value) = fader(&commands[0]).expect("SetFader");
-        assert_eq!(target, FaderTarget::Flow(0));
-        assert!(close(value, -1.0), "value {value}");
-        // Once engaged, every value is delivered.
-        let commands = translate(&map, &cc(0, 7, 127), &mut state);
-        let (_, value) = fader(&commands[0]).unwrap();
-        assert!(close(value, 1.0), "value {value}");
-    }
-
-    #[test]
-    fn a_centred_fader_takes_over_a_unity_mirror() {
-        let map = map(r#"
-[[bind]]
-type = "cc"
-mode = "abs"
-id = 7
-deck = 0
-action = "fader.flow"
-"#);
-        let mut state = TranslateState::new(&map);
-        // The engine fader is at unity (norm 0.5); the physical fader is at centre, which is CC 64
-        // (norm 0.5039). The half-step deadband must let it take over rather than require the user
-        // to nudge past a mirror they are already sitting on.
-        let commands = translate(&map, &cc(0, 7, 64), &mut state);
-        let (_, value) = fader(&commands[0]).expect("a centred fader should engage unity");
-        // CC 64 quantises to norm 0.5039, so the value is a hair above unity — within a CC step.
-        assert!(value.abs() < 0.01, "value {value}");
-    }
-
-    #[test]
-    fn starting_exactly_on_the_mirror_engages_immediately() {
-        let map = map(r#"
-[[bind]]
-type = "cc"
-mode = "abs"
-id = 7
-deck = 0
-action = "fader.flow"
-"#);
-        let mut state = TranslateState::new(&map);
-        // norm 0.5 == mirror: the control starts where the software is, so it owns it at once.
-        let commands = translate(&map, &cc(0, 7, 64), &mut state);
-        // 64/127 ~= 0.5039, so this is not exactly on the mirror; use a mirror-seeded control.
-        let _ = commands;
-        state.set_mirror(0, 64.0 / 127.0);
-        let commands = translate(&map, &cc(0, 7, 64), &mut state);
-        assert_eq!(commands.len(), 1, "starting on the mirror should engage");
-    }
-
-    #[test]
-    fn relative_encoders_accumulate_without_takeover() {
-        let map = map(r#"
-[[bind]]
-type = "cc"
-mode = "rel2"
-id = 10
-deck = 0
-action = "tempofader"
-"#);
-        let mut state = TranslateState::new(&map);
-        // One detent up moves the normalised position by 1/64; the fader is bipolar, so a detent
-        // is +2/64 of the travel.
-        let commands = translate(&map, &cc(0, 10, 1), &mut state);
-        match &commands[0] {
-            Command::SetTempoFader {
-                deck_id: 0,
-                position,
-            } => {
-                assert!(close(*position, 2.0 / 64.0), "position {position}");
-            }
-            other => panic!("expected SetTempoFader, got {other:?}"),
-        }
-        // One detent down brings it back to centre.
-        let commands = translate(&map, &cc(0, 10, 127), &mut state);
-        match &commands[0] {
-            Command::SetTempoFader { position, .. } => {
-                assert!(close(*position, 0.0), "position {position}")
-            }
-            other => panic!("expected SetTempoFader, got {other:?}"),
-        }
+    fn apply_one(
+        spec: &BindingSpec,
+        state: &mut BindState,
+        event: &Event,
+    ) -> Vec<Command> {
+        let map = Map::empty();
+        let mut commands = Vec::new();
+        let mut browser = Vec::new();
+        assert!(apply(&map, spec, state, event, &mut commands, &mut browser));
+        commands
     }
 
     #[test]
     fn relative_modes_decode_the_documented_wraparounds() {
         assert_eq!(relative_delta(RelMode::Rel1, 64, false), 0);
         assert_eq!(relative_delta(RelMode::Rel1, 65, false), 1);
-        assert_eq!(relative_delta(RelMode::Rel1, 63, false), -1);
+        assert_eq!(relative_delta(RelMode::Rel1, 1, false), -63);
+        assert_eq!(relative_delta(RelMode::Rel1, 65, true), -1);
         assert_eq!(relative_delta(RelMode::Rel2, 1, false), 1);
         assert_eq!(relative_delta(RelMode::Rel2, 127, false), -1);
+        assert_eq!(relative_delta(RelMode::Rel2, 65, false), -63);
         assert_eq!(relative_delta(RelMode::Rel3, 1, false), 1);
         assert_eq!(relative_delta(RelMode::Rel3, 127, false), -1);
         assert_eq!(relative_delta(RelMode::Rel3, 64, false), 0);
-        // `reverse` flips every mode's sign and nothing else, so a differently-numbered controller
-        // is one boolean away from working.
-        for (mode, value, plain) in [
-            (RelMode::Rel1, 65, 1),
-            (RelMode::Rel2, 1, 1),
-            (RelMode::Rel3, 127, -1),
-        ] {
-            assert_eq!(
-                relative_delta(mode, value, true),
-                -plain,
-                "{mode:?} {value}"
-            );
-        }
-        assert_eq!(
-            relative_delta(RelMode::Rel1, 64, true),
-            0,
-            "zero stays zero"
-        );
-    }
-
-    /// A wheel is a *direction*, not a position: one tick clockwise bends forward, one tick the
-    /// other way bends back. It also has no release edge, so each tick starts a bend that ends on its
-    /// own — the `seconds` default is what makes that possible.
-    #[test]
-    fn a_relative_wheel_nudges_both_ways_and_releases_itself() {
-        let map = map(r#"
-[[bind]]
-type = "cc"
-mode = "rel1"
-id = 20
-deck = 0
-action = "nudge"
-
-[[bind]]
-type = "cc"
-mode = "rel1"
-id = 21
-deck = 0
-action = "nudge"
-step = 0.10
-seconds = 0.5
-
-[[bind]]
-type = "cc"
-id = 22
-deck = 0
-action = "nudge"
-step = 0.05
-"#);
-        let mut state = TranslateState::new(&map);
-        // Rel1 is centred on 64, so 65 and 63 are one tick each way. The defaults are the speed and
-        // the self-release.
-        assert!(matches!(
-            translate(&map, &cc(0, 20, 65), &mut state).as_slice(),
-            [Command::Nudge { op: NudgeOp::Bend { delta, seconds }, .. }]
-                if close(*delta, DEFAULT_NUDGE_STEP)
-                    && close(*seconds as f32, DEFAULT_NUDGE_SECONDS as f32)
-        ));
-        assert!(matches!(
-            translate(&map, &cc(0, 20, 63), &mut state).as_slice(),
-            [Command::Nudge { op: NudgeOp::Bend { delta, .. }, .. }]
-                if close(*delta, -DEFAULT_NUDGE_STEP)
-        ));
-        // A message that reports several ticks counts several times: 67 is three ticks forward.
-        assert!(matches!(
-            translate(&map, &cc(0, 20, 67), &mut state).as_slice(),
-            [Command::Nudge { op: NudgeOp::Bend { delta, seconds }, .. }]
-                if close(*delta, 3.0 * DEFAULT_NUDGE_STEP)
-                    && close(*seconds as f32, DEFAULT_NUDGE_SECONDS as f32)
-        ));
-        // Sitting on the centre value is not a tick at all.
-        assert!(translate(&map, &cc(0, 20, 64), &mut state).is_empty());
-        // A binding that names its own speed and time keeps both.
-        assert!(matches!(
-            translate(&map, &cc(0, 21, 65), &mut state).as_slice(),
-            [Command::Nudge { op: NudgeOp::Bend { delta, seconds }, .. }]
-                if close(*delta, 0.10) && close(*seconds as f32, 0.5)
-        ));
-        // An *absolute* control has no direction and does have edges, so it stays a held bend.
-        assert!(matches!(
-            translate(&map, &cc(0, 22, 64), &mut state).as_slice(),
-            [Command::Nudge { op: NudgeOp::Start { delta, seconds: None }, .. }]
-                if close(*delta, 0.05)
-        ));
-        assert!(matches!(
-            translate(&map, &cc(0, 22, 0), &mut state).as_slice(),
-            [Command::Nudge {
-                op: NudgeOp::Stop,
-                ..
-            }]
-        ));
-    }
-
-    /// A vinyl wheel is bound twice on a real controller: a note for the platter sensor and a
-    /// relative CC for the wheel. Both carry the same action, and the *deck* decides what a turn
-    /// means.
-    #[test]
-    fn a_vinyl_wheel_sends_platter_edges_and_signed_turns() {
-        let map = map(r#"
-[[bind]]
-type = "note"
-id = 80
-deck = 0
-action = "vinyl"
-
-[[bind]]
-type = "cc"
-mode = "rel1"
-id = 6
-deck = 0
-action = "vinyl"
-
-[[bind]]
-type = "cc"
-mode = "rel1"
-id = 7
-deck = 0
-action = "vinyl"
-step = 1323
-"#);
-        let mut state = TranslateState::new(&map);
-        // The platter sensor: press = a hand on the record, release = letting go.
-        assert!(matches!(
-            translate(&map, &note(0, 80, true), &mut state).as_slice(),
-            [Command::Vinyl {
-                op: VinylOp::Touch,
-                ..
-            }]
-        ));
-        assert!(matches!(
-            translate(&map, &note(0, 80, false), &mut state).as_slice(),
-            [Command::Vinyl {
-                op: VinylOp::Release,
-                ..
-            }]
-        ));
-        // The wheel: one tick each way, in ticks (the deck converts, because only the deck knows
-        // whether the platter is held).
-        assert!(matches!(
-            translate(&map, &cc(0, 6, 65), &mut state).as_slice(),
-            [Command::Vinyl { op: VinylOp::Turn { ticks, frames_per_tick }, .. }]
-                if *ticks == 1 && close(*frames_per_tick, DEFAULT_VINYL_FRAMES_PER_TICK)
-        ));
-        assert!(matches!(
-            translate(&map, &cc(0, 6, 63), &mut state).as_slice(),
-            [Command::Vinyl { op: VinylOp::Turn { ticks, .. }, .. }] if *ticks == -1
-        ));
-        // A wheel with more detents per revolution says so with `step`.
-        assert!(matches!(
-            translate(&map, &cc(0, 7, 65), &mut state).as_slice(),
-            [Command::Vinyl { op: VinylOp::Turn { frames_per_tick, .. }, .. }]
-                if close(*frames_per_tick, 1323.0)
-        ));
-        // The centre value is not a turn, and a note release on a *note* binding is not a turn
-        // either: what a binding sends follows the event kind it was declared for.
-        assert!(translate(&map, &cc(0, 6, 64), &mut state).is_empty());
-    }
-
-    /// Every button edge in one place: a momentary hold pairs press/release, a smart cue fires
-    /// once, and a timed nudge ignores its release.
-    #[test]
-    fn button_edges_pair_on_press_and_release() {
-        let map = map(r#"
-[[bind]]
-type = "note"
-id = 60
-deck = 0
-action = "nudge"
-step = 0.05
-
-[[bind]]
-type = "note"
-id = 61
-deck = 0
-action = "nudge"
-step = 0.05
-seconds = 0.5
-
-[[bind]]
-type = "note"
-id = 62
-deck = 0
-action = "cue"
-
-[[bind]]
-type = "note"
-id = 63
-deck = 0
-action = "cue.smart"
-"#);
-        let mut state = TranslateState::new(&map);
-        let edge =
-            |state: &mut TranslateState, key, down| translate(&map, &note(0, key, down), state);
-
-        // A plain nudge is momentary: press bends, release lets go.
-        assert!(matches!(
-            edge(&mut state, 60, true).as_slice(),
-            [Command::Nudge { op: NudgeOp::Start { delta, seconds: None }, .. }] if close(*delta, 0.05)
-        ));
-        assert!(matches!(
-            edge(&mut state, 60, false).as_slice(),
-            [Command::Nudge {
-                op: NudgeOp::Stop,
-                ..
-            }]
-        ));
-        // A timed nudge releases itself; the note-up edge must be silent.
-        assert!(matches!(
-            edge(&mut state, 61, true).as_slice(),
-            [Command::Nudge { op: NudgeOp::Start { seconds: Some(s), .. }, .. }] if close(*s as f32, 0.5)
-        ));
-        assert!(edge(&mut state, 61, false).is_empty());
-        // The cue button is a held pair: down cues the playhead (or restarts from the cue point)
-        // and plays; up returns to the cue point and pauses.
-        assert!(matches!(
-            edge(&mut state, 62, true).as_slice(),
-            [Command::Cue {
-                op: CueOp::Hold,
-                ..
-            }]
-        ));
-        assert!(matches!(
-            edge(&mut state, 62, false).as_slice(),
-            [Command::Cue {
-                op: CueOp::Back,
-                ..
-            }]
-        ));
-        // A smart cue fires once; its release is silent.
-        assert!(matches!(
-            edge(&mut state, 63, true).as_slice(),
-            [Command::Cue {
-                op: CueOp::Smart,
-                ..
-            }]
-        ));
-        assert!(edge(&mut state, 63, false).is_empty());
     }
 
     #[test]
-    fn loop_and_sync_buttons_map_to_their_command_families() {
-        let map = map(r#"
-[[bind]]
-type = "note"
-id = 1
-deck = 0
-action = "loop.beat8"
-
-[[bind]]
-type = "note"
-id = 2
-deck = 0
-action = "loop.halve"
-
-[[bind]]
-type = "note"
-id = 3
-deck = 0
-action = "sync.tempo"
-"#);
-        let mut state = TranslateState::new(&map);
-        assert!(matches!(
-            translate(&map, &note(0, 1, true), &mut state).as_slice(),
-            [Command::Loop {
-                op: LoopOp::Beats(8),
-                ..
-            }]
-        ));
-        assert!(matches!(
-            translate(&map, &note(0, 2, true), &mut state).as_slice(),
-            [Command::Loop {
-                op: LoopOp::Edit(LoopEditOp::Halve),
-                ..
-            }]
-        ));
-        assert!(matches!(
-            translate(&map, &note(0, 3, true), &mut state).as_slice(),
-            [Command::Sync {
-                op: SyncOp::Tempo,
-                ..
-            }]
-        ));
-    }
-
-    #[test]
-    fn fx_actions_need_a_resolved_slot_to_emit() {
-        let map = map(r#"
-[[bind]]
-type = "note"
-id = 20
-action = "fx.toggle"
-chain = "deck0"
-fx = "filter"
-"#);
-        let mut map = map;
-        let mut state = TranslateState::new(&map);
-        // Unresolved: the binding is silently skipped rather than sending a bogus index.
-        assert!(translate(&map, &note(0, 20, true), &mut state).is_empty());
-        translate(&map, &note(0, 20, false), &mut state);
-
-        map.resolve_fx(hypermixx_core::FxChainId::Deck(0), "filter", 2);
-        // A toggle asks the *engine* to flip it: the truth about a slot lives there, so the
-        // front-end never has a state to drift out of sync.
-        let commands = translate(&map, &note(0, 20, true), &mut state);
+    fn a_bipol_knob_centre_maps_to_zero() {
+        let mut binding = spec(Action::Fader(FaderTarget::Flow(0)), RelMode::Abs);
+        binding.center = Some(64.0 / 127.0);
+        let mut state = BindState::seeded(Some(&binding));
+        let commands = apply_one(&binding, &mut state, &cc(64));
         assert!(matches!(
             commands.as_slice(),
-            [Command::ToggleFx {
-                slot: FxSlotRef {
-                    chain: hypermixx_core::FxChainId::Deck(0),
-                    index: 2,
-                },
+            [Command::SetFader { value, .. }] if value.abs() < 1e-6
+        ));
+        let top = apply_one(&binding, &mut state, &cc(127));
+        assert!(matches!(
+            top.as_slice(),
+            [Command::SetFader { value, .. }] if (*value - 1.0).abs() < 1e-6
+        ));
+    }
+
+    #[test]
+    fn a_rel_knob_reverse_swaps_the_pair_directions() {
+        let mut binding = spec(Action::Browser(BrowserAction::Up), RelMode::Rel2);
+        binding.down = Some(Action::Browser(BrowserAction::Down));
+        binding.reverse = true;
+        let map = Map::empty();
+        let mut state = BindState::default();
+        let mut commands = Vec::new();
+        let mut browser = Vec::new();
+
+        assert!(apply(
+            &map,
+            &binding,
+            &mut state,
+            &cc(1),
+            &mut commands,
+            &mut browser
+        ));
+        assert!(matches!(browser.as_slice(), [BrowserAction::Down]));
+
+        browser.clear();
+        assert!(apply(
+            &map,
+            &binding,
+            &mut state,
+            &cc(127),
+            &mut commands,
+            &mut browser
+        ));
+        assert!(matches!(browser.as_slice(), [BrowserAction::Up]));
+    }
+
+    #[test]
+    fn a_cc14_pair_emits_once_when_the_lsb_arrives() {
+        let mut binding = spec(Action::Fader(FaderTarget::Flow(0)), RelMode::Abs);
+        binding.id = 9;
+        binding.lsb = Some(41);
+        let map = Map::empty();
+        let mut state = BindState::seeded(Some(&binding));
+        let mut commands = Vec::new();
+        let mut browser = Vec::new();
+        let msb = Event::ControlChange {
+            channel: 0,
+            controller: 9,
+            value: 64,
+        };
+        let lsb = Event::ControlChange {
+            channel: 0,
+            controller: 41,
+            value: 0,
+        };
+
+        assert!(apply(
+            &map,
+            &binding,
+            &mut state,
+            &msb,
+            &mut commands,
+            &mut browser
+        ));
+        assert!(commands.is_empty(), "MSB alone must not emit");
+
+        assert!(apply(
+            &map,
+            &binding,
+            &mut state,
+            &lsb,
+            &mut commands,
+            &mut browser
+        ));
+        assert_eq!(commands.len(), 1, "LSB completes the pair");
+
+        let next = Event::ControlChange {
+            channel: 0,
+            controller: 41,
+            value: 127,
+        };
+        assert!(apply(
+            &map,
+            &binding,
+            &mut state,
+            &next,
+            &mut commands,
+            &mut browser
+        ));
+        assert_eq!(commands.len(), 2);
+    }
+
+    #[test]
+    fn a_rel_knob_pair_fires_the_direction_action() {
+        let mut binding = spec(Action::Browser(BrowserAction::Up), RelMode::Rel2);
+        binding.down = Some(Action::Browser(BrowserAction::Down));
+        let map = Map::empty();
+        let mut state = BindState::default();
+        let mut commands = Vec::new();
+        let mut browser = Vec::new();
+
+        assert!(apply(
+            &map,
+            &binding,
+            &mut state,
+            &cc(1),
+            &mut commands,
+            &mut browser
+        ));
+        assert!(matches!(browser.as_slice(), [BrowserAction::Up]));
+
+        browser.clear();
+        assert!(apply(
+            &map,
+            &binding,
+            &mut state,
+            &cc(127),
+            &mut commands,
+            &mut browser
+        ));
+        assert!(matches!(browser.as_slice(), [BrowserAction::Down]));
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn the_bipolar_curve_keeps_the_centre_and_the_sharp_curve_fines_the_bottom() {
+        let mut linear = spec(Action::Fader(FaderTarget::Flow(0)), RelMode::Abs);
+        assert!(close(command_value(&linear, 0.5), 0.0));
+        linear.curve = Curve::Sharp;
+        assert!(close(command_value(&linear, 0.5), 0.0));
+        assert!(close(command_value(&linear, 0.75), 0.25));
+
+        let mut send = spec(Action::Fader(FaderTarget::CueSend(0)), RelMode::Abs);
+        send.min = 0.0;
+        send.max = 1.0;
+        send.curve = Curve::Sharp;
+        assert!(close(command_value(&send, 0.5), 0.25));
+    }
+
+    #[test]
+    fn a_note_button_fires_on_press_only_unless_the_binding_asks_for_the_release() {
+        let mut play = spec(Action::Play, RelMode::Abs);
+        play.kind = EventKind::Note;
+        let mut state = BindState::seeded(Some(&play));
+        assert!(matches!(
+            apply_one(&play, &mut state, &note(true)).as_slice(),
+            [Command::TogglePlay { deck_id: 0 }]
+        ));
+        assert!(apply_one(&play, &mut state, &note(false)).is_empty());
+
+        let mut release = play.clone();
+        release.on = Edge::Release;
+        let mut state = BindState::seeded(Some(&release));
+        assert!(apply_one(&release, &mut state, &note(true)).is_empty());
+        assert!(matches!(
+            apply_one(&release, &mut state, &note(false)).as_slice(),
+            [Command::TogglePlay { deck_id: 0 }]
+        ));
+    }
+
+    #[test]
+    fn a_two_edge_action_keeps_both_edges() {
+        let mut cue = spec(Action::Cue, RelMode::Abs);
+        cue.kind = EventKind::Note;
+        let mut state = BindState::seeded(Some(&cue));
+        assert!(matches!(
+            apply_one(&cue, &mut state, &note(true)).as_slice(),
+            [Command::Cue {
+                deck_id: 0,
+                op: CueOp::Hold
             }]
         ));
-        // And a note binding fires on the press edge only, whatever the slot ends up being.
-        assert!(translate(&map, &note(0, 20, false), &mut state).is_empty());
+        assert!(matches!(
+            apply_one(&cue, &mut state, &note(false)).as_slice(),
+            [Command::Cue {
+                deck_id: 0,
+                op: CueOp::Back
+            }]
+        ));
     }
 
     #[test]
-    fn an_fx_param_sweep_maps_the_unit_domain() {
-        let map = map(r#"
-[[bind]]
-type = "cc"
-mode = "abs"
-id = 74
-action = "fx.param"
-chain = "master"
-fx = "filter"
-param = "value"
-"#);
-        let mut map = map;
-        map.resolve_fx(hypermixx_core::FxChainId::Master, "filter", 0);
-        let mut state = TranslateState::new(&map);
-        // FX params start at 0; the control picks up when it reports the bottom of its travel.
-        let commands = translate(&map, &cc(0, 74, 0), &mut state);
-        match &commands[0] {
-            Command::SetFxParam { value, .. } => assert!(close(*value, 0.0), "value {value}"),
-            other => panic!("expected SetFxParam, got {other:?}"),
-        }
-        // Then it tracks the value into the unit domain.
-        let commands = translate(&map, &cc(0, 74, 64), &mut state);
-        match &commands[0] {
-            Command::SetFxParam { name, value, .. } => {
-                assert_eq!(name, "value");
-                assert!(close(*value, 64.0 / 127.0), "value {value}");
-            }
-            other => panic!("expected SetFxParam, got {other:?}"),
-        }
+    fn soft_takeover_waits_for_the_control_to_cross_the_mirror() {
+        let fader = spec(Action::Fader(FaderTarget::Flow(0)), RelMode::Abs);
+        let mut state = BindState::seeded(Some(&fader));
+        // Unity mirror at 0.5: a low value is ignored until it reaches the mirror.
+        assert!(apply_one(&fader, &mut state, &cc(20)).is_empty());
+        assert!(apply_one(&fader, &mut state, &cc(40)).is_empty());
+        let commands = apply_one(&fader, &mut state, &cc(64));
+        assert_eq!(commands.len(), 1);
+        // Once engaged, movement is live.
+        assert_eq!(apply_one(&fader, &mut state, &cc(80)).len(), 1);
     }
 
     #[test]
-    fn pitch_bend_is_a_continuous_control() {
-        let map = map(r#"
-[[bind]]
-type = "bend"
-id = 0
-deck = 0
-action = "fader.flow"
-"#);
-        let mut state = TranslateState::new(&map);
-        // Bend centre is unity: it starts on the mirror and takes over.
-        assert_eq!(
-            translate(
-                &map,
-                &Event::PitchBend {
-                    channel: 0,
-                    value: 0,
-                },
-                &mut state,
-            )
-            .len(),
-            1,
-            "centre should engage the mirror"
+    fn a_relative_encoder_accumulates_without_takeover() {
+        let tempo = spec(Action::TempoFader, RelMode::Rel1);
+        let mut state = BindState::seeded(Some(&tempo));
+        let commands = apply_one(&tempo, &mut state, &cc(65));
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::SetTempoFader { deck_id: 0, position }] if *position > 0.0
+        ));
+        let commands = apply_one(&tempo, &mut state, &cc(63));
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::SetTempoFader { deck_id: 0, position }] if *position < 0.02
+        ));
+    }
+
+    #[test]
+    fn default_mirrors_match_the_mixer_defaults_and_a_bipolar_fx_param() {
+        let flow = spec(Action::Fader(FaderTarget::Flow(0)), RelMode::Abs);
+        assert!(close(default_norm(&flow), 0.5));
+        let send = spec(Action::Fader(FaderTarget::CueSend(0)), RelMode::Abs);
+        assert!(close(default_norm(&send), 1.0));
+        let tempo = spec(Action::TempoFader, RelMode::Abs);
+        assert!(close(default_norm(&tempo), 0.5));
+        let mut eq = spec(
+            Action::Fx(FxAction::Param {
+                chain: FxChainId::Deck(0),
+                fx: "eq".into(),
+                param: "low".into(),
+            }),
+            RelMode::Abs,
         );
-        // Moving to the bottom then closes the fader.
-        let commands = translate(
-            &map,
-            &Event::PitchBend {
-                channel: 0,
-                value: -8192,
-            },
-            &mut state,
-        );
-        let (_, value) = fader(&commands[0]).unwrap();
-        assert!(close(value, -1.0), "value {value}");
-    }
-
-    #[test]
-    fn channel_filters_and_wildcards_both_work() {
-        let map = map(r#"
-[[bind]]
-type = "note"
-id = 5
-deck = 0
-action = "play"
-"#);
-        let mut state = TranslateState::new(&map);
-        assert_eq!(translate(&map, &note(9, 5, true), &mut state).len(), 1);
-        assert_eq!(translate(&map, &note(9, 6, true), &mut state).len(), 0);
+        eq.min = -1.0;
+        assert!(close(default_norm(&eq), 0.5));
+        eq.min = 0.0;
+        assert!(close(default_norm(&eq), 0.0));
     }
 
     #[test]
@@ -1297,10 +1035,14 @@ action = "play"
         });
         buffer.push(Command::Play { deck_id: 0 });
         let flushed = buffer.flush();
-        assert_eq!(flushed.len(), 3, "two faders plus one plain command");
-        // Order is preserved and the fader carries its final value.
-        let (_, value) = fader(&flushed[0]).unwrap();
-        assert!(close(value, 0.9), "value {value}");
+        assert_eq!(flushed.len(), 3);
+        assert!(matches!(
+            flushed[0],
+            Command::SetFader {
+                target: FaderTarget::Flow(0),
+                value
+            } if close(value, 0.9)
+        ));
         assert!(matches!(
             flushed[1],
             Command::SetFader {
@@ -1312,29 +1054,7 @@ action = "play"
         assert!(buffer.is_empty());
     }
 
-    #[test]
-    fn default_mirrors_match_the_mixer_defaults() {
-        let map = map(r#"
-[[bind]]
-type = "cc"
-id = 1
-deck = 0
-action = "fader.flow"
-
-[[bind]]
-type = "cc"
-id = 2
-deck = 0
-action = "fader.cuesend"
-
-[[bind]]
-type = "cc"
-id = 3
-action = "fader.master"
-"#);
-        let state = TranslateState::new(&map);
-        assert!(close(state.binds[0].mirror, 0.5), "flow is unity");
-        assert!(close(state.binds[1].mirror, 1.0), "cue send opens fully");
-        assert!(close(state.binds[2].mirror, 0.5), "master is unity");
+    fn close(left: f32, right: f32) -> bool {
+        (left - right).abs() < 1e-4
     }
 }

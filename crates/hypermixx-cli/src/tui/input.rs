@@ -642,7 +642,11 @@ fn handle_overlay(app: &mut App, key: KeyEvent, dispatcher: &Dispatcher) {
                         .as_deref()
                         .is_some_and(|path| std::path::Path::new(path).is_file());
                     if map_ready {
-                        app.connect_midi(dispatcher.command_tx.clone(), &dispatcher.notices);
+                        app.connect_midi(
+                            dispatcher.command_tx.clone(),
+                            &dispatcher.notices,
+                            dispatcher,
+                        );
                     } else {
                         app.overlay = Some(Overlay::Files {
                             picker: FilePicker::new(
@@ -684,7 +688,11 @@ fn handle_overlay(app: &mut App, key: KeyEvent, dispatcher: &Dispatcher) {
                         }
                         FilePurpose::MidiMap => {
                             app.midi_map = Some(path);
-                            app.connect_midi(dispatcher.command_tx.clone(), &dispatcher.notices);
+                            app.connect_midi(
+                            dispatcher.command_tx.clone(),
+                            &dispatcher.notices,
+                            dispatcher,
+                        );
                         }
                     }
                 }

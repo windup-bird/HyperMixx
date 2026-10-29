@@ -1,371 +1,473 @@
-# Hypermixx MIDI map.
+# Hypermixx MIDI map — a fuller example.
 #
-# Schema: optional [meta], then one [[bind]] per control.
-#   type = "cc" | "note" | "bend"   mode = "abs" | "rel1" | "rel2" | "rel3" (cc only)
-#   channel / id = 0-based MIDI channel and CC/note number
-#   deck = optional deck id; action = a session command line (target omitted)
-#   action parameters stay fields: chain/fx/param, step, seconds, beats, min/max/curve
+# Units are independent: deck0 and deck1 keep their own active mode. A selector is not an action;
+# `trigger` sets the named mode, `cycle` advances through the declared order.
 #
+# Built-in presets: touchpad | mixer | transport | browser | output | jog
+# All endpoints are unique across the file. Adjust the channel/id pairs to your controller; the
+# preset slot names and mode tables stay the same.
+
 [meta]
 name = "example"
+# device = "DDJ-400"
+# User presets live next to this file; a same-name preset replaces the built-in one.
+presets = ["presets/example.toml"]
 
-[[bind]]
+# ---- deck 0 pad grid -------------------------------------------------------------------------
+[[unit]]
+id = "deck1.pad"
+preset = "touchpad"
+deck = 1
+
+[[unit.control]]
+slot = "pad1"
+type = "note"
+channel = 0
+id = 16
+[[unit.control]]
+slot = "pad2"
+type = "note"
+channel = 0
+id = 17
+[[unit.control]]
+slot = "pad3"
+type = "note"
+channel = 0
+id = 18
+[[unit.control]]
+slot = "pad4"
+type = "note"
+channel = 0
+id = 19
+[[unit.control]]
+slot = "pad5"
+type = "note"
+channel = 0
+id = 20
+[[unit.control]]
+slot = "pad6"
+type = "note"
+channel = 0
+id = 21
+[[unit.control]]
+slot = "pad7"
+type = "note"
+channel = 0
+id = 22
+[[unit.control]]
+slot = "pad8"
+type = "note"
+channel = 0
+id = 23
+
+[[unit.selector]]
+type = "note"
+channel = 0
+id = 24
+behavior = "trigger"
+target = "hotcue"
+[[unit.selector]]
+type = "note"
+channel = 0
+id = 25
+behavior = "trigger"
+target = "loop"
+[[unit.selector]]
+type = "note"
+channel = 0
+id = 26
+behavior = "trigger"
+target = "beatjump"
+[[unit.selector]]
+type = "note"
+channel = 0
+id = 27
+behavior = "trigger"
+target = "stems"
+
+[[unit]]
+id = "deck2.pad"
+preset = "touchpad"
+deck = 2
+
+[[unit.control]]
+slot = "pad1"
+type = "note"
+channel = 1
+id = 16
+[[unit.control]]
+slot = "pad2"
+type = "note"
+channel = 1
+id = 17
+[[unit.control]]
+slot = "pad3"
+type = "note"
+channel = 1
+id = 18
+[[unit.control]]
+slot = "pad4"
+type = "note"
+channel = 1
+id = 19
+[[unit.control]]
+slot = "pad5"
+type = "note"
+channel = 1
+id = 20
+[[unit.control]]
+slot = "pad6"
+type = "note"
+channel = 1
+id = 21
+[[unit.control]]
+slot = "pad7"
+type = "note"
+channel = 1
+id = 22
+[[unit.control]]
+slot = "pad8"
+type = "note"
+channel = 1
+id = 23
+
+[[unit.selector]]
+type = "note"
+channel = 1
+id = 24
+behavior = "trigger"
+target = "hotcue"
+[[unit.selector]]
+type = "note"
+channel = 1
+id = 25
+behavior = "trigger"
+target = "loop"
+[[unit.selector]]
+type = "note"
+channel = 1
+id = 26
+behavior = "trigger"
+target = "beatjump"
+[[unit.selector]]
+type = "note"
+channel = 1
+id = 27
+behavior = "trigger"
+target = "stems"
+
+[[unit]]
+id = "deck1.transport"
+preset = "transport"
+deck = 1
+
+[[unit.control]]
+slot = "play"
 type = "note"
 channel = 0
 id = 0
-deck = 0
-action = "play"
-
-[[bind]]
+[[unit.control]]
+slot = "cue"
 type = "note"
 channel = 0
 id = 1
-deck = 0
-action = "cue"
-
-[[bind]]
+[[unit.control]]
+slot = "sync"
 type = "note"
 channel = 0
-id = 70
-deck = 0
-action = "beatjump -1"
-
-[[bind]]
+id = 2
+[[unit.control]]
+slot = "keylock"
 type = "note"
 channel = 0
-id = 72
-deck = 0
-action = "beatjump 1"
+id = 3
 
-[[bind]]
+[[unit]]
+id = "deck2.transport"
+preset = "transport"
+deck = 2
+
+[[unit.control]]
+slot = "play"
+type = "note"
+channel = 1
+id = 0
+[[unit.control]]
+slot = "cue"
+type = "note"
+channel = 1
+id = 1
+[[unit.control]]
+slot = "sync"
+type = "note"
+channel = 1
+id = 2
+[[unit.control]]
+slot = "keylock"
+type = "note"
+channel = 1
+id = 3
+
+# ---- channel strips --------------------------------------------------------------------------
+# The mixer preset's EQ/filter rows resolve `chain` from the unit's deck, so the same preset works
+# on deck0 and deck1 without editing names.
+[[unit]]
+id = "deck1.mixer"
+preset = "mixer"
+deck = 1
+
+[[unit.control]]
+slot = "fader"
 type = "cc"
-mode = "abs"
+channel = 0
+id = 7
+[[unit.control]]
+slot = "gain"
+type = "cc"
+channel = 0
+id = 8
+[[unit.control]]
+slot = "low"
+type = "cc"
+channel = 0
+id = 9
+[[unit.control]]
+slot = "mid"
+type = "cc"
+channel = 0
+id = 10
+[[unit.control]]
+slot = "high"
+type = "cc"
+channel = 0
+id = 11
+[[unit.control]]
+slot = "filter"
+kind = "BipolKnob"
+type = "cc"
+channel = 0
+id = 12
+[[unit.control]]
+slot = "cue"
+type = "note"
+channel = 0
+id = 13
+[[unit.control]]
+slot = "load"
+type = "note"
+channel = 0
+id = 14
+
+[[unit]]
+id = "deck2.mixer"
+preset = "mixer"
+deck = 2
+
+[[unit.control]]
+slot = "fader"
+type = "cc"
+channel = 1
+id = 7
+[[unit.control]]
+slot = "gain"
+type = "cc"
+channel = 1
+id = 8
+[[unit.control]]
+slot = "low"
+type = "cc"
+channel = 1
+id = 9
+[[unit.control]]
+slot = "mid"
+type = "cc"
+channel = 1
+id = 10
+[[unit.control]]
+slot = "high"
+type = "cc"
+channel = 1
+id = 11
+[[unit.control]]
+slot = "filter"
+kind = "BipolKnob"
+type = "cc"
+channel = 1
+id = 12
+[[unit.control]]
+slot = "cue"
+type = "note"
+channel = 1
+id = 13
+[[unit.control]]
+slot = "load"
+type = "note"
+channel = 1
+id = 14
+
+# ---- tempo faders ----------------------------------------------------------------------------
+[[unit]]
+id = "deck1.tempo"
+deck = 1
+
+[[unit.control]]
+slot = "fader"
+type = "cc"
+channel = 0
+id = 41
+
+[[unit.mode]]
+name = "default"
+[[unit.mode.bind]]
+slot = "fader"
+action = "tempofader"
+
+[[unit]]
+id = "deck2.tempo"
+deck = 2
+
+[[unit.control]]
+slot = "fader"
+type = "cc"
+channel = 1
+id = 41
+
+[[unit.mode]]
+name = "default"
+[[unit.mode.bind]]
+slot = "fader"
+action = "tempofader"
+
+# ---- deck FX (user preset) -------------------------------------------------------------------
+# `presets/example.toml` supplies the `deckfx` preset. Two knobs, two modes; the selector below
+# cycles filter -> eq, and the same physical knobs change meaning.
+[[unit]]
+id = "deck1.deckfx"
+preset = "deckfx"
+deck = 1
+
+[[unit.control]]
+slot = "knob1"
+type = "cc"
+channel = 0
+id = 20
+[[unit.control]]
+slot = "knob2"
+type = "cc"
+channel = 0
+id = 21
+
+[[unit.selector]]
+type = "note"
 channel = 0
 id = 28
-deck = 0
-action = "fader flow"
+behavior = "cycle"
 
-[[bind]]
+[[unit]]
+id = "deck2.deckfx"
+preset = "deckfx"
+deck = 2
+
+[[unit.control]]
+slot = "knob1"
 type = "cc"
-mode = "abs"
+channel = 1
+id = 20
+[[unit.control]]
+slot = "knob2"
+type = "cc"
+channel = 1
+id = 21
+
+[[unit.selector]]
+type = "note"
 channel = 1
 id = 28
-deck = 1
-action = "fader flow"
+behavior = "cycle"
 
-[[bind]]
+[[unit]]
+id = "deck1.jog"
+preset = "jog"
+deck = 1
+
+[[unit.control]]
+slot = "jog"
+kind = "JogWheel"
+touch = { type = "note", channel = 0, id = 80 }
+turn = { type = "cc", mode = "rel2", channel = 0, id = 6 }
+
+[[unit]]
+id = "deck2.jog"
+preset = "jog"
+deck = 2
+
+[[unit.control]]
+slot = "jog"
+kind = "JogWheel"
+touch = { type = "note", channel = 1, id = 80 }
+turn = { type = "cc", mode = "rel2", channel = 1, id = 6 }
+
+# ---- shared controls -------------------------------------------------------------------------
+[[unit]]
+id = "global.output"
+preset = "output"
+
+[[unit.control]]
+slot = "master"
 type = "cc"
-mode = "abs"
 channel = 15
 id = 8
-action = "fader cross"
-
-[[bind]]
+[[unit.control]]
+slot = "cue"
 type = "cc"
-mode = "abs"
-channel = 15
-id = 10
-action = "fader master"
-
-[[bind]]
-type = "cc"
-mode = "rel1"
-channel = 0
-id = 41
-deck = 0
-action = "tempofader"
-
-[[bind]]
-type = "note"
-channel = 4
-id = 20
-deck = 0
-action = "loop in"
-
-[[bind]]
-type = "note"
-channel = 4
-id = 21
-deck = 0
-action = "loop out"
-
-[[bind]]
-type = "note"
-channel = 0
-id = 66
-deck = 0
-action = "loop 4"
-
-[[bind]]
-type = "note"
-channel = 0
-id = 80
-deck = 1
-action = "sync tempo"
-
-[[bind]]
-type = "note"
-channel = 1
-id = 2
-deck = 1
-action = "sync phase"
-
-[[bind]]
-type = "cc"
-mode = "abs"
-channel = 0
-id = 74
-deck = 0
-action = "fx param"
-chain = "deck0"
-fx = "filter"
-param = "value"
-
-[[bind]]
-type = "note"
-channel = 0
-id = 96
-deck = 0
-action = "fx toggle"
-chain = "deck0"
-fx = "filter"
-
-[[bind]]
-type = "note"
-channel = 1
-id = 0
-deck = 1
-action = "play"
-
-[[bind]]
-type = "note"
-channel = 1
-id = 72
-deck = 1
-action = "beatjump 1"
-
-[[bind]]
-type = "note"
-channel = 1
-id = 70
-deck = 1
-action = "beatjump -1"
-
-[[bind]]
-type = "cc"
-mode = "abs"
 channel = 15
 id = 12
-action = "fader cue"
 
-[[bind]]
+[[unit]]
+id = "global.crossfader"
+[[unit.control]]
+slot = "fader"
 type = "cc"
-mode = "rel1"
-channel = 1
-id = 41
-deck = 1
-action = "tempofader"
+channel = 15
+id = 10
 
-# The jog wheel. `vinyl` is two controls in one action: without a hand on the platter it is a
-# pitch bend (`step` is unused then), and with one it *scrubs* — `step` frames of audio per tick,
-# 1323 by default. That number is the vinyl physics: one revolution at 33⅓ RPM is 1.8 s, so
-# `frames_per_tick = 79380 / messages per revolution` (1323 for a 60-detent wheel; 441 to place
-# things finely). Turn the wheel one revolution in the guide's raw monitor to count yours.
-#
-# `mode = "rel2"` because this controller sends **1 / 127** for the two directions (sign in the
-# value's high bit, magnitude in the low bits). `rel1` would be the other convention — centred on 64,
-# so 65 = one step forward and 1 = sixty-three steps *back* — which reads as a wild, one-directional
-# jump rather than a turn. Check yours in the guide's raw monitor: values near 63/64/65 = `rel1`,
-# values like 1,2,3 / 127,126 = `rel2` (or `rel3` for direction only).
-[[bind]]
-type = "cc"
-mode = "rel2"
-channel = 0
-id = 6
-deck = 0
-action = "vinyl"
+[[unit.mode]]
+name = "default"
+[[unit.mode.bind]]
+slot = "fader"
+action = "fader cross"
 
-[[bind]]
-type = "cc"
-mode = "rel2"
-channel = 1
-id = 6
-deck = 1
-action = "vinyl"
+[[unit]]
+id = "global.browser"
+preset = "browser"
 
-# The platter sensor: a note that is down while a hand is on the wheel. It pauses the deck, so the
-# wheel turns into a scrub until you let go.
-[[bind]]
+[[unit.control]]
+slot = "up"
 type = "note"
-channel = 0
-id = 80
-deck = 0
-action = "vinyl"
-
-[[bind]]
+channel = 15
+id = 90
+[[unit.control]]
+slot = "down"
 type = "note"
-channel = 1
-id = 80
-deck = 1
-action = "vinyl"
-
-[[bind]]
+channel = 15
+id = 91
+[[unit.control]]
+slot = "open"
 type = "note"
-channel = 5
-id = 20
-deck = 1
-action = "loop in"
-
-[[bind]]
+channel = 15
+id = 92
+[[unit.control]]
+slot = "exit"
 type = "note"
-channel = 5
-id = 21
-deck = 1
-action = "loop out"
-
-[[bind]]
+channel = 15
+id = 93
+[[unit.control]]
+slot = "load"
 type = "note"
-channel = 4
-id = 22
-deck = 0
-action = "loop exit"
-
-[[bind]]
+channel = 15
+id = 94
+[[unit.control]]
+slot = "refresh"
 type = "note"
-channel = 5
-id = 22
-deck = 1
-action = "loop exit"
-
-[[bind]]
-type = "note"
-channel = 4
-id = 23
-deck = 0
-action = "loop cancel"
-
-[[bind]]
-type = "note"
-channel = 5
-id = 23
-deck = 1
-action = "loop cancel"
-
-[[bind]]
-type = "note"
-channel = 4
-id = 24
-deck = 0
-action = "loop halve"
-
-[[bind]]
-type = "note"
-channel = 5
-id = 24
-deck = 1
-action = "loop halve"
-
-[[bind]]
-type = "note"
-channel = 4
-id = 25
-deck = 0
-action = "loop double"
-
-[[bind]]
-type = "note"
-channel = 5
-id = 25
-deck = 1
-action = "loop double"
-
-[[bind]]
-type = "note"
-channel = 0
-id = 2
-deck = 0
-action = "sync phase"
-
-[[bind]]
-type = "note"
-channel = 6
-id = 20
-deck = 0
-action = "vocals mute"
-
-[[bind]]
-type = "note"
-channel = 6
-id = 21
-deck = 0
-action = "drums mute"
-
-[[bind]]
-type = "note"
-channel = 6
-id = 22
-deck = 0
-action = "bass mute"
-
-[[bind]]
-type = "note"
-channel = 6
-id = 23
-deck = 0
-action = "other mute"
-
-[[bind]]
-type = "note"
-channel = 6
-id = 24
-deck = 0
-action = "vocals solo"
-
-[[bind]]
-type = "cc"
-mode = "abs"
-channel = 6
-id = 40
-deck = 0
-action = "vocals fader"
-
-[[bind]]
-type = "note"
-channel = 1
-id = 1
-deck = 1
-action = "cue"
-
-# Browser navigation is front-end-only (no deck target except `browser.load`, whose optional
-# `deck` field chooses the destination). Uncomment and adjust the notes to your controller.
-#
-# [[bind]]
-# type = "note"
-# channel = 0
-# id = 90
-# action = "browser.up"
-#
-# [[bind]]
-# type = "note"
-# channel = 0
-# id = 91
-# action = "browser.down"
-#
-# [[bind]]
-# type = "note"
-# channel = 0
-# id = 92
-# action = "browser.open"
-#
-# [[bind]]
-# type = "note"
-# channel = 0
-# id = 93
-# action = "browser.exit"
-#
-# [[bind]]
-# type = "note"
-# channel = 0
-# id = 94
-# deck = 0
-# action = "browser.load"
+channel = 15
+id = 95

@@ -1,43 +1,81 @@
-[[bind]]
+[meta]
+device = "Numark Party Mix III:Numark Party Mix III MIDI 1 24:0"
+
+[[unit]]
+id = "deck1.jog"
+preset = "jog"
+deck = 1
+selector = []
+mode = []
+
+[[unit.control]]
+slot = "jog"
+kind = "JogWheel"
+
+[unit.control.touch]
+type = "note"
+channel = 0
+id = 80
+
+[unit.control.turn]
+type = "cc"
+mode = "rel2"
+channel = 0
+id = 6
+
+[[unit]]
+id = "deck1.transport"
+preset = "transport"
+deck = 1
+selector = []
+mode = []
+
+[[unit.control]]
+slot = "play"
+kind = "Button"
 type = "note"
 channel = 0
 id = 0
-deck = 0
-action = "play"
 
-[[bind]]
+[[unit.control]]
+slot = "cue"
+kind = "Button"
 type = "note"
 channel = 0
 id = 1
-deck = 0
-action = "cue"
 
-[[bind]]
+[[unit.control]]
+slot = "sync"
+kind = "Button"
 type = "note"
-channel = 1
-id = 1
+channel = 0
+id = 2
+
+[[unit]]
+id = "deck1.browser"
+preset = "browser"
 deck = 1
-action = "cue"
+selector = []
+mode = []
 
-[[bind]]
-type = "note"
-channel = 1
+[[unit.control]]
+slot = "browse"
+kind = "RelKnob"
+type = "cc"
+mode = "rel2"
+channel = 15
 id = 0
-deck = 1
-action = "play"
 
-[[bind]]
-type = "cc"
-mode = "rel1"
-channel = 0
-id = 6
-deck = 0
-action = "vinyl"
+[[unit.control]]
+slot = "load"
+kind = "Button"
+type = "note"
+channel = 15
+id = 2
 
-[[bind]]
-type = "cc"
-mode = "rel1"
-channel = 1
-id = 6
-deck = 1
-action = "vinyl"
+[[unit.control]]
+slot = "open"
+kind = "Button"
+type = "note"
+channel = 15
+id = 7

@@ -1,0 +1,52 @@
+[[preset]]
+name = "browser"
+global = true
+start = "default"
+
+[[preset.slot]]
+slot = "browse"
+shape = "RelKnob"
+[[preset.slot]]
+slot = "up"
+shape = "Button"
+[[preset.slot]]
+slot = "down"
+shape = "Button"
+[[preset.slot]]
+slot = "open"
+shape = "Button"
+[[preset.slot]]
+slot = "exit"
+shape = "Button"
+[[preset.slot]]
+slot = "load"
+shape = "Button"
+[[preset.slot]]
+slot = "refresh"
+shape = "Button"
+
+[[preset.mode]]
+name = "default"
+[[preset.mode.bind]]
+slot = "browse"
+# The shipped browser encoder turns the other way; reverse the default once here.
+action = "browser down"
+down = "browser up"
+[[preset.mode.bind]]
+slot = "up"
+action = "browser up"
+[[preset.mode.bind]]
+slot = "down"
+action = "browser down"
+[[preset.mode.bind]]
+slot = "open"
+action = "browser open"
+[[preset.mode.bind]]
+slot = "exit"
+action = "browser exit"
+[[preset.mode.bind]]
+slot = "load"
+action = "browser load"
+[[preset.mode.bind]]
+slot = "refresh"
+action = "browser refresh"

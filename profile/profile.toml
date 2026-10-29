@@ -22,10 +22,8 @@ mixer = "mixer.toml"
 live = "live.toml"
 midi = "midi.toml"
 
-# MIDI can also be written inline instead of pointing at a file:
-# [midi]
-# device = "DDJ-400"
-# map = "../midi-map.toml"
+# `midi` points at a map file. The device lives in that map's `[meta].device`; there is no
+# second midi settings shape. `--midi` overrides it for one run.
 
 # The front-end's own settings live in preference.toml next to this file (theme, waveform colours,
 # renderer). This inline section stays reserved for profile-local overrides.

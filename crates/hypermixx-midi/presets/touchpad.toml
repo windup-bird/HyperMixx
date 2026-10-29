@@ -1,0 +1,139 @@
+# A generic 8-pad performance grid. Slot names only; the unit binds note/CC numbers and adds the
+# selectors that choose a mode.
+[[preset]]
+name = "touchpad"
+start = "hotcue"
+mode_order = ["hotcue", "loop", "beatjump", "stems"]
+
+[[preset.slot]]
+slot = "pad1"
+shape = "Button"
+[[preset.slot]]
+slot = "pad2"
+shape = "Button"
+[[preset.slot]]
+slot = "pad3"
+shape = "Button"
+[[preset.slot]]
+slot = "pad4"
+shape = "Button"
+[[preset.slot]]
+slot = "pad5"
+shape = "Button"
+[[preset.slot]]
+slot = "pad6"
+shape = "Button"
+[[preset.slot]]
+slot = "pad7"
+shape = "Button"
+[[preset.slot]]
+slot = "pad8"
+shape = "Button"
+
+[[preset.mode]]
+name = "hotcue"
+[[preset.mode.bind]]
+slot = "pad1"
+action = "hotcue trigger 1"
+[[preset.mode.bind]]
+slot = "pad2"
+action = "hotcue trigger 2"
+[[preset.mode.bind]]
+slot = "pad3"
+action = "hotcue trigger 3"
+[[preset.mode.bind]]
+slot = "pad4"
+action = "hotcue trigger 4"
+[[preset.mode.bind]]
+slot = "pad5"
+action = "hotcue trigger 5"
+[[preset.mode.bind]]
+slot = "pad6"
+action = "hotcue trigger 6"
+[[preset.mode.bind]]
+slot = "pad7"
+action = "hotcue trigger 7"
+[[preset.mode.bind]]
+slot = "pad8"
+action = "hotcue trigger 8"
+
+[[preset.mode]]
+name = "loop"
+[[preset.mode.bind]]
+slot = "pad1"
+action = "loop in"
+[[preset.mode.bind]]
+slot = "pad2"
+action = "loop out"
+[[preset.mode.bind]]
+slot = "pad3"
+action = "loop 1"
+[[preset.mode.bind]]
+slot = "pad4"
+action = "loop 4"
+[[preset.mode.bind]]
+slot = "pad5"
+action = "loop 8"
+[[preset.mode.bind]]
+slot = "pad6"
+action = "loop halve"
+[[preset.mode.bind]]
+slot = "pad7"
+action = "loop double"
+[[preset.mode.bind]]
+slot = "pad8"
+action = "loop exit"
+
+[[preset.mode]]
+name = "beatjump"
+[[preset.mode.bind]]
+slot = "pad1"
+action = "beatjump -16"
+[[preset.mode.bind]]
+slot = "pad2"
+action = "beatjump -8"
+[[preset.mode.bind]]
+slot = "pad3"
+action = "beatjump -4"
+[[preset.mode.bind]]
+slot = "pad4"
+action = "beatjump -1"
+[[preset.mode.bind]]
+slot = "pad5"
+action = "beatjump 1"
+[[preset.mode.bind]]
+slot = "pad6"
+action = "beatjump 4"
+[[preset.mode.bind]]
+slot = "pad7"
+action = "beatjump 8"
+[[preset.mode.bind]]
+slot = "pad8"
+action = "beatjump 16"
+
+[[preset.mode]]
+name = "stems"
+[[preset.mode.bind]]
+slot = "pad1"
+action = "vocals mute"
+[[preset.mode.bind]]
+slot = "pad2"
+action = "drums mute"
+[[preset.mode.bind]]
+slot = "pad3"
+action = "bass mute"
+[[preset.mode.bind]]
+slot = "pad4"
+action = "other mute"
+[[preset.mode.bind]]
+slot = "pad5"
+action = "vocals solo"
+[[preset.mode.bind]]
+slot = "pad6"
+action = "drums solo"
+[[preset.mode.bind]]
+slot = "pad7"
+action = "bass solo"
+[[preset.mode.bind]]
+slot = "pad8"
+action = "other solo"

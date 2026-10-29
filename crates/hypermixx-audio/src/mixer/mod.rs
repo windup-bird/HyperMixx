@@ -313,6 +313,13 @@ impl Mixer {
         Ok(())
     }
 
+    /// Flips one channel's cue send between off and full. The engine owns the value, so a pad and
+    /// the `fader cuesend` path cannot disagree about which way the next press goes.
+    pub fn toggle_cue_send(&self, deck_id: hypermixx_core::DeckId) -> Result<(), String> {
+        self.fader_channel(deck_id)?.toggle_cue_send();
+        Ok(())
+    }
+
     /// Resolves a deck id to its channel. A mistyped id is an error, not a silent no-op, so a
     /// mapping layer's mistake is visible in the log instead of swallowing the fader move.
     fn fader_channel(&self, deck_id: u8) -> Result<&Channel, String> {

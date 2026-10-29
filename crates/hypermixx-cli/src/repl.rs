@@ -24,6 +24,8 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         profile,
         live,
         live_source,
+        midi_control,
+        midi_state,
         library,
         ..
     } = session;
@@ -34,6 +36,9 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     dispatcher.with_profile(profile);
     dispatcher.with_live(live, live_source);
     dispatcher.with_library(library);
+    if let (Some(control), Some(state)) = (midi_control, midi_state) {
+        dispatcher.set_midi(control, state);
+    }
     // Prime every chain's slot list so `fx remove <name>` works from the first command.
     dispatcher.prime(decks, pipeline.response_rx());
     let print_slots = dispatcher.slots();

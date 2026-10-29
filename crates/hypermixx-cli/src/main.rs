@@ -33,14 +33,13 @@ fn main() {
         return;
     }
     // The guide is a self-contained editor: no audio engine, no mixer. It runs before the topology
-    // is even read, so mapping a controller never depends on a working sound card.
+    // is read, so mapping a controller never depends on a working sound card.
     if let Some(path) = args.midi_guide.as_deref() {
         let decks = args.decks.unwrap_or(DECK_COUNT);
-        // The guide can be told its port by the profile too, so mapping a controller does not need
-        // the port repeated on the command line.
-        let guide_port = args.midi.clone().or_else(|| {
-            read_profile(args.profile.as_deref()).and_then(|profile| profile.midi.device)
-        });
+        // The file is the source of truth for the guide: its `[meta].device` wins, and only an
+        // explicit `--midi` overrides it. A profile device belongs to the engine session, not to a
+        // map file the user picked here.
+        let guide_port = args.midi.clone();
         if let Err(err) = tui::guide::run(path, guide_port.as_deref(), decks) {
             eprintln!("error: {err}");
             std::process::exit(1);
@@ -74,18 +73,43 @@ fn main() {
                 }
                 midi
             }
-            Err(_) => profile::MidiSettings::default(),
+            Err(err) => {
+                eprintln!("warning: {}: {err}", profile::DEFAULT_MIDI);
+                profile::MidiSettings::default()
+            }
         },
     };
-    let midi_port = args
-        .midi
-        .clone()
-        .or_else(|| midi_from_profile.device.clone());
     let midi_map = args
         .midi_map
         .clone()
         .or_else(|| midi_from_profile.map.clone())
         .unwrap_or_else(|| profile::DEFAULT_MAP.to_owned());
+    // An explicit map is validated even when no port opens: otherwise a typo would be swallowed by
+    // the "no device" warning and the user would wonder why the session ignored the file.
+    if args.midi_map.is_some() {
+        if let Err(err) = map_error(&midi_map) {
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
+    }
+    // A map file can name its own device. An explicit `--midi-map` is the source of truth for
+    // that choice; without one the profile already carried the device out of the same map.
+    let midi_port = args.midi.clone().or_else(|| {
+        if args.midi_map.is_some() {
+            map_device(&midi_map)
+        } else {
+            midi_from_profile
+                .device
+                .clone()
+                .or_else(|| map_device(&midi_map))
+        }
+    });
+    if args.midi_map.is_some() && midi_port.is_none() {
+        eprintln!(
+            "warning: `{midi_map}` has no `[meta].device`; no MIDI input will open \
+             (use --midi or F2)"
+        );
+    }
 
     // `--config` overrides the built-in reference topology; a bad file is a clean exit, not a
     // half-alive engine (and the mixer's own validation — unknown FX, empty channels — runs
@@ -179,6 +203,8 @@ fn main() {
                 live_source,
                 midi_port: midi_port.clone(),
                 midi_map,
+                midi_control: None,
+                midi_state: None,
                 library: library.clone(),
             },
         );
@@ -212,6 +238,8 @@ fn main() {
     };
 
     // Name the files this run picked up, so "which profile am I on?" is answerable without asking.
+    let midi_control = midi_session.as_ref().map(|session| session.control());
+    let midi_state = midi_session.as_ref().map(|session| session.state());
     let config_note = match (&profile_path, &config_path) {
         (Some(profile), Some(config)) => format!(", profile {profile}, config {config}"),
         (Some(profile), None) => format!(", profile {profile}"),
@@ -237,6 +265,8 @@ fn main() {
             live_source,
             midi_port: midi_port.clone(),
             midi_map,
+            midi_control,
+            midi_state,
             library,
         },
     );
@@ -246,8 +276,8 @@ fn main() {
 /// Reads `--config <path>` (topology file), `--print-config` (emit the reference TOML and exit),
 /// `--backend auto|stratum|timestretch` (default `auto`), `--tui` (terminal UI),
 /// `--midi <port>` (open a MIDI input onto the engine) and `--midi-map <file>` (the mapping file,
-/// default `midi-map.toml`), and `--midi-guide <file>` (the learn-mode editor, which starts no
-/// engine; `--decks` sets its target list). Unknown flags are errors rather than silently ignored:
+/// default `midi-map.toml`; the map's `[meta].device` can supply the port) and `--midi-guide <file>`
+/// (the unit map guide, no engine). Unknown flags are errors rather than silently ignored:
 /// a typo'd `--conifg` that launches the default topology instead is the kind of surprise nobody
 /// wants mid-set.
 #[derive(Debug, Default)]
@@ -260,9 +290,9 @@ struct CliArgs {
     midi: Option<String>,
     /// `--midi-map <file>`: only meaningful with `--midi`.
     midi_map: Option<String>,
-    /// `--midi-guide <file>`: run the guide editor instead of the engine.
+    /// `--midi-guide <file>`: run the unit map guide instead of the engine.
     midi_guide: Option<String>,
-    /// `--decks <n>`: the guide's target list width (no engine to ask).
+    /// `--decks <n>`: how many deck units the guide offers when cloning.
     decks: Option<usize>,
     /// `--live <file>`: this machine's settings (engine rate, ring sizes, stem defaults).
     live: Option<String>,
@@ -350,24 +380,27 @@ impl CliArgs {
                 }
             }
         }
-        // A map without a port would be silently ignored, which reads as "my bindings do nothing".
-        // The guide takes its port from `--midi` optionally, so it is exempt.
-        if args.midi.is_none() && args.midi_map.is_some() && args.midi_guide.is_none() {
-            eprintln!("error: --midi-map requires --midi");
-            std::process::exit(1);
-        }
         args
     }
 }
 
-/// Reads the profile `--profile` names, or the ambient one, and reports whatever it said that is
-/// worth saying (a reserved `[preference]` key, for instance).
-///
-/// A *missing* ambient profile is not an error — "no profile" is the documented way to run the
-/// built-in defaults. A missing **named** one is, because the user asked for it by name.
-fn read_profile(arg: Option<&str>) -> Option<profile::Profile> {
-    let (profile, _) = read_profile_at(arg);
-    profile
+fn read_map(path: &str) -> Result<hypermixx_midi::Map, String> {
+    let text = std::fs::read_to_string(path).map_err(|err| format!("{path}: {err}"))?;
+    let base = std::path::Path::new(path)
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    hypermixx_midi::Map::from_toml_str_at(&text, base).map_err(|err| format!("{path}: {err}"))
+}
+
+fn map_error(path: &str) -> Result<(), String> {
+    read_map(path).map(|_| ())
+}
+
+/// The device a map names in `[meta].device`, if the file parses. A map that does not parse is
+/// left to `attach`, which reports the real error with the file name.
+fn map_device(path: &str) -> Option<String> {
+    read_map(path).ok()?.meta.and_then(|meta| meta.device)
 }
 
 /// The profile and the path it came from: the path is what `profile show`/`profile reload` speak

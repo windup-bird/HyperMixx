@@ -1,0 +1,45 @@
+# A user preset. `[meta] presets = ["presets/example.toml"]` in the map makes it visible; a
+# preset with a built-in's name replaces that built-in for this map only.
+#
+# A preset supplies slot names/shapes and default mode tables. The unit still binds the physical
+# endpoints, so the same preset can be used on deck0 and deck1.
+[[preset]]
+name = "deckfx"
+start = "filter"
+
+[[preset.slot]]
+slot = "knob1"
+shape = "Knob"
+[[preset.slot]]
+slot = "knob2"
+shape = "Knob"
+
+[[preset.mode]]
+name = "filter"
+[[preset.mode.bind]]
+slot = "knob1"
+action = "fx param"
+fx = "filter"
+param = "value"
+[[preset.mode.bind]]
+slot = "knob2"
+action = "fx param"
+fx = "filter"
+param = "resonance"
+
+[[preset.mode]]
+name = "eq"
+[[preset.mode.bind]]
+slot = "knob1"
+action = "fx param"
+fx = "eq"
+param = "low"
+min = -1.0
+max = 1.0
+[[preset.mode.bind]]
+slot = "knob2"
+action = "fx param"
+fx = "eq"
+param = "high"
+min = -1.0
+max = 1.0

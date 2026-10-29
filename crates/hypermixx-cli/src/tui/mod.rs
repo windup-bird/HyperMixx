@@ -52,11 +52,16 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         live_source,
         midi_port,
         midi_map,
+        midi_control,
+        midi_state,
         library,
     } = session;
     let preference_path = preference_path(profile.as_deref());
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
     let mut dispatcher = Dispatcher::new(command_tx.clone(), notice_tx).tap_events(event_tx);
+    if let (Some(control), Some(state)) = (midi_control, midi_state) {
+        dispatcher.set_midi(control, state);
+    }
     dispatcher.with_topology(topology);
     dispatcher.with_profile(profile);
     let ring_frames = live.audio.ring_frames;
@@ -87,7 +92,11 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     app.midi_map = (!midi_map.is_empty()).then_some(midi_map);
     if let Some(port) = midi_port {
         app.midi_port = Some(port);
-        app.connect_midi(dispatcher.command_tx.clone(), &dispatcher.notices);
+        app.connect_midi(
+            dispatcher.command_tx.clone(),
+            &dispatcher.notices,
+            &dispatcher,
+        );
     }
 
     let mut terminal = match ratatui::try_init() {
