@@ -10,15 +10,20 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::map::{ControlShape, Meta, RawMode};
+use crate::map::{Meta, RawMode, SlotKind, SlotRole};
 
 const BUILTINS: &[(&str, &str)] = &[
-    ("touchpad", include_str!("../presets/touchpad.toml")),
-    ("mixer", include_str!("../presets/mixer.toml")),
-    ("transport", include_str!("../presets/transport.toml")),
     ("browser", include_str!("../presets/browser.toml")),
-    ("output", include_str!("../presets/output.toml")),
+    ("crossfader", include_str!("../presets/crossfader.toml")),
+    ("deckfx", include_str!("../presets/deckfx.toml")),
     ("jog", include_str!("../presets/jog.toml")),
+    ("manualjump", include_str!("../presets/manualjump.toml")),
+    ("manualloop", include_str!("../presets/manualloop.toml")),
+    ("mixer", include_str!("../presets/mixer.toml")),
+    ("output", include_str!("../presets/output.toml")),
+    ("pad", include_str!("../presets/pad.toml")),
+    ("tempofader", include_str!("../presets/tempofader.toml")),
+    ("transport", include_str!("../presets/transport.toml")),
 ];
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -28,30 +33,61 @@ pub struct PresetFile {
     pub presets: Vec<Preset>,
 }
 
+/// Which groups a preset can be instantiated in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PresetScope {
+    /// A deck unit (transport, mixer, jog, …).
+    #[default]
+    Deck,
+    /// A global unit that is not tied to a deck (output, crossfader).
+    Global,
+    /// Either: `browser` exists both globally and per deck.
+    Both,
+}
+
+impl PresetScope {
+    /// Whether the preset may be owned by a deck.
+    pub fn takes_deck(self) -> bool {
+        matches!(self, PresetScope::Deck | PresetScope::Both)
+    }
+
+    /// Whether the preset may stand on its own.
+    pub fn takes_global(self) -> bool {
+        matches!(self, PresetScope::Global | PresetScope::Both)
+    }
+}
+
 /// One named preset. Modes are the same shape a unit uses, so a unit can replace one by name.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preset {
     pub name: String,
-    /// A global preset is not tied to a deck; the guide must not ask for one.
     #[serde(default)]
-    pub global: bool,
+    pub scope: PresetScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode_order: Option<Vec<String>>,
     #[serde(default, rename = "slot")]
     pub slots: Vec<PresetSlot>,
     #[serde(default, rename = "mode")]
     pub modes: Vec<RawMode>,
 }
 
+/// One preset slot: its physical kind, plus the role and target when it is a mode slot.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PresetSlot {
     pub slot: String,
+    #[serde(rename = "type")]
+    pub kind: SlotKind,
+    #[serde(default, skip_serializing_if = "is_action_role")]
+    pub role: SlotRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shape: Option<ControlShape>,
+    pub target: Option<String>,
+}
+
+fn is_action_role(role: &SlotRole) -> bool {
+    *role == SlotRole::Action
 }
 
 /// The presets visible to one map. Built-ins are loaded first; a user file with the same preset
@@ -105,8 +141,9 @@ impl PresetRegistry {
         self.presets.get(name)
     }
 
-    pub fn is_global(&self, name: &str) -> bool {
-        self.presets.get(name).is_some_and(|preset| preset.global)
+    /// The groups a preset may be instantiated in.
+    pub fn scope(&self, name: &str) -> Option<PresetScope> {
+        self.presets.get(name).map(|preset| preset.scope)
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
@@ -122,7 +159,19 @@ mod tests {
     #[test]
     fn builtins_parse() {
         let registry = PresetRegistry::load(None, Path::new(".")).expect("built-ins");
-        for name in ["touchpad", "mixer", "transport", "browser", "output", "jog"] {
+        for name in [
+            "browser",
+            "crossfader",
+            "deckfx",
+            "jog",
+            "manualjump",
+            "manualloop",
+            "mixer",
+            "output",
+            "pad",
+            "tempofader",
+            "transport",
+        ] {
             assert!(registry.get(name).is_some(), "missing built-in `{name}`");
         }
     }
@@ -141,10 +190,9 @@ mod tests {
 [[preset]]
 name = "touchpad"
 start = "only"
-mode_order = ["only"]
 [[preset.slot]]
 slot = "mine"
-shape = "pad"
+type = "Button"
 [[preset.mode]]
 name = "only"
 [[preset.mode.bind]]
@@ -157,6 +205,7 @@ deck = 1
         let meta = Meta {
             name: None,
             device: None,
+            description: None,
             presets: vec!["my-presets.toml".to_owned()],
         };
         let registry = PresetRegistry::load(Some(&meta), &dir).expect("user preset");

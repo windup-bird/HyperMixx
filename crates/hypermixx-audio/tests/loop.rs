@@ -20,7 +20,7 @@ use common::{
 };
 use crossbeam_channel::Sender;
 use hypermixx_audio::{Command, SAMPLE_RATE};
-use hypermixx_core::{LoopEditOp, LoopOp, LoopQuantum};
+use hypermixx_core::{BeatLen, LoopEditOp, LoopOp, LoopQuantum};
 
 const BPM: f32 = 122.0;
 /// One beat at the engine rate, as the grid lays it out (float — per-beat rounding stays honest).
@@ -39,7 +39,7 @@ fn beat_loop_engages_edits_and_exits_through_the_protocol() {
     ack(&rx);
 
     // Engage a 4-beat loop; the warm-up hop is another thread, so poll the state for it.
-    ask_loop(&tx, 0, LoopOp::Beats(4));
+    ask_loop(&tx, 0, LoopOp::Beats(BeatLen::beats(4)));
     ack(&rx);
     let engaged = wait_for(&tx, &rx, 0, "a 4-beat loop", |s| s.loop_range.is_some());
     let (in_frame, out_frame) = engaged.loop_range.expect("engaged");
@@ -82,7 +82,7 @@ fn beat_loop_engages_edits_and_exits_through_the_protocol() {
     );
 
     // Halve through the beat-loop verb (decision 5): `in` stays, `out` comes in.
-    ask_loop(&tx, 0, LoopOp::Beats(2));
+    ask_loop(&tx, 0, LoopOp::Beats(BeatLen::beats(2)));
     ack(&rx);
     let moved_in = moved_range.0;
     let halved = wait_for(&tx, &rx, 0, "the halved range", |s| {
@@ -183,7 +183,7 @@ fn loop_commands_refuse_without_a_beat_grid() {
     for (label, op) in [
         ("in", LoopOp::In),
         ("out", LoopOp::Out),
-        ("beat loop", LoopOp::Beats(4)),
+        ("beat loop", LoopOp::Beats(BeatLen::beats(4))),
         ("edit", LoopOp::Edit(LoopEditOp::Move { beats: 1 })),
     ] {
         ask_loop(&tx, 0, op);
@@ -217,7 +217,7 @@ fn loop_exit_is_seamless_while_the_slip_clock_keeps_pace_with_a_sibling() {
     ack(&rx);
     ack(&rx);
 
-    ask_loop(&tx, 1, LoopOp::Beats(4));
+    ask_loop(&tx, 1, LoopOp::Beats(BeatLen::beats(4)));
     ack(&rx);
     let engaged = wait_for(&tx, &rx, 1, "deck1's loop", |s| s.loop_range.is_some());
     let (in_frame, out_frame) = engaged.loop_range.expect("engaged");

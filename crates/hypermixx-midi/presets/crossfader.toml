@@ -1,0 +1,15 @@
+# The shared crossfader, centred at zero.
+[[preset]]
+name = "crossfader"
+scope = "global"
+start = "default"
+
+[[preset.slot]]
+slot = "fader"
+type = "BipolKnob"
+
+[[preset.mode]]
+name = "default"
+[[preset.mode.bind]]
+slot = "fader"
+action = "fader cross"

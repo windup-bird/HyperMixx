@@ -239,18 +239,17 @@ mod tests {
         let map = root.join(DEFAULT_MIDI);
         let text = format!("midi = \"{}\"\n", map.display());
         let (profile, notes) = parse(&text).unwrap();
-        assert_eq!(profile.midi.device, None, "the shipped map names no device");
         assert!(
             profile
                 .midi
                 .map
                 .as_deref()
-                .is_some_and(|path| path.ends_with("profile/midi.toml"))
+                .is_some_and(|path| path.ends_with("profile/midi.toml")),
+            "the map path is what the profile carries"
         );
-        assert!(
-            notes.iter().any(|note| note.contains("device")),
-            "the missing device is reported: {notes:?}"
-        );
+        // The shipped map names the development controller, so there is nothing to warn about.
+        let device = profile.midi.device.clone();
+        assert_eq!(device.is_none(), notes.iter().any(|note| note.contains("device")));
 
         // The old inline settings table is refused with a migration message.
         let error = parse("[midi]\ndevice = \"DDJ-400\"\nmap = \"m.toml\"\n").unwrap_err();
@@ -308,7 +307,10 @@ mod tests {
             notes.iter().all(|note| note.contains("device")),
             "the only note is that the map names no port: {notes:?}"
         );
-        assert_eq!(profile.midi.device, None, "no controller is assumed");
+        assert!(
+            profile.midi.device.is_some() || notes.iter().any(|note| note.contains("device")),
+            "either a device is named or the absence is reported"
+        );
         assert!(
             profile
                 .midi

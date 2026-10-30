@@ -1,11 +1,11 @@
 # Hypermixx MIDI map — a fuller example.
 #
-# Units are independent: deck0 and deck1 keep their own active mode. A selector is not an action;
-# `trigger` sets the named mode, `cycle` advances through the declared order.
+# Units are independent: deck1 and deck2 keep their own active mode. A mode key is an ordinary
+# control with `role = "mode_trigger"` or `role = "mode_cycle"`; it switches the unit's mode and
+# emits no command. Endpoints are unique across the whole file.
 #
-# Built-in presets: touchpad | mixer | transport | browser | output | jog
-# All endpoints are unique across the file. Adjust the channel/id pairs to your controller; the
-# preset slot names and mode tables stay the same.
+# Built-in presets: browser | crossfader | deckfx | jog | manualjump | manualloop | mixer | output |
+# pad | tempofader | transport
 
 [meta]
 name = "example"
@@ -13,149 +13,109 @@ name = "example"
 # User presets live next to this file; a same-name preset replaces the built-in one.
 presets = ["presets/example.toml"]
 
-# ---- deck 0 pad grid -------------------------------------------------------------------------
+# ---- deck 1 pad grid -------------------------------------------------------------------------
 [[unit]]
 id = "deck1.pad"
-preset = "touchpad"
+preset = "pad"
 deck = 1
 
 [[unit.control]]
 slot = "pad1"
-type = "note"
-channel = 0
-id = 16
+endpoint = { midi = "note", channel = 0, id = 16 }
 [[unit.control]]
 slot = "pad2"
-type = "note"
-channel = 0
-id = 17
+endpoint = { midi = "note", channel = 0, id = 17 }
 [[unit.control]]
 slot = "pad3"
-type = "note"
-channel = 0
-id = 18
+endpoint = { midi = "note", channel = 0, id = 18 }
 [[unit.control]]
 slot = "pad4"
-type = "note"
-channel = 0
-id = 19
+endpoint = { midi = "note", channel = 0, id = 19 }
 [[unit.control]]
 slot = "pad5"
-type = "note"
-channel = 0
-id = 20
+endpoint = { midi = "note", channel = 0, id = 20 }
 [[unit.control]]
 slot = "pad6"
-type = "note"
-channel = 0
-id = 21
+endpoint = { midi = "note", channel = 0, id = 21 }
 [[unit.control]]
 slot = "pad7"
-type = "note"
-channel = 0
-id = 22
+endpoint = { midi = "note", channel = 0, id = 22 }
 [[unit.control]]
 slot = "pad8"
-type = "note"
-channel = 0
-id = 23
+endpoint = { midi = "note", channel = 0, id = 23 }
 
-[[unit.selector]]
-type = "note"
-channel = 0
-id = 24
-behavior = "trigger"
+[[unit.control]]
+slot = "mode-hotcue"
+role = "mode_trigger"
 target = "hotcue"
-[[unit.selector]]
-type = "note"
-channel = 0
-id = 25
-behavior = "trigger"
-target = "loop"
-[[unit.selector]]
-type = "note"
-channel = 0
-id = 26
-behavior = "trigger"
+endpoint = { midi = "note", channel = 0, id = 24 }
+[[unit.control]]
+slot = "mode-beatloop"
+role = "mode_trigger"
+target = "beatloop"
+endpoint = { midi = "note", channel = 0, id = 25 }
+[[unit.control]]
+slot = "mode-beatjump"
+role = "mode_trigger"
 target = "beatjump"
-[[unit.selector]]
-type = "note"
-channel = 0
-id = 27
-behavior = "trigger"
-target = "stems"
+endpoint = { midi = "note", channel = 0, id = 26 }
+[[unit.control]]
+slot = "mode-next"
+role = "mode_cycle"
+endpoint = { midi = "note", channel = 0, id = 27 }
 
+# ---- deck 2 pad grid -------------------------------------------------------------------------
 [[unit]]
 id = "deck2.pad"
-preset = "touchpad"
+preset = "pad"
 deck = 2
 
 [[unit.control]]
 slot = "pad1"
-type = "note"
-channel = 1
-id = 16
+endpoint = { midi = "note", channel = 1, id = 16 }
 [[unit.control]]
 slot = "pad2"
-type = "note"
-channel = 1
-id = 17
+endpoint = { midi = "note", channel = 1, id = 17 }
 [[unit.control]]
 slot = "pad3"
-type = "note"
-channel = 1
-id = 18
+endpoint = { midi = "note", channel = 1, id = 18 }
 [[unit.control]]
 slot = "pad4"
-type = "note"
-channel = 1
-id = 19
+endpoint = { midi = "note", channel = 1, id = 19 }
 [[unit.control]]
 slot = "pad5"
-type = "note"
-channel = 1
-id = 20
+endpoint = { midi = "note", channel = 1, id = 20 }
 [[unit.control]]
 slot = "pad6"
-type = "note"
-channel = 1
-id = 21
+endpoint = { midi = "note", channel = 1, id = 21 }
 [[unit.control]]
 slot = "pad7"
-type = "note"
-channel = 1
-id = 22
+endpoint = { midi = "note", channel = 1, id = 22 }
 [[unit.control]]
 slot = "pad8"
-type = "note"
-channel = 1
-id = 23
+endpoint = { midi = "note", channel = 1, id = 23 }
 
-[[unit.selector]]
-type = "note"
-channel = 1
-id = 24
-behavior = "trigger"
+[[unit.control]]
+slot = "mode-hotcue"
+role = "mode_trigger"
 target = "hotcue"
-[[unit.selector]]
-type = "note"
-channel = 1
-id = 25
-behavior = "trigger"
-target = "loop"
-[[unit.selector]]
-type = "note"
-channel = 1
-id = 26
-behavior = "trigger"
+endpoint = { midi = "note", channel = 1, id = 24 }
+[[unit.control]]
+slot = "mode-beatloop"
+role = "mode_trigger"
+target = "beatloop"
+endpoint = { midi = "note", channel = 1, id = 25 }
+[[unit.control]]
+slot = "mode-beatjump"
+role = "mode_trigger"
 target = "beatjump"
-[[unit.selector]]
-type = "note"
-channel = 1
-id = 27
-behavior = "trigger"
-target = "stems"
+endpoint = { midi = "note", channel = 1, id = 26 }
+[[unit.control]]
+slot = "mode-next"
+role = "mode_cycle"
+endpoint = { midi = "note", channel = 1, id = 27 }
 
+# ---- transport -------------------------------------------------------------------------------
 [[unit]]
 id = "deck1.transport"
 preset = "transport"
@@ -163,24 +123,16 @@ deck = 1
 
 [[unit.control]]
 slot = "play"
-type = "note"
-channel = 0
-id = 0
+endpoint = { midi = "note", channel = 0, id = 0 }
 [[unit.control]]
 slot = "cue"
-type = "note"
-channel = 0
-id = 1
+endpoint = { midi = "note", channel = 0, id = 1 }
 [[unit.control]]
 slot = "sync"
-type = "note"
-channel = 0
-id = 2
+endpoint = { midi = "note", channel = 0, id = 2 }
 [[unit.control]]
 slot = "keylock"
-type = "note"
-channel = 0
-id = 3
+endpoint = { midi = "note", channel = 0, id = 3 }
 
 [[unit]]
 id = "deck2.transport"
@@ -189,28 +141,20 @@ deck = 2
 
 [[unit.control]]
 slot = "play"
-type = "note"
-channel = 1
-id = 0
+endpoint = { midi = "note", channel = 1, id = 0 }
 [[unit.control]]
 slot = "cue"
-type = "note"
-channel = 1
-id = 1
+endpoint = { midi = "note", channel = 1, id = 1 }
 [[unit.control]]
 slot = "sync"
-type = "note"
-channel = 1
-id = 2
+endpoint = { midi = "note", channel = 1, id = 2 }
 [[unit.control]]
 slot = "keylock"
-type = "note"
-channel = 1
-id = 3
+endpoint = { midi = "note", channel = 1, id = 3 }
 
-# ---- channel strips --------------------------------------------------------------------------
+# ---- channel strips ---------------------------------------------------------------------------
 # The mixer preset's EQ/filter rows resolve `chain` from the unit's deck, so the same preset works
-# on deck0 and deck1 without editing names.
+# on deck1 and deck2 without editing names.
 [[unit]]
 id = "deck1.mixer"
 preset = "mixer"
@@ -218,45 +162,28 @@ deck = 1
 
 [[unit.control]]
 slot = "fader"
-type = "cc"
-channel = 0
-id = 7
+endpoint = { midi = "cc", channel = 0, id = 7 }
 [[unit.control]]
 slot = "gain"
-type = "cc"
-channel = 0
-id = 8
+endpoint = { midi = "cc", channel = 0, id = 8 }
 [[unit.control]]
 slot = "low"
-type = "cc"
-channel = 0
-id = 9
+endpoint = { midi = "cc", channel = 0, id = 9 }
 [[unit.control]]
 slot = "mid"
-type = "cc"
-channel = 0
-id = 10
+endpoint = { midi = "cc", channel = 0, id = 10 }
 [[unit.control]]
 slot = "high"
-type = "cc"
-channel = 0
-id = 11
+endpoint = { midi = "cc", channel = 0, id = 11 }
 [[unit.control]]
 slot = "filter"
-kind = "BipolKnob"
-type = "cc"
-channel = 0
-id = 12
+endpoint = { midi = "cc", channel = 0, id = 12 }
 [[unit.control]]
 slot = "cue"
-type = "note"
-channel = 0
-id = 13
+endpoint = { midi = "note", channel = 0, id = 13 }
 [[unit.control]]
 slot = "load"
-type = "note"
-channel = 0
-id = 14
+endpoint = { midi = "note", channel = 0, id = 14 }
 
 [[unit]]
 id = "deck2.mixer"
@@ -265,126 +192,159 @@ deck = 2
 
 [[unit.control]]
 slot = "fader"
-type = "cc"
-channel = 1
-id = 7
+endpoint = { midi = "cc", channel = 1, id = 7 }
 [[unit.control]]
 slot = "gain"
-type = "cc"
-channel = 1
-id = 8
+endpoint = { midi = "cc", channel = 1, id = 8 }
 [[unit.control]]
 slot = "low"
-type = "cc"
-channel = 1
-id = 9
+endpoint = { midi = "cc", channel = 1, id = 9 }
 [[unit.control]]
 slot = "mid"
-type = "cc"
-channel = 1
-id = 10
+endpoint = { midi = "cc", channel = 1, id = 10 }
 [[unit.control]]
 slot = "high"
-type = "cc"
-channel = 1
-id = 11
+endpoint = { midi = "cc", channel = 1, id = 11 }
 [[unit.control]]
 slot = "filter"
-kind = "BipolKnob"
-type = "cc"
-channel = 1
-id = 12
+endpoint = { midi = "cc", channel = 1, id = 12 }
 [[unit.control]]
 slot = "cue"
-type = "note"
-channel = 1
-id = 13
+endpoint = { midi = "note", channel = 1, id = 13 }
 [[unit.control]]
 slot = "load"
-type = "note"
-channel = 1
-id = 14
+endpoint = { midi = "note", channel = 1, id = 14 }
 
 # ---- tempo faders ----------------------------------------------------------------------------
 [[unit]]
 id = "deck1.tempo"
+preset = "tempofader"
 deck = 1
 
+# The tempo fader. If the device sends a 14-bit pair (e.g. #9 + #41), write
+# `endpoint = { midi = "cc", id = 9, lsb = 41, ... }` instead — but only when #9 is not already
+# claimed by another slot.
 [[unit.control]]
 slot = "fader"
-type = "cc"
-channel = 0
-id = 41
-
-[[unit.mode]]
-name = "default"
-[[unit.mode.bind]]
-slot = "fader"
-action = "tempofader"
+endpoint = { midi = "cc", lsb = 40, channel = 0, id = 39 }
+[[unit.control]]
+slot = "bend-backward"
+endpoint = { midi = "note", channel = 0, id = 4 }
+[[unit.control]]
+slot = "bend-forward"
+endpoint = { midi = "note", channel = 0, id = 5 }
 
 [[unit]]
 id = "deck2.tempo"
+preset = "tempofader"
 deck = 2
 
 [[unit.control]]
 slot = "fader"
-type = "cc"
-channel = 1
-id = 41
+endpoint = { midi = "cc", lsb = 40, channel = 1, id = 39 }
+[[unit.control]]
+slot = "bend-backward"
+endpoint = { midi = "note", channel = 1, id = 4 }
+[[unit.control]]
+slot = "bend-forward"
+endpoint = { midi = "note", channel = 1, id = 5 }
 
-[[unit.mode]]
-name = "default"
-[[unit.mode.bind]]
-slot = "fader"
-action = "tempofader"
+# ---- loops and jumps -------------------------------------------------------------------------
+[[unit]]
+id = "deck1.loop"
+preset = "manualloop"
+deck = 1
 
-# ---- deck FX (user preset) -------------------------------------------------------------------
-# `presets/example.toml` supplies the `deckfx` preset. Two knobs, two modes; the selector below
-# cycles filter -> eq, and the same physical knobs change meaning.
+[[unit.control]]
+slot = "in"
+endpoint = { midi = "note", channel = 0, id = 32 }
+[[unit.control]]
+slot = "out"
+endpoint = { midi = "note", channel = 0, id = 33 }
+[[unit.control]]
+slot = "exit"
+endpoint = { midi = "note", channel = 0, id = 34 }
+[[unit.control]]
+slot = "double"
+endpoint = { midi = "note", channel = 0, id = 35 }
+[[unit.control]]
+slot = "halve"
+endpoint = { midi = "note", channel = 0, id = 36 }
+[[unit.control]]
+slot = "autoloop"
+endpoint = { midi = "cc", encoding = "two_point", channel = 0, id = 37 }
+
+[[unit]]
+id = "deck2.loop"
+preset = "manualloop"
+deck = 2
+
+[[unit.control]]
+slot = "in"
+endpoint = { midi = "note", channel = 1, id = 32 }
+[[unit.control]]
+slot = "out"
+endpoint = { midi = "note", channel = 1, id = 33 }
+[[unit.control]]
+slot = "exit"
+endpoint = { midi = "note", channel = 1, id = 34 }
+[[unit.control]]
+slot = "double"
+endpoint = { midi = "note", channel = 1, id = 35 }
+[[unit.control]]
+slot = "halve"
+endpoint = { midi = "note", channel = 1, id = 36 }
+[[unit.control]]
+slot = "autoloop"
+endpoint = { midi = "cc", encoding = "two_point", channel = 1, id = 37 }
+
+# ---- deck FX ---------------------------------------------------------------------------------
 [[unit]]
 id = "deck1.deckfx"
 preset = "deckfx"
 deck = 1
 
 [[unit.control]]
-slot = "knob1"
-type = "cc"
-channel = 0
-id = 20
+slot = "toggle"
+endpoint = { midi = "note", channel = 0, id = 40 }
 [[unit.control]]
-slot = "knob2"
-type = "cc"
-channel = 0
-id = 21
+slot = "param1"
+endpoint = { midi = "cc", channel = 0, id = 20 }
+[[unit.control]]
+slot = "param2"
+endpoint = { midi = "cc", channel = 0, id = 21 }
 
-[[unit.selector]]
-type = "note"
-channel = 0
-id = 28
-behavior = "cycle"
+[[unit.control]]
+slot = "mode-filter"
+type = "Button"
+role = "mode_trigger"
+target = "filter"
+endpoint = { midi = "note", channel = 0, id = 41 }
 
+[[unit.control]]
+slot = "mode-eq"
+type = "Button"
+role = "mode_trigger"
+target = "eq"
+endpoint = { midi = "note", channel = 0, id = 42 }
+
+# This one uses the user preset from `presets/example.toml` to show the override path.
 [[unit]]
 id = "deck2.deckfx"
-preset = "deckfx"
+preset = "mydeckfx"
 deck = 2
 
 [[unit.control]]
+slot = "toggle"
+endpoint = { midi = "note", channel = 1, id = 40 }
+[[unit.control]]
 slot = "knob1"
-type = "cc"
-channel = 1
-id = 20
+endpoint = { midi = "cc", channel = 1, id = 20 }
 [[unit.control]]
 slot = "knob2"
-type = "cc"
-channel = 1
-id = 21
+endpoint = { midi = "cc", channel = 1, id = 21 }
 
-[[unit.selector]]
-type = "note"
-channel = 1
-id = 28
-behavior = "cycle"
-
+# ---- jog wheels ------------------------------------------------------------------------------
 [[unit]]
 id = "deck1.jog"
 preset = "jog"
@@ -392,9 +352,10 @@ deck = 1
 
 [[unit.control]]
 slot = "jog"
-kind = "JogWheel"
-touch = { type = "note", channel = 0, id = 80 }
-turn = { type = "cc", mode = "rel2", channel = 0, id = 6 }
+endpoint = [
+  { role = "press", midi = "note", channel = 0, id = 80 },
+  { role = "turn", midi = "cc", encoding = "twos_complement", channel = 0, id = 6 },
+]
 
 [[unit]]
 id = "deck2.jog"
@@ -403,9 +364,10 @@ deck = 2
 
 [[unit.control]]
 slot = "jog"
-kind = "JogWheel"
-touch = { type = "note", channel = 1, id = 80 }
-turn = { type = "cc", mode = "rel2", channel = 1, id = 6 }
+endpoint = [
+  { role = "press", midi = "note", channel = 1, id = 80 },
+  { role = "turn", midi = "cc", encoding = "twos_complement", channel = 1, id = 6 },
+]
 
 # ---- shared controls -------------------------------------------------------------------------
 [[unit]]
@@ -414,60 +376,32 @@ preset = "output"
 
 [[unit.control]]
 slot = "master"
-type = "cc"
-channel = 15
-id = 8
+endpoint = { midi = "cc", channel = 15, id = 8 }
 [[unit.control]]
 slot = "cue"
-type = "cc"
-channel = 15
-id = 12
+endpoint = { midi = "cc", channel = 15, id = 12 }
 
 [[unit]]
 id = "global.crossfader"
+preset = "crossfader"
+
 [[unit.control]]
 slot = "fader"
-type = "cc"
-channel = 15
-id = 10
-
-[[unit.mode]]
-name = "default"
-[[unit.mode.bind]]
-slot = "fader"
-action = "fader cross"
+endpoint = { midi = "cc", channel = 15, id = 10 }
 
 [[unit]]
 id = "global.browser"
 preset = "browser"
 
 [[unit.control]]
-slot = "up"
-type = "note"
-channel = 15
-id = 90
-[[unit.control]]
-slot = "down"
-type = "note"
-channel = 15
-id = 91
+slot = "browse"
+endpoint = { midi = "cc", encoding = "two_point", reverse = true, channel = 15, id = 0 }
 [[unit.control]]
 slot = "open"
-type = "note"
-channel = 15
-id = 92
+endpoint = { midi = "note", channel = 15, id = 90 }
 [[unit.control]]
 slot = "exit"
-type = "note"
-channel = 15
-id = 93
+endpoint = { midi = "note", channel = 15, id = 91 }
 [[unit.control]]
 slot = "load"
-type = "note"
-channel = 15
-id = 94
-[[unit.control]]
-slot = "refresh"
-type = "note"
-channel = 15
-id = 95
+endpoint = { midi = "note", channel = 15, id = 92 }

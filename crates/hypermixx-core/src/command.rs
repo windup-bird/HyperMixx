@@ -32,8 +32,9 @@ impl FxChainId {
     /// A stable label for logs, errors and the front-end's slot book.
     pub fn label(&self) -> String {
         match self {
-            FxChainId::Deck(deck_id) => format!("deck{deck_id}"),
-            FxChainId::Stem { deck, stem } => format!("deck{deck}/{stem}"),
+            // Deck numbers are 1-based everywhere a user reads them; the id itself is 0-based.
+            FxChainId::Deck(deck_id) => format!("deck{}", deck_id + 1),
+            FxChainId::Stem { deck, stem } => format!("deck{}/{stem}", deck + 1),
             FxChainId::Master => "master".into(),
         }
     }
@@ -119,6 +120,85 @@ pub enum LoopEditOp {
     Out { beats: i64 },
 }
 
+/// A musical length, exact for every loop a DJ uses: `4` beats, `1/2` beat, `1/4` beat.
+///
+/// The denominator is a power of two, so a length converts to frames without drift. A `u64` beat
+/// count could not express the sub-beat loops a controller's beat-loop pads send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BeatLen {
+    num: u32,
+    den: u32,
+}
+
+impl BeatLen {
+    /// The length in whole beats.
+    pub const fn beats(num: u32) -> Self {
+        Self { num, den: 1 }
+    }
+
+    /// `numerator/denominator` beats. The denominator must be a non-zero power of two.
+    pub const fn fraction(num: u32, den: u32) -> Option<Self> {
+        if num == 0 || den == 0 || !den.is_power_of_two() {
+            return None;
+        }
+        Some(Self { num, den })
+    }
+
+    /// Parses `4`, `1/2`, `3/4`. Integers only, so `0.25` is rejected rather than guessed.
+    pub fn parse(token: &str) -> Option<Self> {
+        let token = token.trim();
+        match token.split_once('/') {
+            Some((num, den)) => {
+                let num: u32 = num.trim().parse().ok()?;
+                let den: u32 = den.trim().parse().ok()?;
+                Self::fraction(num, den)
+            }
+            None => {
+                let num: u32 = token.parse().ok()?;
+                (num > 0).then(|| Self::beats(num))
+            }
+        }
+    }
+
+    pub const fn numerator(self) -> u32 {
+        self.num
+    }
+
+    pub const fn denominator(self) -> u32 {
+        self.den
+    }
+
+    /// The number of whole beats in the length.
+    pub const fn whole_beats(self) -> u64 {
+        (self.num / self.den) as u64
+    }
+
+    /// The fraction of a beat left after the whole beats.
+    pub fn fraction_of_beat(self) -> f64 {
+        f64::from(self.num % self.den) / f64::from(self.den)
+    }
+
+    /// The length as a `f64` beat count.
+    pub fn to_beats(self) -> f64 {
+        f64::from(self.num) / f64::from(self.den)
+    }
+
+    /// `4` or `1/4`, the spelling a map file and a session line use.
+    pub fn label(self) -> String {
+        if self.den == 1 {
+            self.num.to_string()
+        } else {
+            format!("{}/{}", self.num, self.den)
+        }
+    }
+}
+
+impl std::fmt::Display for BeatLen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label())
+    }
+}
+
 /// One loop command. The whole family rides a single [`Command::Loop`] variant so the deck's
 /// loop state machine stays one match arm.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -133,15 +213,15 @@ pub enum LoopOp {
     Exit,
     /// Beat loop: with no loop engaged, open an N-beat loop at the quantized current beat; while
     /// looping, re-time the current loop's `out` to `in + N` beats (halve/double), in place.
-    Beats(u64),
+    Beats(BeatLen),
     /// Arm a slip loop: `playing` keeps its slip clock, `shadow` is the audible loop.
     SlipIn,
     /// Engage the armed slip loop.
     SlipOut,
     /// Slip beat loop: audible loop, `playing` continues silently underneath.
-    SlipBeats(u64),
+    SlipBeats(BeatLen),
     /// Slip roll: a slip beat loop whose shadow reads backwards.
-    SlipRoll(u64),
+    SlipRoll(BeatLen),
     /// Edit the active loop's range in place — no flow change.
     Edit(LoopEditOp),
     /// Set the deck's out-point quantization granularity.

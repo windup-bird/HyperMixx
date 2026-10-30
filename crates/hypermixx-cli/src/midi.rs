@@ -250,11 +250,22 @@ pub fn resolve_with(
     for unit in &map.units {
         for mode in &unit.modes {
             for bind in mode.binds.iter().flatten() {
-                if let Action::Fx(action) = &bind.action {
-                    let (chain, fx) = action.address();
-                    let pair = (chain, fx.to_owned());
-                    if !wanted.contains(&pair) {
-                        wanted.push(pair);
+                for action in [
+                    &bind.actions.main,
+                    &bind.actions.press,
+                    &bind.actions.turn,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let Action::Fx(fx_action) = action {
+                        let pair = {
+                            let (chain, fx) = fx_action.address();
+                            (chain, fx.to_owned())
+                        };
+                        if !wanted.contains(&pair) {
+                            wanted.push(pair);
+                        }
                     }
                 }
             }
@@ -321,14 +332,13 @@ mod tests {
         let map = Map::from_toml_str(
             r#"
 [[unit]]
-id = "deck0.pad"
+id = "deck1.pad"
 deck = 1
 
 [[unit.control]]
 slot = "pad"
-type = "note"
-channel = 0
-id = 48
+type = "Button"
+endpoint = { midi = "note", channel = 0, id = 48 }
 
 [[unit.mode]]
 name = "m"
@@ -376,33 +386,29 @@ action = "play"
         let mut map = Map::from_toml_str(
             r#"
 [[unit]]
-id = "deck0.mixer"
+id = "deck1.mixer"
 deck = 1
 
 [[unit.control]]
 slot = "low"
-type = "cc"
-channel = 0
-id = 20
+type = "Knob"
+endpoint = { midi = "cc", channel = 0, id = 20 }
 
 [[unit.control]]
 slot = "mid"
-type = "cc"
-channel = 0
-id = 21
+type = "Knob"
+endpoint = { midi = "cc", channel = 0, id = 21 }
 
 [[unit.mode]]
 name = "m"
 [[unit.mode.bind]]
 slot = "low"
-action = "fx param"
+action = "fx param value"
 fx = "filter"
-param = "value"
 [[unit.mode.bind]]
 slot = "mid"
-action = "fx param"
+action = "fx param value"
 fx = "missing"
-param = "value"
 "#,
         )
         .unwrap();
@@ -411,6 +417,6 @@ param = "value"
             (candidate == chain && name == "filter").then_some(2)
         });
         assert_eq!(map.fx_slot(chain, "filter"), Some(2));
-        assert_eq!(unresolved, vec!["deck0/missing".to_owned()]);
+        assert_eq!(unresolved, vec!["deck1/missing".to_owned()]);
     }
 }

@@ -2,7 +2,7 @@
 
 REPL 与 `--tui` 共用同一套语法（`crates/hypermixx-cli/src/command.rs`）与同一套响应渲染
 （`response.rs`），本文档覆盖：启动参数、会话语法、全部会话命令、TUI 键位与输出格式。
-MIDI 映射文件的 action 表见 [`midi-mapping.md`](midi-mapping.md)。
+MIDI 映射文件的 action 表见 [`MIDI.md`](MIDI.md)。
 
 ---
 
@@ -211,7 +211,7 @@ state                       打印全部 deck 的状态行
 
 只动 `nudgerate`，结束时 `tempo` 原封不动；`nudgerate` 总限幅 ±15%（PLL ±5% + nudge ±10%）。
 MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` 写进 mapping（见
-[`midi-mapping.md`](midi-mapping.md)）。
+[`MIDI.md`](MIDI.md)）。
 
 ### 3.5 循环 `loop`
 
@@ -425,7 +425,7 @@ output refresh   （别名 reload/reopen）重试所有不可用的目的地，�
 
 映射文件里的 `action` 就是**一条去掉目标的会话命令**（`"beatjump 4"`、`"vocals mute"`、
 `"sync phase pid"`），目标取 binding 的 `deck` 字段。语法表只有一份
-（`hypermixx-core::action::ACTIONS`），guide 的目标清单与 `docs/midi-mapping.md` 都由它生成；
+（`hypermixx-core::action::ACTIONS`），guide 的目标清单与 `docs/MIDI.md` 都由它生成；
 CLI 侧有一个测试逐一断言每个 action 都有对应的会话动词。
 
 ```
@@ -434,7 +434,7 @@ midi ports    列出可用 MIDI 输入端口（别名 list；无端口则提示 
 
 只有列端口走会话命令：打开端口在启动时（`--midi`）或 TUI 的 `F2` 完成——映射是
 对运行中引擎接线一次，不支持会话中途开关。映射表格式与全部 action 见
-[`midi-mapping.md`](midi-mapping.md)。
+[`MIDI.md`](MIDI.md)。
 
 ### 3.11 本机设置 `live`
 
@@ -606,4 +606,4 @@ hypermixx> quit
 
 - [`../README.md`](../README.md) — 安装、架构速览、脚本实测数据
 - [`../ARCHITECTURE.md`](../ARCHITECTURE.md) — 六 crate 分层、引擎/混音/同步内部设计
-- [`midi-mapping.md`](midi-mapping.md) — MIDI 映射 TOML schema、action 注册表、guide 向导
+- [`MIDI.md`](MIDI.md) — MIDI 映射 TOML schema、action 注册表、guide 向导

@@ -26,10 +26,13 @@ pub mod router;
 pub mod translate;
 
 pub use guide::{
-    Button, Candidate, Guide, GuideStep, GuideView, Row, RowKind, Stage, TreeButton, TreeNode,
-    TreeNodeKind, TreeView,
+    action_names, Candidate, Column, ControlPart, Entered, Guide, GuideStep, Nav, Row, TreeButton,
+    View,
 };
-pub use map::{manifest, Action, ActionSpec, BindingSpec, Map, MapError, Meta, Target, ACTIONS};
+pub use map::{
+    manifest, Action, ActionSpec, BindingSpec, Encoding, Map, MapError, Meta, SlotKind, SlotRole,
+    Target, ACTIONS,
+};
 pub use msg::{Decoder, Event};
 pub use ports::{list_ports, Input, PortInfo, Received};
 pub use router::{Feed, Router, RouterCommand, RouterState, UnitModeState};

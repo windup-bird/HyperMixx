@@ -1,14 +1,15 @@
+# Master and cue bus trims. Not tied to a deck.
 [[preset]]
 name = "output"
-global = true
+scope = "global"
 start = "default"
 
 [[preset.slot]]
 slot = "master"
-shape = "Knob"
+type = "Knob"
 [[preset.slot]]
 slot = "cue"
-shape = "Knob"
+type = "Knob"
 
 [[preset.mode]]
 name = "default"

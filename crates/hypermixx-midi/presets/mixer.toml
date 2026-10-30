@@ -1,33 +1,34 @@
-# One channel strip. The FX names assume the shipped topology's per-deck `eq` + `filter` chain;
-# an unresolved name disables that one row rather than the whole unit.
+# One channel strip. The FX names assume the shipped topology's per-deck `eq` + `filter` chain; an
+# unresolved name disables that one row rather than the whole unit.
 [[preset]]
 name = "mixer"
+scope = "deck"
 start = "default"
 
 [[preset.slot]]
 slot = "fader"
-shape = "Knob"
+type = "Knob"
 [[preset.slot]]
 slot = "gain"
-shape = "Knob"
+type = "Knob"
 [[preset.slot]]
 slot = "low"
-shape = "Knob"
+type = "Knob"
 [[preset.slot]]
 slot = "mid"
-shape = "Knob"
+type = "Knob"
 [[preset.slot]]
 slot = "high"
-shape = "Knob"
+type = "Knob"
 [[preset.slot]]
 slot = "filter"
-shape = "BipolKnob"
+type = "BipolKnob"
 [[preset.slot]]
 slot = "cue"
-shape = "Button"
+type = "Button"
 [[preset.slot]]
 slot = "load"
-shape = "Button"
+type = "Button"
 
 [[preset.mode]]
 name = "default"
@@ -39,30 +40,26 @@ slot = "gain"
 action = "fader gain"
 [[preset.mode.bind]]
 slot = "low"
-action = "fx param"
+action = "fx param low"
 fx = "eq"
-param = "low"
 min = -1.0
 max = 1.0
 [[preset.mode.bind]]
 slot = "mid"
-action = "fx param"
+action = "fx param mid"
 fx = "eq"
-param = "mid"
 min = -1.0
 max = 1.0
 [[preset.mode.bind]]
 slot = "high"
-action = "fx param"
+action = "fx param high"
 fx = "eq"
-param = "high"
 min = -1.0
 max = 1.0
 [[preset.mode.bind]]
 slot = "filter"
-action = "fx param"
+action = "fx param value"
 fx = "filter"
-param = "value"
 [[preset.mode.bind]]
 slot = "cue"
 action = "fader cuesend toggle"

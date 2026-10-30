@@ -17,7 +17,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use hypermixx_core::{BeatGrid, LoopQuantum, Source, CHANNELS};
+use hypermixx_core::{BeatGrid, BeatLen, LoopQuantum, Source, CHANNELS};
 
 /// A loop as a half-open frame range `[in_frame, out_frame)`, `out > in`, `out ≤` track end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,13 +262,21 @@ pub fn provisional_range(
 
 /// The frame `beats` whole beats past `in_frame` on the grid (for beat loops and length edits).
 /// Non-uniform grids included: this is an exact grid distance, not `beats × nominal fpb`.
-pub fn beats_after(grid: &BeatGrid, in_frame: u64, beats: u64) -> Option<u64> {
-    if grid.is_empty() || beats == 0 {
+pub fn beats_after(grid: &BeatGrid, in_frame: u64, len: BeatLen) -> Option<u64> {
+    if grid.is_empty() || len.numerator() == 0 {
         return None;
     }
     let floor = grid.floor_beat(in_frame);
-    let next = floor.checked_add(beats)?;
-    Some(grid.frame_at_beat(next))
+    let whole = len.whole_beats();
+    let base = grid.frame_at_beat(floor.checked_add(whole)?);
+    let frac = len.fraction_of_beat();
+    if frac == 0.0 {
+        return Some(base);
+    }
+    // A sub-beat length is a fraction of the *current* beat, so a tempo change inside the loop
+    // still measures from the beat the loop starts on.
+    let width = grid.beat_width(floor);
+    Some(base + (frac * width as f64).round() as u64)
 }
 
 /// The frame `beats` (may be negative) from `base`, as a grid distance in frames. `beats == 0`
@@ -443,11 +451,11 @@ mod tests {
         let base = g.frame_at_beat(7) + 500;
         // Four beats from an exact head…
         assert_eq!(
-            beats_after(&g, g.frame_at_beat(3), 4),
+            beats_after(&g, g.frame_at_beat(3), BeatLen::beats(4)),
             Some(g.frame_at_beat(7))
         );
         // …and from mid-beat, the distance still starts at the containing beat's head.
-        assert_eq!(beats_after(&g, base, 2), Some(g.frame_at_beat(9)));
+        assert_eq!(beats_after(&g, base, BeatLen::beats(2)), Some(g.frame_at_beat(9)));
 
         assert_eq!(beat_shift(&g, base, 0), Some(base));
         assert_eq!(

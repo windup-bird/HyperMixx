@@ -17,7 +17,8 @@ use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::fx::FxKind;
 use hypermixx_audio::{AudioPipeline, Command, SAMPLE_RATE};
 use hypermixx_core::{
-    Backend, CommandResponse, CueOp, FxChainId, FxSlotRef, HotCueOp, KeylockMode, LiveConfig,
+    Backend, BeatLen, CommandResponse, CueOp, FxChainId, FxSlotRef, HotCueOp, KeylockMode,
+    LiveConfig,
     LoopEditOp, LoopOp, LoopQuantum, NudgeOp, OutputOp, PhaseMode, Shared, Stem, StemOp,
     StemPreset, SyncOp, TrackAnalysis, VinylOp,
 };
@@ -1149,7 +1150,7 @@ fn loop_command<'a>(
     deck_id: u8,
     command_tx: &Sender<Command>,
 ) -> Action {
-    let usage = "usage: [deck] loop in | out | <beats> | slip in | slip out | slip <beats> | slip roll <beats> | exit | cancel | halve | double | edit <len|move|in|out> <beats> | quantum <beat|half|quarter|eighth>";
+    let usage = "usage: [deck] loop in | out | <beats|num/den> | slip in | slip out | slip <beats> | slip roll <beats> | exit | cancel | halve | double | edit <len|move|in|out> <beats> | quantum <beat|half|quarter|eighth>";
     let Some(sub) = words.next() else {
         return Action::Message(usage.into());
     };
@@ -1161,13 +1162,13 @@ fn loop_command<'a>(
         "slip" => match words.next() {
             Some("in") => LoopOp::SlipIn,
             Some("out") => LoopOp::SlipOut,
-            Some("roll") => match words.next().and_then(|token| token.parse::<u64>().ok()) {
-                Some(beats) if beats > 0 => LoopOp::SlipRoll(beats),
-                _ => return Action::Failed("usage: [deck] loop slip roll <beats>".into()),
+            Some("roll") => match words.next().and_then(BeatLen::parse) {
+                Some(beats) => LoopOp::SlipRoll(beats),
+                None => return Action::Failed("usage: [deck] loop slip roll <beats>".into()),
             },
-            Some(raw) => match raw.parse::<u64>() {
-                Ok(beats) if beats > 0 => LoopOp::SlipBeats(beats),
-                _ => {
+            Some(raw) => match BeatLen::parse(raw) {
+                Some(beats) => LoopOp::SlipBeats(beats),
+                None => {
                     return Action::Failed(format!(
                         "unknown slip loop subcommand `{raw}` — in|out|roll <beats>|<beats>"
                     ));
@@ -1200,10 +1201,9 @@ fn loop_command<'a>(
         // clamped to 1/32..=64 beats by the engine.
         "halve" | "/2" | "÷2" => LoopOp::Edit(LoopEditOp::Halve),
         "double" | "x2" | "*2" | "×2" => LoopOp::Edit(LoopEditOp::Double),
-        raw => match raw.parse::<u64>() {
-            Ok(beats) if beats > 0 => LoopOp::Beats(beats),
-            Ok(_) => return Action::Failed("a loop needs at least 1 beat".into()),
-            Err(_) => {
+        raw => match BeatLen::parse(raw) {
+            Some(beats) => LoopOp::Beats(beats),
+            None => {
                 return Action::Failed(format!("unknown loop subcommand `{raw}`\n{usage}"));
             }
         },

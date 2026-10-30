@@ -11,7 +11,7 @@ use hypermixx_core::{
 };
 
 use crate::map::{
-    Action, BindingSpec, Curve, Edge, EventKind, FxAction, LoopAction, Map, RelMode, SyncAction,
+    Action, BindingSpec, Curve, Edge, Encoding, EventKind, FxAction, LoopAction, Map, SyncAction,
     DEFAULT_NUDGE_SECONDS,
 };
 use crate::msg::Event;
@@ -81,7 +81,7 @@ impl BindState {
     /// relative encoder keeps turning. No-op bindings simply forget their mirror.
     pub fn rearm(&mut self, spec: Option<&BindingSpec>) {
         match spec {
-            Some(spec) if spec.mode != RelMode::Abs => {
+            Some(spec) if spec.encoding.is_relative() => {
                 self.engaged = true;
                 self.mirror = self.norm;
             }
@@ -251,8 +251,8 @@ impl<'a> BindingOut<'a> {
     /// Handles a CC value: continuous actions read it as a position (absolute or relative), button
     /// actions as an edge.
     fn on_control(&mut self, value: u8) {
-        if self.spec.mode != RelMode::Abs {
-            let delta = relative_delta(self.spec.mode, value, self.spec.reverse);
+        if self.spec.encoding.is_relative() {
+            let delta = relative_delta(self.spec.encoding, value, self.spec.reverse);
             let norm = (self.state.norm + delta as f32 * REL_SCALE).clamp(0.0, 1.0);
             self.state.norm = norm;
             // A relative encoder is endless: there is nothing to pick up.
@@ -584,21 +584,28 @@ fn command_value(spec: &BindingSpec, norm: f32) -> f32 {
 ///
 /// `reverse` flips the sign: a controller that numbers its detents the other way round is one
 /// boolean away from working, and the guide cannot tell which way a wheel turns.
-pub(crate) fn relative_delta(mode: RelMode, value: u8, reverse: bool) -> i16 {
-    let delta = match mode {
-        RelMode::Abs => 0,
-        RelMode::Rel1 => i16::from(value) - 64,
-        RelMode::Rel2 => {
+pub(crate) fn relative_delta(encoding: Encoding, value: u8, reverse: bool) -> i16 {
+    let delta = match encoding {
+        Encoding::Absolute => 0,
+        Encoding::Offset64 => i16::from(value) - 64,
+        Encoding::TwosComplement => {
             if value < 0x40 {
                 i16::from(value)
             } else {
                 i16::from(value) - 0x80
             }
         }
-        RelMode::Rel3 => match value.cmp(&64) {
+        Encoding::Direction => match value.cmp(&64) {
             std::cmp::Ordering::Less => 1,
             std::cmp::Ordering::Greater => -1,
             std::cmp::Ordering::Equal => 0,
+        },
+        // A two-point encoder reports one step, at one of two extreme values. Anything in between
+        // is noise from a different device sharing the controller number, so it is not movement.
+        Encoding::TwoPoint => match value {
+            1 => 1,
+            127 => -1,
+            _ => 0,
         },
     };
     if reverse {
@@ -706,10 +713,10 @@ mod tests {
     use crate::map::{Curve, Edge, Map};
     use hypermixx_core::FxChainId;
 
-    fn spec(action: Action, mode: RelMode) -> BindingSpec {
+    fn spec(action: Action, encoding: Encoding) -> BindingSpec {
         BindingSpec {
             kind: EventKind::Cc,
-            mode,
+            encoding,
             reverse: false,
             channel: 0,
             id: 7,
@@ -763,21 +770,21 @@ mod tests {
 
     #[test]
     fn relative_modes_decode_the_documented_wraparounds() {
-        assert_eq!(relative_delta(RelMode::Rel1, 64, false), 0);
-        assert_eq!(relative_delta(RelMode::Rel1, 65, false), 1);
-        assert_eq!(relative_delta(RelMode::Rel1, 1, false), -63);
-        assert_eq!(relative_delta(RelMode::Rel1, 65, true), -1);
-        assert_eq!(relative_delta(RelMode::Rel2, 1, false), 1);
-        assert_eq!(relative_delta(RelMode::Rel2, 127, false), -1);
-        assert_eq!(relative_delta(RelMode::Rel2, 65, false), -63);
-        assert_eq!(relative_delta(RelMode::Rel3, 1, false), 1);
-        assert_eq!(relative_delta(RelMode::Rel3, 127, false), -1);
-        assert_eq!(relative_delta(RelMode::Rel3, 64, false), 0);
+        assert_eq!(relative_delta(Encoding::Offset64, 64, false), 0);
+        assert_eq!(relative_delta(Encoding::Offset64, 65, false), 1);
+        assert_eq!(relative_delta(Encoding::Offset64, 1, false), -63);
+        assert_eq!(relative_delta(Encoding::Offset64, 65, true), -1);
+        assert_eq!(relative_delta(Encoding::TwosComplement, 1, false), 1);
+        assert_eq!(relative_delta(Encoding::TwosComplement, 127, false), -1);
+        assert_eq!(relative_delta(Encoding::TwosComplement, 65, false), -63);
+        assert_eq!(relative_delta(Encoding::Direction, 1, false), 1);
+        assert_eq!(relative_delta(Encoding::Direction, 127, false), -1);
+        assert_eq!(relative_delta(Encoding::Direction, 64, false), 0);
     }
 
     #[test]
     fn a_bipol_knob_centre_maps_to_zero() {
-        let mut binding = spec(Action::Fader(FaderTarget::Flow(0)), RelMode::Abs);
+        let mut binding = spec(Action::Fader(FaderTarget::Flow(0)), Encoding::Absolute);
         binding.center = Some(64.0 / 127.0);
         let mut state = BindState::seeded(Some(&binding));
         let commands = apply_one(&binding, &mut state, &cc(64));
@@ -794,7 +801,7 @@ mod tests {
 
     #[test]
     fn a_rel_knob_reverse_swaps_the_pair_directions() {
-        let mut binding = spec(Action::Browser(BrowserAction::Up), RelMode::Rel2);
+        let mut binding = spec(Action::Browser(BrowserAction::Up), Encoding::TwosComplement);
         binding.down = Some(Action::Browser(BrowserAction::Down));
         binding.reverse = true;
         let map = Map::empty();
@@ -826,7 +833,7 @@ mod tests {
 
     #[test]
     fn a_cc14_pair_emits_once_when_the_lsb_arrives() {
-        let mut binding = spec(Action::Fader(FaderTarget::Flow(0)), RelMode::Abs);
+        let mut binding = spec(Action::Fader(FaderTarget::Flow(0)), Encoding::Absolute);
         binding.id = 9;
         binding.lsb = Some(41);
         let map = Map::empty();
@@ -882,7 +889,7 @@ mod tests {
 
     #[test]
     fn a_rel_knob_pair_fires_the_direction_action() {
-        let mut binding = spec(Action::Browser(BrowserAction::Up), RelMode::Rel2);
+        let mut binding = spec(Action::Browser(BrowserAction::Up), Encoding::TwosComplement);
         binding.down = Some(Action::Browser(BrowserAction::Down));
         let map = Map::empty();
         let mut state = BindState::default();
@@ -914,13 +921,13 @@ mod tests {
 
     #[test]
     fn the_bipolar_curve_keeps_the_centre_and_the_sharp_curve_fines_the_bottom() {
-        let mut linear = spec(Action::Fader(FaderTarget::Flow(0)), RelMode::Abs);
+        let mut linear = spec(Action::Fader(FaderTarget::Flow(0)), Encoding::Absolute);
         assert!(close(command_value(&linear, 0.5), 0.0));
         linear.curve = Curve::Sharp;
         assert!(close(command_value(&linear, 0.5), 0.0));
         assert!(close(command_value(&linear, 0.75), 0.25));
 
-        let mut send = spec(Action::Fader(FaderTarget::CueSend(0)), RelMode::Abs);
+        let mut send = spec(Action::Fader(FaderTarget::CueSend(0)), Encoding::Absolute);
         send.min = 0.0;
         send.max = 1.0;
         send.curve = Curve::Sharp;
@@ -929,7 +936,7 @@ mod tests {
 
     #[test]
     fn a_note_button_fires_on_press_only_unless_the_binding_asks_for_the_release() {
-        let mut play = spec(Action::Play, RelMode::Abs);
+        let mut play = spec(Action::Play, Encoding::Absolute);
         play.kind = EventKind::Note;
         let mut state = BindState::seeded(Some(&play));
         assert!(matches!(
@@ -950,7 +957,7 @@ mod tests {
 
     #[test]
     fn a_two_edge_action_keeps_both_edges() {
-        let mut cue = spec(Action::Cue, RelMode::Abs);
+        let mut cue = spec(Action::Cue, Encoding::Absolute);
         cue.kind = EventKind::Note;
         let mut state = BindState::seeded(Some(&cue));
         assert!(matches!(
@@ -971,7 +978,7 @@ mod tests {
 
     #[test]
     fn soft_takeover_waits_for_the_control_to_cross_the_mirror() {
-        let fader = spec(Action::Fader(FaderTarget::Flow(0)), RelMode::Abs);
+        let fader = spec(Action::Fader(FaderTarget::Flow(0)), Encoding::Absolute);
         let mut state = BindState::seeded(Some(&fader));
         // Unity mirror at 0.5: a low value is ignored until it reaches the mirror.
         assert!(apply_one(&fader, &mut state, &cc(20)).is_empty());
@@ -984,7 +991,7 @@ mod tests {
 
     #[test]
     fn a_relative_encoder_accumulates_without_takeover() {
-        let tempo = spec(Action::TempoFader, RelMode::Rel1);
+        let tempo = spec(Action::TempoFader, Encoding::Offset64);
         let mut state = BindState::seeded(Some(&tempo));
         let commands = apply_one(&tempo, &mut state, &cc(65));
         assert!(matches!(
@@ -1000,11 +1007,11 @@ mod tests {
 
     #[test]
     fn default_mirrors_match_the_mixer_defaults_and_a_bipolar_fx_param() {
-        let flow = spec(Action::Fader(FaderTarget::Flow(0)), RelMode::Abs);
+        let flow = spec(Action::Fader(FaderTarget::Flow(0)), Encoding::Absolute);
         assert!(close(default_norm(&flow), 0.5));
-        let send = spec(Action::Fader(FaderTarget::CueSend(0)), RelMode::Abs);
+        let send = spec(Action::Fader(FaderTarget::CueSend(0)), Encoding::Absolute);
         assert!(close(default_norm(&send), 1.0));
-        let tempo = spec(Action::TempoFader, RelMode::Abs);
+        let tempo = spec(Action::TempoFader, Encoding::Absolute);
         assert!(close(default_norm(&tempo), 0.5));
         let mut eq = spec(
             Action::Fx(FxAction::Param {
@@ -1012,7 +1019,7 @@ mod tests {
                 fx: "eq".into(),
                 param: "low".into(),
             }),
-            RelMode::Abs,
+            Encoding::Absolute,
         );
         eq.min = -1.0;
         assert!(close(default_norm(&eq), 0.5));

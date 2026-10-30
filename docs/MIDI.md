@@ -4,148 +4,287 @@
 `crates/hypermixx-midi/src/map.rs`，`Event → Command` 的翻译在 `translate.rs`，learn 模式编辑器在
 `hypermixx_midi::guide` + `crates/hypermixx-cli/src/tui/guide.rs`。
 
-> 会话命令的语法见 [`commands.md`](commands.md)。本文只讲映射文件本身。
+> 会话命令的语法见 [`COMMANDS.md`](COMMANDS.md)。本文只讲映射文件本身。
 >
 > **`action` 就是一条去掉目标的会话命令**：`"play"`、`"beatjump 4"`、`"sync phase pid"`、
-> `"vocals mute"`、`"fader gain"`。目标由 binding 的 `deck` 字段提供；行首自己写了目标词
-> （`"d1 play"`、`"master fx toggle filter"`）则以那个为准。语法表在
-> `crates/hypermixx-core/src/action.rs::ACTIONS`，guide 的目标清单、这份文档与全部 action 都由它生成。
+> `"loop 1/4"`、`"fx param value"`。目标由 unit 的 `deck`（或这一行的 `deck`）提供。
 
 ---
 
-## 1. 文件骨架
+## 1. 三层结构
+
+```text
+unit      一组物理控件（一个 deck 的一条通道、一块 pad 阵列、一个全局面板）
+  control 一个 slot：类型（type）+ 硬件事实（endpoint）+ 角色（role）
+  mode    一张 slot → action 表
+```
+
+- **`type`** 是 slot 的物理种类：`Button`、`Knob`、`BipolKnob`、`RelKnob`、`JogWheel`。
+- **`endpoint`** 是硬件事实：MIDI 消息、通道、控制器号、编码方式。
+- **`role`** 说明这个 slot 做什么：发命令（`action`，默认）、切模式（`mode_trigger` /
+  `mode_cycle`）。
+- **preset** 是「slot 名 + 类型 + 默认 mode 表」的模板；unit 只负责绑定端点。
+
+## 2. 文件骨架
 
 ```toml
 [meta]
 name = "my-controller"          # 可选，仅用于标识
+device = "DDJ-400:DDJ-400 MIDI 1 24:0"
+description = "two decks, one pad grid"
 
-[[bind]]
-type = "note"                   # cc | note | bend
-channel = 0                     # 0-based；省略 = 匹配任意通道
-id = 0                          # CC 号 / note key（bend 忽略）
-deck = 0                        # 目标 deck；省略 = 全局目标
-action = "play"
+[[unit]]
+id = "deck1.mixer"              # 全局唯一
+preset = "mixer"                # 可选
+deck = 1                        # 1-based；省略 = 全局 unit
+start = "default"               # 可选：起始 mode
+mode_order = ["default"]        # 可选：把列出的 mode 排到前面
+
+[[unit.control]]
+slot = "filter"
+endpoint = { midi = "cc", channel = 0, id = 12 }
+
+[[unit.mode]]
+name = "default"
+[[unit.mode.bind]]
+slot = "filter"
+action = "fx param value"
+fx = "filter"
 ```
 
 - 解析是 `deny_unknown_fields`：拼错的键是**报错 + TOML 行号**，不是静默忽略。
-- 一份 bind 匹配一个 `(type, channel, id)`；`channel` 省略时匹配任意通道。
-- 同一个事件可以被多条 bind 匹配（互不排斥），但通常一条控件一条 bind。
+- deck 号在文件里是 **1-based**（`deck = 1` 是第一个 deck），引擎内部是 0-based。
+- 一份文件里每个 `(midi, channel, id)` 只能属于一个 slot；14-bit 的 `lsb` 也算一个。
 
-## 2. 每个 bind 的字段
+## 3. endpoint
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `type` | `cc` \| `note` \| `bend` | 监听的事件种类。必填 |
-| `mode` | `abs` \| `rel1` \| `rel2` \| `rel3` | 仅 `cc`；相对编码器的回绕约定，见 §3 |
-| `reverse` | bool | 相对模式的**反向**开关（`rel1`/`rel2`/`rel3`）：整体取反 |
-| `channel` | 0..=15 | 省略 = 任意通道 |
-| `id` | u8 | CC 控制器号或 note key |
-| `deck` | u8 | 目标 deck；需要 deck 的 action 必须给 |
-| `action` | string | 一条去掉目标的会话命令，见 §5（旧的点号拼写仍被接受，见 §5.1） |
-| `min` / `max` | f32 | 归一化到 `0..=1` 后的映射端点（推子默认按其域：双极 `-1..=1`，FX 参数 `0..=1`） |
-| `curve` | `linear` \| `sharp` | 端点之间的响应曲线（`sharp` = 平方律，底部更细） |
-| `step` | f32 | 连续动作的步长/量（`beatjump` 的拍数、`vinyl` 每 tick 帧数、`nudge` 的 delta） |
-| `seconds` | f64 | `nudge` 的持续秒数；给了就是定时释放（忽略松开边沿），不给 = 按住式 |
-| `beats` | u64 | `loop.beat` 的拍数 |
-| `chain` | string | FX 目标链：`master`/`m`、`deck0`/`d0`/`0` |
-| `fx` | string | 效果名（不是槽位号 —— 槽位会因增删而移位，名字不会） |
-| `param` | string | 参数名（`fx.param` 用） |
+```toml
+[[unit.control]]
+slot = "filter"
+endpoint = { midi = "cc", channel = 0, id = 12 }
+```
 
-## 3. 相对编码器（`mode`）
-
-厂商约定不同，所以 `mode` 是**每条 bind** 的属性。`relative_delta`（`translate.rs`）的解码规则：
-
-| mode | 规则 |
+| 字段 | 说明 |
 |---|---|
-| `rel1` | 以 64 为中心的偏移二进制：`value − 64`，64 = 不动，65..127 = +，1..63 = − |
-| `rel2` | 以 64 为中心的二进制补码：1..63 = +，65..127 = −（127 = −1） |
-| `rel3` | 只看方向：1..63 = +，65..127 = −，幅度忽略（每条消息算一步） |
-| `abs` | 绝对：`value/127` 归一化后按 `min`/`max`/`curve` 映射 |
+| `midi` | `note` \| `cc` \| `bend` |
+| `id` | CC 号或 note key；`bend` 省略 |
+| `channel` | 0..=15（文件里 0-based，与 MIDI 线号一致；guide 列表显示的是 1-based 的 `ch1`） |
+| `encoding` | 仅 `cc`：`absolute`（默认）\| `offset64` \| `twos_complement` \| `direction` \| `two_point` |
+| `lsb` | 14-bit CC 对的低 7 位；`id` 此时是高位 |
+| `reverse` | 相对编码反向 |
+| `role` | 仅 `JogWheel`：`press` / `turn` |
 
-**怎么判断自己的设备是哪种**：打开 `--midi-guide` 的 raw 监视器，慢转一圈看取值：
-63/64/65 附近 = `rel1`；1,2,3 / 127,126 = `rel2`（或 `rel3`，如果幅度不变化）。
+一个 slot 通常只有一个 endpoint；`JogWheel` 要两个：
 
-`reverse = true` 把解出的 delta 取反。相对编码器的**方向自动识别**留到 guide 重构时再做，
-当前需要手动试。
-
-## 4. 值的整形
-
-绝对控件先归一化到 `0..=1`，再经 `curve`、再线性映到 `min..max`：
-
-```
-norm   = value / 127
-shaped = curve(norm)          # linear: norm；sharp: norm²（双极动作在中心折返，中心点不动）
-value  = min + shaped × (max − min)
+```toml
+[[unit.control]]
+slot = "jog"
+endpoint = [
+  { role = "press", midi = "note", channel = 0, id = 80 },
+  { role = "turn", midi = "cc", encoding = "two_point", channel = 0, id = 6 },
+]
 ```
 
-- 推子（`fader.*`、`tempofader`）是**双极**的：默认 `min = -1`、`max = 1`，0 = unity。
-- `fader.cuesend` 是线性的 `0..=1`。
-- FX 参数默认 `0..=1`（效果自己的域）。
+### 编码
 
-## 5. action 表
-
-`crates/hypermixx-core/src/action.rs::ACTIONS` 是唯一真源：guide 的目标清单、这份文档、以及两侧的
-语法都由它生成。`deck` 列表示该 action 必须给 `deck` 字段（除非行首自己写了目标）。
-
-| action（= 会话命令，去掉目标） | deck | 说明 |
+| `encoding` | 规则 | 典型设备 |
 |---|---|---|
-| `play` | 是 | 切换播放/暂停 |
-| `cue` | 是 | 按住式 cue 键（note）：按下 = cue，松开 = 归位 |
-| `vinyl [frames_per_tick]` | 是 | 唱盘：note = 贴盘/松手，相对 CC = 转轮（缺省 1323 帧/tick） |
-| `beatjump [beats]` | 是 | 按整拍 seek，保持相位（可正可负；缺省量取 `step`） |
-| `hotcue set\|trigger\|clear <slot>` | 是 | 1..8（A..H）的 hot cue；trigger 保持当前播放状态 |
-| `fader flow` | 是 | 通道级电平（装了 stems 就写全部四路） |
-| `<stem> fader` | 是 | 单路 stem 电平（`<stem>` = drums \| bass \| other \| vocals） |
-| `<stem> mute` | 是 | latch 该 stem 的静音 |
-| `<stem> solo` | 是 | latch 该 stem 的 solo 成员资格 |
-| `fader deck` | 是 | deck 电平 |
-| `fader gain` | 是 | 通道 trim（`0` = 0 dB，`1` = +6 dB，`-1` = 静音） |
-| `fader cuesend` | 是 | cue 送出量（线性 0..=1） |
-| `fader cross` | 否 | crossfader |
-| `fader master` | 否 | master trim |
-| `fader cue` | 否 | cue trim |
-| `tempofader` | 是 | 速度推子位置（按 deck 自己的 `temporange` 折算） |
-| `nudge [delta] [seconds]` | 是 | 临时速率弯折；给了秒数就是定时释放，否则按住式 |
-| `loop in` / `loop out` | 是 | 手动 loop 入/出点 |
-| `loop exit` / `loop cancel` | 是 | 退出 loop / 取消 armed in |
-| `loop halve` / `loop double` | 是 | 当前 loop 长度 ÷2 / ×2 |
-| `loop [beats]` | 是 | beat loop（缺省 4 拍；也可用 binding 的 `beats` 字段） |
-| `sync tempo` | 是 | 对 BPM 一次 |
-| `sync phase [mode] [seconds]` | 是 | 对拍（含 tempo），mode = instant \| linear \| pid（缺省 pid） |
-| `sync tempolock` | 是 | 共享 tempo |
-| `sync phaselock [mode] [seconds]` | 是 | follower 严格跟随 leader |
-| `sync set-leader` | 是 | 把该 deck 设为 leader |
-| `sync unlock` | 是 | 解锁并清修正 |
-| `fx on` / `fx off` / `fx toggle` | 否 | 按 `chain` + `fx` 开关一个槽位 |
-| `fx pad` | 否 | 按住 = engaged，松开恢复原状态 |
-| `fx trigger` | 否 | 触发一次性动作 |
-| `fx param` | 否 | 写 `chain` + `fx` + `param`（这是 `fx set` 的连续形式：值来自控制器） |
-| `browser up` / `browser down` | 否 | 浏览器选择上/下 |
-| `browser open` / `browser exit` | 否 | 进入下一级/进入 tracks；返回上一级 |
-| `browser load` | 否 | 加载当前 track；binding 的 `deck` 可选 |
-| `browser refresh` | 否 | 重新扫描所有曲库来源 |
+| `absolute` | `value/127` | 推子、绝对旋钮 |
+| `offset64` | `value − 64` | 老的无限旋钮 |
+| `twos_complement` | 1..63 = +，65..127 = − | 多数无限旋钮 |
+| `direction` | 只看方向 | 每格值相同 |
+| `two_point` | `1` = 一步 +，`127` = 一步 −，其余忽略 | 小控制器的 `{0,1,127}` 旋钮 |
 
-`browser *` 不会进入引擎：`translate_split` 把它们交给前端（TUI 的浏览器），其余 action 仍走
-`Command`。REPL 没有浏览器状态，因此忽略这些动作。
+`two_point` 是给「只发 1 和 127」的编码器用的，不要再靠 `twos_complement` 兼职。
+判不准就用 `--midi-guide` 的 raw 监视器看一遍，guide 的 learn 也会自动识别。
 
-`fx toggle` 与其他 FX 动作一样由**引擎**翻状态（`Command::ToggleFx`），前端不留镜像 —— 否则任何别的
-路径改了槽位状态，镜像就错了。
+## 4. slot 类型
 
-### 5.1 旧拼写
+| `type` | 端点 | 能带的 action |
+|---|---|---|
+| `Button` | 1 个（note 或绝对 CC） | 任意非连续 action |
+| `Knob` | 1 个绝对端点 | 连续 action；相对端点时可用 `nudge`/`vinyl` |
+| `BipolKnob` | 1 个绝对端点 | 连续 action，默认 `min = -1, max = 1`，中心 = 0 |
+| `RelKnob` | 1 个相对端点 | 连续 action，或 `action` + `down` 两个 edge action |
+| `JogWheel` | `press` + `turn` | `vinyl`、`vinyl slip`、`nudge` |
 
-点号拼写（`fader.flow`、`beatjump+`、`stem.vocals.mute`、`sync.leader`、`loop.beat8`…）**仍然可用**，
-由 `hypermixx_core::action::canonical` 翻译到规范形式；guide 保存时会写成新形式。文件是用户手编的，
-升级后静默失效比多认几个拼写糟得多。
+## 5. mode bind
 
-## 6. FX 的寻址
+```toml
+[[unit.mode]]
+name = "default"
+
+[[unit.mode.bind]]
+slot = "fader"
+action = "fader flow"
+
+[[unit.mode.bind]]
+slot = "filter"
+action = "fx param value"
+fx = "filter"
+min = -1.0
+max = 1.0
+
+# RelKnob：一个方向一个 action
+[[unit.mode.bind]]
+slot = "browse"
+action = "browser up"
+down = "browser down"
+
+# JogWheel：两半分别绑
+[[unit.mode.bind]]
+slot = "jog"
+press = "vinyl slip"
+turn = "vinyl"
+```
+
+| 字段 | 说明 |
+|---|---|
+| `action` | 主端点的 action（JogWheel 下等于同时给 press 和 turn） |
+| `press` / `turn` | 只对 `JogWheel`：覆盖对应那一半 |
+| `down` | 只对 `RelKnob`：反向 detent 的 action |
+| `deck` | 覆盖 unit 的 deck（全局 unit 控制某个 deck 时才需要） |
+| `min` / `max` | 归一化位置映射到的值域 |
+| `curve` | `linear` \| `sharp` |
+| `on` | `press`（默认）\| `release`；两边缘 action 不接受 |
+| `chain` / `fx` | FX 的地址：链（`master`、`deck1`、`deck1/vocals`）与效果名 |
+
+**action 的参数写在行内**，没有别的字段：
+
+```toml
+action = "loop 1/4"        # 分数拍长
+action = "beatjump -8"
+action = "nudge 0.15 0.06"
+action = "vinyl 1323"
+action = "fx param value"  # 参数名在行内，槽位名在 fx 字段
+```
+
+## 6. mode slot（模式键）
+
+```toml
+[[unit.control]]
+slot = "mode-hotcue"
+type = "Button"
+role = "mode_trigger"
+target = "hotcue"
+endpoint = { midi = "note", channel = 0, id = 24 }
+
+[[unit.control]]
+slot = "mode-next"
+type = "Button"
+role = "mode_cycle"
+endpoint = { midi = "note", channel = 0, id = 25 }
+```
+
+- 它们**不产生 command**，出现在 `[[unit.mode.bind]]` 里会报错。
+- `mode_trigger` 必须有 `target`；`mode_cycle` 按 unit 的 mode 顺序前进。
+- 没有绑定端点时只是没有接线，不算错误（guide 之后会学）。
+
+## 7. preset
+
+```toml
+[[preset]]
+name = "my-pad"
+scope = "deck"                 # deck | global | both
+start = "hotcue"
+
+[[preset.slot]]
+slot = "pad1"
+type = "Button"
+
+[[preset.slot]]
+slot = "mode-hotcue"
+type = "Button"
+role = "mode_trigger"
+target = "hotcue"
+
+[[preset.mode]]
+name = "hotcue"
+[[preset.mode.bind]]
+slot = "pad1"
+action = "hotcue trigger 1"
+```
+
+内置 preset：`browser`(both) `crossfader`(global) `deckfx` `jog` `manualjump` `manualloop` `mixer`
+`output`(global) `pad` `tempofader` `transport`。
+
+用户 preset 放在 `[meta] presets = ["presets/my.toml"]` 列出的文件里（相对 map 所在目录）；
+同名 preset 整体覆盖内置。
+
+### preset 与 unit 的合并
+
+1. slot 顺序：preset 的 slot 先，unit 新增的接在后面。
+2. unit 的 `[[unit.control]]` 可以省略 `type`（用 preset 的）；写了必须一致。
+3. mode：preset 的 modes 先；unit 同名 mode **整个替换**，新名追加。
+4. `mode_order`（只写在 unit 上）把列出的 mode 排到前面，其余保持声明顺序。
+5. `start`：unit > preset > 第一个 mode。
+
+## 8. FX 的寻址
 
 文件里 FX 只写**名字**（`chain`/`fx`/`param`），从不写槽位号：槽位会因增删移位，文件必须能跨重启。
 CLI 启动时用 `ListFx` 拿到每条链的槽位名，再 `Map::resolve_fx` 把名字钉到索引上。
 
-## 7. 打开与编辑
+`chain` 省略时用 unit 的 deck，所以同一个 `mixer` preset 在 deck1 和 deck2 上各指各的链。
 
-- `--midi <port> [--midi-map <file>]`：启动时打开端口并按映射翻译（缺省 `midi-map.toml`）。
-  端口可以是名字或序号（`midi ports` 可列）。
+## 9. 打开与编辑
+
+- `--midi <port> [--midi-map <file>]`：启动时打开端口并按映射翻译。
 - `--tui` 下 `F2` 选端口、`F3` 选映射文件。
-- `--midi-guide [<file>] [--midi <port>] [--decks <n>]`：learn 模式编辑器，**不启动音频引擎**。
-  键位 `↑↓ Enter 空格 m x s p f q`；右侧 raw 监视器是判断 `mode` 与数 tick 的地方。
+- `--midi-guide <file> [--midi <port>] [--decks <n>]`：learn 模式编辑器，不启动音频引擎。
+  三列 `deck | unit | slot`：`←→` 换列、`↑↓` 换行、`Enter` 下钻 / 在 `add unit` 上开 preset 菜单 /
+  在 slot 上进 learn、`Tab` 到命令行（再按 Tab/`←→` 换按钮、`Enter` 执行、`Esc` 回列）、
+  `[`/`]` 换当前 mode、`PgUp`/`PgDn` 翻 raw 监视器。
+  命令行只保留 `Clone`（仅 deck unit）、`Learn`（仅 slot）和常驻的 `Connect` / `Open` / `Save` / `Exit`；
+  加 unit 用 `add unit` 行回车，mode 编辑暂不做。
+  进入 learn 后按下/转动控件 → `Confirm`。`JogWheel` 分两步：先按盘，再转轮。
+  `Encoding` 按钮在 `absolute` / `two_point` / `twos_complement` / `offset64` / `direction`
+  之间切换候选。
+
+### 14-bit 的自动识别
+
+转动/推动一个 14-bit 控件时它会连发两个 CC（高位 + 低位，编号差 32，例如 `#9` 和 `#41`）。
+learn 模式下，同一个 slot 在 120ms 内收到两个相差 32 的控制器号，就记为
+`endpoint = { midi = "cc", id = <MSB>, lsb = <LSB> }`，屏幕上显示成 `cc14 ch1 #9/#41`。
+手动写也一样：`lsb` 就是低位，`id` 是高位。
+
+## 10. action 表
+
+`crates/hypermixx-core/src/action.rs::ACTIONS` 是唯一真源。
+
+| action | 需要 deck | 说明 |
+|---|---|---|
+| `play` | 是 | 切换播放/暂停 |
+| `cue` | 是 | 按住式 cue：按下 cue，松开归位 |
+| `cue smart` | 是 | 只按一次：回 cue 或就地设 cue |
+| `vinyl [frames_per_tick]` | 是 | 唱盘：press = 贴盘/松手，turn = 转轮 |
+| `vinyl slip` | 是 | 下一次贴盘算 slip scratch |
+| `hotcue set\|trigger\|clear <1..8>` | 是 | hot cue |
+| `beatjump <±beats>` | 是 | 按整拍 seek，保持相位 |
+| `loop <beats\|num/den>` | 是 | beat loop；`1/4`、`1/2` 是分数拍 |
+| `loop in` / `loop out` / `loop exit` / `loop cancel` | 是 | 手动 loop |
+| `loop halve` / `loop double` | 是 | 当前 loop ÷2 / ×2 |
+| `fader flow` / `deck` / `gain` / `cuesend` | 是 | 通道电平类 |
+| `fader cuesend toggle` | 是 | cue send 开/关 |
+| `fader cross` / `master` / `cue` | 否 | 全局电平 |
+| `<stem> fader` / `mute` / `solo` | 是 | 单条 stem |
+| `tempofader` | 是 | 速度推子位置 |
+| `keylock [on\|off\|toggle]` | 是 | keylock |
+| `key <semitone>` | 是 | 变调（占位） |
+| `nudge [delta] [seconds]` | 是 | 临时速率弯折 |
+| `sync tempo\|phase\|tempolock\|phaselock\|set-leader\|unlock` | 是 | 同步族 |
+| `fx on\|off\|toggle\|pad\|trigger` | 否 | 按 `chain` + `fx` 寻址 |
+| `fx param <name>` | 否 | 连续参数，值来自控制器 |
+| `browser up\|down\|open\|exit\|load\|refresh` | 否 | 浏览器（交给前端，不进引擎） |
+
+旧的点号拼写（`fader.flow`、`beatjump+`、`sync.leader`…）仍由
+`hypermixx_core::action::canonical` 翻译到规范形式。
+
+## 11. 加分拍长（`loop 1/4`）
+
+`LoopOp::Beats` 收的是 `BeatLen`（分子/分母，分母是 2 的幂），所以 `1/4`、`1/2`、`3/4` 都精确：
+
+```text
+frames = frame_at_beat(floor + whole) + round(frac × beat_width(floor))
+```
+
+分数部分是**当前那拍**的比例，所以循环起点有变速也不会漂。会话里同样可以写 `loop 1/4`。

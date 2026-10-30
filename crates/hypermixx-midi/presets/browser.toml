@@ -1,43 +1,30 @@
+# Library navigation. `both` scope: a browser strip can be global or live on one deck.
 [[preset]]
 name = "browser"
-global = true
+scope = "both"
 start = "default"
 
+# A two-point encoder: 1 = one step, 127 = the other. Reversed once here because the shipped
+# encoder turns the other way.
 [[preset.slot]]
 slot = "browse"
-shape = "RelKnob"
-[[preset.slot]]
-slot = "up"
-shape = "Button"
-[[preset.slot]]
-slot = "down"
-shape = "Button"
+type = "RelKnob"
 [[preset.slot]]
 slot = "open"
-shape = "Button"
+type = "Button"
 [[preset.slot]]
 slot = "exit"
-shape = "Button"
+type = "Button"
 [[preset.slot]]
 slot = "load"
-shape = "Button"
-[[preset.slot]]
-slot = "refresh"
-shape = "Button"
+type = "Button"
 
 [[preset.mode]]
 name = "default"
 [[preset.mode.bind]]
 slot = "browse"
-# The shipped browser encoder turns the other way; reverse the default once here.
 action = "browser down"
 down = "browser up"
-[[preset.mode.bind]]
-slot = "up"
-action = "browser up"
-[[preset.mode.bind]]
-slot = "down"
-action = "browser down"
 [[preset.mode.bind]]
 slot = "open"
 action = "browser open"
@@ -47,6 +34,3 @@ action = "browser exit"
 [[preset.mode.bind]]
 slot = "load"
 action = "browser load"
-[[preset.mode.bind]]
-slot = "refresh"
-action = "browser refresh"

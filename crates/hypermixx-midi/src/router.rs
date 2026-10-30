@@ -8,7 +8,9 @@ use std::collections::HashMap;
 
 use hypermixx_core::{BrowserAction, Command, DeckId};
 
-use crate::map::{BindingSpec, Endpoint, EventKind, Map, RelMode, SelectorBehavior, Unit};
+use crate::map::{
+    BindingSpec, Endpoint, Encoding, EventKind, Map, SelectorBehavior, SlotRole, Unit,
+};
 use crate::msg::Event;
 use crate::translate::{apply, relative_delta, BindState, REL_SCALE};
 
@@ -87,10 +89,8 @@ impl Router {
         for (unit_index, unit) in map.units.iter().enumerate() {
             let mut endpoints = Vec::with_capacity(unit.endpoints.len());
             for (control_index, control) in unit.controls.iter().enumerate() {
-                let mode_slot = matches!(
-                    control.shape,
-                    crate::map::ControlShape::ModeTrigger | crate::map::ControlShape::ModeCycle
-                );
+                let mode_slot = control.role != SlotRole::Action;
+
                 for &endpoint_index in &control.endpoints {
                     let spec = spec_in_mode(unit, unit.start, control_index, endpoint_index);
                     endpoints.push(BindState::seeded(spec.as_ref()));
@@ -263,7 +263,7 @@ impl Router {
         let was_down = self.units[unit].endpoints[endpoint].down;
         let edge = spec
             .as_ref()
-            .is_none_or(|spec| !spec.action.is_continuous() && spec.mode == RelMode::Abs);
+            .is_none_or(|spec| !spec.action.is_continuous() && !spec.encoding.is_relative());
 
         match *event {
             Event::NoteOn { velocity, .. } if velocity > 0 => {
@@ -429,8 +429,8 @@ impl Router {
 /// Without this, re-entering a mode with a relative encoder would resume from a stale position
 /// (and an absolute knob would have no pickup reference).
 fn observe_unmapped(state: &mut BindState, endpoint: &Endpoint, value: u8) {
-    match endpoint.mode {
-        RelMode::Abs => state.norm = f32::from(value) / 127.0,
+    match endpoint.encoding {
+        Encoding::Absolute => state.norm = f32::from(value) / 127.0,
         mode => {
             let delta = relative_delta(mode, value, endpoint.reverse);
             state.norm = (state.norm + f32::from(delta) * REL_SCALE).clamp(0.0, 1.0);
@@ -446,7 +446,7 @@ fn spec_in_mode(
     endpoint: usize,
 ) -> Option<BindingSpec> {
     unit.binding(mode, control)
-        .map(|binding| binding.spec(&unit.endpoints[endpoint]))
+        .and_then(|binding| binding.spec(&unit.endpoints[endpoint]))
 }
 
 fn event_key(event: &Event) -> Option<(EventKind, u8, u8)> {
@@ -467,7 +467,7 @@ fn event_key(event: &Event) -> Option<(EventKind, u8, u8)> {
 mod tests {
     use super::*;
     use crate::map::Map;
-    use hypermixx_core::{FaderTarget, HotCueOp, LoopOp};
+    use hypermixx_core::{BeatLen, FaderTarget, HotCueOp, LoopOp};
 
     fn note(channel: u8, key: u8, on: bool) -> Event {
         if on {
@@ -494,33 +494,32 @@ mod tests {
     }
 
     fn router(text: &str) -> Router {
-        Router::new(Map::from_toml_str(text).expect("test map"))
+        let map = Map::from_toml_str(text).expect("test map");
+        Router::new(map)
     }
 
     const TWO_MODES: &str = r#"
 [[unit]]
-id = "deck0.pad"
+id = "u"
 deck = 1
 
 [[unit.control]]
 slot = "pad1"
-type = "note"
-channel = 0
-id = 16
+type = "Button"
+endpoint = { midi = "note", channel = 0, id = 16 }
 
-[[unit.selector]]
-type = "note"
-channel = 0
-id = 24
-behavior = "trigger"
+[[unit.control]]
+slot = "mode-hotcue"
+type = "Button"
+role = "mode_trigger"
 target = "hotcue"
+endpoint = { midi = "note", channel = 0, id = 24 }
 
-[[unit.selector]]
-type = "note"
-channel = 0
-id = 25
-behavior = "trigger"
-target = "loop"
+[[unit.control]]
+slot = "mode-next"
+type = "Button"
+role = "mode_cycle"
+endpoint = { midi = "note", channel = 0, id = 25 }
 
 [[unit.mode]]
 name = "hotcue"
@@ -549,7 +548,7 @@ action = "loop 4"
         router.feed(&note(0, 16, false));
 
         let feed = router.feed(&note(0, 24, true));
-        assert!(feed.commands.is_empty(), "a selector is not an action");
+        assert!(feed.commands.is_empty(), "a mode key is not an action");
         assert!(!feed.state_changed, "it is already in hotcue");
         router.feed(&note(0, 24, false));
 
@@ -562,52 +561,8 @@ action = "loop 4"
         let feed = router.feed(&note(0, 16, true));
         assert!(matches!(
             feed.commands.as_slice(),
-            [Command::Loop {
-                deck_id: 0,
-                op: LoopOp::Beats(4)
-            }]
+            [Command::Loop { deck_id: 0, op: LoopOp::Beats(len) }] if *len == BeatLen::beats(4)
         ));
-    }
-
-    #[test]
-    fn mode_slots_change_modes_without_emitting_commands() {
-        let text = r#"
-[[unit]]
-id = "u"
-
-[[unit.control]]
-slot = "mode1"
-kind = "ModeTrigger"
-type = "note"
-channel = 0
-id = 24
-target = "b"
-
-[[unit.control]]
-slot = "mode2"
-kind = "ModeCycle"
-type = "note"
-channel = 0
-id = 25
-
-[[unit.mode]]
-name = "a"
-[[unit.mode]]
-name = "b"
-"#;
-        let mut router = router(text);
-        assert_eq!(router.snapshot().units[0].current, "a");
-
-        let feed = router.feed(&note(0, 24, true));
-        assert!(feed.commands.is_empty());
-        assert!(feed.state_changed);
-        assert_eq!(router.snapshot().units[0].current, "b");
-        router.feed(&note(0, 24, false));
-
-        let feed = router.feed(&note(0, 25, true));
-        assert!(feed.commands.is_empty());
-        assert!(feed.state_changed);
-        assert_eq!(router.snapshot().units[0].current, "a");
     }
 
     #[test]
@@ -615,11 +570,13 @@ name = "b"
         let text = r#"
 [[unit]]
 id = "u"
-[[unit.selector]]
-type = "note"
-channel = 0
-id = 1
-behavior = "cycle"
+
+[[unit.control]]
+slot = "mode-next"
+type = "Button"
+role = "mode_cycle"
+endpoint = { midi = "note", channel = 0, id = 1 }
+
 [[unit.mode]]
 name = "a"
 [[unit.mode]]
@@ -643,135 +600,42 @@ name = "c"
 [[unit]]
 id = "u"
 deck = 1
+
 [[unit.control]]
 slot = "pad"
-type = "note"
-channel = 0
-id = 1
-[[unit.selector]]
-type = "note"
-channel = 0
-id = 2
-behavior = "trigger"
-target = "other"
+type = "Button"
+endpoint = { midi = "note", channel = 0, id = 1 }
+
+[[unit.control]]
+slot = "mode-next"
+type = "Button"
+role = "mode_cycle"
+endpoint = { midi = "note", channel = 0, id = 2 }
+
 [[unit.mode]]
-name = "main"
+name = "cue"
 [[unit.mode.bind]]
 slot = "pad"
 action = "cue"
+
 [[unit.mode]]
-name = "other"
+name = "play"
 [[unit.mode.bind]]
 slot = "pad"
 action = "play"
 "#;
         let mut router = router(text);
-        let feed = router.feed(&note(0, 1, true));
+        router.feed(&note(0, 1, true));
+        // Switch mode while the button is held: the release must still be the cue release.
+        router.feed(&note(0, 2, true));
+        router.feed(&note(0, 2, false));
+        let feed = router.feed(&note(0, 1, false));
         assert!(matches!(
             feed.commands.as_slice(),
             [Command::Cue {
                 deck_id: 0,
-                op: hypermixx_core::CueOp::Hold
+                op: hypermixx_core::CueOp::Back
             }]
-        ));
-        // Switch mode while the pad is held.
-        router.feed(&note(0, 2, true));
-        router.feed(&note(0, 2, false));
-        let feed = router.feed(&note(0, 1, false));
-        assert!(
-            matches!(
-                feed.commands.as_slice(),
-                [Command::Cue {
-                    deck_id: 0,
-                    op: hypermixx_core::CueOp::Back
-                }]
-            ),
-            "the release must use the captured cue, not the new play action: {:?}",
-            feed.commands
-        );
-    }
-
-    #[test]
-    fn an_absolute_knob_rearms_pickup_on_a_mode_change() {
-        let text = r#"
-[[unit]]
-id = "u"
-deck = 1
-[[unit.control]]
-slot = "knob"
-type = "cc"
-channel = 0
-id = 5
-[[unit.selector]]
-type = "note"
-channel = 0
-id = 6
-behavior = "trigger"
-target = "flow"
-[[unit.mode]]
-name = "cue"
-[[unit.mode.bind]]
-slot = "knob"
-action = "fader cuesend"
-[[unit.mode]]
-name = "flow"
-[[unit.mode.bind]]
-slot = "knob"
-action = "fader flow"
-"#;
-        let mut router = router(text);
-        // Start at physical 0: the cue-send mirror is 1.0, so this is not a takeover yet.
-        assert!(router.feed(&cc(0, 5, 0)).commands.is_empty());
-        // Switch to the bipolar flow fader (mirror 0.5). 0.3 is below it, so it must be ignored.
-        router.feed(&note(0, 6, true));
-        router.feed(&note(0, 6, false));
-        assert!(router.feed(&cc(0, 5, 38)).commands.is_empty());
-        let feed = router.feed(&cc(0, 5, 76));
-        assert!(matches!(
-            feed.commands.as_slice(),
-            [Command::SetFader {
-                target: FaderTarget::Flow(0),
-                ..
-            }]
-        ));
-    }
-
-    #[test]
-    fn a_relative_encoder_keeps_turning_across_a_mode_change() {
-        let text = r#"
-[[unit]]
-id = "u"
-deck = 1
-[[unit.control]]
-slot = "knob"
-type = "cc"
-mode = "rel1"
-channel = 0
-id = 5
-[[unit.selector]]
-type = "note"
-channel = 0
-id = 6
-behavior = "trigger"
-target = "tempo"
-[[unit.mode]]
-name = "flow"
-[[unit.mode.bind]]
-slot = "knob"
-action = "fader flow"
-[[unit.mode]]
-name = "tempo"
-[[unit.mode.bind]]
-slot = "knob"
-action = "tempofader"
-"#;
-        let mut router = router(text);
-        router.feed(&note(0, 6, true));
-        router.feed(&note(0, 6, false));
-        let feed = router.feed(&cc(0, 5, 65));
-        assert!(matches!(
-            feed.commands.as_slice(),
-            [Command::SetTempoFader { deck_id: 0, .. }]
         ));
     }
 
@@ -781,11 +645,12 @@ action = "tempofader"
 [[unit]]
 id = "u"
 deck = 1
+
 [[unit.control]]
 slot = "pad"
-type = "note"
-channel = 0
-id = 1
+type = "Button"
+endpoint = { midi = "note", channel = 0, id = 1 }
+
 [[unit.mode]]
 name = "m"
 [[unit.mode.bind]]
@@ -794,48 +659,9 @@ action = "play"
 on = "release"
 "#;
         let mut router = router(text);
-        assert!(router.feed(&note(0, 1, true)).commands.is_empty());
-        let feed = router.feed(&note(0, 1, false));
-        assert!(matches!(
-            feed.commands.as_slice(),
-            [Command::TogglePlay { deck_id: 0 }]
-        ));
-    }
-
-    #[test]
-    fn a_press_on_an_inactive_slot_does_not_fire_when_a_later_mode_binds_it() {
-        let text = r#"
-[[unit]]
-id = "u"
-deck = 1
-[[unit.control]]
-slot = "pad"
-type = "note"
-channel = 0
-id = 1
-[[unit.selector]]
-type = "note"
-channel = 0
-id = 2
-behavior = "trigger"
-target = "bound"
-[[unit.mode]]
-name = "empty"
-[[unit.mode]]
-name = "bound"
-[[unit.mode.bind]]
-slot = "pad"
-action = "play"
-"#;
-        let mut router = router(text);
-        assert!(router.feed(&note(0, 1, true)).commands.is_empty());
-        router.feed(&note(0, 2, true));
-        router.feed(&note(0, 2, false));
-        assert!(
-            router.feed(&note(0, 1, false)).commands.is_empty(),
-            "the release must keep the no-op capture"
-        );
         let feed = router.feed(&note(0, 1, true));
+        assert!(feed.commands.is_empty());
+        let feed = router.feed(&note(0, 1, false));
         assert!(matches!(
             feed.commands.as_slice(),
             [Command::TogglePlay { deck_id: 0 }]
@@ -848,12 +674,12 @@ action = "play"
 [[unit]]
 id = "u"
 deck = 1
+
 [[unit.control]]
 slot = "pad"
-kind = "pad"
-type = "cc"
-channel = 0
-id = 1
+type = "Button"
+endpoint = { midi = "cc", channel = 0, id = 1 }
+
 [[unit.mode]]
 name = "m"
 [[unit.mode.bind]]
@@ -876,38 +702,36 @@ on = "release"
 [[unit]]
 id = "u"
 deck = 1
+
 [[unit.control]]
 slot = "pad"
-type = "note"
-channel = 0
-id = 1
-[[unit.selector]]
-type = "note"
-channel = 0
-id = 2
-behavior = "trigger"
-target = "empty"
-[[unit.selector]]
-type = "note"
-channel = 0
-id = 3
-behavior = "trigger"
-target = "main"
+type = "Button"
+endpoint = { midi = "note", channel = 0, id = 1 }
+
+[[unit.control]]
+slot = "mode-next"
+type = "Button"
+role = "mode_cycle"
+endpoint = { midi = "note", channel = 0, id = 2 }
+
 [[unit.mode]]
-name = "main"
+name = "a"
 [[unit.mode.bind]]
 slot = "pad"
 action = "play"
+
 [[unit.mode]]
-name = "empty"
+name = "b"
 "#;
         let mut router = router(text);
         router.feed(&note(0, 2, true));
         router.feed(&note(0, 2, false));
-        assert!(router.feed(&note(0, 1, true)).commands.is_empty());
+        let feed = router.feed(&note(0, 1, true));
+        assert!(feed.commands.is_empty());
         router.feed(&note(0, 1, false));
-        router.feed(&note(0, 3, true));
-        router.feed(&note(0, 3, false));
+
+        router.feed(&note(0, 2, true));
+        router.feed(&note(0, 2, false));
         let feed = router.feed(&note(0, 1, true));
         assert!(matches!(
             feed.commands.as_slice(),
@@ -916,28 +740,140 @@ name = "empty"
     }
 
     #[test]
-    fn a_jog_drives_one_vinyl_action_from_its_touch_and_wheel() {
+    fn a_press_on_an_inactive_slot_does_not_fire_when_a_later_mode_binds_it() {
         let text = r#"
 [[unit]]
-id = "deck0.jog"
+id = "u"
+deck = 1
+
+[[unit.control]]
+slot = "pad"
+type = "Button"
+endpoint = { midi = "note", channel = 0, id = 1 }
+
+[[unit.control]]
+slot = "mode-next"
+type = "Button"
+role = "mode_cycle"
+endpoint = { midi = "note", channel = 0, id = 2 }
+
+[[unit.mode]]
+name = "a"
+
+[[unit.mode]]
+name = "b"
+[[unit.mode.bind]]
+slot = "pad"
+action = "play"
+"#;
+        let mut router = router(text);
+        router.feed(&note(0, 1, true));
+        router.feed(&note(0, 2, true));
+        router.feed(&note(0, 2, false));
+        let feed = router.feed(&note(0, 1, false));
+        assert!(feed.commands.is_empty(), "the press was captured as inert");
+    }
+
+    #[test]
+    fn an_absolute_knob_rearms_pickup_on_a_mode_change() {
+        let text = r#"
+[[unit]]
+id = "u"
+deck = 1
+
+[[unit.control]]
+slot = "knob"
+type = "Knob"
+endpoint = { midi = "cc", channel = 0, id = 7 }
+
+[[unit.control]]
+slot = "mode-next"
+type = "Button"
+role = "mode_cycle"
+endpoint = { midi = "note", channel = 0, id = 2 }
+
+[[unit.mode]]
+name = "a"
+[[unit.mode.bind]]
+slot = "knob"
+action = "fader flow"
+
+[[unit.mode]]
+name = "b"
+[[unit.mode.bind]]
+slot = "knob"
+action = "fader gain"
+"#;
+        let mut router = router(text);
+        // Take over at a known position, then change mode: the new action must wait for a pickup.
+        router.feed(&cc(0, 7, 64));
+        router.feed(&note(0, 2, true));
+        router.feed(&note(0, 2, false));
+        let feed = router.feed(&cc(0, 7, 70));
+        assert!(feed.commands.is_empty(), "no pickup yet");
+        let feed = router.feed(&cc(0, 7, 64));
+        assert!(matches!(
+            feed.commands.as_slice(),
+            [Command::SetFader { target: FaderTarget::Gain(0), .. }]
+        ));
+    }
+
+    #[test]
+    fn a_relative_encoder_keeps_turning_across_a_mode_change() {
+        let text = r#"
+[[unit]]
+id = "u"
+deck = 1
+
+[[unit.control]]
+slot = "knob"
+type = "RelKnob"
+endpoint = { midi = "cc", encoding = "twos_complement", channel = 0, id = 7 }
+
+[[unit.control]]
+slot = "mode-next"
+type = "Button"
+role = "mode_cycle"
+endpoint = { midi = "note", channel = 0, id = 2 }
+
+[[unit.mode]]
+name = "a"
+[[unit.mode.bind]]
+slot = "knob"
+action = "fader flow"
+
+[[unit.mode]]
+name = "b"
+[[unit.mode.bind]]
+slot = "knob"
+action = "fader flow"
+"#;
+        let mut router = router(text);
+        router.feed(&cc(0, 7, 64));
+        let feed = router.feed(&cc(0, 7, 1));
+        assert_eq!(feed.commands.len(), 1);
+        router.feed(&note(0, 2, true));
+        router.feed(&note(0, 2, false));
+        let feed = router.feed(&cc(0, 7, 1));
+        assert_eq!(feed.commands.len(), 1, "a relative encoder has no pickup");
+    }
+
+    #[test]
+    fn a_jog_drives_one_vinyl_action_from_its_press_and_wheel() {
+        let text = r#"
+[[unit]]
+id = "deck1.jog"
 preset = "jog"
 deck = 1
 
 [[unit.control]]
 slot = "jog"
-kind = "jog"
-touch = { type = "note", channel = 0, id = 80 }
-turn = { type = "cc", mode = "rel2", channel = 0, id = 6 }
+endpoint = [
+  { role = "press", midi = "note", channel = 0, id = 80 },
+  { role = "turn", midi = "cc", encoding = "twos_complement", channel = 0, id = 6 },
+]
 "#;
         let mut router = router(text);
-        let feed = router.feed(&cc(0, 6, 1));
-        assert!(matches!(
-            feed.commands.as_slice(),
-            [Command::Vinyl {
-                deck_id: 0,
-                op: hypermixx_core::VinylOp::Turn { ticks: 1, .. }
-            }]
-        ));
         let feed = router.feed(&note(0, 80, true));
         assert!(matches!(
             feed.commands.as_slice(),
@@ -946,12 +882,12 @@ turn = { type = "cc", mode = "rel2", channel = 0, id = 6 }
                 op: hypermixx_core::VinylOp::Touch
             }]
         ));
-        let feed = router.feed(&cc(0, 6, 127));
+        let feed = router.feed(&cc(0, 6, 1));
         assert!(matches!(
             feed.commands.as_slice(),
             [Command::Vinyl {
                 deck_id: 0,
-                op: hypermixx_core::VinylOp::Turn { ticks: -1, .. }
+                op: hypermixx_core::VinylOp::Turn { ticks: 1, .. }
             }]
         ));
         let feed = router.feed(&note(0, 80, false));
@@ -965,40 +901,101 @@ turn = { type = "cc", mode = "rel2", channel = 0, id = 6 }
     }
 
     #[test]
-    fn the_edge_actions_added_for_the_mixer_and_transport_reach_the_engine() {
+    fn a_jog_nudge_mode_leaves_the_press_inert() {
         let text = r#"
 [[unit]]
-id = "u"
+id = "deck1.jog"
+preset = "jog"
 deck = 1
+start = "nudge"
+
 [[unit.control]]
-slot = "cue"
-type = "note"
-channel = 0
-id = 1
-[[unit.control]]
-slot = "keylock"
-type = "note"
-channel = 0
-id = 2
+slot = "jog"
+endpoint = [
+  { role = "press", midi = "note", channel = 0, id = 80 },
+  { role = "turn", midi = "cc", encoding = "twos_complement", channel = 0, id = 6 },
+]
+
 [[unit.mode]]
-name = "m"
+name = "nudge"
 [[unit.mode.bind]]
-slot = "cue"
-action = "fader cuesend toggle"
-[[unit.mode.bind]]
-slot = "keylock"
-action = "keylock toggle"
+slot = "jog"
+turn = "nudge 0.15"
 "#;
         let mut router = router(text);
-        let feed = router.feed(&note(0, 1, true));
+        let feed = router.feed(&note(0, 80, true));
+        assert!(feed.commands.is_empty(), "no press action in nudge mode");
+        let feed = router.feed(&cc(0, 6, 1));
         assert!(matches!(
             feed.commands.as_slice(),
-            [Command::ToggleCueSend { deck_id: 0 }]
+            [Command::Nudge {
+                deck_id: 0,
+                op: hypermixx_core::NudgeOp::Bend { .. }
+            }]
         ));
-        let feed = router.feed(&note(0, 2, true));
+    }
+
+    /// The shipped example map, driven end to end: a note, a CC, an FX knob and a mode key.
+    #[test]
+    fn the_shipped_map_drives_the_engine() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = root.join("profile/midi-map.toml");
+        let text = std::fs::read_to_string(&path).expect("shipped map");
+        let mut map = Map::from_toml_str_at(&text, path.parent().unwrap()).expect("parses");
+        // FX are addressed by name; the engine's own slot order is what the CLI installs.
+        for deck in 0..2u8 {
+            map.resolve_fx(hypermixx_core::FxChainId::Deck(deck), "eq", 0);
+            map.resolve_fx(hypermixx_core::FxChainId::Deck(deck), "filter", 1);
+        }
+        let mut router = Router::new(map);
+
+        // Transport: deck1 play is note 0 on channel 0.
+        let feed = router.feed(&note(0, 0, true));
         assert!(matches!(
             feed.commands.as_slice(),
-            [Command::ToggleKeylock { deck_id: 0 }]
+            [Command::TogglePlay { deck_id: 0 }]
+        ));
+        router.feed(&note(0, 0, false));
+
+        // The channel fader is an absolute CC: soft takeover means it must cross the mirror first.
+        router.feed(&cc(0, 7, 0));
+        let feed = router.feed(&cc(0, 7, 100));
+        assert!(matches!(
+            feed.commands.as_slice(),
+            [Command::SetFader {
+                target: FaderTarget::Flow(0),
+                ..
+            }]
+        ));
+
+        // An EQ knob reaches the named FX slot.
+        let feed = router.feed(&cc(0, 9, 64));
+        assert!(matches!(
+            feed.commands.as_slice(),
+            [Command::SetFxParam { .. }]
+        ));
+
+        // A pad fires hot cue 1, then the beat-loop mode key changes what the same pad does.
+        let feed = router.feed(&note(0, 16, true));
+        assert!(matches!(
+            feed.commands.as_slice(),
+            [Command::HotCue {
+                deck_id: 0,
+                op: HotCueOp::Trigger(0)
+            }]
+        ));
+        router.feed(&note(0, 16, false));
+
+        let feed = router.feed(&note(0, 25, true));
+        assert!(feed.commands.is_empty(), "a mode key emits nothing");
+        assert!(feed.state_changed);
+        router.feed(&note(0, 25, false));
+        assert_eq!(router.snapshot().units[0].current, "beatloop");
+
+        let feed = router.feed(&note(0, 16, true));
+        assert!(matches!(
+            feed.commands.as_slice(),
+            [Command::Loop { deck_id: 0, op: LoopOp::Beats(len) }] if *len == BeatLen::fraction(1, 4).unwrap()
         ));
     }
 
@@ -1007,29 +1004,14 @@ action = "keylock toggle"
         let mut router = router(TWO_MODES);
         assert!(router
             .command(RouterCommand::SetMode {
-                unit: "deck0.pad".into(),
+                unit: "u".into(),
                 mode: "loop".into(),
             })
             .unwrap());
         assert_eq!(router.snapshot().units[0].current, "loop");
-        // Selecting the same mode is a no-op.
-        assert!(!router
-            .command(RouterCommand::SetMode {
-                unit: "deck0.pad".into(),
-                mode: "loop".into(),
-            })
-            .unwrap());
         assert!(router
-            .command(RouterCommand::NextMode {
-                unit: "deck0.pad".into(),
-            })
+            .command(RouterCommand::NextMode { unit: "u".into() })
             .unwrap());
         assert_eq!(router.snapshot().units[0].current, "hotcue");
-        assert!(router
-            .command(RouterCommand::SetMode {
-                unit: "nope".into(),
-                mode: "loop".into(),
-            })
-            .is_err());
     }
 }

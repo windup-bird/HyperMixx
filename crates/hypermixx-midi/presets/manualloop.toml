@@ -1,0 +1,46 @@
+# Manual loop keys plus a relative knob that doubles and halves the running loop.
+[[preset]]
+name = "manualloop"
+scope = "deck"
+start = "default"
+
+[[preset.slot]]
+slot = "in"
+type = "Button"
+[[preset.slot]]
+slot = "out"
+type = "Button"
+[[preset.slot]]
+slot = "exit"
+type = "Button"
+[[preset.slot]]
+slot = "double"
+type = "Button"
+[[preset.slot]]
+slot = "halve"
+type = "Button"
+[[preset.slot]]
+slot = "autoloop"
+type = "RelKnob"
+
+[[preset.mode]]
+name = "default"
+[[preset.mode.bind]]
+slot = "in"
+action = "loop in"
+[[preset.mode.bind]]
+slot = "out"
+action = "loop out"
+[[preset.mode.bind]]
+slot = "exit"
+action = "loop exit"
+[[preset.mode.bind]]
+slot = "double"
+action = "loop double"
+[[preset.mode.bind]]
+slot = "halve"
+action = "loop halve"
+[[preset.mode.bind]]
+slot = "autoloop"
+action = "loop double"
+down = "loop halve"

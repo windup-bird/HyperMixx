@@ -1,19 +1,21 @@
+# Transport buttons. One per deck; the unit binds the note numbers.
 [[preset]]
 name = "transport"
+scope = "deck"
 start = "default"
 
 [[preset.slot]]
 slot = "play"
-shape = "Button"
+type = "Button"
 [[preset.slot]]
 slot = "cue"
-shape = "Button"
+type = "Button"
 [[preset.slot]]
 slot = "sync"
-shape = "Button"
+type = "Button"
 [[preset.slot]]
 slot = "keylock"
-shape = "Button"
+type = "Button"
 
 [[preset.mode]]
 name = "default"

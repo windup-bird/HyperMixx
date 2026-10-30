@@ -1,34 +1,54 @@
-# A generic 8-pad performance grid. Slot names only; the unit binds note/CC numbers and adds the
-# selectors that choose a mode.
+# An 8-pad grid with three modes. The mode slots are ordinary controls: the unit binds one note
+# each, and pressing one switches the unit's mode without emitting a command.
 [[preset]]
-name = "touchpad"
+name = "pad"
+scope = "deck"
 start = "hotcue"
-mode_order = ["hotcue", "loop", "beatjump", "stems"]
 
 [[preset.slot]]
 slot = "pad1"
-shape = "Button"
+type = "Button"
 [[preset.slot]]
 slot = "pad2"
-shape = "Button"
+type = "Button"
 [[preset.slot]]
 slot = "pad3"
-shape = "Button"
+type = "Button"
 [[preset.slot]]
 slot = "pad4"
-shape = "Button"
+type = "Button"
 [[preset.slot]]
 slot = "pad5"
-shape = "Button"
+type = "Button"
 [[preset.slot]]
 slot = "pad6"
-shape = "Button"
+type = "Button"
 [[preset.slot]]
 slot = "pad7"
-shape = "Button"
+type = "Button"
 [[preset.slot]]
 slot = "pad8"
-shape = "Button"
+type = "Button"
+
+[[preset.slot]]
+slot = "mode-hotcue"
+type = "Button"
+role = "mode_trigger"
+target = "hotcue"
+[[preset.slot]]
+slot = "mode-beatloop"
+type = "Button"
+role = "mode_trigger"
+target = "beatloop"
+[[preset.slot]]
+slot = "mode-beatjump"
+type = "Button"
+role = "mode_trigger"
+target = "beatjump"
+[[preset.slot]]
+slot = "mode-next"
+type = "Button"
+role = "mode_cycle"
 
 [[preset.mode]]
 name = "hotcue"
@@ -57,32 +77,33 @@ action = "hotcue trigger 7"
 slot = "pad8"
 action = "hotcue trigger 8"
 
+# Beat-loop lengths, shortest first: 1/4, 1/2, 1, 2, 4, 8, 16, 32 beats.
 [[preset.mode]]
-name = "loop"
+name = "beatloop"
 [[preset.mode.bind]]
 slot = "pad1"
-action = "loop in"
+action = "loop 1/4"
 [[preset.mode.bind]]
 slot = "pad2"
-action = "loop out"
+action = "loop 1/2"
 [[preset.mode.bind]]
 slot = "pad3"
 action = "loop 1"
 [[preset.mode.bind]]
 slot = "pad4"
-action = "loop 4"
+action = "loop 2"
 [[preset.mode.bind]]
 slot = "pad5"
-action = "loop 8"
+action = "loop 4"
 [[preset.mode.bind]]
 slot = "pad6"
-action = "loop halve"
+action = "loop 8"
 [[preset.mode.bind]]
 slot = "pad7"
-action = "loop double"
+action = "loop 16"
 [[preset.mode.bind]]
 slot = "pad8"
-action = "loop exit"
+action = "loop 32"
 
 [[preset.mode]]
 name = "beatjump"
@@ -97,10 +118,10 @@ slot = "pad3"
 action = "beatjump -4"
 [[preset.mode.bind]]
 slot = "pad4"
-action = "beatjump -1"
+action = "beatjump -2"
 [[preset.mode.bind]]
 slot = "pad5"
-action = "beatjump 1"
+action = "beatjump 2"
 [[preset.mode.bind]]
 slot = "pad6"
 action = "beatjump 4"
@@ -110,30 +131,3 @@ action = "beatjump 8"
 [[preset.mode.bind]]
 slot = "pad8"
 action = "beatjump 16"
-
-[[preset.mode]]
-name = "stems"
-[[preset.mode.bind]]
-slot = "pad1"
-action = "vocals mute"
-[[preset.mode.bind]]
-slot = "pad2"
-action = "drums mute"
-[[preset.mode.bind]]
-slot = "pad3"
-action = "bass mute"
-[[preset.mode.bind]]
-slot = "pad4"
-action = "other mute"
-[[preset.mode.bind]]
-slot = "pad5"
-action = "vocals solo"
-[[preset.mode.bind]]
-slot = "pad6"
-action = "drums solo"
-[[preset.mode.bind]]
-slot = "pad7"
-action = "bass solo"
-[[preset.mode.bind]]
-slot = "pad8"
-action = "other solo"

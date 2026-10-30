@@ -1,50 +1,41 @@
 //! The mapping file: a TOML schema built around **units**, plus its validation.
 //!
-//! A unit is one physical cluster (a pad grid, a channel strip, a browser row). It owns:
-//!
-//! * **controls** — hardware facts only: a slot name, an event kind, a channel and an id;
-//! * **selectors** — pads/buttons that choose the active mode (trigger or cycle);
-//! * **modes** — one slot → action table per mode.
-//!
 //! ```toml
 //! [[unit]]
-//! id = "deck0.pad"
-//! preset = "touchpad"
+//! id = "deck1.mixer"
+//! preset = "mixer"
 //! deck = 1
 //!
 //! [[unit.control]]
-//! slot = "pad1"
-//! type = "note"
-//! channel = 0
-//! id = 16
-//!
-//! [[unit.selector]]
-//! type = "note"
-//! channel = 0
-//! id = 24
-//! behavior = "trigger"
-//! target = "hotcue"
+//! slot = "filter"
+//! type = "BipolKnob"
+//! endpoint = { midi = "cc", channel = 0, id = 12 }
 //!
 //! [[unit.mode]]
-//! name = "hotcue"
+//! name = "default"
 //! [[unit.mode.bind]]
-//! slot = "pad1"
-//! action = "hotcue trigger 1"
+//! slot = "filter"
+//! action = "fx param value"
+//! fx = "filter"
 //! ```
+//!
+//! Three layers, each with one job:
+//!
+//! * **`type`** is the slot's physical kind — `Button`, `Knob`, `BipolKnob`, `RelKnob`,
+//!   `JogWheel`. It decides which values the slot can produce and which actions it can carry.
+//! * **`endpoint`** is the hardware fact — a MIDI message, a channel, a controller number, and how
+//!   its value is encoded.
+//! * **`role`** says what the slot *does*: emit an action, or switch the unit's mode.
 //!
 //! Parsing is `deny_unknown_fields`, so a typo is a TOML error rather than a silently ignored
 //! binding. Endpoints must be unique across the whole file: one physical control belongs to one
-//! slot. Units may mix pads, knobs and jogs; that is the "crossing" the design allows.
-//!
-//! The file names FX by **name** (`chain`/`fx`/`param`), never by slot index: indices shift when an
-//! earlier slot is removed, and the file must survive a restart. The CLI resolves names to indices
-//! via `ListFx` and installs them with [`Map::resolve_fx`].
+//! slot. FX are named, never indexed, because indices shift when an earlier slot is removed.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use hypermixx_core::{
-    BrowserAction, DeckId, FaderTarget, FxChainId, HotCueOp, KeylockMode, PhaseMode, Stem,
+    BeatLen, BrowserAction, DeckId, FaderTarget, FxChainId, HotCueOp, KeylockMode, PhaseMode, Stem,
 };
 use serde::{Deserialize, Serialize};
 
@@ -83,15 +74,17 @@ pub struct Meta {
     /// The MIDI input this map belongs to. The guide writes it; `--midi` still overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+    /// One line of prose, shown by the guide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// User preset files, relative to the map file's folder. A user preset with the same name as a
     /// built-in replaces it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub presets: Vec<String>,
 }
 
-/// Which MIDI message kind an endpoint listens for.
-/// Deck numbers are written 1-based in TOML and stored 0-based in the engine. Keeping the
-/// conversion at the file boundary avoids an off-by-one in every audio/mixer index.
+/// Deck numbers are written 1-based in TOML and stored 0-based. Keeping the conversion at the file
+/// boundary avoids an off-by-one in every audio/mixer index.
 mod deck_number {
     use super::DeckId;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -120,6 +113,7 @@ mod deck_number {
     }
 }
 
+/// Which MIDI message an endpoint listens for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EventKind {
@@ -128,20 +122,33 @@ pub enum EventKind {
     Bend,
 }
 
-/// How a CC carries movement. Absolute knobs and faders are `Abs`; endless encoders differ by
-/// vendor, so the exact wraparound rule is per endpoint.
+/// How one endpoint's data bytes become movement.
+///
+/// Absolute controls carry a position; the rest carry a step and differ only in how a vendor packs
+/// its sign. Naming them by *meaning* rather than by `rel1`/`rel2` keeps a map readable: what matters
+/// is "this wheel reports two's complement", not which of three vendor conventions the number was.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RelMode {
+#[serde(rename_all = "snake_case")]
+pub enum Encoding {
+    /// A position, `0..=127` (or `0..=16383` with `lsb`).
     #[default]
-    Abs,
+    Absolute,
     /// Offset binary around 64: `value - 64`, so 64 is "no movement", 65..127 = +, 1..63 = −.
-    Rel1,
+    Offset64,
     /// Two's complement around 64: 1..63 = +, 65..127 = − (127 = −1).
-    Rel2,
-    /// Direction only (1..63 = +, 65..127 = −); the magnitude is ignored, so a fast turn is worth
-    /// the same as a slow one.
-    Rel3,
+    TwosComplement,
+    /// Direction only: 1..63 = +, 65..127 = −. The magnitude is ignored.
+    Direction,
+    /// A two-point encoder: 1 = one step up, 127 = one step down, everything else is neutral.
+    /// This is the `{0, 1, 127}` shape most small controllers send.
+    TwoPoint,
+}
+
+impl Encoding {
+    /// Whether this encoding carries a step rather than a position.
+    pub fn is_relative(self) -> bool {
+        !matches!(self, Encoding::Absolute)
+    }
 }
 
 /// A response shaping applied after the value is normalised to `0..=1`.
@@ -154,8 +161,7 @@ pub enum Curve {
     Sharp,
 }
 
-/// Which edge of a one-shot control fires the action. Two-edge actions (`cue`, `vinyl`, held
-/// `nudge`, `fx pad`) always use both edges and reject this field.
+/// Which edge of a one-shot control fires the action.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Edge {
@@ -164,106 +170,136 @@ pub enum Edge {
     Release,
 }
 
-/// What kind of physical control a slot is.
+/// What kind of physical control a slot is. This is the reusable half of a slot: a preset names a
+/// slot's kind, and a unit only supplies the endpoint and the deck.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub enum ControlShape {
-    /// A note/CC button. One-shot actions fire on an edge; `cue`/`vinyl`/`fx pad` use both.
+pub enum SlotKind {
+    /// A note or absolute-CC button. One-shot actions fire on an edge.
     #[serde(rename = "Button", alias = "button", alias = "pad")]
     Button,
-    /// A continuous control: an absolute CC, a relative encoder, or pitch bend.
+    /// An absolute control read as a position `0..=1`.
     #[serde(rename = "Knob", alias = "knob")]
     Knob,
-    /// An absolute control whose centre is zero: `0..127` becomes `-1..1`.
+    /// An absolute control whose centre is zero: `0..=127` becomes `-1..=1`.
     #[serde(rename = "BipolKnob", alias = "bipolknob")]
     BipolKnob,
-    /// A relative encoder. Its delta can drive a continuous action, or an `action`/`down` pair.
+    /// A relative encoder. It drives a continuous action, or one action per direction.
     #[serde(rename = "RelKnob", alias = "relknob")]
     RelKnob,
-    /// A platter: a touch/press note plus a relative wheel, both driving `vinyl`.
+    /// A platter: a press/touch note plus a relative wheel.
     #[serde(rename = "JogWheel", alias = "jogwheel", alias = "jog")]
     JogWheel,
-    /// A mode selector slot: press selects `target`, no command is emitted.
-    #[serde(rename = "ModeTrigger", alias = "modetrigger")]
+}
+
+/// What a slot does besides carrying an action.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotRole {
+    /// The normal case: the slot's mode bindings fire commands.
+    #[default]
+    Action,
+    /// Pressing selects the mode named by `target`.
     ModeTrigger,
-    /// A mode selector slot: press advances to the next mode, no command is emitted.
-    #[serde(rename = "ModeCycle", alias = "modecycle")]
+    /// Pressing advances to the next mode in the unit's order.
     ModeCycle,
 }
 
-/// One endpoint used inside a jog's `touch`/`turn` tables.
+/// The part of a compound slot an endpoint belongs to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointRole {
+    /// The slot's only (or main) endpoint.
+    #[default]
+    Main,
+    /// A jog's press/touch sensor.
+    Press,
+    /// A jog's wheel.
+    Turn,
+}
+
+/// One physical endpoint, in the shape the file writes it.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawEndpoint {
-    #[serde(rename = "type")]
-    pub kind: EventKind,
-    /// Optional LSB controller for a 14-bit CC pair. Only valid with `type = "cc"`.
+    /// Only needed for a jog, whose two endpoints are told apart by role.
+    #[serde(default, skip_serializing_if = "is_default_role")]
+    pub role: EndpointRole,
+    /// The MIDI message kind.
+    #[serde(rename = "midi")]
+    pub midi: EventKind,
+    #[serde(default, skip_serializing_if = "is_absolute")]
+    pub encoding: Encoding,
+    /// The LSB controller of a 14-bit CC pair; `id` is then the MSB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lsb: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<RelMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reverse: Option<bool>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reverse: bool,
     pub channel: u8,
-    pub id: u8,
+    /// The CC controller or note key. Pitch bend has no number, so it omits this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u8>,
 }
 
-/// One `[[unit.control]]`: the hardware side of a slot.
+fn is_default_role(role: &EndpointRole) -> bool {
+    *role == EndpointRole::Main
+}
+
+fn is_absolute(encoding: &Encoding) -> bool {
+    *encoding == Encoding::Absolute
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// One value or a list, so a jog can write two endpoints and everything else stays a table.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> OneOrMany<T> {
+    pub fn as_slice(&self) -> &[T] {
+        match self {
+            OneOrMany::One(value) => std::slice::from_ref(value),
+            OneOrMany::Many(values) => values,
+        }
+    }
+}
+
+impl<T: Serialize> Serialize for OneOrMany<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            OneOrMany::One(value) => value.serialize(serializer),
+            OneOrMany::Many(values) => values.serialize(serializer),
+        }
+    }
+}
+
+/// One `[[unit.control]]`: a slot plus the hardware it listens to.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawControl {
     pub slot: String,
-    /// Optional override when the event kind alone is ambiguous (a CC button is `kind = "pad"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<ControlShape>,
+    /// The slot's kind. A preset normally supplies it; a unit may repeat it, and it must agree.
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
-    pub event_type: Option<EventKind>,
-    /// Optional LSB controller for a 14-bit CC pair; `id` is then the MSB.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lsb: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<RelMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reverse: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channel: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<u8>,
-    /// A jog's press/touch sensor (usually a note). `press` is accepted as an alias.
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "press")]
-    pub touch: Option<RawEndpoint>,
-    /// A jog's wheel (a relative CC).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn: Option<RawEndpoint>,
-    /// The mode selected by a `ModeTrigger` slot.
+    pub kind: Option<SlotKind>,
+    #[serde(default, skip_serializing_if = "is_action_role")]
+    pub role: SlotRole,
+    /// The mode a `mode_trigger` slot selects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<OneOrMany<RawEndpoint>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RawSelectorBehavior {
-    /// Pressing selects the named mode and leaves it there.
-    Trigger,
-    /// Pressing advances to the next mode in declaration order, wrapping.
-    Cycle,
-}
-
-/// One `[[unit.selector]]`: a mode button. It is not an action slot.
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawSelector {
-    #[serde(rename = "type")]
-    pub kind: EventKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<RelMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reverse: Option<bool>,
-    pub channel: u8,
-    pub id: u8,
-    pub behavior: RawSelectorBehavior,
-    /// The mode a `trigger` selector selects. Required for `trigger`, refused for `cycle`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<String>,
+fn is_action_role(role: &SlotRole) -> bool {
+    *role == SlotRole::Action
 }
 
 /// One slot → action row inside a mode.
@@ -271,8 +307,16 @@ pub struct RawSelector {
 #[serde(deny_unknown_fields)]
 pub struct RawModeBind {
     pub slot: String,
-    pub action: String,
-    /// The reverse direction of a `RelKnob`: one edge action per negative detent.
+    /// The action for the slot's main endpoint (see [`EndpointRole`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// A jog's press action; overrides `action` for the press endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub press: Option<String>,
+    /// A jog's turn action; overrides `action` for the turn endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<String>,
+    /// The reverse direction of a `RelKnob`: one action per negative detent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub down: Option<String>,
     /// Written 1-based in TOML; stored 0-based internally.
@@ -288,18 +332,12 @@ pub struct RawModeBind {
     pub max: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub curve: Option<Curve>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub step: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seconds: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub beats: Option<u64>,
+    /// The FX chain address, when the action's line does not name one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<String>,
+    /// The FX slot name an `fx …` action addresses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fx: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub param: Option<String>,
     /// `press` (default) or `release` for one-shot actions. Two-edge actions reject it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<Edge>,
@@ -320,7 +358,7 @@ pub struct RawMode {
 #[serde(deny_unknown_fields)]
 pub struct RawUnit {
     pub id: String,
-    /// A built-in or user preset that supplies slot names and default modes.
+    /// A built-in or user preset that supplies slot kinds and default modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
     /// The deck this unit targets by default, written 1-based in TOML. Omit for a global unit.
@@ -333,13 +371,12 @@ pub struct RawUnit {
     /// The mode the unit starts in. Defaults to the preset's `start`, then the first mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<String>,
-    /// The exact mode order (and whitelist) for cycle selectors. Defaults to declaration order.
+    /// An explicit mode order: the modes named here come first, in this order, and any other mode
+    /// follows in declaration order. Cycle selectors walk the resulting list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_order: Option<Vec<String>>,
     #[serde(default, rename = "control")]
     pub controls: Vec<RawControl>,
-    #[serde(default, rename = "selector")]
-    pub selectors: Vec<RawSelector>,
     #[serde(default, rename = "mode")]
     pub modes: Vec<RawMode>,
 }
@@ -364,20 +401,12 @@ impl MapFile {
     }
 }
 
-/// The role an endpoint plays inside one control.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EndpointRole {
-    Main,
-    Touch,
-    Turn,
-}
-
 /// A compiled, physical endpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint {
     pub role: EndpointRole,
     pub kind: EventKind,
-    pub mode: RelMode,
+    pub encoding: Encoding,
     pub reverse: bool,
     pub channel: u8,
     pub id: u8,
@@ -406,15 +435,25 @@ impl Endpoint {
     }
 }
 
-/// One compiled slot: its physical endpoints (one for pad/knob, two for a jog).
+/// One compiled slot.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Control {
     pub slot: String,
-    pub shape: ControlShape,
-    /// Indices into [`Unit::endpoints`].
-    pub endpoints: Vec<usize>,
+    pub kind: SlotKind,
+    pub role: SlotRole,
     /// The mode name for a `ModeTrigger` slot; `None` for every other kind.
     pub target: Option<String>,
+    /// Indices into [`Unit::endpoints`].
+    pub endpoints: Vec<usize>,
+}
+
+impl Control {
+    fn endpoint_index(&self, endpoints: &[Endpoint], role: EndpointRole) -> Option<usize> {
+        self.endpoints
+            .iter()
+            .copied()
+            .find(|&index| endpoints[index].role == role)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -423,23 +462,61 @@ pub enum SelectorBehavior {
     Cycle,
 }
 
+/// A slot that switches the unit's mode. Compiled from a control's `role`, never written directly.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Selector {
     pub endpoint: Endpoint,
     pub behavior: SelectorBehavior,
-    /// Set when this selector came from a `ModeTrigger`/`ModeCycle` slot.
-    pub slot: Option<String>,
+    pub slot: String,
 }
 
-/// A slot's action in one mode, before the physical endpoint is attached.
+/// The actions one slot carries, one per endpoint role.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ActionSet {
+    pub main: Option<Action>,
+    pub press: Option<Action>,
+    pub turn: Option<Action>,
+    /// The reverse direction of a `RelKnob`; `None` means the delta is continuous.
+    pub down: Option<Action>,
+}
+
+impl ActionSet {
+    /// The action that handles one endpoint. A jog's explicit `press`/`turn` rows win; otherwise the
+    /// shorthand `action` covers both halves.
+    pub fn for_role(&self, role: EndpointRole) -> Option<&Action> {
+        match role {
+            EndpointRole::Main => self.main.as_ref(),
+            EndpointRole::Press => self.press.as_ref().or(self.main.as_ref()),
+            EndpointRole::Turn => self.turn.as_ref().or(self.main.as_ref()),
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Action> {
+        [&self.main, &self.press, &self.turn, &self.down]
+            .into_iter()
+            .flatten()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.iter().next().is_none()
+    }
+
+    fn any_continuous(&self) -> bool {
+        self.iter().any(|action| action.is_continuous())
+    }
+
+    fn any_bipolar(&self) -> bool {
+        self.iter().any(|action| action.is_bipolar())
+    }
+}
+
+/// A slot's actions in one mode, before the physical endpoint is attached.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModeBinding {
     pub deck: Option<DeckId>,
-    pub action: Action,
-    /// The reverse direction of a `RelKnob`; `None` means the delta is continuous.
-    pub down: Option<Action>,
-    /// The slot type is needed to pick the centre of an absolute `BipolKnob`.
-    pub shape: ControlShape,
+    pub actions: ActionSet,
+    /// The slot kind decides the centre of an absolute `BipolKnob`.
+    pub kind: SlotKind,
     pub min: f32,
     pub max: f32,
     pub curve: Curve,
@@ -447,28 +524,34 @@ pub struct ModeBinding {
 }
 
 impl ModeBinding {
-    /// Combines the mode's action with one endpoint into an executable binding.
-    pub fn spec(&self, endpoint: &Endpoint) -> BindingSpec {
-        BindingSpec {
+    /// Combines the mode's action with one endpoint into an executable binding. `None` means this
+    /// endpoint has no action in this mode, so the router treats it as unbound.
+    pub fn spec(&self, endpoint: &Endpoint) -> Option<BindingSpec> {
+        let action = self.actions.for_role(endpoint.role)?.clone();
+        let down = match endpoint.role {
+            EndpointRole::Main => self.actions.down.clone(),
+            _ => None,
+        };
+        Some(BindingSpec {
             kind: endpoint.kind,
-            mode: endpoint.mode,
+            encoding: endpoint.encoding,
             reverse: endpoint.reverse,
             channel: endpoint.channel,
             id: endpoint.id,
             lsb: endpoint.lsb,
-            deck: self.deck,
-            center: (self.shape == ControlShape::BipolKnob).then(|| match endpoint.kind {
+            center: (self.kind == SlotKind::BipolKnob).then(|| match endpoint.kind {
                 EventKind::Bend => 0.5,
                 _ if endpoint.lsb.is_some() => 8192.0 / 16383.0,
                 _ => 64.0 / 127.0,
             }),
-            action: self.action.clone(),
-            down: self.down.clone(),
+            deck: self.deck,
+            action,
+            down,
             min: self.min,
             max: self.max,
             curve: self.curve,
             on: self.on,
-        }
+        })
     }
 }
 
@@ -500,13 +583,9 @@ impl Unit {
         self.modes.iter().position(|mode| mode.name == name)
     }
 
-    /// The action bound to one control in one mode.
+    /// The actions one slot carries in one mode.
     pub fn binding(&self, mode: usize, control: usize) -> Option<&ModeBinding> {
-        self.modes
-            .get(mode)?
-            .binds
-            .get(control)?
-            .as_ref()
+        self.modes.get(mode)?.binds.get(control)?.as_ref()
     }
 }
 
@@ -514,7 +593,7 @@ impl Unit {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BindingSpec {
     pub kind: EventKind,
-    pub mode: RelMode,
+    pub encoding: Encoding,
     pub reverse: bool,
     pub channel: u8,
     pub id: u8,
@@ -544,61 +623,16 @@ impl BindingSpec {
     }
 }
 
-/// The action-side fields of one mode binding, in the shape [`parse_action`] already understands.
-/// The physical fields are filled from the slot's endpoint; the rest come from the mode row.
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawBinding {
-    #[serde(rename = "type")]
-    pub kind: EventKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<RelMode>,
-    /// Flip the sign of a relative encoder's delta. Some controllers number their detents the other
-    /// way round; the guide cannot tell, so it is a per-binding choice.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reverse: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channel: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deck: Option<DeckId>,
-    pub action: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub curve: Option<Curve>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub step: Option<f32>,
-    /// Nudge duration in seconds; when present the bend releases itself and the note-up edge is
-    /// ignored (otherwise the binding is momentary — held for as long as the button is down).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seconds: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub beats: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chain: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fx: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub param: Option<String>,
-}
-
-
 /// A binding's parsed, parameterised action.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Play,
     /// Momentary cue button. The press edge is [`CueOp::Hold`](hypermixx_core::CueOp::Hold): while
     /// playing it is a back cue, while paused it cues the playhead and plays it. The release edge is
-    /// `Back`. This is the only cue row the guide lists.
+    /// `Back`.
     Cue,
     /// One-shot cue: the deck decides between "back to cue" and "set cue here", and never plays.
-    ///
-    /// Kept — and kept out of [`ACTIONS`], so the guide offers one cue row instead of two — for a
-    /// button that should only *place* the cue point. `cue.smart` is the name a map uses for it.
+    /// Kept out of [`ACTIONS`], so the guide offers one cue row instead of two.
     CueSmart,
     BeatJump {
         beats: i64,
@@ -621,17 +655,10 @@ pub enum Action {
         delta: f32,
         seconds: Option<f64>,
     },
-    /// A DJ wheel, which is two controls in one message stream and is therefore bound **twice** on a
-    /// real controller:
-    ///
-    /// * a **note** (the platter sensor) → the touch and its release;
-    /// * a **relative CC** (the wheel itself) → turns, `step` frames of audio per tick.
-    ///
-    /// What a turn *means* — move the playhead or bend the tempo — is the deck's decision, because
-    /// only the deck knows whether the platter is held. That is why both bindings carry the same
-    /// action name.
+    /// A DJ wheel: the press edge is the platter touch and the turn edge is a scrub. What a turn
+    /// *means* is the deck's decision, because only the deck knows whether the platter is held.
     Vinyl {
-        /// Frames of audio per wheel tick (the `step` field), applied only while the platter is held.
+        /// Frames of audio per wheel tick, applied only while the platter is held.
         frames_per_tick: f32,
     },
     /// Arm the next platter touch as a slip scratch (press-only).
@@ -677,6 +704,14 @@ impl Action {
     pub fn is_bipolar(&self) -> bool {
         matches!(self, Action::Fader(target) if target.is_bipolar())
     }
+
+    /// The action a jog wheel may carry on one of its halves.
+    fn is_jog_action(&self) -> bool {
+        matches!(
+            self,
+            Action::Vinyl { .. } | Action::Slip | Action::Nudge { .. }
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -687,7 +722,7 @@ pub enum LoopAction {
     Cancel,
     Halve,
     Double,
-    Beats(u64),
+    Beats(BeatLen),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -758,39 +793,16 @@ impl FxAction {
 /// the session command lines a front-end takes (minus the target).
 pub use hypermixx_core::action::{ActionSpec, ACTIONS};
 
-/// The baseline nudge, as a rate: one wheel message bends by this much (`0.15` = 15 % fast), and a
-/// binding that omits `step` gets it.
-///
-/// Deliberately large, because most controller encoders report ±1 per message however fast you turn:
-/// the message *rate* is the only speed information there is, so one message has to be worth
-/// something on its own. With `Nudge::bend` accumulating up to `NUDGE_LIMIT`, two messages reach a
-/// wheel-sized bend.
+/// The baseline nudge, as a rate: one wheel message bends by this much (`0.15` = 15 % fast).
 pub const DEFAULT_NUDGE_STEP: f32 = 0.15;
 
-/// How long a bend started by a **relative encoder tick** lasts when the binding omits `seconds`.
-///
-/// Short on purpose: each message bends, then gets out of the way, so turning feels like nudging the
-/// platter rather than gradually changing the tempo. The release is re-armed by every message, so a
-/// turn that keeps going keeps bending.
-///
-/// An encoder has no release edge — one tick is one message — so a bend with no end would never be
-/// released. (A *note* has both edges, so `seconds` omitted there still means "hold while the button
-/// is down", which is why this default is applied by the translator rather than at parse time.)
+/// How long a bend started by a relative-encoder tick lasts when the line omits a duration.
 pub const DEFAULT_NUDGE_SECONDS: f64 = 0.06;
 
-/// Frames of audio one wheel tick moves the playhead while the platter is held, when a `vinyl`
-/// binding omits `step` (or an `action = "vinyl"` line omits its argument).
+/// Frames of audio one wheel tick moves the playhead while the platter is held.
 ///
-/// Tune it with the physics: a record at 33⅓ RPM carries **1.8 s per revolution**, so
-///
-/// ```text
-/// frames_per_tick = 79380 / (ticks your wheel sends per revolution)
-/// ```
-///
-/// A slow encoder that reports ±1 a few times a second needs a big number to feel like a platter at
-/// all; 1323 is that formula for a 60-detent wheel (and 441 = ⅓ of it, for deliberately fine
-/// placement). To measure yours: open the guide's raw monitor, turn the wheel exactly one revolution,
-/// and count the messages.
+/// A record at 33⅓ RPM carries **1.8 s per revolution**, so `frames_per_tick = 79380 / (ticks your
+/// wheel sends per revolution)`. 1323 is that formula for a 60-detent wheel.
 pub const DEFAULT_VINYL_FRAMES_PER_TICK: f32 = 1323.0;
 
 /// One selectable target in the guide's checklist: an action, scoped to a deck when it needs one.
@@ -804,9 +816,6 @@ pub struct Target {
 }
 
 /// Builds the standard checklist for `decks` decks from [`ACTIONS`].
-///
-/// The label is the command line, so what the guide shows is exactly what it writes into the file —
-/// and exactly what a user could have typed in the session.
 pub fn manifest(decks: usize) -> Vec<Target> {
     let mut out = Vec::new();
     for spec in ACTIONS {
@@ -830,7 +839,6 @@ pub fn manifest(decks: usize) -> Vec<Target> {
     }
     out
 }
-
 
 /// A parsed mapping, ready to translate events.
 #[derive(Clone, Debug)]
@@ -916,36 +924,27 @@ impl Map {
         self.fx_slots.get(&(chain, name.to_owned())).copied()
     }
 
-    /// Every endpoint in the file must be claimed once. A physical control cannot drive two slots
-    /// or two mode selectors at the same time.
+    /// Every endpoint in the file must be claimed once. A physical control cannot drive two slots.
     fn validate_endpoints(&self) -> Result<(), String> {
         let mut seen: HashMap<(EventKind, u8, u8), String> = HashMap::new();
         for unit in &self.units {
             for control in &unit.controls {
+                let owner = format!("`{}/{}`", unit.id, control.slot);
                 for &endpoint in &control.endpoints {
-                    let endpoint = &unit.endpoints[endpoint];
-                    let owner = format!("`{}/{}`", unit.id, control.slot);
-                    for key in endpoint.keys() {
-                        if let Some(previous) = seen.insert(key, owner.clone()) {
-                            if previous != owner {
-                                return Err(format!(
-                                    "endpoint {:?} ch{} id{} is claimed by {previous} and {owner}",
-                                    key.0, key.1, key.2
-                                ));
-                            }
-                        }
+                    for key in unit.endpoints[endpoint].keys() {
+                        seen.insert(key, owner.clone());
                     }
                 }
             }
-            for selector in &unit.selectors {
-                let endpoint = &selector.endpoint;
-                let owner = match &selector.slot {
-                    Some(slot) => format!("`{}/{}`", unit.id, slot),
-                    None => format!("`{}/selector`", unit.id),
-                };
-                for key in endpoint.keys() {
-                    if let Some(previous) = seen.insert(key, owner.clone()) {
-                        if previous != owner {
+        }
+        // A second pass so the error names both owners rather than only the survivor.
+        let mut claimed: HashMap<(EventKind, u8, u8), String> = HashMap::new();
+        for unit in &self.units {
+            for control in &unit.controls {
+                let owner = format!("`{}/{}`", unit.id, control.slot);
+                for &endpoint in &control.endpoints {
+                    for key in unit.endpoints[endpoint].keys() {
+                        if let Some(previous) = claimed.insert(key, owner.clone()) {
                             return Err(format!(
                                 "endpoint {:?} ch{} id{} is claimed by {previous} and {owner}",
                                 key.0, key.1, key.2
@@ -966,7 +965,7 @@ fn check_name(what: &str, value: &str) -> Result<(), String> {
         return Err(format!("{what} must not be empty"));
     }
     if value.chars().any(char::is_whitespace) {
-        return Err(format!("{what} `{value}` must not contain whitespace"));
+        return Err(format!("{what} `{value}` cannot contain whitespace"));
     }
     Ok(())
 }
@@ -984,14 +983,11 @@ fn compile_unit(raw: &RawUnit, presets: &crate::preset::PresetRegistry) -> Resul
 
     // Slot names: preset order first, then unit-only slots in declaration order.
     let mut slot_order: Vec<String> = Vec::new();
-    let mut preset_shapes: HashMap<String, Option<ControlShape>> = HashMap::new();
+    let mut preset_slots: HashMap<String, &crate::preset::PresetSlot> = HashMap::new();
     if let Some(preset) = preset {
         for slot in &preset.slots {
             check_name("slot", &slot.slot)?;
-            if preset_shapes
-                .insert(slot.slot.clone(), slot.shape)
-                .is_some()
-            {
+            if preset_slots.insert(slot.slot.clone(), slot).is_some() {
                 return Err(format!(
                     "preset `{}` declares slot `{}` twice",
                     preset.name, slot.slot
@@ -1003,23 +999,20 @@ fn compile_unit(raw: &RawUnit, presets: &crate::preset::PresetRegistry) -> Resul
     let mut unit_controls: HashMap<String, &RawControl> = HashMap::new();
     for control in &raw.controls {
         check_name("slot", &control.slot)?;
-        if unit_controls
-            .insert(control.slot.clone(), control)
-            .is_some()
-        {
+        if unit_controls.insert(control.slot.clone(), control).is_some() {
             return Err(format!("slot `{}` is declared twice", control.slot));
         }
-        if !preset_shapes.contains_key(&control.slot) {
+        if !preset_slots.contains_key(&control.slot) {
             slot_order.push(control.slot.clone());
         }
     }
 
     // Modes: preset defaults, same-name unit modes replace, new names append.
     let mut modes: Vec<RawMode> = preset.map(|preset| preset.modes.clone()).unwrap_or_default();
-    let mut mode_names = HashSet::new();
+    let mut seen_modes = HashSet::new();
     for mode in &modes {
         check_name("mode", &mode.name)?;
-        if !mode_names.insert(mode.name.clone()) {
+        if !seen_modes.insert(mode.name.clone()) {
             return Err(format!(
                 "preset `{}` declares mode `{}` twice",
                 raw.preset.as_deref().unwrap_or(""),
@@ -1032,49 +1025,25 @@ fn compile_unit(raw: &RawUnit, presets: &crate::preset::PresetRegistry) -> Resul
         if let Some(existing) = modes.iter_mut().find(|existing| existing.name == mode.name) {
             *existing = mode.clone();
         } else {
+            seen_modes.insert(mode.name.clone());
             modes.push(mode.clone());
         }
-    }
-    // A unit's own `mode_order` is an exact whitelist. A preset's order is a default: it orders
-    // the preset modes, but a unit-added mode is appended rather than silently dropped, so user
-    // extensions do not disappear behind a built-in list.
-    let unit_modes: HashSet<String> = raw.modes.iter().map(|mode| mode.name.clone()).collect();
-    if let Some(order) = raw.mode_order.clone() {
-        let mut ordered = Vec::with_capacity(order.len());
-        for name in order {
-            let Some(index) = modes.iter().position(|mode| mode.name == name) else {
-                return Err(format!("`mode_order` names unknown mode `{name}`"));
-            };
-            ordered.push(modes.remove(index));
-        }
-        modes = ordered;
-    } else if let Some(order) = preset.and_then(|preset| preset.mode_order.clone()) {
-        let mut ordered = Vec::with_capacity(modes.len());
-        for name in order {
-            let Some(index) = modes.iter().position(|mode| mode.name == name) else {
-                return Err(format!(
-                    "preset `{}` names unknown mode `{name}` in `mode_order`",
-                    raw.preset.as_deref().unwrap_or("")
-                ));
-            };
-            ordered.push(modes.remove(index));
-        }
-        // Keep modes the unit declared, even if the preset's default order does not name them.
-        ordered.extend(
-            modes
-                .into_iter()
-                .filter(|mode| unit_modes.contains(&mode.name)),
-        );
-        modes = ordered;
     }
     if modes.is_empty() {
         return Err("has no modes".to_owned());
     }
-    let mut seen_modes = HashSet::new();
-    for mode in &modes {
-        if !seen_modes.insert(mode.name.clone()) {
-            return Err(format!("mode `{}` is declared twice", mode.name));
+    // An explicit unit order moves the named modes to the front; everything else keeps its place.
+    if let Some(order) = raw.mode_order.clone() {
+        let mut ordered = Vec::with_capacity(modes.len());
+        for name in &order {
+            let index = modes
+                .iter()
+                .position(|mode| &mode.name == name)
+                .ok_or_else(|| format!("`mode_order` names unknown mode `{name}`"))?;
+            ordered.push(modes.remove(index));
         }
+        ordered.extend(modes);
+        modes = ordered;
     }
 
     // Controls and endpoints.
@@ -1082,22 +1051,20 @@ fn compile_unit(raw: &RawUnit, presets: &crate::preset::PresetRegistry) -> Resul
     let mut endpoints = Vec::new();
     for slot in &slot_order {
         let raw_control = unit_controls.get(slot).copied();
-        let preset_shape = preset_shapes.get(slot).copied().flatten();
-        let (shape, compiled, target) = compile_control(slot, raw_control, preset_shape)?;
+        let preset_slot = preset_slots.get(slot).copied();
+        let (control, compiled) = compile_control(slot, raw_control, preset_slot)?;
         let base = endpoints.len();
         endpoints.extend(compiled);
         controls.push(Control {
-            slot: slot.clone(),
-            shape,
             endpoints: (base..endpoints.len()).collect(),
-            target,
+            ..control
         });
     }
 
     // Mode bindings.
     let mut compiled_modes = Vec::with_capacity(modes.len());
     for raw_mode in &modes {
-        let mut binds = vec![None; controls.len()];
+        let mut binds: Vec<Option<ModeBinding>> = vec![None; controls.len()];
         let mut seen_slots = HashSet::new();
         for raw_bind in &raw_mode.binds {
             let Some(control) = controls
@@ -1115,18 +1082,8 @@ fn compile_unit(raw: &RawUnit, presets: &crate::preset::PresetRegistry) -> Resul
                     raw_mode.name, raw_bind.slot
                 ));
             }
-            if matches!(
-                controls[control].shape,
-                ControlShape::ModeTrigger | ControlShape::ModeCycle
-            ) {
-                return Err(format!(
-                    "mode `{}` binds mode slot `{}`; mode slots do not emit commands",
-                    raw_mode.name, raw_bind.slot
-                ));
-            }
-            let binding =
-                compile_mode_binding(raw_bind, &controls[control], &endpoints, raw.deck)?;
-            validate_shape(&controls[control], &binding, &endpoints)?;
+            let binding = compile_mode_binding(raw_bind, &controls[control], raw.deck)?;
+            validate_binding(&controls[control], &binding, &endpoints)?;
             binds[control] = Some(binding);
         }
         compiled_modes.push(Mode {
@@ -1139,15 +1096,15 @@ fn compile_unit(raw: &RawUnit, presets: &crate::preset::PresetRegistry) -> Resul
         });
     }
 
-    // Selectors: mode slots first, then the legacy `[[unit.selector]]` tables.
-    let mut selectors = Vec::with_capacity(raw.selectors.len() + controls.len());
+    // Selectors come from mode slots, never from a separate table.
+    let mut selectors = Vec::new();
     for control in &controls {
-        let behavior = match control.shape {
-            ControlShape::ModeTrigger => {
-                let target = control
-                    .target
-                    .as_deref()
-                    .ok_or_else(|| format!("slot `{}`: ModeTrigger has no target", control.slot))?;
+        let behavior = match control.role {
+            SlotRole::Action => continue,
+            SlotRole::ModeTrigger => {
+                let target = control.target.as_deref().ok_or_else(|| {
+                    format!("slot `{}`: a mode_trigger needs a `target`", control.slot)
+                })?;
                 let mode = compiled_modes
                     .iter()
                     .position(|mode| mode.name == target)
@@ -1156,38 +1113,17 @@ fn compile_unit(raw: &RawUnit, presets: &crate::preset::PresetRegistry) -> Resul
                     })?;
                 SelectorBehavior::Trigger { mode }
             }
-            ControlShape::ModeCycle => SelectorBehavior::Cycle,
-            _ => continue,
+            SlotRole::ModeCycle => SelectorBehavior::Cycle,
         };
-        if let Some(&endpoint_index) = control.endpoints.first() {
-            selectors.push(Selector {
-                endpoint: endpoints[endpoint_index].clone(),
-                behavior,
-                slot: Some(control.slot.clone()),
-            });
-        }
-    }
-    for raw_selector in &raw.selectors {
-        let endpoint = compile_selector_endpoint(raw_selector)?;
-        let behavior = match raw_selector.behavior {
-            RawSelectorBehavior::Trigger => {
-                let target = raw_selector.target.as_deref().ok_or_else(|| {
-                    "a `trigger` selector needs a `target` mode".to_owned()
-                })?;
-                let mode = compiled_modes
-                    .iter()
-                    .position(|mode| mode.name == target)
-                    .ok_or_else(|| format!("selector targets unknown mode `{target}`"))?;
-                SelectorBehavior::Trigger { mode }
-            }
-            RawSelectorBehavior::Cycle => {
-                if raw_selector.target.is_some() {
-                    return Err("`target` is only meaningful for a `trigger` selector".to_owned());
-                }
-                SelectorBehavior::Cycle
-            }
+        // A mode slot with no endpoint yet is simply not wired: the guide learns it later.
+        let Some(endpoint) = control.endpoint_index(&endpoints, EndpointRole::Main) else {
+            continue;
         };
-        selectors.push(Selector { endpoint, behavior, slot: None });
+        selectors.push(Selector {
+            endpoint: endpoints[endpoint].clone(),
+            behavior,
+            slot: control.slot.clone(),
+        });
     }
 
     let start_name = raw
@@ -1216,360 +1152,214 @@ fn compile_unit(raw: &RawUnit, presets: &crate::preset::PresetRegistry) -> Resul
 fn compile_control(
     slot: &str,
     raw: Option<&RawControl>,
-    preset_shape: Option<ControlShape>,
-) -> Result<(ControlShape, Vec<Endpoint>, Option<String>), String> {
-    let Some(raw) = raw else {
-        return match preset_shape {
-            Some(ControlShape::ModeTrigger) => Err(format!(
-                "slot `{slot}`: a ModeTrigger needs a `target` mode"
-            )),
-            Some(shape) => Ok((shape, Vec::new(), None)),
-            None => Err(format!(
-                "slot `{slot}` has no endpoint and the preset gives no `shape`"
-            )),
-        };
+    preset: Option<&crate::preset::PresetSlot>,
+) -> Result<(Control, Vec<Endpoint>), String> {
+    let kind = match (raw.and_then(|raw| raw.kind), preset.map(|slot| slot.kind)) {
+        (Some(from_unit), Some(from_preset)) if from_unit != from_preset => {
+            return Err(format!(
+                "slot `{slot}`: `type = \"{from_unit:?}\"` disagrees with the preset's `{from_preset:?}`"
+            ))
+        }
+        (Some(kind), _) | (None, Some(kind)) => kind,
+        (None, None) => {
+            return Err(format!("slot `{slot}`: add `type` (Button | Knob | BipolKnob | RelKnob | JogWheel)"))
+        }
     };
-
-    // A jog shares one action between its press/touch note and its wheel.
-    if raw.touch.is_some() || raw.turn.is_some() {
-        if raw.event_type.is_some()
-            || raw.id.is_some()
-            || raw.lsb.is_some()
-            || raw.channel.is_some()
-            || raw.mode.is_some()
-            || raw.reverse.is_some()
-        {
-            return Err(format!(
-                "slot `{slot}`: a jog declares `press`/`turn`; put `type`/`channel`/`id`/`mode` inside those tables"
-            ));
-        }
-        if raw.target.is_some() {
-            return Err(format!(
-                "slot `{slot}`: `target` is only for ModeTrigger slots"
-            ));
-        }
-        let touch = raw
-            .touch
-            .as_ref()
-            .ok_or_else(|| format!("slot `{slot}`: a jog needs `press` (or `touch`)"))?;
-        let turn = raw
-            .turn
-            .as_ref()
-            .ok_or_else(|| format!("slot `{slot}`: a jog needs `turn`"))?;
-        let shape = raw.kind.unwrap_or(ControlShape::JogWheel);
-        if shape != ControlShape::JogWheel {
-            return Err(format!(
-                "slot `{slot}`: `press`/`turn` mean a jog, not {shape:?}"
-            ));
-        }
-        if preset_shape.is_some_and(|preset| preset != ControlShape::JogWheel) {
-            return Err(format!(
-                "slot `{slot}`: the preset says {preset_shape:?}, the endpoints say jog"
-            ));
-        }
-        let touch = compile_raw_endpoint(touch, EndpointRole::Touch)?;
-        let turn = compile_raw_endpoint(turn, EndpointRole::Turn)?;
-        if turn.kind != EventKind::Cc || turn.mode == RelMode::Abs {
-            return Err(format!(
-                "slot `{slot}`: the jog `turn` must be a relative CC (rel1 | rel2 | rel3)"
-            ));
-        }
-        return Ok((ControlShape::JogWheel, vec![touch, turn], None));
+    // A `[[unit.control]]` carries a role only when it overrides the preset's; otherwise the
+    // preset's role (a mode key, usually) wins.
+    let role = match raw {
+        Some(raw) if raw.role != SlotRole::Action => raw.role,
+        _ => preset.map(|slot| slot.role).unwrap_or_default(),
+    };
+    let preset_target = preset.and_then(|slot| slot.target.clone());
+    let target = raw
+        .and_then(|raw| raw.target.clone())
+        .or(preset_target.clone());
+    if role != SlotRole::ModeTrigger && target.is_some() {
+        return Err(format!(
+            "slot `{slot}`: `target` is only for `role = \"mode_trigger\"`"
+        ));
+    }
+    if role == SlotRole::ModeTrigger && target.is_none() {
+        return Err(format!(
+            "slot `{slot}`: `role = \"mode_trigger\"` needs a `target` mode"
+        ));
+    }
+    if role != SlotRole::Action && kind != SlotKind::Button {
+        return Err(format!(
+            "slot `{slot}`: a mode slot is a `Button`, not `{kind:?}`"
+        ));
     }
 
-    let kind = raw
-        .event_type
-        .ok_or_else(|| format!("slot `{slot}`: add `type` (cc | note | bend)"))?;
-    let channel = raw
-        .channel
-        .ok_or_else(|| format!("slot `{slot}`: add `channel`"))?;
-    let id = raw
-        .id
-        .ok_or_else(|| format!("slot `{slot}`: add `id`"))?;
-    let lsb = raw.lsb;
-    if let Some(lsb) = lsb {
-        if kind != EventKind::Cc {
+    let raw_endpoints = raw
+        .and_then(|raw| raw.endpoint.as_ref())
+        .map(OneOrMany::as_slice)
+        .unwrap_or_default();
+    let mut endpoints = Vec::with_capacity(raw_endpoints.len());
+    for raw_endpoint in raw_endpoints {
+        endpoints.push(compile_endpoint(slot, raw_endpoint)?);
+    }
+    validate_endpoint_roles(slot, kind, &endpoints)?;
+
+    Ok((
+        Control {
+            slot: slot.to_owned(),
+            kind,
+            role,
+            target,
+            endpoints: Vec::new(),
+        },
+        endpoints,
+    ))
+}
+
+/// Which endpoint roles a slot kind needs.
+fn validate_endpoint_roles(slot: &str, kind: SlotKind, endpoints: &[Endpoint]) -> Result<(), String> {
+    if endpoints.is_empty() {
+        return Ok(());
+    }
+    match kind {
+        SlotKind::JogWheel => {
+            if endpoints.len() != 2 {
+                return Err(format!(
+                    "slot `{slot}`: a JogWheel needs two endpoints (`press` and `turn`)"
+                ));
+            }
+            let press = endpoints
+                .iter()
+                .find(|endpoint| endpoint.role == EndpointRole::Press)
+                .ok_or_else(|| format!("slot `{slot}`: a JogWheel needs an endpoint with `role = \"press\"`"))?;
+            let turn = endpoints
+                .iter()
+                .find(|endpoint| endpoint.role == EndpointRole::Turn)
+                .ok_or_else(|| format!("slot `{slot}`: a JogWheel needs an endpoint with `role = \"turn\"`"))?;
+            if press.kind == EventKind::Bend {
+                return Err(format!("slot `{slot}`: a jog press is a note or a button CC"));
+            }
+            if turn.kind != EventKind::Cc || !turn.encoding.is_relative() {
+                return Err(format!(
+                    "slot `{slot}`: a jog turn is a relative CC (offset64 | twos_complement | direction | two_point)"
+                ));
+            }
+        }
+        _ => {
+            if endpoints.len() != 1 {
+                return Err(format!("slot `{slot}`: one endpoint, or none while unbound"));
+            }
+            if endpoints[0].role != EndpointRole::Main {
+                return Err(format!(
+                    "slot `{slot}`: `role` is only for a JogWheel's two halves"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compile_endpoint(slot: &str, raw: &RawEndpoint) -> Result<Endpoint, String> {
+    if raw.channel > 15 {
+        return Err(format!("slot `{slot}`: channel {} is out of range (0..=15)", raw.channel));
+    }
+    let mut encoding = raw.encoding;
+    if raw.midi != EventKind::Cc {
+        if encoding != Encoding::Absolute {
             return Err(format!(
-                "slot `{slot}`: `lsb` is only meaningful for `type = \"cc\"`"
+                "slot `{slot}`: `encoding` is only for `midi = \"cc\"`"
             ));
         }
+        if raw.lsb.is_some() {
+            return Err(format!(
+                "slot `{slot}`: `lsb` is only for `midi = \"cc\"`"
+            ));
+        }
+    }
+    let id = match (raw.midi, raw.id) {
+        (EventKind::Bend, _) => 0,
+        (_, Some(id)) => id,
+        (_, None) => return Err(format!("slot `{slot}`: add `id` (a CC controller or note key)")),
+    };
+    if let Some(lsb) = raw.lsb {
         if lsb == id {
             return Err(format!("slot `{slot}`: `lsb` must differ from `id`"));
         }
-        if lsb > 127 || id > 127 {
-            return Err(format!("slot `{slot}`: controller numbers must be 0..=127"));
+        if lsb > 127 {
+            return Err(format!("slot `{slot}`: `lsb` must be 0..=127"));
         }
+        encoding = Encoding::Absolute;
     }
-    let mode = match kind {
-        EventKind::Cc => raw.mode.unwrap_or(RelMode::Abs),
-        EventKind::Note | EventKind::Bend => {
-            if raw.mode.is_some() {
-                return Err(format!(
-                    "slot `{slot}`: `mode` is only meaningful for `type = \"cc\"`"
-                ));
-            }
-            RelMode::Abs
-        }
-    };
-    if lsb.is_some() && mode != RelMode::Abs {
+    if raw.reverse && !encoding.is_relative() {
         return Err(format!(
-            "slot `{slot}`: a 14-bit CC pair is absolute; remove `mode`"
+            "slot `{slot}`: `reverse` is only meaningful for a relative `encoding`"
         ));
-    }
-    let reverse = raw.reverse.unwrap_or(false);
-    if reverse && mode == RelMode::Abs {
-        return Err(format!(
-            "slot `{slot}`: `reverse` is only meaningful for a relative `mode`"
-        ));
-    }
-    let inferred = match kind {
-        EventKind::Note => ControlShape::Button,
-        EventKind::Bend => ControlShape::Knob,
-        EventKind::Cc => ControlShape::Knob,
-    };
-    let shape = raw.kind.unwrap_or(inferred);
-    if lsb.is_some() && !matches!(shape, ControlShape::Knob | ControlShape::BipolKnob) {
-        return Err(format!(
-            "slot `{slot}`: a 14-bit CC pair is a Knob or BipolKnob"
-        ));
-    }
-    if shape == ControlShape::JogWheel {
-        return Err(format!(
-            "slot `{slot}`: a jog needs `press` and `turn`, not `type`/`id`"
-        ));
-    }
-    if let Some(preset) = preset_shape {
-        if preset != shape {
-            return Err(format!(
-                "slot `{slot}`: endpoint shape {shape:?} does not match the preset's {preset:?}"
-            ));
-        }
-    }
-
-    if matches!(shape, ControlShape::ModeTrigger | ControlShape::ModeCycle) {
-        if kind == EventKind::Bend {
-            return Err(format!(
-                "slot `{slot}`: a mode slot is a note or an absolute CC"
-            ));
-        }
-        if mode != RelMode::Abs || reverse {
-            return Err(format!(
-                "slot `{slot}`: a mode slot is absolute; remove `mode`/`reverse`"
-            ));
-        }
-        if lsb.is_some() {
-            return Err(format!("slot `{slot}`: a mode slot does not take `lsb`"));
-        }
-        match shape {
-            ControlShape::ModeTrigger => {
-                let target = raw
-                    .target
-                    .clone()
-                    .ok_or_else(|| format!("slot `{slot}`: a ModeTrigger needs a `target`"))?;
-                check_name("mode", &target)?;
-                let endpoint =
-                    compile_endpoint(kind, mode, false, channel, id, None, EndpointRole::Main)?;
-                return Ok((shape, vec![endpoint], Some(target)));
-            }
-            ControlShape::ModeCycle => {
-                if raw.target.is_some() {
-                    return Err(format!(
-                        "slot `{slot}`: `target` is only for ModeTrigger slots"
-                    ));
-                }
-                let endpoint =
-                    compile_endpoint(kind, mode, false, channel, id, None, EndpointRole::Main)?;
-                return Ok((shape, vec![endpoint], None));
-            }
-            _ => unreachable!(),
-        }
-    }
-    if raw.target.is_some() {
-        return Err(format!(
-            "slot `{slot}`: `target` is only for ModeTrigger slots"
-        ));
-    }
-
-    match (kind, shape) {
-        (EventKind::Note, ControlShape::Button)
-        | (EventKind::Bend, ControlShape::Knob)
-        | (EventKind::Bend, ControlShape::BipolKnob)
-        | (EventKind::Cc, ControlShape::Knob)
-        | (EventKind::Cc, ControlShape::BipolKnob)
-        | (EventKind::Cc, ControlShape::RelKnob)
-        | (EventKind::Cc, ControlShape::Button) => {}
-        (EventKind::Note, _) => {
-            return Err(format!(
-                "slot `{slot}`: a note is a Button; a continuous control must be a CC or bend"
-            ))
-        }
-        (EventKind::Bend, _) => {
-            return Err(format!("slot `{slot}`: pitch bend is a Knob or BipolKnob"))
-        }
-        (EventKind::Cc, ControlShape::JogWheel) => unreachable!(),
-        (EventKind::Cc, ControlShape::ModeTrigger | ControlShape::ModeCycle) => unreachable!(),
-    }
-    if shape == ControlShape::BipolKnob && mode != RelMode::Abs {
-        return Err(format!(
-            "slot `{slot}`: a BipolKnob needs an absolute CC or bend"
-        ));
-    }
-    if kind == EventKind::Cc && mode != RelMode::Abs && !matches!(shape, ControlShape::Knob | ControlShape::RelKnob) {
-        return Err(format!(
-            "slot `{slot}`: a relative CC is a Knob or RelKnob, not a Button"
-        ));
-    }
-    if shape == ControlShape::RelKnob && mode == RelMode::Abs {
-        return Err(format!(
-            "slot `{slot}`: a RelKnob needs a relative `mode` (rel1 | rel2 | rel3)"
-        ));
-    }
-    let endpoint = compile_endpoint(kind, mode, reverse, channel, id, lsb, EndpointRole::Main)?;
-    Ok((shape, vec![endpoint], None))
-}
-
-fn compile_raw_endpoint(raw: &RawEndpoint, role: EndpointRole) -> Result<Endpoint, String> {
-    let mode = match raw.kind {
-        EventKind::Cc => raw.mode.unwrap_or(RelMode::Abs),
-        EventKind::Note | EventKind::Bend => {
-            if raw.mode.is_some() {
-                return Err("`mode` is only meaningful for `type = \"cc\"`".to_owned());
-            }
-            RelMode::Abs
-        }
-    };
-    let reverse = raw.reverse.unwrap_or(false);
-    if reverse && mode == RelMode::Abs {
-        return Err("`reverse` is only meaningful for a relative `mode`".to_owned());
-    }
-    if raw.lsb.is_some() && (raw.kind != EventKind::Cc || mode != RelMode::Abs) {
-        return Err("`lsb` is only meaningful for an absolute `type = \"cc\"`".to_owned());
-    }
-    let id = if raw.kind == EventKind::Bend { 0 } else { raw.id };
-    compile_endpoint(raw.kind, mode, reverse, raw.channel, id, raw.lsb, role)
-}
-
-fn compile_selector_endpoint(raw: &RawSelector) -> Result<Endpoint, String> {
-    match raw.kind {
-        EventKind::Bend => Err("a selector must be a note or an absolute CC".to_owned()),
-        EventKind::Cc => {
-            let mode = raw.mode.unwrap_or(RelMode::Abs);
-            if mode != RelMode::Abs {
-                return Err("a selector must be a note or an absolute CC".to_owned());
-            }
-            if raw.reverse == Some(true) {
-                return Err("a selector does not take `reverse`".to_owned());
-            }
-            compile_endpoint(raw.kind, mode, false, raw.channel, raw.id, None, EndpointRole::Main)
-        }
-        EventKind::Note => {
-            if raw.mode.is_some() {
-                return Err("`mode` is only meaningful for `type = \"cc\"`".to_owned());
-            }
-            if raw.reverse == Some(true) {
-                return Err("a selector does not take `reverse`".to_owned());
-            }
-            compile_endpoint(raw.kind, RelMode::Abs, false, raw.channel, raw.id, None, EndpointRole::Main)
-        }
-    }
-}
-
-fn compile_endpoint(
-    kind: EventKind,
-    mode: RelMode,
-    reverse: bool,
-    channel: u8,
-    id: u8,
-    lsb: Option<u8>,
-    role: EndpointRole,
-) -> Result<Endpoint, String> {
-    if channel > 15 {
-        return Err(format!("channel {channel} is out of range (0..=15)"));
     }
     Ok(Endpoint {
-        role,
-        kind,
-        mode,
-        reverse,
-        channel,
+        role: raw.role,
+        kind: raw.midi,
+        encoding,
+        reverse: raw.reverse,
+        channel: raw.channel,
         id,
-        lsb,
+        lsb: raw.lsb,
     })
+}
+
+/// Everything an action line may need from the row that carries it.
+struct ActionCtx<'a> {
+    deck: Option<DeckId>,
+    chain: Option<&'a str>,
+    fx: Option<&'a str>,
 }
 
 fn compile_mode_binding(
     raw: &RawModeBind,
     control: &Control,
-    endpoints: &[Endpoint],
     unit_deck: Option<DeckId>,
 ) -> Result<ModeBinding, String> {
-    let primary = control.endpoints.first().map(|&index| &endpoints[index]);
-    let deck = raw.deck.or(unit_deck);
-    let make_raw = |line: &str| RawBinding {
-        kind: primary.map_or(EventKind::Cc, |endpoint| endpoint.kind),
-        mode: Some(primary.map_or(RelMode::Abs, |endpoint| endpoint.mode)),
-        reverse: Some(primary.is_some_and(|endpoint| endpoint.reverse)),
-        channel: Some(primary.map_or(0, |endpoint| endpoint.channel)),
-        id: Some(primary.map_or(0, |endpoint| endpoint.id)),
-        deck,
-        action: line.to_owned(),
-        min: raw.min,
-        max: raw.max,
-        curve: raw.curve,
-        step: raw.step,
-        seconds: raw.seconds,
-        beats: raw.beats,
-        chain: raw.chain.clone(),
-        fx: raw.fx.clone(),
-        param: raw.param.clone(),
+    if control.role != SlotRole::Action {
+        return Err(format!(
+            "slot `{}`: a mode slot does not emit commands; remove the `bind` row",
+            control.slot
+        ));
+    }
+    let ctx = ActionCtx {
+        deck: raw.deck.or(unit_deck),
+        chain: raw.chain.as_deref(),
+        fx: raw.fx.as_deref(),
     };
-    let action = parse_action(&make_raw(&raw.action))
-        .map_err(|message| format!("slot `{}` action `{}`: {message}", raw.slot, raw.action))?;
-    let down = raw
-        .down
-        .as_deref()
-        .map(|line| {
-            parse_action(&make_raw(line)).map_err(|message| {
-                format!("slot `{}` down action `{line}`: {message}", raw.slot)
-            })
+    let parse = |line: Option<&str>| -> Result<Option<Action>, String> {
+        line.map(|line| {
+            parse_action(line, &ctx)
+                .map_err(|message| format!("slot `{}` action `{line}`: {message}", raw.slot))
         })
-        .transpose()?;
-
-    if let Some(down_action) = &down {
-        if control.shape != ControlShape::RelKnob {
-            return Err(format!(
-                "slot `{}`: only a RelKnob takes a `down` action",
-                raw.slot
-            ));
-        }
-        if primary.is_some_and(|endpoint| endpoint.mode == RelMode::Abs) {
-            return Err(format!(
-                "slot `{}`: a RelKnob needs a relative `mode` (rel1 | rel2 | rel3)",
-                raw.slot
-            ));
-        }
-        if action.is_continuous() || down_action.is_continuous() {
-            return Err(format!(
-                "slot `{}`: the `action`/`down` pair must both be edge actions",
-                raw.slot
-            ));
-        }
-        if action.is_momentary() || down_action.is_momentary() {
-            return Err(format!(
-                "slot `{}`: a RelKnob pair cannot use a held/momentary action",
-                raw.slot
-            ));
-        }
-        if raw.on.is_some() || raw.min.is_some() || raw.max.is_some() || raw.curve.is_some() {
-            return Err(format!(
-                "slot `{}`: a RelKnob pair has no `on`/`min`/`max`/`curve`; each detent fires one action",
-                raw.slot
-            ));
-        }
+        .transpose()
+    };
+    let actions = ActionSet {
+        main: parse(raw.action.as_deref())?,
+        press: parse(raw.press.as_deref())?,
+        turn: parse(raw.turn.as_deref())?,
+        down: parse(raw.down.as_deref())?,
+    };
+    if actions.is_empty() {
+        return Err(format!(
+            "slot `{}`: a bind row needs `action` (or `press`/`turn` for a JogWheel)",
+            raw.slot
+        ));
+    }
+    if actions.down.is_some() && actions.main.is_none() {
+        return Err(format!(
+            "slot `{}`: `down` needs an `action` to pair with",
+            raw.slot
+        ));
+    }
+    if (actions.press.is_some() || actions.turn.is_some()) && actions.main.is_some() {
+        return Err(format!(
+            "slot `{}`: use `action`, or `press`/`turn`, not both",
+            raw.slot
+        ));
     }
 
-    let bipolar = control.shape == ControlShape::BipolKnob
-        || action.is_bipolar()
+    let bipolar = control.kind == SlotKind::BipolKnob
+        || actions.any_bipolar()
         || raw.min.is_some_and(|min| min < 0.0);
     let (default_min, default_max) = if bipolar { (-1.0, 1.0) } else { (0.0, 1.0) };
     let min = raw.min.unwrap_or(default_min);
@@ -1580,31 +1370,33 @@ fn compile_mode_binding(
             raw.slot
         ));
     }
-    let on = if down.is_some() {
-        Edge::Press
-    } else {
-        match raw.on {
-            Some(_) if action.is_momentary() => {
-                return Err(format!(
-                    "slot `{}`: this action uses both edges; `on` is only for one-shot actions",
-                    raw.slot
-                ))
-            }
-            Some(_) if action.is_continuous() => {
-                return Err(format!(
-                    "slot `{}`: a continuous action has no press/release edge; remove `on`",
-                    raw.slot
-                ))
-            }
-            Some(edge) => edge,
-            None => Edge::Press,
+    let on = match raw.on {
+        Some(_) if actions.iter().any(|action| action.is_momentary()) => {
+            return Err(format!(
+                "slot `{}`: this action uses both edges; `on` is only for one-shot actions",
+                raw.slot
+            ))
         }
+        Some(_) if actions.down.is_some() => {
+            return Err(format!(
+                "slot `{}`: a two-action RelKnob has no `on`; each detent fires one action",
+                raw.slot
+            ))
+        }
+        Some(_) if actions.any_continuous() => {
+            return Err(format!(
+                "slot `{}`: a continuous action has no press/release edge; remove `on`",
+                raw.slot
+            ))
+        }
+        Some(edge) => edge,
+        None => Edge::Press,
     };
+
     Ok(ModeBinding {
-        deck,
-        action,
-        down,
-        shape: control.shape,
+        deck: raw.deck.or(unit_deck),
+        actions,
+        kind: control.kind,
         min,
         max,
         curve: raw.curve.unwrap_or_default(),
@@ -1612,103 +1404,141 @@ fn compile_mode_binding(
     })
 }
 
-/// The physical shape has to be able to carry every action the slot is bound to.
-fn validate_shape(
+/// Which actions a slot kind can carry, per endpoint role.
+fn validate_binding(
     control: &Control,
     binding: &ModeBinding,
     endpoints: &[Endpoint],
 ) -> Result<(), String> {
-    if control.endpoints.is_empty() {
+    let slot = &control.slot;
+    let actions = &binding.actions;
+    let relative = control
+        .endpoint_index(endpoints, EndpointRole::Main)
+        .is_some_and(|index| endpoints[index].encoding.is_relative());
+
+    if control.role != SlotRole::Action {
+        return Err(format!("slot `{slot}`: a mode slot does not emit commands"));
+    }
+
+    // A jog's two halves carry their own actions.
+    if actions.press.is_some() || actions.turn.is_some() {
+        if control.kind != SlotKind::JogWheel {
+            return Err(format!(
+                "slot `{slot}`: `press`/`turn` are for a JogWheel, not `{:?}`",
+                control.kind
+            ));
+        }
+        if actions.down.is_some() {
+            return Err(format!("slot `{slot}`: a JogWheel has no `down` direction"));
+        }
+        if let Some(press) = &actions.press {
+            if !press.is_jog_action() {
+                return Err(format!(
+                    "slot `{slot}`: a jog press carries `vinyl` or `vinyl slip`, not {press:?}"
+                ));
+            }
+        }
+        if let Some(turn) = &actions.turn {
+            if !matches!(turn, Action::Vinyl { .. } | Action::Nudge { .. }) {
+                return Err(format!(
+                    "slot `{slot}`: a jog turn carries `vinyl` or `nudge`, not {turn:?}"
+                ));
+            }
+        }
         return Ok(());
     }
-    let endpoint = &endpoints[control.endpoints[0]];
-    let relative = endpoint.mode != RelMode::Abs;
-    match control.shape {
-        ControlShape::Button => {
-            if binding.action.is_continuous() {
-                return Err(format!(
-                    "slot `{}`: a Button cannot drive a continuous action",
-                    control.slot
-                ));
+
+    let Some(main) = &actions.main else {
+        return Err(format!("slot `{slot}`: missing `action`"));
+    };
+
+    match control.kind {
+        SlotKind::Button => {
+            if main.is_continuous() {
+                return Err(format!("slot `{slot}`: a Button cannot drive a continuous action"));
+            }
+            if actions.down.is_some() {
+                return Err(format!("slot `{slot}`: `down` is for a RelKnob"));
             }
         }
-        ControlShape::Knob => {
-            match &binding.action {
-                Action::Fader(_)
-                | Action::TempoFader
-                | Action::Fx(FxAction::Param { .. }) => {}
-                Action::Nudge { .. } | Action::Vinyl { .. } if relative => {}
-                Action::Nudge { .. } | Action::Vinyl { .. } => {
-                    return Err(format!(
-                        "slot `{}`: this action needs a relative encoder",
-                        control.slot
-                    ))
-                }
-                _ => {
-                    return Err(format!(
-                        "slot `{}`: a Knob can only drive a continuous action (or nudge/vinyl on a relative encoder)",
-                        control.slot
-                    ))
-                }
-            }
-        }
-        ControlShape::BipolKnob => {
+        SlotKind::BipolKnob => {
             if relative {
                 return Err(format!(
-                    "slot `{}`: a BipolKnob needs an absolute CC or bend",
-                    control.slot
+                    "slot `{slot}`: a BipolKnob needs an absolute endpoint, not a relative encoding"
                 ));
             }
-            if !binding.action.is_continuous() {
+            if !main.is_continuous() {
                 return Err(format!(
-                    "slot `{}`: a BipolKnob can only drive a continuous action",
-                    control.slot
+                    "slot `{slot}`: a BipolKnob drives a continuous action, not {main:?}"
+                ));
+            }
+            if actions.down.is_some() {
+                return Err(format!("slot `{slot}`: `down` is for a RelKnob"));
+            }
+        }
+        SlotKind::Knob => {
+            if main.is_continuous() {
+                return Ok(());
+            }
+            if !relative {
+                return Err(format!(
+                    "slot `{slot}`: `{main:?}` needs a relative `encoding`"
+                ));
+            }
+            if !matches!(
+                main,
+                Action::Nudge { .. } | Action::Vinyl { .. } | Action::Slip
+            ) {
+                return Err(format!(
+                    "slot `{slot}`: a Knob drives a continuous action, `nudge`, or `vinyl`; not {main:?}"
+                ));
+            }
+            if actions.down.is_some() {
+                return Err(format!(
+                    "slot `{slot}`: `down` is for a RelKnob; a Knob's detent is a delta"
                 ));
             }
         }
-        ControlShape::RelKnob => {
+        SlotKind::RelKnob => {
             if !relative {
                 return Err(format!(
-                    "slot `{}`: a RelKnob needs a relative `mode`",
-                    control.slot
+                    "slot `{slot}`: a RelKnob needs a relative `encoding`"
                 ));
             }
-            if binding.down.is_none() {
-                match &binding.action {
-                    Action::Fader(_)
-                    | Action::TempoFader
-                    | Action::Fx(FxAction::Param { .. }) => {}
-                    Action::Nudge { .. } | Action::Vinyl { .. } => {}
-                    _ => {
+            match &actions.down {
+                Some(down) => {
+                    if main.is_continuous() || down.is_continuous() {
                         return Err(format!(
-                            "slot `{}`: a RelKnob needs a continuous action or an `action`/`down` pair",
-                            control.slot
-                        ))
+                            "slot `{slot}`: the `action`/`down` pair must both be edge actions"
+                        ));
+                    }
+                    if main.is_momentary() || down.is_momentary() {
+                        return Err(format!(
+                            "slot `{slot}`: a RelKnob pair cannot use a held action"
+                        ));
+                    }
+                }
+                None => {
+                    if !main.is_continuous() {
+                        return Err(format!(
+                            "slot `{slot}`: a RelKnob without `down` needs a continuous action (or add `down`)"
+                        ));
                     }
                 }
             }
         }
-        ControlShape::JogWheel => {
-            if !matches!(binding.action, Action::Vinyl { .. }) {
+        SlotKind::JogWheel => {
+            if !main.is_jog_action() {
                 return Err(format!(
-                    "slot `{}`: a JogWheel can only drive `vinyl`",
-                    control.slot
+                    "slot `{slot}`: a JogWheel carries `vinyl`, `vinyl slip`, or `nudge`, not {main:?}"
                 ));
             }
-        }
-        ControlShape::ModeTrigger | ControlShape::ModeCycle => {
-            return Err(format!(
-                "slot `{}`: a mode slot does not emit commands",
-                control.slot
-            ));
         }
     }
     Ok(())
 }
 
-
-/// Parses a stem out of an action name, naming the alternatives when it is wrong — the same
-/// treatment `deck` gets.
+/// Resolves a stem out of an action name, naming the alternatives when it is wrong.
 fn stem_of(token: &str) -> Result<Stem, String> {
     Stem::parse(token).ok_or_else(|| {
         format!(
@@ -1722,29 +1552,26 @@ fn stem_of(token: &str) -> Result<Stem, String> {
     })
 }
 
-/// Resolves a binding's `action` plus its optional parameters.
+/// Resolves an action line into its parameterised [`Action`].
 ///
-/// The action is **a session command line without the target**: `"play"`, `"beatjump 4"`,
-/// `"sync phase pid"`, `"vocals mute"`, `"fader flow"`. The target is the binding's `deck` field
-/// (or, when the line names one itself, that word). Legacy dot-spelled names are still accepted —
-/// see [`hypermixx_core::action::canonical`] — because the file is user-editable and a map that
-/// silently stops working after an upgrade is worse than one that keeps an old spelling.
-///
-/// Binding-level parameters stay fields (`step`, `seconds`, `beats`, `chain`/`fx`/`param`) because
-/// they describe the *control* rather than the command: a hardware encoder's detent size, a
-/// controller's nudge duration, the slot an FX button addresses by name.
-fn parse_action(raw: &RawBinding) -> Result<Action, String> {
-    let Some(line) = hypermixx_core::action::canonical(&raw.action) else {
+/// The line is **a session command line without the target**: `"play"`, `"beatjump 4"`,
+/// `"sync phase pid"`, `"vocals mute"`, `"fader flow"`, `"loop 1/4"`. Every value the action needs
+/// is in the line; the row only supplies the deck, and the FX chain address. Legacy dot-spelled
+/// names are still accepted — see [`hypermixx_core::action::canonical`].
+fn parse_action(line: &str, ctx: &ActionCtx<'_>) -> Result<Action, String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Err("the action line is empty".to_owned());
+    }
+    let Some(line) = hypermixx_core::action::canonical(line) else {
         return Err(format!(
-            "unknown action `{}` (see `docs/midi-mapping.md` for the list)",
-            raw.action
+            "unknown action `{line}` (see `docs/MIDI.md` for the list)"
         ));
     };
     let words: Vec<&str> = line.split_whitespace().collect();
-    let original = raw.action.as_str();
-    let deck = |what: &str| -> Result<DeckId, String> {
-        raw.deck
-            .ok_or_else(|| format!("action `{what}` needs a `deck`"))
+    let deck = |_what: &str| -> Result<DeckId, String> {
+        ctx.deck
+            .ok_or_else(|| "this action needs a `deck` (the unit's, or the row's)".to_owned())
     };
     let number = |word: Option<&str>, what: &str| -> Result<Option<f64>, String> {
         match word {
@@ -1756,8 +1583,17 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
         }
     };
 
-    match words.as_slice() {
-        // Edge-only additions: the sustained `fader cuesend` and `vinyl` forms stay below.
+    // A leading target word addresses a chain (`master fx toggle limiter`, `deck1/vocals fx …`).
+    let mut named_chain = None;
+    let words: &[&str] = match words.as_slice() {
+        [target, rest @ ..] if rest.first() == Some(&"fx") => {
+            named_chain = Some(chain_of(ctx.deck, target)?);
+            rest
+        }
+        other => other,
+    };
+
+    match words {
         ["fader", "cuesend", "toggle"] => {
             deck("fader cuesend toggle")?;
             Ok(Action::ToggleCueSend)
@@ -1778,9 +1614,9 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
         }
         ["key", semitones] => {
             deck("key")?;
-            let semitones = semitones.parse::<i32>().map_err(|_| {
-                format!("`key` needs a signed whole number, got `{semitones}`")
-            })?;
+            let semitones = semitones
+                .parse::<i32>()
+                .map_err(|_| format!("`key` needs a signed whole number, got `{semitones}`"))?;
             Ok(Action::Key(semitones))
         }
         ["play"] => {
@@ -1808,15 +1644,13 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
             "open" => BrowserAction::Open,
             "exit" => BrowserAction::Exit,
             "refresh" => BrowserAction::Refresh,
-            "load" => BrowserAction::Load { deck: raw.deck },
+            "load" => BrowserAction::Load { deck: ctx.deck },
             other => return Err(format!("unknown browser action `{other}`")),
         })),
         ["cue"] => {
             deck("cue")?;
             Ok(Action::Cue)
         }
-        // Not in the registry (the guide offers one cue row), but a valid spelling: a button that
-        // only *places* the cue point.
         ["cue", "smart"] => {
             deck("cue smart")?;
             Ok(Action::CueSmart)
@@ -1825,7 +1659,7 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
             deck("vinyl")?;
             let step = match number(words.get(1).copied(), "vinyl frames per tick")? {
                 Some(frames) => frames as f32,
-                None => raw.step.unwrap_or(DEFAULT_VINYL_FRAMES_PER_TICK),
+                None => DEFAULT_VINYL_FRAMES_PER_TICK,
             };
             if !step.is_finite() || step <= 0.0 {
                 return Err("vinyl frames per tick must be a positive number".to_owned());
@@ -1834,25 +1668,18 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
                 frames_per_tick: step,
             })
         }
-        ["beatjump"] | ["beatjump", _] => {
+        ["beatjump", beats] => {
             deck("beatjump")?;
-            // The sign can come from either the line (`beatjump -8`) or a legacy name
-            // (`beatjump-`), and the magnitude from the line or the binding's `step`.
-            let from_line = number(words.get(1).copied(), "beatjump beats")?;
-            let magnitude = match from_line {
-                Some(beats) => beats.abs(),
-                None => f64::from(raw.step.unwrap_or(1.0)).abs(),
-            };
-            if !magnitude.is_finite() || magnitude < 1.0 {
-                return Err("a beatjump needs at least one beat".to_owned());
-            }
-            let negative =
-                from_line.map(|beats| beats < 0.0).unwrap_or(false) || original.ends_with('-');
-            let beats = magnitude.round() as i64;
-            Ok(Action::BeatJump {
-                beats: if negative { -beats } else { beats },
-            })
+            let beats = beats
+                .parse::<i64>()
+                .ok()
+                .filter(|beats| *beats != 0)
+                .ok_or_else(|| {
+                    format!("`beatjump` needs a non-zero whole number of beats, got `{beats}`")
+                })?;
+            Ok(Action::BeatJump { beats })
         }
+        ["beatjump"] => Err("`beatjump` needs a whole number of beats (`beatjump -4`)".to_owned()),
         ["fader", "flow"] => Ok(Action::Fader(FaderTarget::Flow(deck("fader flow")?))),
         ["fader", "deck"] => Ok(Action::Fader(FaderTarget::Deck(deck("fader deck")?))),
         ["fader", "gain"] => Ok(Action::Fader(FaderTarget::Gain(deck("fader gain")?))),
@@ -1860,11 +1687,9 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
         ["fader", "cross"] => Ok(Action::Fader(FaderTarget::Crossfader)),
         ["fader", "master"] => Ok(Action::Fader(FaderTarget::Master)),
         ["fader", "cue"] => Ok(Action::Fader(FaderTarget::Cue)),
-        // `<stem> fader | mute | solo` — the stem is the first word, exactly as a session line
-        // writes it (`deck0 vocals mute`).
         [stem_name, what @ ("fader" | "mute" | "solo")] => {
             let stem = stem_of(stem_name)?;
-            let deck_id = deck(original)?;
+            let deck_id = deck(line.as_str())?;
             match *what {
                 "fader" => Ok(Action::Fader(FaderTarget::Stem {
                     deck: deck_id,
@@ -1878,19 +1703,16 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
             deck("tempofader")?;
             Ok(Action::TempoFader)
         }
-        ["nudge"] | ["nudge", _, _] => {
+        ["nudge"] | ["nudge", _] | ["nudge", _, _] => {
             deck("nudge")?;
             let delta = match number(words.get(1).copied(), "nudge delta")? {
                 Some(delta) => delta as f32,
-                None => raw.step.unwrap_or(DEFAULT_NUDGE_STEP),
+                None => DEFAULT_NUDGE_STEP,
             };
             if !delta.is_finite() || delta == 0.0 {
                 return Err("a nudge delta must be non-zero".to_owned());
             }
-            let seconds = match number(words.get(2).copied(), "nudge seconds")? {
-                Some(seconds) => Some(seconds),
-                None => raw.seconds,
-            };
+            let seconds = number(words.get(2).copied(), "nudge seconds")?;
             Ok(Action::Nudge { delta, seconds })
         }
         ["loop", what @ ("in" | "out" | "exit" | "cancel" | "halve" | "double")] => {
@@ -1904,34 +1726,39 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
                 _ => LoopAction::Double,
             }))
         }
-        // `loop 8`, or `loop` with the length in the binding's `beats` field.
-        ["loop"] | ["loop", _] => {
+        ["loop"] => {
             deck("loop")?;
-            // A button with no length is the DJ default: four beats. (The CLI requires the number —
-            // a *line* has room for it, a button does not.)
-            let beats = match number(words.get(1).copied(), "loop beats")? {
-                Some(beats) if beats >= 1.0 => beats.round() as u64,
-                Some(_) => return Err("a beat loop needs at least one beat".to_owned()),
-                None => raw.beats.filter(|beats| *beats > 0).unwrap_or(4),
-            };
-            Ok(Action::Loop(LoopAction::Beats(beats)))
+            Ok(Action::Loop(LoopAction::Beats(BeatLen::beats(4))))
         }
-        ["sync", what] => {
+        ["loop", len] => {
+            deck("loop")?;
+            let len = BeatLen::parse(len).ok_or_else(|| {
+                format!("`loop` takes a beat count or a fraction (`4`, `1/2`), got `{len}`")
+            })?;
+            Ok(Action::Loop(LoopAction::Beats(len)))
+        }
+        ["sync", what @ ("tempo" | "tempolock" | "set-leader" | "leader" | "unlock")] => {
             deck("sync")?;
             Ok(Action::Sync(match *what {
                 "tempo" => SyncAction::Tempo,
                 "tempolock" => SyncAction::TempoLock,
                 "set-leader" | "leader" => SyncAction::Leader,
-                "unlock" => SyncAction::Unlock,
-                "phase" => SyncAction::Phase {
-                    mode: PhaseMode::Pid,
-                    t_seconds: None,
-                },
-                "phaselock" => SyncAction::PhaseLock {
-                    mode: PhaseMode::Pid,
-                    t_seconds: None,
-                },
-                other => return Err(format!("unknown sync action `{other}`")),
+                _ => SyncAction::Unlock,
+            }))
+        }
+        ["sync", phase @ ("phase" | "phaselock")] => {
+            deck("sync")?;
+            let (mode, seconds) = phase_args(&[])?;
+            Ok(Action::Sync(if *phase == "phase" {
+                SyncAction::Phase {
+                    mode,
+                    t_seconds: seconds,
+                }
+            } else {
+                SyncAction::PhaseLock {
+                    mode,
+                    t_seconds: seconds,
+                }
             }))
         }
         ["sync", phase @ ("phase" | "phaselock"), rest @ ..] => {
@@ -1949,42 +1776,19 @@ fn parse_action(raw: &RawBinding) -> Result<Action, String> {
                 }
             }))
         }
-        // `<stem> fx …` / `master fx …` / `d1 fx …`: the action names its chain, the way a session
-        // line's leading target word does (`deck0 vocals fx toggle filter`).
-        [target, "fx", what @ ("on" | "off" | "toggle" | "pad" | "trigger")] => {
-            let named = chain_of(raw, target)?;
-            let kind = match *what {
-                "on" => FxActionKind::On,
-                "off" => FxActionKind::Off,
-                "toggle" => FxActionKind::Toggle,
-                "pad" => FxActionKind::Pad,
-                _ => FxActionKind::Trigger,
-            };
-            Ok(Action::Fx(fx_slot_action(raw, Some(named), kind)?))
-        }
-        [target, "fx", "param"] => {
-            let named = chain_of(raw, target)?;
-            let (chain, fx) = fx_address(raw, Some(named))?;
-            let param = raw.param.clone().ok_or("`fx param` needs a `param` name")?;
-            Ok(Action::Fx(FxAction::Param { chain, fx, param }))
-        }
         ["fx", what @ ("on" | "off" | "toggle" | "pad" | "trigger")] => {
-            let kind = match *what {
-                "on" => FxActionKind::On,
-                "off" => FxActionKind::Off,
-                "toggle" => FxActionKind::Toggle,
-                "pad" => FxActionKind::Pad,
-                _ => FxActionKind::Trigger,
-            };
-            Ok(Action::Fx(fx_slot_action(raw, None, kind)?))
+            let slot = fx_action(ctx, named_chain, *what)?;
+            Ok(Action::Fx(slot))
         }
-        ["fx", "param"] => {
-            let (chain, fx) = fx_address(raw, None)?;
-            let param = raw.param.clone().ok_or("`fx param` needs a `param` name")?;
-            Ok(Action::Fx(FxAction::Param { chain, fx, param }))
+        ["fx", "param", param] => {
+            let (chain, fx) = fx_address(ctx, named_chain)?;
+            Ok(Action::Fx(FxAction::Param {
+                chain,
+                fx,
+                param: (*param).to_owned(),
+            }))
         }
-        // The *canonical* line is what is named, so a legacy spelling gets an error about the
-        // spelling it resolves to (`vocals solo_only`) rather than about the string in the file.
+        ["fx", "param"] => Err("`fx param` needs the parameter name (`fx param value`)".to_owned()),
         _ => Err(format!("unknown action `{line}`")),
     }
 }
@@ -2013,70 +1817,59 @@ fn phase_args(rest: &[&str]) -> Result<(PhaseMode, Option<f64>), String> {
     Ok((mode, seconds))
 }
 
-/// The five slot-level FX actions, which all need `chain` + `fx` but no parameter.
-enum FxActionKind {
-    On,
-    Off,
-    Toggle,
-    Pad,
-    Trigger,
-}
-
-/// Builds a slot-level FX action from its `chain`/`fx` fields.
-fn fx_slot_action(
-    raw: &RawBinding,
+/// Builds one of the five slot-level FX actions, which all need `chain` + `fx` but no parameter.
+fn fx_action(
+    ctx: &ActionCtx<'_>,
     named: Option<FxChainId>,
-    kind: FxActionKind,
+    what: &str,
 ) -> Result<FxAction, String> {
-    let (chain, fx) = fx_address(raw, named)?;
-    Ok(match kind {
-        FxActionKind::On => FxAction::On { chain, fx },
-        FxActionKind::Off => FxAction::Off { chain, fx },
-        FxActionKind::Toggle => FxAction::Toggle { chain, fx },
-        FxActionKind::Pad => FxAction::Pad { chain, fx },
-        FxActionKind::Trigger => FxAction::Trigger { chain, fx },
+    let (chain, fx) = fx_address(ctx, named)?;
+    Ok(match what {
+        "on" => FxAction::On { chain, fx },
+        "off" => FxAction::Off { chain, fx },
+        "toggle" => FxAction::Toggle { chain, fx },
+        "pad" => FxAction::Pad { chain, fx },
+        _ => FxAction::Trigger { chain, fx },
     })
 }
 
 /// The `chain` + `fx` address every FX action carries: the chain from the action line if it named
-/// one, else from the binding's `chain` field.
-fn fx_address(raw: &RawBinding, named: Option<FxChainId>) -> Result<(FxChainId, String), String> {
+/// one, else from the row's `chain` field, else the slot's deck.
+fn fx_address(ctx: &ActionCtx<'_>, named: Option<FxChainId>) -> Result<(FxChainId, String), String> {
     let chain = match named {
         Some(chain) => chain,
-        None => match raw.chain.as_deref() {
-            Some(token) => chain_of(raw, token)?,
-            // A unit's mode can omit `chain`: the slot's deck is the chain. This is what lets one
-            // per-deck preset (`fx = "eq"`) become `deck0` on one instance and `deck1` on another.
-            None => raw
+        None => match ctx.chain {
+            Some(token) => chain_of(ctx.deck, token)?,
+            // A per-deck preset (`fx = "eq"`) becomes deck1 on one unit and deck2 on another.
+            None => ctx
                 .deck
                 .map(FxChainId::Deck)
                 .ok_or_else(|| "an FX action needs a `chain` or a `deck`".to_owned())?,
         },
     };
-    let fx = raw.fx.clone().ok_or("an FX action needs an `fx` name")?;
-    Ok((chain, fx))
+    let fx = ctx
+        .fx
+        .ok_or("an FX action needs an `fx` name (the slot it addresses)")?;
+    Ok((chain, fx.to_owned()))
 }
 
 /// Resolves an FX chain address the way the session grammar writes it:
 ///
 /// * `master` / `m` — the summed mix;
-/// * `deck0` / `d0` / `0` — that deck's channel chain;
-/// * `<stem>` — that stem's own chain, with the deck from the binding's `deck` field
-///   (`deck = 1` + `chain = "vocals"` is `deck0 vocals`);
-/// * `deck0/<stem>` / `d1/<stem>` — the same, spelled outright.
-///
-/// The stem form is what makes "every stem its own FX" reachable from a controller: the CLI has had
-/// `deck0 vocals fx …` all along, and this is the mapping side of it.
-fn chain_of(raw: &RawBinding, token: &str) -> Result<FxChainId, String> {
+/// * `deck1` / `d1` / `1` — that deck's channel chain;
+/// * `<stem>` — that stem's own chain, with the deck from the row
+///   (`deck = 1` + `chain = "vocals"` is deck1's vocal chain);
+/// * `deck1/<stem>` — the same, spelled outright.
+fn chain_of(deck: Option<DeckId>, token: &str) -> Result<FxChainId, String> {
     let token = token.trim();
     if let Some((head, stem_name)) = token.split_once('/') {
         let stem = stem_of(stem_name.trim())?;
         let deck = if head.trim().is_empty() {
-            raw.deck
+            deck
         } else {
             parse_deck_token(head.trim())
         };
-        let deck = deck.ok_or_else(|| format!("chain `{token}` needs a deck (`deck0/{stem}`)"))?;
+        let deck = deck.ok_or_else(|| format!("chain `{token}` needs a deck (`deck1/{stem}`)"))?;
         return Ok(FxChainId::Stem { deck, stem });
     }
     if let Some(deck) = parse_deck_token(token) {
@@ -2085,286 +1878,318 @@ fn chain_of(raw: &RawBinding, token: &str) -> Result<FxChainId, String> {
     if token.eq_ignore_ascii_case("master") || token.eq_ignore_ascii_case("m") {
         return Ok(FxChainId::Master);
     }
-    // A bare stem name: the deck comes from the binding, exactly like `fader flow` does.
     if let Some(stem) = Stem::parse(token) {
-        let deck = raw
-            .deck
-            .ok_or_else(|| format!("chain `{token}` needs a `deck`"))?;
+        let deck = deck.ok_or_else(|| format!("chain `{token}` needs a `deck`"))?;
         return Ok(FxChainId::Stem { deck, stem });
     }
     Err(format!(
-        "unknown chain `{token}` (master | deck0 | <stem> | deck0/<stem>)"
+        "unknown chain `{token}` (master | deck1 | <stem> | deck1/<stem>)"
     ))
 }
 
-/// `deck0` / `d0` / `0` → that deck's id.
+/// `deck1` / `d1` / `1` → that deck's id. Deck numbers are 1-based, as everywhere in the file.
 fn parse_deck_token(token: &str) -> Option<DeckId> {
     let lower = token.to_ascii_lowercase();
     let digits = lower
         .strip_prefix("deck")
         .or_else(|| lower.strip_prefix('d'))
         .unwrap_or(&lower);
-    digits.parse::<u8>().ok()
+    let number: u8 = digits.parse().ok()?;
+    (number > 0).then_some(number - 1)
 }
-
-/// Parses a chain address without a binding: `master`/`m` or a deck. Kept for callers that have no
-/// binding to take a stem's deck from.
-pub fn parse_chain(token: &str) -> Option<FxChainId> {
-    if token.eq_ignore_ascii_case("master") || token.eq_ignore_ascii_case("m") {
-        return Some(FxChainId::Master);
-    }
-    parse_deck_token(token).map(FxChainId::Deck)
-}
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn touchpad() -> &'static str {
-        r#"
-[[unit]]
-id = "deck0.pad"
-preset = "touchpad"
-deck = 1
-
-[[unit.control]]
-slot = "pad1"
-type = "note"
-channel = 0
-id = 16
-[[unit.control]]
-slot = "pad2"
-type = "note"
-channel = 0
-id = 17
-[[unit.control]]
-slot = "pad3"
-type = "note"
-channel = 0
-id = 18
-[[unit.control]]
-slot = "pad4"
-type = "note"
-channel = 0
-id = 19
-[[unit.control]]
-slot = "pad5"
-type = "note"
-channel = 0
-id = 20
-[[unit.control]]
-slot = "pad6"
-type = "note"
-channel = 0
-id = 21
-[[unit.control]]
-slot = "pad7"
-type = "note"
-channel = 0
-id = 22
-[[unit.control]]
-slot = "pad8"
-type = "note"
-channel = 0
-id = 23
-
-[[unit.selector]]
-type = "note"
-channel = 0
-id = 24
-behavior = "trigger"
-target = "hotcue"
-
-[[unit.selector]]
-type = "note"
-channel = 0
-id = 25
-behavior = "cycle"
-"#
+    fn parse(text: &str) -> Result<Map, MapError> {
+        Map::from_toml_str(text)
     }
 
-    fn mixer(deck: DeckId, channel: u8) -> String {
+    fn deck_unit(body: &str) -> String {
         format!(
             r#"
 [[unit]]
-id = "deck{deck}.mixer"
-preset = "mixer"
-deck = {number}
-
-[[unit.control]]
-slot = "fader"
-type = "cc"
-channel = {channel}
-id = 7
-[[unit.control]]
-slot = "gain"
-type = "cc"
-channel = {channel}
-id = 8
-[[unit.control]]
-slot = "low"
-type = "cc"
-channel = {channel}
-id = 9
-[[unit.control]]
-slot = "mid"
-type = "cc"
-channel = {channel}
-id = 10
-[[unit.control]]
-slot = "high"
-type = "cc"
-channel = {channel}
-id = 11
-[[unit.control]]
-slot = "filter"
-kind = "BipolKnob"
-type = "cc"
-channel = {channel}
-id = 12
-[[unit.control]]
-slot = "cue"
-type = "note"
-channel = {channel}
-id = 13
-[[unit.control]]
-slot = "load"
-type = "note"
-channel = {channel}
-id = 14
-"#,
-            number = deck + 1,
+id = "u"
+deck = 1
+{body}
+"#
         )
     }
 
     #[test]
-    fn a_touchpad_preset_compiles_its_slots_modes_and_selectors() {
-        let map = Map::from_toml_str(touchpad()).expect("touchpad map");
+    fn a_button_slot_reads_a_note_and_fires_one_action() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "play"
+type = "Button"
+endpoint = { midi = "note", channel = 0, id = 16 }
+
+[[unit.mode]]
+name = "default"
+[[unit.mode.bind]]
+slot = "play"
+action = "play"
+"#,
+        );
+        let map = parse(&text).expect("button slot");
         let unit = &map.units[0];
-        assert_eq!(unit.controls.len(), 8);
-        assert_eq!(unit.modes.len(), 4);
-        assert_eq!(unit.modes[unit.start].name, "hotcue");
+        assert_eq!(unit.controls[0].kind, SlotKind::Button);
+        assert_eq!(unit.endpoints[0].role, EndpointRole::Main);
+        let binding = unit.binding(0, 0).expect("binding");
+        assert!(matches!(binding.actions.main, Some(Action::Play)));
+    }
+
+    #[test]
+    fn a_bipol_knob_defaults_to_the_bipolar_range() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "filter"
+type = "BipolKnob"
+endpoint = { midi = "cc", channel = 0, id = 12 }
+
+[[unit.mode]]
+name = "default"
+[[unit.mode.bind]]
+slot = "filter"
+action = "fx param value"
+fx = "filter"
+"#,
+        );
+        let map = parse(&text).expect("bipolar knob");
+        let binding = map.units[0].binding(0, 0).expect("binding");
+        assert_eq!((binding.min, binding.max), (-1.0, 1.0));
+        let spec = binding.spec(&map.units[0].endpoints[0]).expect("spec");
+        assert!(spec.center.is_some());
+    }
+
+    #[test]
+    fn a_rel_knob_carries_one_action_per_direction() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "browse"
+type = "RelKnob"
+endpoint = { midi = "cc", encoding = "two_point", reverse = true, channel = 0, id = 1 }
+
+[[unit.mode]]
+name = "default"
+[[unit.mode.bind]]
+slot = "browse"
+action = "browser up"
+down = "browser down"
+"#,
+        );
+        let map = parse(&text).expect("relknob pair");
+        let unit = &map.units[0];
+        assert_eq!(unit.endpoints[0].encoding, Encoding::TwoPoint);
+        assert!(unit.endpoints[0].reverse);
+        let binding = unit.binding(0, 0).expect("binding");
+        assert!(matches!(
+            binding.actions.main,
+            Some(Action::Browser(BrowserAction::Up))
+        ));
+        assert!(matches!(
+            binding.actions.down,
+            Some(Action::Browser(BrowserAction::Down))
+        ));
+    }
+
+    #[test]
+    fn a_rel_knob_pair_rejects_continuous_actions() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "fader"
+type = "RelKnob"
+endpoint = { midi = "cc", encoding = "twos_complement", channel = 0, id = 1 }
+
+[[unit.mode]]
+name = "default"
+[[unit.mode.bind]]
+slot = "fader"
+action = "fader flow"
+down = "play"
+"#,
+        );
+        let error = parse(&text).expect_err("continuous pair");
+        assert!(error.message().contains("edge actions"), "{error}");
+    }
+
+    #[test]
+    fn a_jog_wheel_has_a_press_and_a_turn() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "jog"
+type = "JogWheel"
+endpoint = [
+  { role = "press", midi = "note", channel = 0, id = 80 },
+  { role = "turn", midi = "cc", encoding = "two_point", channel = 0, id = 6 },
+]
+
+[[unit.mode]]
+name = "vinyl"
+[[unit.mode.bind]]
+slot = "jog"
+action = "vinyl"
+
+[[unit.mode]]
+name = "slip"
+[[unit.mode.bind]]
+slot = "jog"
+press = "vinyl slip"
+turn = "vinyl"
+
+[[unit.mode]]
+name = "nudge"
+[[unit.mode.bind]]
+slot = "jog"
+turn = "nudge 0.15"
+"#,
+        );
+        let map = parse(&text).expect("jog");
+        let unit = &map.units[0];
+        assert_eq!(unit.controls[0].kind, SlotKind::JogWheel);
+        assert_eq!(unit.endpoints.len(), 2);
+
+        let vinyl = unit.binding(0, 0).expect("vinyl");
+        let press = vinyl.spec(&unit.endpoints[0]).expect("press spec");
+        let turn = vinyl.spec(&unit.endpoints[1]).expect("turn spec");
+        assert!(matches!(press.action, Action::Vinyl { .. }));
+        assert!(matches!(turn.action, Action::Vinyl { .. }));
+
+        let slip = unit.binding(1, 0).expect("slip");
+        assert!(matches!(
+            slip.spec(&unit.endpoints[0]).map(|spec| spec.action),
+            Some(Action::Slip)
+        ));
+
+        let nudge = unit.binding(2, 0).expect("nudge");
+        assert!(nudge.spec(&unit.endpoints[0]).is_none(), "press is inert");
+        assert!(matches!(
+            nudge.spec(&unit.endpoints[1]).map(|spec| spec.action),
+            Some(Action::Nudge { .. })
+        ));
+    }
+
+    #[test]
+    fn a_jog_wheel_rejects_two_endpoints_without_roles() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "jog"
+type = "JogWheel"
+endpoint = [
+  { midi = "note", channel = 0, id = 80 },
+  { midi = "cc", encoding = "two_point", channel = 0, id = 6 },
+]
+
+[[unit.mode]]
+name = "m"
+"#,
+        );
+        let error = parse(&text).expect_err("roles are required");
+        assert!(error.message().contains("role"), "{error}");
+    }
+
+    #[test]
+    fn a_cc14_pair_claims_both_controller_numbers() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "tempo"
+type = "Knob"
+endpoint = { midi = "cc", lsb = 41, channel = 0, id = 9 }
+
+[[unit.mode]]
+name = "default"
+[[unit.mode.bind]]
+slot = "tempo"
+action = "tempofader"
+"#,
+        );
+        let map = parse(&text).expect("cc14");
+        let endpoint = &map.units[0].endpoints[0];
+        assert_eq!(endpoint.lsb, Some(41));
+        assert_eq!(endpoint.keys().len(), 2);
+    }
+
+    #[test]
+    fn a_cc14_pair_cannot_overlap_another_endpoint() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "tempo"
+type = "Knob"
+endpoint = { midi = "cc", lsb = 41, channel = 0, id = 9 }
+
+[[unit.control]]
+slot = "other"
+type = "Knob"
+endpoint = { midi = "cc", channel = 0, id = 41 }
+
+[[unit.mode]]
+name = "default"
+[[unit.mode.bind]]
+slot = "tempo"
+action = "tempofader"
+[[unit.mode.bind]]
+slot = "other"
+action = "fader flow"
+"#,
+        );
+        let error = parse(&text).expect_err("lsb must be unique");
+        assert!(error.message().contains("claimed by"), "{error}");
+    }
+
+    #[test]
+    fn mode_slots_are_controls_that_emit_no_commands() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "mode-hotcue"
+type = "Button"
+role = "mode_trigger"
+target = "hotcue"
+endpoint = { midi = "note", channel = 0, id = 24 }
+
+[[unit.control]]
+slot = "mode-next"
+type = "Button"
+role = "mode_cycle"
+endpoint = { midi = "note", channel = 0, id = 25 }
+
+[[unit.mode]]
+name = "hotcue"
+[[unit.mode]]
+name = "beatloop"
+"#,
+        );
+        let map = parse(&text).expect("mode slots");
+        let unit = &map.units[0];
+        assert_eq!(unit.controls[0].role, SlotRole::ModeTrigger);
         assert_eq!(unit.selectors.len(), 2);
         assert!(matches!(
             unit.selectors[0].behavior,
             SelectorBehavior::Trigger { mode } if unit.modes[mode].name == "hotcue"
         ));
+        assert_eq!(unit.selectors[0].slot, "mode-hotcue");
         assert!(matches!(unit.selectors[1].behavior, SelectorBehavior::Cycle));
-        assert!(matches!(
-            unit.modes[0].binds[0].as_ref().map(|bind| &bind.action),
-            Some(Action::HotCue(HotCueOp::Trigger(0)))
-        ));
-    }
 
-    #[test]
-    fn a_mixer_preset_resolves_fx_chains_from_the_unit_deck() {
-        let map = Map::from_toml_str(&mixer(1, 1)).expect("mixer map");
-        let unit = &map.units[0];
-        let low = unit.modes[0].binds[2].as_ref().expect("low is bound");
-        assert!(matches!(
-            &low.action,
-            Action::Fx(FxAction::Param {
-                chain: FxChainId::Deck(1),
-                fx,
-                param
-            }) if fx == "eq" && param == "low"
-        ));
-        assert_eq!(low.min, -1.0);
-        assert_eq!(low.max, 1.0);
-        let cue = unit.modes[0].binds[6].as_ref().expect("cue is bound");
-        assert!(matches!(cue.action, Action::ToggleCueSend));
-        assert_eq!(cue.deck, Some(1));
-        let load = unit.modes[0].binds[7].as_ref().expect("load is bound");
-        assert!(matches!(
-            load.action,
-            Action::Browser(BrowserAction::Load { deck: Some(1) })
-        ));
-    }
-
-    #[test]
-    fn action_lines_take_the_arguments_a_session_line_takes() {
-        for (line, expected) in [
-            ("keylock on", "keylock on"),
-            ("keylock toggle", "keylock toggle"),
-            ("key 2", "key 2"),
-            ("vinyl slip", "vinyl slip"),
-            ("fader cuesend toggle", "fader cuesend toggle"),
-        ] {
-            let raw = RawBinding {
-                kind: EventKind::Note,
-                mode: None,
-                reverse: None,
-                channel: Some(0),
-                id: Some(1),
-                deck: Some(0),
-                action: line.to_owned(),
-                min: None,
-                max: None,
-                curve: None,
-                step: None,
-                seconds: None,
-                beats: None,
-                chain: None,
-                fx: None,
-                param: None,
-            };
-            assert!(parse_action(&raw).is_ok(), "{expected} should parse");
-        }
-    }
-
-    #[test]
-    fn an_endpoint_cannot_be_claimed_twice() {
-        let text = touchpad().replace(
-            "[[unit.selector]]\ntype = \"note\"\nchannel = 0\nid = 24",
-            "[[unit.selector]]\ntype = \"note\"\nchannel = 0\nid = 16",
+        let bad = text.replace(
+            "[[unit.mode]]\nname = \"hotcue\"",
+            "[[unit.mode]]\nname = \"hotcue\"\n[[unit.mode.bind]]\nslot = \"mode-hotcue\"\naction = \"play\"",
         );
-        let error = Map::from_toml_str(&text).expect_err("duplicate endpoint");
-        assert!(error.message().contains("claimed by"), "{error}");
-    }
-
-    #[test]
-    fn a_pad_cannot_drive_a_continuous_action_and_a_knob_cannot_drive_an_edge() {
-        let pad = r#"
-[[unit]]
-id = "u"
-deck = 1
-[[unit.control]]
-slot = "pad"
-type = "note"
-channel = 0
-id = 1
-[[unit.mode]]
-name = "m"
-[[unit.mode.bind]]
-slot = "pad"
-action = "fader flow"
-"#;
-        let error = Map::from_toml_str(pad).expect_err("pad cannot be continuous");
-        assert!(error.message().contains("continuous"), "{error}");
-
-        let knob = r#"
-[[unit]]
-id = "u"
-deck = 1
-[[unit.control]]
-slot = "knob"
-type = "cc"
-channel = 0
-id = 1
-[[unit.mode]]
-name = "m"
-[[unit.mode.bind]]
-slot = "knob"
-action = "play"
-"#;
-        let error = Map::from_toml_str(knob).expect_err("knob cannot be an edge");
-        assert!(error.message().contains("continuous action"), "{error}");
+        let error = parse(&bad).expect_err("mode slots cannot bind actions");
+        assert!(error.message().contains("does not emit"), "{error}");
     }
 
     #[test]
     fn deck_numbers_are_written_one_based() {
-        let map = Map::from_toml_str(
+        let map = parse(
             r#"
 [[unit]]
 id = "u"
@@ -2376,7 +2201,7 @@ name = "m"
         .expect("deck1");
         assert_eq!(map.units[0].deck, Some(0));
 
-        let error = Map::from_toml_str(
+        let error = parse(
             r#"
 [[unit]]
 id = "u"
@@ -2390,302 +2215,142 @@ name = "m"
     }
 
     #[test]
-    fn mode_slots_are_controls_that_emit_no_commands() {
-        let text = r#"
-[[unit]]
-id = "u"
-deck = 1
-
+    fn a_button_cannot_drive_a_continuous_action_and_a_knob_cannot_drive_an_edge() {
+        let pad = deck_unit(
+            r#"
 [[unit.control]]
-slot = "mode1"
-kind = "ModeTrigger"
-type = "note"
-channel = 0
-id = 24
-target = "hotcue"
-
-[[unit.control]]
-slot = "mode2"
-kind = "ModeCycle"
-type = "note"
-channel = 0
-id = 25
+slot = "pad"
+type = "Button"
+endpoint = { midi = "note", channel = 0, id = 1 }
 
 [[unit.mode]]
-name = "hotcue"
-[[unit.mode]]
-name = "loop"
-"#;
-        let map = Map::from_toml_str(text).expect("mode slots");
-        let unit = &map.units[0];
-        assert_eq!(unit.controls[0].shape, ControlShape::ModeTrigger);
-        assert_eq!(unit.selectors.len(), 2);
-        assert!(matches!(
-            unit.selectors[0].behavior,
-            SelectorBehavior::Trigger { mode } if unit.modes[mode].name == "hotcue"
-        ));
-        assert_eq!(unit.selectors[0].slot.as_deref(), Some("mode1"));
-        assert!(matches!(unit.selectors[1].behavior, SelectorBehavior::Cycle));
-
-        let bad = text.replace(
-            "[[unit.mode]]
-name = \"hotcue\"",
-            "[[unit.mode]]
-name = \"hotcue\"\n[[unit.mode.bind]]\nslot = \"mode1\"\naction = \"play\"",
+name = "m"
+[[unit.mode.bind]]
+slot = "pad"
+action = "fader flow"
+"#,
         );
-        let error = Map::from_toml_str(&bad).expect_err("mode slot cannot bind an action");
-        assert!(error.message().contains("do not emit commands"), "{error}");
-    }
+        let error = parse(&pad).expect_err("a button cannot be continuous");
+        assert!(error.message().contains("continuous"), "{error}");
 
-    #[test]
-    fn a_one_cc_jog_accepts_press_and_a_relative_turn() {
-        let text = r#"
-[[unit]]
-id = "u"
-deck = 1
-
+        let knob = deck_unit(
+            r#"
 [[unit.control]]
-slot = "jog"
-kind = "JogWheel"
-press = { type = "note", channel = 0, id = 80 }
-turn = { type = "cc", mode = "rel2", reverse = true, channel = 0, id = 6 }
+slot = "knob"
+type = "Knob"
+endpoint = { midi = "cc", channel = 0, id = 1 }
 
 [[unit.mode]]
 name = "m"
 [[unit.mode.bind]]
-slot = "jog"
-action = "vinyl"
-"#;
-        let map = Map::from_toml_str(text).expect("one-CC jog");
-        let control = &map.units[0].controls[0];
-        assert_eq!(control.shape, ControlShape::JogWheel);
-        assert_eq!(control.endpoints.len(), 2);
-        let turn = &map.units[0].endpoints[control.endpoints[1]];
-        assert_eq!(turn.mode, RelMode::Rel2);
-        assert!(turn.reverse);
-    }
-
-    #[test]
-    fn a_cc14_pair_claims_both_controller_numbers() {
-        let text = r#"
-[[unit]]
-id = "u"
-deck = 1
-
-[[unit.control]]
-slot = "tempo"
-type = "cc"
-lsb = 41
-channel = 0
-id = 9
-
-[[unit.mode]]
-name = "m"
-[[unit.mode.bind]]
-slot = "tempo"
-action = "tempofader"
-"#;
-        let map = Map::from_toml_str(text).expect("cc14");
-        let endpoint = &map.units[0].endpoints[0];
-        assert_eq!(endpoint.lsb, Some(41));
-        assert_eq!(endpoint.keys().len(), 2);
-    }
-
-    #[test]
-    fn a_cc14_pair_cannot_overlap_another_endpoint() {
-        let text = r#"
-[[unit]]
-id = "u"
-deck = 1
-
-[[unit.control]]
-slot = "tempo"
-type = "cc"
-lsb = 41
-channel = 0
-id = 9
-
-[[unit.control]]
-slot = "other"
-type = "cc"
-channel = 0
-id = 41
-
-[[unit.mode]]
-name = "m"
-[[unit.mode.bind]]
-slot = "tempo"
-action = "tempofader"
-[[unit.mode.bind]]
-slot = "other"
-action = "fader flow"
-"#;
-        let error = Map::from_toml_str(text).expect_err("lsb must be unique");
-        assert!(error.message().contains("claimed by"), "{error}");
-    }
-
-    #[test]
-    fn a_rel_knob_carries_both_directions_in_the_mode() {
-        let text = r#"
-[[unit]]
-id = "u"
-
-[[unit.control]]
-slot = "browse"
-type = "cc"
-kind = "RelKnob"
-mode = "rel2"
-channel = 0
-id = 1
-
-[[unit.mode]]
-name = "m"
-[[unit.mode.bind]]
-slot = "browse"
-action = "browser up"
-down = "browser down"
-"#;
-        let map = Map::from_toml_str(text).expect("relknob pair");
-        let unit = &map.units[0];
-        assert_eq!(unit.controls[0].shape, ControlShape::RelKnob);
-        let binding = unit.binding(0, 0).expect("binding");
-        assert!(matches!(binding.action, Action::Browser(BrowserAction::Up)));
-        assert!(matches!(
-            binding.down,
-            Some(Action::Browser(BrowserAction::Down))
-        ));
-    }
-
-    #[test]
-    fn a_rel_knob_pair_rejects_continuous_actions() {
-        let text = r#"
-[[unit]]
-id = "u"
-deck = 1
-
-[[unit.control]]
-slot = "fader"
-type = "cc"
-kind = "RelKnob"
-mode = "rel2"
-channel = 0
-id = 1
-
-[[unit.mode]]
-name = "m"
-[[unit.mode.bind]]
-slot = "fader"
-action = "fader flow"
-down = "play"
-"#;
-        let error = Map::from_toml_str(text).expect_err("continuous pair");
-        assert!(error.message().contains("edge actions"), "{error}");
-    }
-
-    #[test]
-    fn a_bipol_knob_defaults_to_the_bipolar_range() {
-        let text = r#"
-[[unit]]
-id = "u"
-deck = 1
-
-[[unit.control]]
-slot = "filter"
-type = "cc"
-kind = "BipolKnob"
-channel = 0
-id = 1
-
-[[unit.mode]]
-name = "m"
-[[unit.mode.bind]]
-slot = "filter"
-action = "fx param"
-fx = "filter"
-param = "value"
-"#;
-        let map = Map::from_toml_str(text).expect("bipol knob");
-        let binding = map.units[0].binding(0, 0).expect("binding");
-        assert_eq!((binding.min, binding.max), (-1.0, 1.0));
-    }
-
-    #[test]
-    fn a_bipol_knob_cannot_take_a_relative_encoder() {
-        let text = r#"
-[[unit]]
-id = "u"
-deck = 1
-
-[[unit.control]]
-slot = "filter"
-type = "cc"
-kind = "BipolKnob"
-mode = "rel2"
-channel = 0
-id = 1
-
-[[unit.mode]]
-name = "m"
-[[unit.mode.bind]]
-slot = "filter"
-action = "fx param"
-fx = "filter"
-param = "value"
-"#;
-        let error = Map::from_toml_str(text).expect_err("bipol knob must be absolute");
-        assert!(error.message().contains("absolute"), "{error}");
+slot = "knob"
+action = "play"
+"#,
+        );
+        let error = parse(&knob).expect_err("a knob cannot be an edge");
+        assert!(error.message().contains("relative"), "{error}");
     }
 
     #[test]
     fn on_is_only_for_one_shot_actions() {
-        let text = r#"
-[[unit]]
-id = "u"
-deck = 1
+        let text = deck_unit(
+            r#"
 [[unit.control]]
 slot = "pad"
-type = "note"
-channel = 0
-id = 1
+type = "Button"
+endpoint = { midi = "note", channel = 0, id = 1 }
+
 [[unit.mode]]
 name = "m"
 [[unit.mode.bind]]
 slot = "pad"
 action = "cue"
 on = "release"
-"#;
-        let error = Map::from_toml_str(text).expect_err("cue uses both edges");
+"#,
+        );
+        let error = parse(&text).expect_err("cue uses both edges");
         assert!(error.message().contains("both edges"), "{error}");
     }
 
     #[test]
-    fn selectors_must_name_a_real_mode_and_trigger_needs_a_target() {
-        let text = touchpad().replace("target = \"hotcue\"", "target = \"missing\"");
-        let error = Map::from_toml_str(&text).expect_err("unknown selector target");
-        assert!(error.message().contains("unknown mode"), "{error}");
+    fn action_lines_carry_their_own_arguments() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "pad"
+type = "Button"
+endpoint = { midi = "note", channel = 0, id = 1 }
+
+[[unit.mode]]
+name = "m"
+[[unit.mode.bind]]
+slot = "pad"
+action = "loop 1/4"
+"#,
+        );
+        let map = parse(&text).expect("fractional loop");
+        assert!(matches!(
+            map.units[0].binding(0, 0).map(|bind| &bind.actions.main),
+            Some(Some(Action::Loop(LoopAction::Beats(len))))
+                if *len == BeatLen::fraction(1, 4).unwrap()
+        ));
     }
 
     #[test]
-    fn mode_order_selects_and_orders_the_visible_modes() {
-        let text = touchpad().replace(
-            "preset = \"touchpad\"",
-            "preset = \"touchpad\"\nmode_order = [\"loop\", \"hotcue\"]\nstart = \"loop\"",
-        );
-        let map = Map::from_toml_str(&text).expect("ordered modes");
+    fn a_preset_slot_supplies_the_kind_and_the_mode_keys() {
+        let text = r#"
+[[unit]]
+id = "deck1.pad"
+preset = "pad"
+deck = 1
+"#;
+        let map = parse(text).expect("pad preset");
         let unit = &map.units[0];
-        assert_eq!(unit.modes.len(), 2);
-        assert_eq!(unit.modes[0].name, "loop");
-        assert_eq!(unit.modes[1].name, "hotcue");
-        assert_eq!(unit.start, 0);
+        assert_eq!(unit.controls.len(), 12);
+        assert_eq!(unit.modes.len(), 3);
+        // Unbound mode keys produce no selector until the guide learns their endpoint.
+        assert_eq!(unit.selectors.len(), 0);
+        assert_eq!(unit.controls[8].role, SlotRole::ModeTrigger);
+        assert_eq!(unit.controls[11].role, SlotRole::ModeCycle);
+    }
+
+    #[test]
+    fn a_unit_may_override_a_preset_slot_kind_only_to_agree() {
+        let text = r#"
+[[unit]]
+id = "deck1.mixer"
+preset = "mixer"
+deck = 1
+
+[[unit.control]]
+slot = "filter"
+type = "Knob"
+endpoint = { midi = "cc", channel = 0, id = 12 }
+"#;
+        let error = parse(text).expect_err("the preset says BipolKnob");
+        assert!(error.message().contains("disagrees"), "{error}");
     }
 
     #[test]
     fn a_unit_can_add_a_slot_that_the_preset_does_not_have() {
-        let text = touchpad().replace(
-            "[[unit.selector]]\ntype = \"note\"\nchannel = 0\nid = 24",
-            "[[unit.control]]\nslot = \"extra\"\ntype = \"note\"\nchannel = 0\nid = 40\n\n[[unit.mode]]\nname = \"mine\"\n[[unit.mode.bind]]\nslot = \"extra\"\naction = \"play\"\n\n[[unit.selector]]\ntype = \"note\"\nchannel = 0\nid = 24",
-        );
-        let map = Map::from_toml_str(&text).expect("extra slot");
+        let text = r#"
+[[unit]]
+id = "deck1.mixer"
+preset = "mixer"
+deck = 1
+
+[[unit.control]]
+slot = "extra"
+type = "Button"
+endpoint = { midi = "note", channel = 0, id = 40 }
+
+[[unit.mode]]
+name = "mine"
+[[unit.mode.bind]]
+slot = "extra"
+action = "play"
+"#;
+        let map = parse(text).expect("extra slot");
         let unit = &map.units[0];
         assert_eq!(unit.controls.len(), 9);
         assert_eq!(unit.controls.last().unwrap().slot, "extra");
@@ -2694,22 +2359,29 @@ on = "release"
             .iter()
             .find(|mode| mode.name == "mine")
             .expect("mine mode");
-        assert!(matches!(
-            mine.binds.last().and_then(|bind| bind.as_ref()).map(|bind| &bind.action),
-            Some(Action::Play)
-        ));
+        assert!(mine
+            .binds
+            .last()
+            .and_then(|bind| bind.as_ref())
+            .is_some_and(|bind| matches!(bind.actions.main, Some(Action::Play))));
     }
 
     #[test]
-    fn a_unit_mode_not_in_the_preset_order_is_appended() {
-        let text = touchpad().replace(
-            "[[unit.selector]]\ntype = \"note\"\nchannel = 0\nid = 24",
-            "[[unit.mode]]\nname = \"mine\"\n\n[[unit.selector]]\ntype = \"note\"\nchannel = 0\nid = 24",
-        );
-        let map = Map::from_toml_str(&text).expect("unit mode extension");
+    fn an_explicit_mode_order_moves_the_named_modes_first() {
+        let text = r#"
+[[unit]]
+id = "deck1.pad"
+preset = "pad"
+deck = 1
+mode_order = ["beatjump", "hotcue"]
+start = "beatjump"
+"#;
+        let map = parse(text).expect("ordered modes");
         let unit = &map.units[0];
-        assert_eq!(unit.modes.len(), 5);
-        assert_eq!(unit.modes.last().unwrap().name, "mine");
+        assert_eq!(unit.modes[0].name, "beatjump");
+        assert_eq!(unit.modes[1].name, "hotcue");
+        assert_eq!(unit.modes[2].name, "beatloop");
+        assert_eq!(unit.start, 0);
     }
 
     #[test]
@@ -2724,14 +2396,17 @@ on = "release"
     }
 
     #[test]
-    fn the_old_flat_bind_table_is_gone() {
-        let error = Map::from_toml_str(
-            "[[bind]]\ntype = \"note\"\nid = 1\naction = \"play\"\n",
+    fn the_old_schema_is_refused() {
+        let error = parse(
+            r#"
+[[bind]]
+type = "note"
+channel = 0
+id = 1
+action = "play"
+"#,
         )
-        .expect_err("flat binds are no longer a schema");
-        assert!(
-            error.message().contains("unknown field") || error.message().contains("bind"),
-            "{error}"
-        );
+        .expect_err("the flat bind table is gone");
+        assert!(error.message().contains("bind"), "{error}");
     }
 }

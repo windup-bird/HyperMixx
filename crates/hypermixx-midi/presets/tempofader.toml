@@ -1,0 +1,27 @@
+# The pitch fader plus its two bend keys. The fader is bipolar: centre = the track's own tempo.
+[[preset]]
+name = "tempofader"
+scope = "deck"
+start = "default"
+
+[[preset.slot]]
+slot = "fader"
+type = "BipolKnob"
+[[preset.slot]]
+slot = "bend-backward"
+type = "Button"
+[[preset.slot]]
+slot = "bend-forward"
+type = "Button"
+
+[[preset.mode]]
+name = "default"
+[[preset.mode.bind]]
+slot = "fader"
+action = "tempofader"
+[[preset.mode.bind]]
+slot = "bend-backward"
+action = "nudge -0.08"
+[[preset.mode.bind]]
+slot = "bend-forward"
+action = "nudge 0.08"

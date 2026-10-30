@@ -1,0 +1,49 @@
+# One deck FX slot: two parameter knobs and a bypass button, with two parameter maps.
+[[preset]]
+name = "deckfx"
+scope = "deck"
+start = "filter"
+
+[[preset.slot]]
+slot = "toggle"
+type = "Button"
+[[preset.slot]]
+slot = "param1"
+type = "Knob"
+[[preset.slot]]
+slot = "param2"
+type = "Knob"
+
+[[preset.mode]]
+name = "filter"
+[[preset.mode.bind]]
+slot = "toggle"
+action = "fx toggle"
+fx = "filter"
+[[preset.mode.bind]]
+slot = "param1"
+action = "fx param value"
+fx = "filter"
+[[preset.mode.bind]]
+slot = "param2"
+action = "fx param resonance"
+fx = "filter"
+
+[[preset.mode]]
+name = "eq"
+[[preset.mode.bind]]
+slot = "toggle"
+action = "fx toggle"
+fx = "eq"
+[[preset.mode.bind]]
+slot = "param1"
+action = "fx param low"
+fx = "eq"
+min = -1.0
+max = 1.0
+[[preset.mode.bind]]
+slot = "param2"
+action = "fx param high"
+fx = "eq"
+min = -1.0
+max = 1.0

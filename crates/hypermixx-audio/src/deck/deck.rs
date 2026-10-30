@@ -17,8 +17,8 @@ use std::sync::Arc;
 use crate::flow::EngineProfile;
 use arc_swap::ArcSwapOption;
 use hypermixx_core::{
-    CueOp, HotCue, HotCueOp, Key, KeylockMode, KeylockSettings, LoopEditOp, LoopOp, LoopQuantum,
-    Source, TrackAnalysis, VinylOp, HOT_CUE_SLOTS,
+    BeatLen, CueOp, HotCue, HotCueOp, Key, KeylockMode, KeylockSettings, LoopEditOp, LoopOp,
+    LoopQuantum, Source, TrackAnalysis, VinylOp, HOT_CUE_SLOTS,
 };
 
 use super::jump::{resolve, Seek};
@@ -1187,23 +1187,23 @@ impl Deck {
     /// Beat loop. While a loop runs, this only re-times its `out` to `in + N` beats — in place,
     /// clock untouched (halve/double). Otherwise it opens a fresh N-beat loop at the quantized
     /// current beat: a flow born *with* the range, warmed, then switched in (不跟跑).
-    fn loop_beats(&mut self, beats: u64) -> Result<(), String> {
+    fn loop_beats(&mut self, beats: BeatLen) -> Result<(), String> {
         self.loop_beats_impl(beats, false, false)
     }
 
     /// Slip beat loop: the loop is heard, `playing` keeps the slip clock.
-    pub fn slip_beats(&mut self, beats: u64) -> Result<(), String> {
+    pub fn slip_beats(&mut self, beats: BeatLen) -> Result<(), String> {
         self.loop_beats_impl(beats, true, false)
     }
 
     /// Slip roll: a slip beat loop whose shadow reads backwards.
-    pub fn slip_roll(&mut self, beats: u64) -> Result<(), String> {
+    pub fn slip_roll(&mut self, beats: BeatLen) -> Result<(), String> {
         self.loop_beats_impl(beats, true, true)
     }
 
-    fn loop_beats_impl(&mut self, beats: u64, slip: bool, reverse: bool) -> Result<(), String> {
-        if beats == 0 {
-            return Err("a loop needs at least 1 beat".into());
+    fn loop_beats_impl(&mut self, beats: BeatLen, slip: bool, reverse: bool) -> Result<(), String> {
+        if beats.numerator() == 0 {
+            return Err("a loop needs a positive length".into());
         }
         let analysis = self.require_grid()?;
         if let Some(range) = self.loop_range() {
@@ -2315,7 +2315,7 @@ mod tests {
         let mut deck = loop_deck(total);
         let mut out = vec![0.0f32; 256 * CHANNELS];
 
-        deck.apply_loop(LoopOp::Beats(4)).expect("beat loop");
+        deck.apply_loop(LoopOp::Beats(BeatLen::beats(4))).expect("beat loop");
         settle_loop(&mut deck, &mut out);
         let range = deck.loop_range().expect("engaged");
         let grid = deck.analysis().expect("grid").beatgrid.clone();
@@ -2354,7 +2354,7 @@ mod tests {
         let mut deck = loop_deck(total);
         let mut out = vec![0.0f32; 256 * CHANNELS];
 
-        deck.apply_loop(LoopOp::Beats(2)).expect("beat loop");
+        deck.apply_loop(LoopOp::Beats(BeatLen::beats(2))).expect("beat loop");
         settle_loop(&mut deck, &mut out);
         let range = deck.loop_range().expect("engaged");
 
@@ -2427,7 +2427,7 @@ mod tests {
         let mut deck = loop_deck(total);
         let mut out = vec![0.0f32; 256 * CHANNELS];
 
-        deck.apply_loop(LoopOp::Beats(4)).expect("beat loop");
+        deck.apply_loop(LoopOp::Beats(BeatLen::beats(4))).expect("beat loop");
         settle_loop(&mut deck, &mut out);
         let range = deck.loop_range().expect("engaged");
         // Run three laps: the slip clock climbs far past `out` while the audible wraps.
@@ -2504,7 +2504,7 @@ mod tests {
         let mut out = vec![0.0f32; 256 * CHANNELS];
         deck.process_block(&mut out);
 
-        deck.slip_beats(4).expect("slip loop");
+        deck.slip_beats(BeatLen::beats(4)).expect("slip loop");
         let range = deck.loop_range().expect("engaged");
         let start_virtual = deck.virtual_frame();
         assert!(deck.shadow.as_ref().is_some_and(|s| s.slip));
@@ -2568,7 +2568,7 @@ mod tests {
         let mut out = vec![0.0f32; 8 * CHANNELS];
         deck.process_block(&mut out);
 
-        deck.slip_roll(4).expect("slip roll");
+        deck.slip_roll(BeatLen::beats(4)).expect("slip roll");
         let range = deck.loop_range().expect("engaged");
         assert!(deck.shadow.as_ref().is_some_and(|s| s.slip));
         let before = deck.current_frame();
@@ -2589,7 +2589,7 @@ mod tests {
         let total = crate::SAMPLE_RATE as u64 * 60;
         let mut deck = loop_deck(total);
         let mut out = vec![0.0f32; 256 * CHANNELS];
-        deck.apply_loop(LoopOp::Beats(4)).expect("beat loop");
+        deck.apply_loop(LoopOp::Beats(BeatLen::beats(4))).expect("beat loop");
         settle_loop(&mut deck, &mut out);
         let original = deck.loop_range().expect("engaged");
         let clock = deck.virtual_frame();
@@ -2599,13 +2599,13 @@ mod tests {
         let beats_from_in = |n: u64| grid.frame_at_beat(b + n) - grid.frame_at_beat(b);
 
         // halve/double through the beat-loop verb (decision 5): out moves, in and clock don't.
-        deck.apply_loop(LoopOp::Beats(2)).expect("halve");
+        deck.apply_loop(LoopOp::Beats(BeatLen::beats(2))).expect("halve");
         let halved = deck.loop_range().expect("still looping");
         assert_eq!(halved.in_frame, original.in_frame, "`in` must not move");
         assert_eq!(halved.out_frame - halved.in_frame, beats_from_in(2));
         assert_eq!(deck.virtual_frame(), clock, "an edit never moves the clock");
 
-        deck.apply_loop(LoopOp::Beats(8)).expect("double");
+        deck.apply_loop(LoopOp::Beats(BeatLen::beats(8))).expect("double");
         let doubled = deck.loop_range().expect("still looping");
         assert_eq!(doubled.out_frame - doubled.in_frame, beats_from_in(8));
 
@@ -2667,7 +2667,7 @@ mod tests {
         let total = crate::SAMPLE_RATE as u64 * 60;
         let mut deck = loop_deck(total);
         let mut out = vec![0.0f32; 256 * CHANNELS];
-        deck.apply_loop(LoopOp::Beats(4)).expect("beat loop");
+        deck.apply_loop(LoopOp::Beats(BeatLen::beats(4))).expect("beat loop");
         settle_loop(&mut deck, &mut out);
         let engaged = deck.loop_range().expect("engaged");
         let clock = deck.virtual_frame();
@@ -2801,7 +2801,7 @@ mod tests {
         assert!(deck.loop_range().is_none());
 
         // A zero-beat loop is refused.
-        assert!(deck.apply_loop(LoopOp::Beats(0)).is_err(), "0-beat loop");
+        assert!(deck.apply_loop(LoopOp::Beats(BeatLen::beats(0))).is_err(), "0-beat loop");
         // Editing with no loop is refused.
         assert!(
             deck.apply_loop(LoopOp::Edit(LoopEditOp::Move { beats: 1 }))
@@ -2816,7 +2816,7 @@ mod tests {
             LoopOp::In,
             LoopOp::Out,
             LoopOp::Exit,
-            LoopOp::Beats(4),
+            LoopOp::Beats(BeatLen::beats(4)),
             LoopOp::Cancel,
             LoopOp::SetQuantum(LoopQuantum::Half),
         ] {
@@ -2838,7 +2838,7 @@ mod tests {
         let total = crate::SAMPLE_RATE as u64 * 60;
         let mut deck = loop_deck(total);
         let mut out = vec![0.0f32; 256 * CHANNELS];
-        deck.apply_loop(LoopOp::Beats(4)).expect("beat loop");
+        deck.apply_loop(LoopOp::Beats(BeatLen::beats(4))).expect("beat loop");
         settle_loop(&mut deck, &mut out);
 
         // 循环中再按 in → 退出当前,开新: the arm appears at once, the running loop goes away
@@ -2887,7 +2887,7 @@ mod tests {
         let mut out = vec![0.0f32; 256 * CHANNELS];
         deck.jump(fpb() * 8);
         settle_at(&mut deck, &mut out, fpb() * 8);
-        deck.apply_loop(LoopOp::Beats(4)).expect("beat loop");
+        deck.apply_loop(LoopOp::Beats(BeatLen::beats(4))).expect("beat loop");
         settle_loop(&mut deck, &mut out);
         let range = deck.loop_range().expect("engaged");
         assert!(range.out_frame <= total, "out clamped to the track end");
@@ -3039,7 +3039,7 @@ mod tests {
         let mut deck = loop_deck(total);
         let mut out = vec![0.0f32; 256 * CHANNELS];
 
-        deck.apply_loop(LoopOp::Beats(4)).expect("beat loop");
+        deck.apply_loop(LoopOp::Beats(BeatLen::beats(4))).expect("beat loop");
         settle_loop(&mut deck, &mut out);
         let range = deck.loop_range().expect("engaged");
 
@@ -3103,7 +3103,7 @@ mod tests {
         assert_eq!(deck.stream_count(), 4);
         deck.set_analysis(grid_122bpm(total));
 
-        deck.slip_beats(4).expect("slip loop over stems");
+        deck.slip_beats(BeatLen::beats(4)).expect("slip loop over stems");
         let mut buses: Vec<Bus> = (0..4).map(|_| Bus::stereo(frames)).collect();
         deck.pull_streams_into(&mut buses);
         for i in 0..frames {

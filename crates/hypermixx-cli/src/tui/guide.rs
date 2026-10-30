@@ -17,8 +17,8 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use hypermixx_midi::guide::{TreeButton, TreeNodeKind, TreeView};
-use hypermixx_midi::map::{Edge, EventKind, RawSelectorBehavior};
+use hypermixx_midi::guide::{Column, ColumnFocus, Entered, Row, TreeButton, View};
+use hypermixx_midi::map::{Edge, EventKind, SlotRole};
 use hypermixx_midi::{ports, Guide, Input, Received};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -55,9 +55,12 @@ struct Session {
     monitor_offset: usize,
     overlay: Overlay,
     button_focus: usize,
+    /// Tab moves focus between the columns and the command row; while the row has focus the columns
+    /// keep only their grey selection.
+    buttons_focused: bool,
     button_rects: Vec<(Rect, TreeButton)>,
-    list_rect: Rect,
-    list_offset: usize,
+    /// `(rect, column, row index)` for every rendered column row, so a click can select it.
+    row_rects: Vec<(Rect, Column, usize)>,
     confirm_quit: bool,
     quit: bool,
 }
@@ -104,6 +107,8 @@ enum TextAction {
     NewMode,
     ActionLine,
     SaveAs,
+    /// The channel offset a clone applies to every endpoint.
+    CloneOffset { deck: usize },
 }
 
 impl Session {
@@ -120,9 +125,9 @@ impl Session {
             monitor_offset: 0,
             overlay: Overlay::None,
             button_focus: 0,
+            buttons_focused: false,
             button_rects: Vec::new(),
-            list_rect: Rect::default(),
-            list_offset: 0,
+            row_rects: Vec::new(),
             confirm_quit: false,
             quit: false,
         })
@@ -162,7 +167,12 @@ impl Session {
             if self.monitor.len() > MONITOR_CAP {
                 self.monitor.pop_front();
             }
-            self.guide.feed(&received.event);
+            let at_ms = received
+                .at
+                .duration_since(UNIX_EPOCH)
+                .map(|delta| delta.as_millis() as u64)
+                .ok();
+            self.guide.feed_at(&received.event, at_ms);
         }
     }
 
@@ -226,21 +236,47 @@ fn handle_key(session: &mut Session, key: KeyEvent) -> bool {
         handle_overlay(session, key);
         return false;
     }
-    match key.code {
-        KeyCode::Up => session.guide.move_tree_selection(-1),
-        KeyCode::Down => session.guide.move_tree_selection(1),
-        KeyCode::Tab | KeyCode::Right => move_button(session, 1),
-        KeyCode::Left => move_button(session, -1),
-        KeyCode::Enter => {
-            let view = session.guide.tree_view();
-            if let Some(button) = view
-                .buttons
-                .get(session.button_focus.min(view.buttons.len().saturating_sub(1)))
-                .copied()
-            {
-                activate_button(session, button);
+    if session.buttons_focused {
+        match key.code {
+            KeyCode::Tab | KeyCode::Right => move_button(session, 1),
+            KeyCode::BackTab | KeyCode::Left => move_button(session, -1),
+            KeyCode::Enter => {
+                let view = session.guide.view();
+                if let Some(button) = view
+                    .buttons
+                    .get(session.button_focus.min(view.buttons.len().saturating_sub(1)))
+                    .copied()
+                {
+                    activate_button(session, button);
+                }
             }
+            KeyCode::Esc | KeyCode::Up | KeyCode::Down => session.buttons_focused = false,
+            KeyCode::PageUp => session.scroll_monitor(MONITOR_PAGE as isize),
+            KeyCode::PageDown => session.scroll_monitor(-(MONITOR_PAGE as isize)),
+            _ => {}
         }
+        return false;
+    }
+    match key.code {
+        KeyCode::Up => session.guide.move_cursor(-1),
+        KeyCode::Down => session.guide.move_cursor(1),
+        KeyCode::Left => session.guide.move_column(-1),
+        KeyCode::Right => session.guide.move_column(1),
+        KeyCode::Char('[') => session.guide.step_mode(-1),
+        KeyCode::Char(']') => session.guide.step_mode(1),
+        KeyCode::Tab => {
+            session.buttons_focused = true;
+            session.button_focus = 0;
+        }
+        KeyCode::BackTab => {
+            session.buttons_focused = true;
+            session.button_focus = session.guide.view().buttons.len().saturating_sub(1);
+        }
+        KeyCode::Enter => match session.guide.enter() {
+            Ok(Entered::AddUnit) => open_new_unit_menu(session),
+            Ok(Entered::Moved) | Ok(Entered::Learning) => {}
+            Err(err) => session.guide.note(err),
+        },
         KeyCode::PageUp => session.scroll_monitor(MONITOR_PAGE as isize),
         KeyCode::PageDown => session.scroll_monitor(-(MONITOR_PAGE as isize)),
         KeyCode::Esc => {
@@ -254,7 +290,7 @@ fn handle_key(session: &mut Session, key: KeyEvent) -> bool {
 }
 
 fn move_button(session: &mut Session, delta: isize) {
-    let len = session.guide.tree_view().buttons.len();
+    let len = session.guide.view().buttons.len();
     if len == 0 {
         return;
     }
@@ -262,25 +298,34 @@ fn move_button(session: &mut Session, delta: isize) {
         (session.button_focus as isize + delta).rem_euclid(len as isize) as usize;
 }
 
+/// The preset menu the `add unit` row opens.
+fn open_new_unit_menu(session: &mut Session) {
+    let items = session.guide.preset_names();
+    if items.is_empty() {
+        session.guide.note("no presets available".to_owned());
+        return;
+    }
+    session.overlay = Overlay::Menu(Menu {
+        title: "new unit — preset".to_owned(),
+        items,
+        selected: 0,
+        action: MenuAction::NewUnitPreset,
+    });
+}
+
 fn activate_button(session: &mut Session, button: TreeButton) {
     if button != TreeButton::Exit {
         session.confirm_quit = false;
     }
     let result = match button {
-        TreeButton::Learn => session.guide.tree_begin_learn(),
+        TreeButton::Learn => match session.guide.enter() {
+            Ok(Entered::Learning) | Ok(Entered::Moved) => Ok(()),
+            Ok(Entered::AddUnit) => Err("select a slot first".to_owned()),
+            Err(err) => Err(err),
+        },
         TreeButton::NewUnit => {
-            let items = session.guide.preset_names();
-            if items.is_empty() {
-                Err("no presets available".to_owned())
-            } else {
-                session.overlay = Overlay::Menu(Menu {
-                    title: "new unit — preset".to_owned(),
-                    items,
-                    selected: 0,
-                    action: MenuAction::NewUnitPreset,
-                });
-                Ok(())
-            }
+            open_new_unit_menu(session);
+            Ok(())
         }
         TreeButton::Clone => {
             let deck = session.guide.tree_selected_unit_deck();
@@ -290,7 +335,7 @@ fn activate_button(session: &mut Session, button: TreeButton) {
                     .note("select a unit to clone".to_owned());
             };
             let items: Vec<String> = (0..session.decks)
-                .filter(|deck| *deck as u8 != current)
+                .filter(|deck| *deck != current)
                 .map(|deck| format!("deck {}", deck + 1))
                 .collect();
             if items.is_empty() {
@@ -322,12 +367,13 @@ fn activate_button(session: &mut Session, button: TreeButton) {
             });
             Ok(())
         }
-        TreeButton::Delete => session.guide.tree_delete(),
-        TreeButton::Up => session.guide.tree_move_mode(-1),
-        TreeButton::Down => session.guide.tree_move_mode(1),
-        TreeButton::SetStart => session.guide.tree_set_start(),
-        TreeButton::Edit => match session.guide.selected_tree_kind() {
-            Some(TreeNodeKind::Action { .. }) => {
+        TreeButton::Delete => session.guide.delete_selected(),
+        TreeButton::Up => session.guide.move_mode(-1),
+        TreeButton::Down => session.guide.move_mode(1),
+        TreeButton::SetStart => session.guide.set_start(),
+        TreeButton::Edit => match session.guide.current_slot_role() {
+            Some(SlotRole::Action) if session.guide.is_capturing() => Ok(()),
+            Some(SlotRole::Action) => {
                 let mut items = vec!["<type a line>".to_owned()];
                 items.extend(
                     hypermixx_midi::guide::action_names()
@@ -342,7 +388,7 @@ fn activate_button(session: &mut Session, button: TreeButton) {
                 });
                 Ok(())
             }
-            Some(TreeNodeKind::Selector { .. }) => {
+            Some(SlotRole::ModeTrigger) | Some(SlotRole::ModeCycle) => {
                 let modes = session.guide.mode_names();
                 let mut items = vec!["cycle".to_owned()];
                 items.extend(modes.into_iter().map(|mode| format!("trigger {mode}")));
@@ -354,16 +400,16 @@ fn activate_button(session: &mut Session, button: TreeButton) {
                 });
                 Ok(())
             }
-            _ => Err("select an action or selector first".to_owned()),
+            None => Err("select a slot first".to_owned()),
         },
         TreeButton::On => {
-            let next = match session.guide.tree_on() {
+            let next = match session.guide.on() {
                 Some(_) => None,
                 None => Some(Edge::Release),
             };
-            session.guide.tree_set_on(next)
+            session.guide.set_on(next)
         }
-        TreeButton::Confirm => session.guide.tree_confirm_learn(),
+        TreeButton::Confirm => session.guide.confirm_learn(),
         TreeButton::Cancel => {
             session.guide.cancel_learn();
             Ok(())
@@ -434,27 +480,37 @@ fn handle_mouse(session: &mut Session, mouse: MouseEvent) {
         {
             if let Some(index) = session
                 .guide
-                .tree_view()
+                .view()
                 .buttons
                 .iter()
                 .position(|candidate| *candidate == button)
             {
                 session.button_focus = index;
             }
+            session.buttons_focused = true;
             activate_button(session, button);
             return;
         }
     }
-    let inner = Block::bordered().inner(session.list_rect);
-    if mouse.column >= inner.x
-        && mouse.column < inner.x + inner.width
-        && mouse.row >= inner.y
-        && mouse.row < inner.y + inner.height
-    {
-        let row = (mouse.row - inner.y) as usize + session.list_offset;
-        let len = session.guide.tree_view().nodes.len();
-        if row < len {
-            session.guide.select_tree_row(row);
+    for (rect, column, index) in session.row_rects.clone() {
+        if mouse.row == rect.y && mouse.column >= rect.x && mouse.column < rect.x + rect.width {
+            while session.guide.column() != column {
+                let forward = matches!(
+                    (session.guide.column(), column),
+                    (Column::Deck, Column::Unit) | (Column::Unit, Column::Slot)
+                );
+                session.guide.move_column(if forward { 1 } else { -1 });
+            }
+            let current = match column {
+                Column::Deck => session.guide.nav().deck,
+                Column::Unit => session.guide.nav().unit,
+                Column::Slot => session.guide.nav().slot,
+            };
+            session.buttons_focused = false;
+            session
+                .guide
+                .move_cursor(index as isize - current as isize);
+            return;
         }
     }
 }
@@ -549,8 +605,8 @@ fn menu_enter(session: &mut Session, menu: Menu) {
     };
     match menu.action {
         MenuAction::NewUnitPreset => {
-            if session.guide.preset_is_global(&selected) {
-                if let Err(err) = session.guide.tree_new_global_unit(&selected, None) {
+            if !session.guide.preset_scope(&selected).takes_deck() {
+                if let Err(err) = session.guide.new_unit(&selected, None, None) {
                     session.guide.note(err);
                 }
                 return;
@@ -574,22 +630,23 @@ fn menu_enter(session: &mut Session, menu: Menu) {
         }
         MenuAction::NewUnitDeck { preset } => {
             let deck = parse_deck(&selected);
-            if let Err(err) = session.guide.tree_new_unit(&preset, deck, None) {
+            if let Err(err) = session.guide.new_unit(&preset, Some(deck), None) {
                 session.guide.note(err);
             }
         }
         MenuAction::CloneDeck => {
+            // The channel shift is device-specific (a 4-deck controller may put a deck on
+            // channels 0, 2, 4 …), so it is asked for rather than assumed.
             let deck = parse_deck(&selected);
-            if let Err(err) = session.guide.tree_clone(deck) {
-                session.guide.note(err);
-            }
+            session.overlay = Overlay::Text(TextPrompt {
+                title: format!("channel offset for deck {}", deck + 1),
+                buffer: "1".to_owned(),
+                action: TextAction::CloneOffset { deck },
+            });
         }
         MenuAction::NewSelector => {
             if selected == "Cycle" {
-                if let Err(err) = session
-                    .guide
-                    .tree_begin_selector(RawSelectorBehavior::Cycle, None)
-                {
+                if let Err(err) = session.guide.begin_mode_key(false, None) {
                     session.guide.note(err);
                 }
             } else {
@@ -603,16 +660,13 @@ fn menu_enter(session: &mut Session, menu: Menu) {
             }
         }
         MenuAction::SelectorTarget => {
-            if let Err(err) = session
-                .guide
-                .tree_begin_selector(RawSelectorBehavior::Trigger, Some(selected))
-            {
+            if let Err(err) = session.guide.begin_mode_key(true, Some(selected)) {
                 session.guide.note(err);
             }
         }
         MenuAction::ActionPick => {
             let buffer = if selected == "<type a line>" {
-                session.guide.tree_action_text().unwrap_or_default()
+                session.guide.action_text().unwrap_or_default()
             } else {
                 format!("{selected} ")
             };
@@ -623,15 +677,15 @@ fn menu_enter(session: &mut Session, menu: Menu) {
             });
         }
         MenuAction::SelectorBehavior => {
-            let (behavior, target) = if selected == "cycle" {
-                (RawSelectorBehavior::Cycle, None)
+            let (trigger, target) = if selected == "cycle" {
+                (false, None)
             } else if let Some(mode) = selected.strip_prefix("trigger ") {
-                (RawSelectorBehavior::Trigger, Some(mode.to_owned()))
+                (true, Some(mode.to_owned()))
             } else {
-                session.guide.note(format!("unknown selector behavior `{selected}`"));
+                session.guide.note(format!("unknown mode key behavior `{selected}`"));
                 return;
             };
-            if let Err(err) = session.guide.tree_set_selector_behavior(behavior, target) {
+            if let Err(err) = session.guide.set_mode_key(trigger, target) {
                 session.guide.note(err);
             }
         }
@@ -640,47 +694,85 @@ fn menu_enter(session: &mut Session, menu: Menu) {
 
 fn text_enter(session: &mut Session, prompt: TextPrompt) {
     let result = match prompt.action {
-        TextAction::NewMode => session.guide.tree_add_mode(prompt.buffer),
-        TextAction::ActionLine => session.guide.tree_set_action(prompt.buffer),
+        TextAction::NewMode => session.guide.add_mode(prompt.buffer),
+        TextAction::ActionLine => session.guide.set_action(prompt.buffer),
         TextAction::SaveAs => session.guide.save_as(prompt.buffer.trim()),
+        TextAction::CloneOffset { deck } => match prompt.buffer.trim().parse::<i16>() {
+            Ok(offset) => session.guide.clone_unit(deck, offset),
+            Err(_) => Err(format!("`{}` is not a channel offset", prompt.buffer.trim())),
+        },
     };
     if let Err(err) = result {
         session.guide.note(err);
     }
 }
 
-fn parse_deck(label: &str) -> u8 {
+fn parse_deck(label: &str) -> usize {
     label
         .rsplit(' ')
         .next()
-        .and_then(|value| value.parse().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|number| number.saturating_sub(1))
         .unwrap_or(0)
 }
 
 fn render(frame: &mut Frame, session: &mut Session) {
-    let view = session.guide.tree_view();
+    let view = session.guide.view();
     let area = frame.area();
     let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(8),
-        Constraint::Length(2),
-        Constraint::Length(1), // separator
-        Constraint::Length(1), // cfdisk-style button row
+        Constraint::Length(1), // header
+        Constraint::Min(8),    // the three columns
+        Constraint::Fill(1),   // info
+        Constraint::Fill(1),   // raw midi / watchdog
+        Constraint::Length(2), // status
+        Constraint::Length(1), // button row
     ])
     .split(area);
 
     render_header(frame, chunks[0], session, &view);
-    let body = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(chunks[1]);
-    session.list_rect = body[0];
-    render_tree(frame, body[0], session, &view);
-    let right = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(body[1]);
-    render_detail(frame, right[0], &view);
-    render_monitor(frame, right[1], session, &view);
-    render_status(frame, chunks[2], session, &view);
-    render_separator(frame, chunks[3], area.width);
-    render_buttons(frame, chunks[4], session, &view);
+    let columns = Layout::horizontal([
+        Constraint::Length(18),
+        Constraint::Percentage(38),
+        Constraint::Fill(1),
+    ])
+    .split(chunks[1]);
+    session.row_rects.clear();
+    let focused_column = if session.buttons_focused {
+        None
+    } else {
+        Some(view.nav.focus)
+    };
+    render_column(
+        frame,
+        columns[0],
+        " deck ",
+        &view.decks,
+        (view.nav.deck, focused_column == Some(ColumnFocus::Deck)),
+        Column::Deck,
+        session,
+    );
+    render_column(
+        frame,
+        columns[1],
+        " unit ",
+        &view.units,
+        (view.nav.unit, focused_column == Some(ColumnFocus::Unit)),
+        Column::Unit,
+        session,
+    );
+    render_column(
+        frame,
+        columns[2],
+        " slot ",
+        &view.slots,
+        (view.nav.slot, focused_column == Some(ColumnFocus::Slot)),
+        Column::Slot,
+        session,
+    );
+    render_detail(frame, chunks[2], &view);
+    render_monitor(frame, chunks[3], session, &view);
+    render_status(frame, chunks[4], session, &view);
+    render_buttons(frame, chunks[5], session, &view);
 
     match &session.overlay {
         Overlay::None => {}
@@ -693,8 +785,8 @@ fn render(frame: &mut Frame, session: &mut Session) {
     }
 }
 
-/// Header: only the file and the controller, as the mapping editor's two pieces of context.
-fn render_header(frame: &mut Frame, area: Rect, session: &Session, view: &TreeView) {
+/// Header: only the file and the controller, the mapping editor's two pieces of context.
+fn render_header(frame: &mut Frame, area: Rect, session: &Session, view: &View) {
     let file = view.path.as_deref().unwrap_or("<no file>");
     let controller = view
         .device
@@ -718,51 +810,75 @@ fn render_header(frame: &mut Frame, area: Rect, session: &Session, view: &TreeVi
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_tree(frame: &mut Frame, area: Rect, session: &mut Session, view: &TreeView) {
-    let items: Vec<ListItem> = view
-        .nodes
-        .iter()
-        .map(|node| {
-            let indent = "  ".repeat(node.depth);
-            let (style, marker) = match node.kind {
-                TreeNodeKind::Deck { .. } => (Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD), "▾ "),
-                TreeNodeKind::AddUnit { .. } => (Style::default().fg(Color::Green), "+ "),
-                TreeNodeKind::Unit { .. } => (Style::default().fg(Color::White).add_modifier(Modifier::BOLD), ""),
-                TreeNodeKind::Control { .. } => (Style::default().fg(Color::White), ""),
-                TreeNodeKind::ControlPart { part, .. } => (
-                    Style::default().fg(Color::Gray),
-                    match part {
-                        hypermixx_midi::guide::ControlPart::Press => "◉ ",
-                        hypermixx_midi::guide::ControlPart::Turn => "↻ ",
-                    },
-                ),
-                TreeNodeKind::Mode { .. } => (Style::default().fg(Color::Cyan), "• "),
-                TreeNodeKind::Action { .. } => (Style::default().fg(Color::Gray), ""),
-                TreeNodeKind::Selector { .. } => (Style::default().fg(Color::Magenta), ""),
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{indent}{marker}{}", node.label), style),
-                Span::raw("  "),
-                Span::styled(node.hint.clone(), Style::default().fg(Color::DarkGray)),
-            ]))
-        })
-        .collect();
-    let list = List::new(items)
-        .block(Block::bordered().title(" map "))
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
-        .highlight_symbol("▶ ");
-    let mut state = ListState::default().with_selected(Some(view.selected));
-    frame.render_stateful_widget(list, area, &mut state);
-    session.list_offset = state.offset();
+/// One bordered column, styled like the main TUI: the *border* colour carries focus (cyan when the
+/// column owns the cursor, grey otherwise), and the selected row is the grey `List` highlight.
+fn render_column(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    rows: &[Row],
+    (selected, focused): (usize, bool),
+    column: Column,
+    session: &mut Session,
+) {
+    let border = if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let block = Block::bordered()
+        .border_style(Style::default().fg(border))
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled("—", Style::default().fg(Color::DarkGray))),
+            inner,
+        );
+        return;
+    }
+    let selected = selected.min(rows.len() - 1);
+    let height = inner.height as usize;
+    let start = if rows.len() <= height || selected < height {
+        0
+    } else {
+        selected + 1 - height
+    };
+    let mut lines = Vec::new();
+    for (index, row) in rows.iter().enumerate().skip(start).take(height) {
+        let active = index == selected;
+        // Same highlight as the browser's list: grey background, white text.
+        let style = if active {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        } else if row.muted {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let marker = if active { "› " } else { "  " };
+        let text = if active && !row.hint.is_empty() {
+            format!("{marker}{}  {}", row.label, row.hint)
+        } else {
+            format!("{marker}{}", row.label)
+        };
+        session.row_rects.push((
+            Rect::new(inner.x, inner.y + (index - start) as u16, inner.width, 1),
+            column,
+            index,
+        ));
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-fn render_detail(frame: &mut Frame, area: Rect, view: &TreeView) {
+fn render_detail(frame: &mut Frame, area: Rect, view: &View) {
     let mut lines: Vec<Line> = view
         .details
         .iter()
         .map(|(key, value)| {
             Line::from(vec![
-                Span::styled(format!("{key}: "), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!(" {key}: "), Style::default().fg(Color::DarkGray)),
                 Span::raw(value.clone()),
             ])
         })
@@ -770,31 +886,35 @@ fn render_detail(frame: &mut Frame, area: Rect, view: &TreeView) {
     if view.capturing {
         if let Some(candidate) = &view.candidate {
             lines.push(Line::from(vec![
-                Span::styled("detected: ", Style::default().fg(Color::Cyan)),
+                Span::styled(" detected: ", Style::default().fg(Color::Cyan)),
                 Span::styled(candidate.label(), Style::default().fg(Color::Cyan)),
             ]));
         } else {
             lines.push(Line::from(Span::styled(
-                "waiting for a control…",
+                " waiting for a control…",
                 Style::default().fg(Color::Cyan),
             )));
         }
     }
     if let Some(error) = &view.error {
         lines.push(Line::from(Span::styled(
-            error.clone(),
+            format!(" {error}"),
             Style::default().fg(Color::Red),
         )));
     }
+    let title = match &view.mode {
+        Some((index, count, name)) => format!(" info · mode {}/{count} {name} ", index + 1),
+        None => " info ".to_owned(),
+    };
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(Block::bordered().title(" selected "))
+            .block(Block::bordered().title(title))
             .wrap(Wrap { trim: false }),
         area,
     );
 }
 
-fn render_monitor(frame: &mut Frame, area: Rect, session: &Session, view: &TreeView) {
+fn render_monitor(frame: &mut Frame, area: Rect, session: &Session, view: &View) {
     let inner = Block::bordered().inner(area);
     let height = inner.height as usize;
     let total = session.monitor.len();
@@ -817,7 +937,7 @@ fn render_monitor(frame: &mut Frame, area: Rect, session: &Session, view: &TreeV
     let title = if session.monitor_offset > 0 {
         format!(" raw midi [↑{}] ", session.monitor_offset)
     } else {
-        " raw midi ".to_owned()
+        " raw midi / watchdog ".to_owned()
     };
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(Block::bordered().title(title)),
@@ -825,18 +945,7 @@ fn render_monitor(frame: &mut Frame, area: Rect, session: &Session, view: &TreeV
     );
 }
 
-fn render_separator(frame: &mut Frame, area: Rect, width: u16) {
-    let line = "─".repeat(width as usize);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            line,
-            Style::default().fg(Color::DarkGray),
-        ))),
-        area,
-    );
-}
-
-fn render_status(frame: &mut Frame, area: Rect, session: &Session, view: &TreeView) {
+fn render_status(frame: &mut Frame, area: Rect, session: &Session, view: &View) {
     let first = view
         .message
         .clone()
@@ -847,7 +956,10 @@ fn render_status(frame: &mut Frame, area: Rect, session: &Session, view: &TreeVi
             } else if view.capturing {
                 "press the control, then Confirm".to_owned()
             } else {
-                "select a tree row; its actions appear in the bottom bar".to_owned()
+                format!(
+                    "{} column · Enter to drill in · [ ] mode",
+                    view.nav.focus.column().label()
+                )
             }
         });
     let style = if view.error.is_some() {
@@ -868,7 +980,7 @@ fn render_status(frame: &mut Frame, area: Rect, session: &Session, view: &TreeVi
             .get(session.button_focus)
             .map(|button| button.hint())
             .unwrap_or("select a row");
-        format!("{focused} · ↑↓ tree · ←→ button · Enter activate · PgUp/PgDn raw")
+        format!("{focused} · ↑↓ row · ←→ column · Tab button · Enter")
     };
     frame.render_widget(
         Paragraph::new(Text::from(vec![
@@ -883,7 +995,7 @@ fn render_status(frame: &mut Frame, area: Rect, session: &Session, view: &TreeVi
     );
 }
 
-fn render_buttons(frame: &mut Frame, area: Rect, session: &mut Session, view: &TreeView) {
+fn render_buttons(frame: &mut Frame, area: Rect, session: &mut Session, view: &View) {
     session.button_rects.clear();
     if view.buttons.is_empty() {
         return;
@@ -927,11 +1039,14 @@ fn render_buttons(frame: &mut Frame, area: Rect, session: &mut Session, view: &T
         if x + width > area.x + area.width {
             break;
         }
-        let style = if *index == session.button_focus {
+        let style = if *index == session.button_focus && session.buttons_focused {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
+        } else if *index == session.button_focus {
+            // The row does not own the cursor, so the focused button is only outlined by colour.
+            Style::default().fg(Color::Cyan)
         } else {
             Style::default().fg(Color::White)
         };
@@ -1048,8 +1163,9 @@ mod tests {
 
     #[test]
     fn a_deck_label_parses_back_to_its_number() {
-        assert_eq!(parse_deck("deck 0"), 0);
-        assert_eq!(parse_deck("deck 1"), 1);
+        // The menu is 1-based; the stored deck id is 0-based.
+        assert_eq!(parse_deck("deck 1"), 0);
+        assert_eq!(parse_deck("deck 2"), 1);
     }
 
     #[test]
@@ -1069,6 +1185,74 @@ mod tests {
         assert_eq!(session.monitor_offset, 0);
     }
 
+    /// The whole flow the guide exists for: pick a preset, learn an endpoint, save, reopen.
+    #[test]
+    fn a_whole_edit_round_trips_and_renders() {
+        let dir = std::env::temp_dir().join(format!("hypermixx-cli-guide-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("map.toml");
+        let path_text = path.display().to_string();
+        let mut session = Session::new(&path_text, 2).unwrap();
+
+        session
+            .guide
+            .new_unit("transport", Some(0), None)
+            .unwrap();
+        session.guide.select_slot(0, "play");
+        session.guide.begin_learn().unwrap();
+        session.guide.feed(&hypermixx_midi::Event::NoteOn {
+            channel: 0,
+            key: 16,
+            velocity: 100,
+        });
+        session.guide.confirm_learn().unwrap();
+        render_once(&mut session);
+        session.guide.save_as(&path_text).unwrap();
+        assert!(path.exists());
+
+        let reopened = Session::new(&path_text, 2).unwrap();
+        assert!(reopened.guide.view().error.is_none());
+        assert!(!reopened.guide.view().units.is_empty());
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn render_once(session: &mut Session) {
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, session))
+            .expect("guide layout");
+    }
+
+    #[test]
+    fn the_shipped_map_renders_its_units_and_slots() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = root.join("profile/midi-map.toml");
+        let mut session = Session::new(&path.display().to_string(), 2).unwrap();
+        session.open_map(&path).unwrap();
+        let view = session.guide.view();
+        assert!(view.error.is_none(), "{:?}", view.error);
+        let decks: Vec<&str> = view.decks.iter().map(|row| row.label.as_str()).collect();
+        assert!(decks.contains(&"deck1") && decks.contains(&"global"), "{decks:?}");
+        let units: Vec<&str> = view.units.iter().map(|row| row.label.as_str()).collect();
+        assert!(units.contains(&"deck1.pad"), "{units:?}");
+
+        // The slot column lists the jog's two halves.
+        let jog = session.guide.unit_index("deck1.jog").expect("deck1.jog");
+        session.guide.select_slot(jog, "jog");
+        let slots: Vec<String> = session
+            .guide
+            .view()
+            .slots
+            .into_iter()
+            .map(|row| row.label)
+            .collect();
+        assert!(slots.contains(&"press".to_owned()), "{slots:?}");
+        assert!(slots.contains(&"turn".to_owned()), "{slots:?}");
+        render_once(&mut session);
+    }
+
     #[test]
     fn the_layout_renders_at_normal_and_tiny_sizes() {
         let mut session = test_session();
@@ -1082,30 +1266,110 @@ mod tests {
     }
 
     #[test]
-    fn the_tree_context_switches_the_bottom_buttons() {
+    fn the_column_context_switches_the_bottom_buttons() {
         let mut session = test_session();
         session
             .guide
-            .tree_new_unit("touchpad", 0, None)
+            .new_unit("pad", Some(0), None)
             .expect("unit from preset");
-        let tree = session.guide.tree();
-        let control = tree
+
+        // Unit column: a deck unit can be cloned, and nothing else but the persistent four.
+        let view = session.guide.view();
+        assert_eq!(
+            view.buttons,
+            vec![
+                TreeButton::Clone,
+                TreeButton::Connect,
+                TreeButton::Open,
+                TreeButton::Save,
+                TreeButton::Exit
+            ]
+        );
+
+        // A global unit has no deck to clone to.
+        session
+            .guide
+            .new_unit("output", None, None)
+            .expect("global unit");
+        let view = session.guide.view();
+        assert_eq!(
+            view.buttons,
+            vec![
+                TreeButton::Connect,
+                TreeButton::Open,
+                TreeButton::Save,
+                TreeButton::Exit
+            ]
+        );
+
+        // Slot column: learning is the only extra.
+        let pad = session.guide.unit_index("deck1.pad").expect("pad");
+        session.guide.select_slot(pad, "pad1");
+        let view = session.guide.view();
+        assert_eq!(
+            view.buttons,
+            vec![
+                TreeButton::Learn,
+                TreeButton::Connect,
+                TreeButton::Open,
+                TreeButton::Save,
+                TreeButton::Exit
+            ]
+        );
+    }
+
+    #[test]
+    fn tab_then_enter_activates_the_button_row_not_the_columns() {
+        let mut session = test_session();
+        session
+            .guide
+            .new_unit("transport", Some(0), None)
+            .unwrap();
+        let before = session.guide.nav().focus;
+
+        handle_key(&mut session, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert!(session.buttons_focused, "Tab moves the cursor to the buttons");
+        // The columns keep their selection but no longer look focused.
+        assert_eq!(session.guide.nav().focus, before);
+
+        // Walk to `Open` and press Enter: the file picker must open, not a drill-down.
+        let view = session.guide.view();
+        let open = view
+            .buttons
             .iter()
-            .position(|node| matches!(node.kind, TreeNodeKind::Control { control: 0, .. }))
-            .expect("pad1");
-        session.guide.select_tree_row(control);
-        let view = session.guide.tree_view();
-        assert!(view.buttons.contains(&TreeButton::Learn));
-        assert!(!view.buttons.contains(&TreeButton::Edit));
-        let action = tree
+            .position(|button| *button == TreeButton::Open)
+            .expect("open button");
+        session.button_focus = open;
+        handle_key(&mut session, KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(matches!(session.overlay, Overlay::Files(_)), "{:?}", std::mem::discriminant(&session.overlay));
+        assert_eq!(session.guide.column(), before.column());
+    }
+
+    #[test]
+    fn clicking_a_column_row_moves_the_cursor() {
+        let mut session = test_session();
+        session
+            .guide
+            .new_unit("transport", Some(0), None)
+            .unwrap();
+        render_once(&mut session);
+        let (rect, column, index) = session
+            .row_rects
             .iter()
-            .position(|node| matches!(node.kind, TreeNodeKind::Action { mode: 0, control: 0, .. }))
-            .expect("hotcue/pad1 action");
-        session.guide.select_tree_row(action);
-        let view = session.guide.tree_view();
-        assert!(view.buttons.contains(&TreeButton::Edit));
-        assert!(view.buttons.contains(&TreeButton::On));
-        assert!(view.nodes.iter().any(|node| node.label.contains("pad1")));
+            .find(|(_, column, index)| *column == Column::Slot && *index == 0)
+            .copied()
+            .expect("a slot row");
+        handle_mouse(
+            &mut session,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x + 1,
+                row: rect.y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+        assert_eq!(session.guide.column(), column);
+        assert_eq!(session.guide.nav().slot, index);
     }
 
     #[test]
@@ -1144,3 +1408,4 @@ mod tests {
         assert!(matches!(session.overlay, Overlay::Ports(_)));
     }
 }
+

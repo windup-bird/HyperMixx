@@ -1,45 +1,53 @@
-# A user preset. `[meta] presets = ["presets/example.toml"]` in the map makes it visible; a
-# preset with a built-in's name replaces that built-in for this map only.
+# A user preset. `[meta] presets = ["presets/example.toml"]` in the map makes it visible; a preset
+# with a built-in's name replaces that built-in for this map only.
 #
-# A preset supplies slot names/shapes and default mode tables. The unit still binds the physical
-# endpoints, so the same preset can be used on deck0 and deck1.
+# A preset supplies slot names, kinds and default mode tables. The unit still binds the physical
+# endpoints, so the same preset can be used on deck1 and deck2.
 [[preset]]
-name = "deckfx"
+name = "mydeckfx"
+scope = "deck"
 start = "filter"
 
 [[preset.slot]]
 slot = "knob1"
-shape = "Knob"
+type = "Knob"
 [[preset.slot]]
 slot = "knob2"
-shape = "Knob"
+type = "Knob"
+[[preset.slot]]
+slot = "toggle"
+type = "Button"
 
 [[preset.mode]]
 name = "filter"
 [[preset.mode.bind]]
-slot = "knob1"
-action = "fx param"
+slot = "toggle"
+action = "fx toggle"
 fx = "filter"
-param = "value"
+[[preset.mode.bind]]
+slot = "knob1"
+action = "fx param value"
+fx = "filter"
 [[preset.mode.bind]]
 slot = "knob2"
-action = "fx param"
+action = "fx param resonance"
 fx = "filter"
-param = "resonance"
 
 [[preset.mode]]
 name = "eq"
 [[preset.mode.bind]]
-slot = "knob1"
-action = "fx param"
+slot = "toggle"
+action = "fx toggle"
 fx = "eq"
-param = "low"
+[[preset.mode.bind]]
+slot = "knob1"
+action = "fx param low"
+fx = "eq"
 min = -1.0
 max = 1.0
 [[preset.mode.bind]]
 slot = "knob2"
-action = "fx param"
+action = "fx param high"
 fx = "eq"
-param = "high"
 min = -1.0
 max = 1.0

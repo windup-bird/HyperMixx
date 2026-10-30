@@ -107,12 +107,12 @@ TUI 内尽量不用启动参数:`--tui` 下按 `F2` 选 MIDI 端口、`F3` 选�
 `auto` 按 kitty → braille 选择（tmux/screen 暂回 braille）；kitty 可用 60Hz。
 
 `profile/` 放全部默认文件：`profile.toml`（用哪几个文件）、`mixer.toml`（拓扑）、`live.toml`（本机设置）、
-`midi.toml`（设备名 + 映射）、`preference.toml`（波形颜色/backend/刷新率），命名 profile 也放这里
+`midi.toml`（映射文件，设备名在 `[meta].device`）、`preference.toml`（波形颜色/backend/刷新率），命名 profile 也放这里
 （`--profile dj` → `profile/dj.toml`）。文件里的相对路径都相对它所在的文件夹。
 运行时改配置不必重启：`mixer reload` 重建拓扑（保留走带），`live reload` 重读本机设置
 （引擎率/ring 需重启，`[stems]` 立即生效）。
 
-终端内 `midi ports` 列出可用 MIDI 输入端口；映射表格式与全部 action 见 `midi-map.toml` 注释与 [`docs/midi-mapping.md`](docs/midi-mapping.md)。
+终端内 `midi ports` 列出可用 MIDI 输入端口；映射表格式与全部 action 见 `midi-map.toml` 注释与 [`docs/MIDI.md`](docs/MIDI.md)。
 
 
 ## 脚本

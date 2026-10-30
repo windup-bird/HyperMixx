@@ -1,13 +1,28 @@
+# A platter. The press note is the touch; the CC is the wheel. Three modes: scratch, slip, bend.
 [[preset]]
 name = "jog"
-start = "default"
+scope = "deck"
+start = "vinyl"
 
 [[preset.slot]]
 slot = "jog"
-shape = "JogWheel"
+type = "JogWheel"
 
 [[preset.mode]]
-name = "default"
+name = "vinyl"
 [[preset.mode.bind]]
 slot = "jog"
 action = "vinyl"
+
+[[preset.mode]]
+name = "slip"
+[[preset.mode.bind]]
+slot = "jog"
+press = "vinyl slip"
+turn = "vinyl"
+
+[[preset.mode]]
+name = "nudge"
+[[preset.mode.bind]]
+slot = "jog"
+turn = "nudge 0.15"

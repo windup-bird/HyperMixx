@@ -1,0 +1,28 @@
+# Manual beat-jump keys plus a relative knob that jumps both ways.
+[[preset]]
+name = "manualjump"
+scope = "deck"
+start = "default"
+
+[[preset.slot]]
+slot = "forward"
+type = "Button"
+[[preset.slot]]
+slot = "backward"
+type = "Button"
+[[preset.slot]]
+slot = "autojump"
+type = "RelKnob"
+
+[[preset.mode]]
+name = "default"
+[[preset.mode.bind]]
+slot = "forward"
+action = "beatjump 4"
+[[preset.mode.bind]]
+slot = "backward"
+action = "beatjump -4"
+[[preset.mode.bind]]
+slot = "autojump"
+action = "beatjump 1"
+down = "beatjump -1"
