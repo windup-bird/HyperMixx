@@ -444,10 +444,7 @@ impl App {
                 source.kind.label(),
                 stats.summary()
             ))),
-            Err(err) => self.push_log(LogLine::error(format!(
-                "[library] {}: {err}",
-                source.name
-            ))),
+            Err(err) => self.push_log(LogLine::error(format!("[library] {}: {err}", source.name))),
         }
     }
 

@@ -630,6 +630,26 @@ impl Mixer {
                 },
                 None => CommandResponse::Error(slot_error(&slot)),
             },
+            Command::SetFxParamIndex { slot, index, value } => match self.resolve_fx(&slot) {
+                Some(found) => {
+                    let Some(name) = found.fx().param_names().get(index).copied() else {
+                        return CommandResponse::Error(format!(
+                            "{}: parameter index {} is out of range",
+                            slot.chain.label(),
+                            index + 1
+                        ));
+                    };
+                    match found.set_param(name, value) {
+                        Ok(()) => CommandResponse::Ok,
+                        Err(err) => CommandResponse::Error(format!(
+                            "{} {name}: {}",
+                            slot.chain.label(),
+                            err.message()
+                        )),
+                    }
+                }
+                None => CommandResponse::Error(slot_error(&slot)),
+            },
             Command::FxTrigger { slot } => match self.resolve_fx_mut(&slot) {
                 Some(found) => {
                     found.trigger();
@@ -1118,7 +1138,15 @@ mod tests {
             CommandResponse::Ok => {}
             other => panic!("expected Ok, got {other:?}"),
         }
-        assert_eq!(mixer.resolve_fx(&slot).unwrap().get_param("gain"), Some(0.25));
+        match mixer.handle_fx_command(Command::SetFxParamIndex {
+            slot,
+            index: 0,
+            value: 0.5,
+        }) {
+            CommandResponse::Ok => {}
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        assert_eq!(mixer.resolve_fx(&slot).unwrap().get_param("gain"), Some(0.5));
 
         mixer.handle_fx_command(Command::SetFxEnabled { slot, enabled: false });
         assert!(!mixer.resolve_fx(&slot).unwrap().is_enabled());

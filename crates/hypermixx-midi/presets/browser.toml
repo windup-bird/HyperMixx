@@ -7,7 +7,7 @@ start = "default"
 # A two-point encoder: 1 = one step, 127 = the other. Reversed once here because the shipped
 # encoder turns the other way.
 [[preset.slot]]
-slot = "browse"
+slot = "choose"
 type = "RelKnob"
 [[preset.slot]]
 slot = "open"
@@ -22,7 +22,7 @@ type = "Button"
 [[preset.mode]]
 name = "default"
 [[preset.mode.bind]]
-slot = "browse"
+slot = "choose"
 action = "browser down"
 down = "browser up"
 [[preset.mode.bind]]

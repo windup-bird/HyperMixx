@@ -43,10 +43,7 @@ impl ProcessMonitor {
 
     /// Samples if a second has passed. Safe to call every UI tick.
     pub fn refresh(&mut self) {
-        if self
-            .last
-            .is_some_and(|last| last.elapsed() < SAMPLE_EVERY)
-        {
+        if self.last.is_some_and(|last| last.elapsed() < SAMPLE_EVERY) {
             return;
         }
         self.sample();
@@ -94,7 +91,11 @@ mod tests {
         // 200% top-style = two cores = 25% of an 8-core machine.
         assert_eq!(normalise_cpu(200.0, 8.0), 25.0);
         assert_eq!(normalise_cpu(50.0, 4.0), 12.5);
-        assert_eq!(normalise_cpu(1000.0, 8.0), 100.0, "clamped to a machine share");
+        assert_eq!(
+            normalise_cpu(1000.0, 8.0),
+            100.0,
+            "clamped to a machine share"
+        );
         assert_eq!(normalise_cpu(f32::NAN, 8.0), 0.0);
     }
 }

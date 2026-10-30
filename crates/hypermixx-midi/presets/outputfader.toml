@@ -1,6 +1,6 @@
 # Master and cue bus trims. Not tied to a deck.
 [[preset]]
-name = "output"
+name = "outputfader"
 scope = "global"
 start = "default"
 

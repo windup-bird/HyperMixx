@@ -1,0 +1,31 @@
+# One generic deck FX section. It addresses the stable slot name fx2; the effect behind that
+# pointer can change later without touching the MIDI map.
+[[preset]]
+name = "deckfx2"
+scope = "deck"
+start = "default"
+
+[[preset.slot]]
+slot = "toggle"
+type = "Button"
+[[preset.slot]]
+slot = "param1"
+type = "Knob"
+[[preset.slot]]
+slot = "param2"
+type = "Knob"
+
+[[preset.mode]]
+name = "default"
+[[preset.mode.bind]]
+slot = "toggle"
+action = "fx toggle"
+fx = "fx2"
+[[preset.mode.bind]]
+slot = "param1"
+action = "fx param 1"
+fx = "fx2"
+[[preset.mode.bind]]
+slot = "param2"
+action = "fx param 2"
+fx = "fx2"

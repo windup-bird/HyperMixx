@@ -58,11 +58,8 @@ endpoint = { midi = "cc", channel = 0, id = 23 }
 slot = "filter"
 endpoint = { midi = "cc", channel = 0, id = 26 }
 [[unit.control]]
-slot = "cue"
+slot = "cue-toggle"
 endpoint = { midi = "note", channel = 0, id = 27 }
-[[unit.control]]
-slot = "load"
-endpoint = { midi = "note", channel = 15, id = 2 }
 
 [[unit]]
 id = "deck1.browser"
@@ -70,7 +67,7 @@ preset = "browser"
 deck = 1
 
 [[unit.control]]
-slot = "browse"
+slot = "choose"
 endpoint = { midi = "cc", encoding = "two_point", reverse = true, channel = 15, id = 0 }
 [[unit.control]]
 slot = "open"
@@ -139,11 +136,8 @@ endpoint = { midi = "cc", channel = 1, id = 23 }
 slot = "filter"
 endpoint = { midi = "cc", channel = 1, id = 26 }
 [[unit.control]]
-slot = "cue"
+slot = "cue-toggle"
 endpoint = { midi = "note", channel = 1, id = 27 }
-[[unit.control]]
-slot = "load"
-endpoint = { midi = "note", channel = 15, id = 3 }
 
 [[unit]]
 id = "deck2.tempo"

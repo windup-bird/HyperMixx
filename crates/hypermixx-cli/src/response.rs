@@ -183,11 +183,7 @@ pub fn deck_line(state: &DeckState, sample_rate: u32) -> String {
 }
 
 /// The loop's length: a bare beat count when a grid is available, otherwise a clock duration.
-pub fn loop_length(
-    state: &DeckState,
-    grid: Option<&BeatGrid>,
-    sample_rate: u32,
-) -> Option<String> {
+pub fn loop_length(state: &DeckState, grid: Option<&BeatGrid>, sample_rate: u32) -> Option<String> {
     let (in_frame, out_frame) = state.loop_range?;
     let frames = out_frame.checked_sub(in_frame)?;
     if frames == 0 {

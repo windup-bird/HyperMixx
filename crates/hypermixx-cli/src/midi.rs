@@ -76,8 +76,7 @@ impl MidiSession {
 
 /// Reads and parses a map file. FX-name resolution is the caller's job (see [`resolve_with`]).
 pub fn read_map(map_path: &str) -> Result<Map, String> {
-    let text =
-        std::fs::read_to_string(map_path).map_err(|err| format!("{map_path}: {err}"))?;
+    let text = std::fs::read_to_string(map_path).map_err(|err| format!("{map_path}: {err}"))?;
     let base = Path::new(map_path)
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
@@ -250,13 +249,9 @@ pub fn resolve_with(
     for unit in &map.units {
         for mode in &unit.modes {
             for bind in mode.binds.iter().flatten() {
-                for action in [
-                    &bind.actions.main,
-                    &bind.actions.press,
-                    &bind.actions.turn,
-                ]
-                .into_iter()
-                .flatten()
+                for action in [&bind.actions.main, &bind.actions.press, &bind.actions.turn]
+                    .into_iter()
+                    .flatten()
                 {
                     if let Action::Fx(fx_action) = action {
                         let pair = {

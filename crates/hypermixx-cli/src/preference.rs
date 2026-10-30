@@ -108,7 +108,6 @@ impl LibraryFormat {
             Self::VirtualDj => SourceKind::VirtualDj,
         }
     }
-
 }
 
 /// Library discovery settings. A category that is absent or empty contributes no sources; this is
@@ -235,7 +234,12 @@ fn parse_display(
 ) {
     for (key, value) in table {
         match key.as_str() {
-            "key" => match value.as_str().map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            "key" => match value
+                .as_str()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
                 Some("camelot" | "camlot") => display.key_format = KeyFormat::Camelot,
                 Some("classic" | "traditional") => display.key_format = KeyFormat::Traditional,
                 _ => notes.push("display.key must be camelot | classic".to_owned()),
@@ -266,9 +270,9 @@ fn parse_library(
                 for value in values {
                     match value.as_str().and_then(LibraryFormat::parse) {
                         Some(format) => target.push(format),
-                        None => notes.push(format!(
-                            "library.{key} entries must be rkb | serato | vdj"
-                        )),
+                        None => {
+                            notes.push(format!("library.{key} entries must be rkb | serato | vdj"))
+                        }
                     }
                 }
             }
@@ -339,8 +343,7 @@ fn parse_waveform(
             "backend" => match value.as_str().and_then(WaveformBackend::parse) {
                 Some(backend) => waveform.backend = backend,
                 None => notes.push(
-                    "waveform.backend must be auto | kitty | braille; using the default"
-                        .to_owned(),
+                    "waveform.backend must be auto | kitty | braille; using the default".to_owned(),
                 ),
             },
             "refresh_hz" => match value.as_integer() {

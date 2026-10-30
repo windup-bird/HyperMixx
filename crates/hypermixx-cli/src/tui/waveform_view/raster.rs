@@ -67,7 +67,6 @@ impl Palette {
         }
         Self { rgba }
     }
-
 }
 
 fn rgb(color: Color) -> [u8; 4] {
@@ -158,7 +157,15 @@ pub fn rasterize_with(
     let start_frame = playhead - f64::from(center_x) * frames_per_pixel;
 
     if let Some((in_frame, out_frame)) = overlay.loop_range {
-        draw_loop(&mut indices, width, height, playhead, frames_per_pixel, in_frame, out_frame);
+        draw_loop(
+            &mut indices,
+            width,
+            height,
+            playhead,
+            frames_per_pixel,
+            in_frame,
+            out_frame,
+        );
     }
     if let Some(grid) = grid {
         draw_beats(
@@ -391,20 +398,10 @@ mod tests {
             memory_cue: Some(500),
             hot_cues: [Some(510), None, None, None, None, None, None, None],
         };
-        let image = rasterize_with(
-            Some(&waveform),
-            None,
-            500.0,
-            1.0,
-            21,
-            13,
-            false,
-            &overlay,
-        );
+        let image = rasterize_with(Some(&waveform), None, 500.0, 1.0, 21, 13, false, &overlay);
         let index = |x: u32| image.indices[(6 * image.width + x) as usize];
-        assert!((0..21).any(|x| (0..13).any(|y| {
-            image.indices[(y * image.width + x) as usize] == LOOP
-        })));
+        assert!((0..21)
+            .any(|x| (0..13).any(|y| { image.indices[(y * image.width + x) as usize] == LOOP })));
         assert_eq!(index(10), MEMORY);
         assert_eq!(index(20), HOT0);
     }
@@ -416,12 +413,10 @@ mod tests {
         let raster = rasterize(Some(&waveform), None, 128.0, 1.0, 21, 12, false);
         let center = raster.height / 2;
         let left = (0..center).any(|y| {
-            (0..raster.width)
-                .any(|x| raster.indices[(y * raster.width + x) as usize] != BG)
+            (0..raster.width).any(|x| raster.indices[(y * raster.width + x) as usize] != BG)
         });
         let right = (center + 1..raster.height).any(|y| {
-            (0..raster.width)
-                .any(|x| raster.indices[(y * raster.width + x) as usize] != BG)
+            (0..raster.width).any(|x| raster.indices[(y * raster.width + x) as usize] != BG)
         });
         assert!(left, "left channel should paint above the centre");
         assert!(!right, "right channel is empty");

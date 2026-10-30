@@ -1,113 +1,18 @@
-//! The map editor's model: a tree over the file, plus the state machine that learns an endpoint.
+//! The map editor's model: three columns over the file, plus the state machine that learns an
+//! endpoint.
 //!
-//! The tree is built from the **file**, not from the compiled map, so a half-finished map still
-//! renders (and can be fixed) instead of disappearing behind a compile error. Compilation is only
-//! used to report whether the current file is valid.
+//! The columns are built from the **file**, not from the compiled map, so a half-finished map
+//! still renders (and can be fixed) instead of disappearing behind a compile error. Compilation is
+//! only used to report whether the current file is valid.
 
 use std::path::{Path, PathBuf};
 
 use crate::map::{
-    Edge, Encoding, EndpointRole, EventKind, Map, MapFile, RawControl, RawEndpoint, RawMode,
-    RawModeBind, RawUnit, SlotKind, SlotRole,
+    Encoding, EndpointRole, EventKind, Map, MapFile, RawControl, RawEndpoint, RawModeBind, RawUnit,
+    SlotKind, SlotRole,
 };
 use crate::msg::Event;
 use crate::preset::{Preset, PresetRegistry, PresetScope};
-
-/// The four-way buttons the bottom bar shows. Connect/Open/Save/Exit are always appended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TreeButton {
-    Learn,
-    NewUnit,
-    Clone,
-    NewMode,
-    NewSelector,
-    Delete,
-    Up,
-    Down,
-    SetStart,
-    Edit,
-    On,
-    Confirm,
-    Cancel,
-    Mode,
-    Connect,
-    Open,
-    Save,
-    Exit,
-}
-
-impl TreeButton {
-    pub fn label(self) -> &'static str {
-        match self {
-            TreeButton::Learn => "Learn",
-            TreeButton::NewUnit => "New unit",
-            TreeButton::Clone => "Clone",
-            TreeButton::NewMode => "New mode",
-            TreeButton::NewSelector => "New mode key",
-            TreeButton::Delete => "Del",
-            TreeButton::Up => "Up",
-            TreeButton::Down => "Down",
-            TreeButton::SetStart => "Start",
-            TreeButton::Edit => "Edit",
-            TreeButton::On => "On",
-            TreeButton::Confirm => "Confirm",
-            TreeButton::Cancel => "Cancel",
-            TreeButton::Mode => "Encoding",
-            TreeButton::Connect => "Connect",
-            TreeButton::Open => "Open",
-            TreeButton::Save => "Save",
-            TreeButton::Exit => "Exit",
-        }
-    }
-
-    /// One short line under the button row, so the focused action explains itself.
-    pub fn hint(self) -> &'static str {
-        match self {
-            TreeButton::Learn => "learn the selected slot's endpoint",
-            TreeButton::NewUnit => "add a unit from a preset",
-            TreeButton::Clone => "copy this unit to another deck",
-            TreeButton::NewMode => "add a mode to this unit",
-            TreeButton::NewSelector => "add a mode key (trigger or cycle)",
-            TreeButton::Delete => "delete the selected item",
-            TreeButton::Up => "move the mode up",
-            TreeButton::Down => "move the mode down",
-            TreeButton::SetStart => "mark this mode as the start mode",
-            TreeButton::Edit => "edit the selected action or mode key",
-            TreeButton::On => "toggle press / release edge",
-            TreeButton::Confirm => "confirm the learned endpoint",
-            TreeButton::Cancel => "cancel learning",
-            TreeButton::Mode => "cycle absolute / two-point / offset / complement / direction",
-            TreeButton::Connect => "choose the MIDI input",
-            TreeButton::Open => "open a map file",
-            TreeButton::Save => "save the map",
-            TreeButton::Exit => "quit the guide",
-        }
-    }
-}
-
-/// One half of a compound slot (currently a jog wheel). The slot stays a single control so press and
-/// turn share `vinyl` and the touch state; the tree only shows them separately.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ControlPart {
-    Press,
-    Turn,
-}
-
-impl ControlPart {
-    pub fn label(self) -> &'static str {
-        match self {
-            ControlPart::Press => "press",
-            ControlPart::Turn => "turn",
-        }
-    }
-
-    fn role(self) -> EndpointRole {
-        match self {
-            ControlPart::Press => EndpointRole::Press,
-            ControlPart::Turn => EndpointRole::Turn,
-        }
-    }
-}
 
 /// Which column has the cursor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,8 +41,6 @@ pub struct Nav {
     pub deck: usize,
     pub unit: usize,
     pub slot: usize,
-    /// The mode the info pane is showing.
-    pub mode: usize,
     pub focus: ColumnFocus,
 }
 
@@ -166,6 +69,21 @@ pub enum Entered {
     Moved,
     Learning,
     AddUnit,
+    NewDeck,
+}
+
+/// Which kind of row a deck-column entry is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeckKind {
+    Global,
+    Deck(usize),
+    New,
+}
+
+/// One deck-column row.
+struct DeckEntry {
+    row: Row,
+    kind: DeckKind,
 }
 
 /// A unit row, with the id it points at (`None` for the trailing `add unit`).
@@ -174,18 +92,16 @@ struct UnitEntry {
     unit: Option<usize>,
 }
 
-/// A slot row: a control, a jog half, or a mode key.
+/// A slot row: one control, including mode keys.
 struct SlotEntry {
     row: Row,
     slot: Option<usize>,
-    part: Option<ControlPart>,
 }
 
 /// One rendered row of a column.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Row {
     pub label: String,
-    pub hint: String,
     /// Drawn dim: the trailing `add unit` row.
     pub muted: bool,
 }
@@ -202,15 +118,12 @@ pub struct View {
     pub units: Vec<Row>,
     pub slots: Vec<Row>,
     pub nav: Nav,
-    /// Lines for the right-hand info card.
+    /// Lines for the info pane.
     pub details: Vec<(String, String)>,
     /// Endpoints to highlight in the raw monitor.
     pub endpoints: Vec<(EventKind, u8, u8)>,
-    pub buttons: Vec<TreeButton>,
     pub capturing: bool,
     pub candidate: Option<Candidate>,
-    /// `(index, count, name)` of the mode the info pane shows, when a unit is selected.
-    pub mode: Option<(usize, usize, String)>,
 }
 
 /// A detected endpoint, before it is committed to a slot.
@@ -292,7 +205,6 @@ struct SlotInfo {
     target: Option<String>,
     /// The raw endpoints bound to it, as `(role, endpoint)`.
     endpoints: Vec<(EndpointRole, RawEndpoint)>,
-    from_preset: bool,
 }
 
 /// The guide session.
@@ -305,6 +217,9 @@ pub struct Guide {
     compiled: Option<Map>,
     error: Option<String>,
     decks: usize,
+    /// Decks created from the `new` row that have no unit yet. They exist for this session only;
+    /// the first unit added to one is what makes it appear in the file.
+    extra_decks: std::collections::BTreeSet<usize>,
     nav: Nav,
     capture: Option<Capture>,
     dirty: bool,
@@ -314,18 +229,22 @@ pub struct Guide {
 impl Guide {
     /// An empty session that has not loaded anything.
     pub fn empty(decks: usize) -> Result<Self, String> {
-        Self::from_map_file(MapFile {
-            meta: None,
-            units: Vec::new(),
-        }, PathBuf::from("."), None, decks)
+        Self::from_map_file(
+            MapFile {
+                meta: None,
+                units: Vec::new(),
+            },
+            PathBuf::from("."),
+            None,
+            decks,
+        )
     }
 
     /// Opens a file, or starts empty when the path does not exist yet.
     pub fn new(path: Option<&str>, decks: usize) -> Result<Self, String> {
         match path {
             Some(path) => {
-                let text = std::fs::read_to_string(path)
-                    .map_err(|err| format!("{path}: {err}"))?;
+                let text = std::fs::read_to_string(path).map_err(|err| format!("{path}: {err}"))?;
                 let base = Path::new(path)
                     .parent()
                     .filter(|dir| !dir.as_os_str().is_empty())
@@ -363,6 +282,7 @@ impl Guide {
             compiled: None,
             error: None,
             decks: decks.max(1),
+            extra_decks: std::collections::BTreeSet::new(),
             nav: Nav::default(),
             capture: None,
             dirty: false,
@@ -422,7 +342,10 @@ impl Guide {
         }
     }
 
-    fn with_map<T>(&mut self, edit: impl FnOnce(&mut MapFile) -> Result<T, String>) -> Result<T, String> {
+    fn with_map<T>(
+        &mut self,
+        edit: impl FnOnce(&mut MapFile) -> Result<T, String>,
+    ) -> Result<T, String> {
         let out = edit(&mut self.map)?;
         self.dirty = true;
         self.recompile();
@@ -442,6 +365,7 @@ impl Guide {
         self.map = file;
         self.presets = presets;
         self.path = Some(path.to_owned());
+        self.extra_decks.clear();
         self.nav = Nav::default();
         self.capture = None;
         self.dirty = false;
@@ -510,10 +434,12 @@ impl Guide {
         if deck.is_none() && !scope.takes_global() {
             return Err(format!("preset `{preset}` needs a deck"));
         }
-        let id = id.filter(|id| !id.trim().is_empty()).unwrap_or_else(|| match deck {
-            Some(deck) => format!("deck{}.{preset}", deck + 1),
-            None => format!("global.{preset}"),
-        });
+        let id = id
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| match deck {
+                Some(deck) => format!("deck{}.{preset}", deck + 1),
+                None => format!("global.{preset}"),
+            });
         validate_name("unit id", &id)?;
         let id = self.unique_unit_id(id);
         let unit = RawUnit {
@@ -535,14 +461,6 @@ impl Guide {
         Ok(())
     }
 
-    pub fn tree_new_unit(&mut self, preset: &str, deck: usize, id: Option<String>) -> Result<(), String> {
-        self.new_unit(preset, Some(deck), id)
-    }
-
-    pub fn tree_new_global_unit(&mut self, preset: &str, id: Option<String>) -> Result<(), String> {
-        self.new_unit(preset, None, id)
-    }
-
     fn unique_unit_id(&self, base: String) -> String {
         if !self.map.units.iter().any(|unit| unit.id == base) {
             return base;
@@ -561,49 +479,12 @@ impl Guide {
         let index = self
             .selected_unit_key()
             .ok_or_else(|| "select a unit to clone".to_owned())?;
-        let source = self.map.units[index].clone();
-        let Some(old_deck) = source.deck else {
-            return Err("a global unit has no deck to clone to".to_owned());
-        };
-        let target = target_deck as u8;
-        if old_deck == target {
-            return Err(format!("`{}` is already on deck {}", source.id, target_deck + 1));
-        }
-        let mut cloned = source.clone();
-        cloned.id = clone_id(&source.id, old_deck, target);
+        let cloned = copy_unit(&self.map.units[index], target_deck, channel_offset)?;
         if self.map.units.iter().any(|unit| unit.id == cloned.id) {
             return Err(format!(
                 "unit `{}` already exists; delete it first or pick another deck",
                 cloned.id
             ));
-        }
-        cloned.deck = Some(target);
-        // Endpoints and per-row decks move with the unit.
-        for control in &mut cloned.controls {
-            let Some(one_or_many) = control.endpoint.as_mut() else {
-                continue;
-            };
-            match one_or_many {
-                crate::map::OneOrMany::One(endpoint) => {
-                    endpoint.channel = shift_channel(endpoint.channel, channel_offset)?;
-                }
-                crate::map::OneOrMany::Many(endpoints) => {
-                    for endpoint in endpoints.iter_mut() {
-                        endpoint.channel = shift_channel(endpoint.channel, channel_offset)?;
-                    }
-                }
-            }
-        }
-        for mode in &mut cloned.modes {
-            for bind in &mut mode.binds {
-                if bind.deck == Some(old_deck) {
-                    bind.deck = Some(target);
-                }
-                bind.chain = bind
-                    .chain
-                    .as_deref()
-                    .map(|token| rewrite_chain(token, old_deck, target));
-            }
         }
         self.with_map(|map| {
             map.units.push(cloned);
@@ -618,13 +499,176 @@ impl Guide {
         Ok(())
     }
 
-    pub fn tree_clone(&mut self, target_deck: usize, channel_offset: i16) -> Result<(), String> {
-        self.clone_unit(target_deck, channel_offset)
+    /// The next deck number after every deck already shown or configured.
+    pub fn next_deck(&self) -> usize {
+        self.deck_entries()
+            .iter()
+            .filter_map(|entry| match entry.kind {
+                DeckKind::Deck(deck) => Some(deck + 1),
+                DeckKind::Global | DeckKind::New => None,
+            })
+            .max()
+            .unwrap_or(0)
+            .max(self.decks)
     }
 
-    pub fn tree_selected_unit_deck(&self) -> Option<usize> {
-        let index = self.selected_unit_key()?;
-        self.map.units[index].deck.map(usize::from)
+    /// Selects a fresh empty deck. It becomes part of the file only when its first unit is added.
+    pub fn start_deck(&mut self) -> usize {
+        let target = self.next_deck();
+        self.extra_decks.insert(target);
+        self.select_deck(target);
+        self.message = Some(format!("deck{} — add a unit to persist it", target + 1));
+        target
+    }
+
+    /// Copies every unit of `source` to the next fresh deck, shifting channels by the deck distance.
+    pub fn clone_deck(&mut self, source: usize) -> Result<usize, String> {
+        let target = self.next_deck();
+        if target <= source {
+            return Err("there is no newer deck to clone into".to_owned());
+        }
+        let offset = target as i16 - source as i16;
+        let indexes: Vec<usize> = self
+            .map
+            .units
+            .iter()
+            .enumerate()
+            .filter(|(_, unit)| unit.deck.map(usize::from) == Some(source))
+            .map(|(index, _)| index)
+            .collect();
+        if indexes.is_empty() {
+            return Err(format!("deck{} has no units to clone", source + 1));
+        }
+        let mut clones = Vec::with_capacity(indexes.len());
+        for index in indexes {
+            let cloned = copy_unit(&self.map.units[index], target, offset)?;
+            if self.map.units.iter().any(|unit| unit.id == cloned.id)
+                || clones
+                    .iter()
+                    .any(|unit: &crate::map::RawUnit| unit.id == cloned.id)
+            {
+                return Err(format!(
+                    "unit `{}` already exists on deck{}",
+                    cloned.id,
+                    target + 1
+                ));
+            }
+            clones.push(cloned);
+        }
+        let count = clones.len();
+        self.with_map(|map| {
+            map.units.extend(clones);
+            Ok(())
+        })?;
+        self.extra_decks.insert(target);
+        self.select_deck(target);
+        self.message = Some(format!(
+            "cloned deck{} → deck{} ({count} unit{}, channels {offset:+})",
+            source + 1,
+            target + 1,
+            if count == 1 { "" } else { "s" }
+        ));
+        Ok(target)
+    }
+
+    /// Instantiates a preset in the deck/global group the deck column points at.
+    pub fn add_unit_selected(&mut self, preset: &str) -> Result<(), String> {
+        let decks = self.deck_entries();
+        let kind = decks
+            .get(self.nav.deck)
+            .map(|entry| entry.kind)
+            .ok_or_else(|| "select a deck first".to_owned())?;
+        match kind {
+            DeckKind::Global => self.new_unit(preset, None, None),
+            DeckKind::Deck(deck) => self.new_unit(preset, Some(deck), None),
+            DeckKind::New => Err("choose a new deck first".to_owned()),
+        }
+    }
+
+    /// The deck/global label the columns currently point at.
+    pub fn selected_group_label(&self) -> String {
+        self.deck_entries()
+            .get(self.nav.deck)
+            .map(|entry| entry.row.label.clone())
+            .unwrap_or_else(|| "global".to_owned())
+    }
+
+    /// Deletes the selected unit, or unbinds the selected slot from the unit.
+    pub fn delete_selected(&mut self) -> Result<(), String> {
+        match self.nav.focus {
+            ColumnFocus::Deck => Err("select a unit or slot to delete".to_owned()),
+            ColumnFocus::Unit => {
+                let unit = self
+                    .selected_unit_key()
+                    .ok_or_else(|| "select a unit to delete".to_owned())?;
+                self.with_map(|map| {
+                    map.units.remove(unit);
+                    Ok(())
+                })?;
+                self.nav.unit = self.nav.unit.saturating_sub(1);
+                self.clamp_nav();
+                self.message = Some("unit deleted".to_owned());
+                Ok(())
+            }
+            ColumnFocus::Slot => {
+                let (unit, control) = self
+                    .current_slot_key()
+                    .ok_or_else(|| "select a slot to delete".to_owned())?;
+                let slot = self
+                    .unit_slots(unit)
+                    .into_iter()
+                    .nth(control)
+                    .ok_or_else(|| "the slot disappeared".to_owned())?;
+                let name = slot.name.clone();
+                if !self.map.units[unit]
+                    .controls
+                    .iter()
+                    .any(|control| control.slot == name)
+                {
+                    return Err(format!("`{name}` comes from the preset; nothing to delete"));
+                }
+                self.with_map(|map| {
+                    let unit = &mut map.units[unit];
+                    unit.controls.retain(|control| control.slot != name);
+                    for mode in &mut unit.modes {
+                        mode.binds.retain(|bind| bind.slot != name);
+                    }
+                    Ok(())
+                })?;
+                self.clamp_nav();
+                self.message = Some(format!("unbound `{name}`"));
+                Ok(())
+            }
+        }
+    }
+
+    /// Built-in presets for the group the unit column points at.
+    pub fn add_unit_presets(&self) -> Vec<String> {
+        let decks = self.deck_entries();
+        match decks.get(self.nav.deck).map(|entry| entry.kind) {
+            Some(DeckKind::Global) => self.preset_names_for(None),
+            Some(DeckKind::Deck(deck)) => self.preset_names_for(Some(deck)),
+            Some(DeckKind::New) | None => Vec::new(),
+        }
+    }
+
+    /// Built-in presets that can be instantiated in `deck` (`None` = global).
+    pub fn preset_names_for(&self, deck: Option<usize>) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .presets
+            .builtin_names()
+            .filter(|name| {
+                let scope = self.presets.scope(name).unwrap_or_default();
+                if deck.is_some() {
+                    scope.takes_deck()
+                } else {
+                    scope.takes_global()
+                }
+            })
+            .map(str::to_owned)
+            .collect();
+        names.sort();
+        names
     }
 
     /// The unit the unit column points at; `None` on the trailing `add unit` row.
@@ -650,16 +694,20 @@ impl Guide {
         let mut slots: Vec<SlotInfo> = Vec::new();
         if let Some(preset) = preset {
             for slot in &preset.slots {
-                let control = raw.controls.iter().find(|control| control.slot == slot.slot);
+                let control = raw
+                    .controls
+                    .iter()
+                    .find(|control| control.slot == slot.slot);
                 slots.push(SlotInfo {
                     name: slot.slot.clone(),
-                    kind: control.and_then(|control| control.kind).unwrap_or(slot.kind),
+                    kind: control
+                        .and_then(|control| control.kind)
+                        .unwrap_or(slot.kind),
                     role: control.map(|control| control.role).unwrap_or(slot.role),
                     target: control
                         .and_then(|control| control.target.clone())
                         .or_else(|| slot.target.clone()),
                     endpoints: control.map(raw_endpoints).unwrap_or_default(),
-                    from_preset: true,
                 });
             }
         }
@@ -676,10 +724,17 @@ impl Guide {
                 role: control.role,
                 target: control.target.clone(),
                 endpoints: raw_endpoints(control),
-                from_preset: false,
             });
         }
         slots
+    }
+
+    #[cfg(test)]
+    fn unit_mode_names_for_test(&self, unit: usize) -> Vec<String> {
+        self.unit_modes(unit)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect()
     }
 
     /// The merged mode list: preset order, unit replacement, unit-only modes appended.
@@ -719,20 +774,13 @@ impl Guide {
 
     fn unit_start(&self, unit: usize) -> Option<usize> {
         let raw = self.map.units.get(unit)?;
-        let name = raw
-            .start
-            .clone()
-            .or_else(|| self.preset_of_unit(unit).and_then(|preset| preset.start.clone()))?;
+        let name = raw.start.clone().or_else(|| {
+            self.preset_of_unit(unit)
+                .and_then(|preset| preset.start.clone())
+        })?;
         self.unit_modes(unit)
             .iter()
             .position(|(mode, _, _)| *mode == name)
-    }
-
-    fn unit_mode_names(&self, unit: usize) -> Vec<String> {
-        self.unit_modes(unit)
-            .into_iter()
-            .map(|(name, _, _)| name)
-            .collect()
     }
 
     /// The merged bind row for one slot, before any edit.
@@ -756,127 +804,60 @@ impl Guide {
             .cloned()
     }
 
-    fn bind_action(
-        &self,
-        unit: usize,
-        mode: &str,
-        slot: &str,
-        part: Option<ControlPart>,
-    ) -> Option<String> {
-        let bind = self.raw_bind(unit, mode, slot)?;
-        match part {
-            None => bind.action,
-            Some(ControlPart::Press) => bind.press.or(bind.action),
-            Some(ControlPart::Turn) => bind.turn.or(bind.action),
-        }
-    }
-
-    fn bind_on(&self, unit: usize, mode: &str, slot: &str) -> Option<Edge> {
-        self.raw_bind(unit, mode, slot)?.on
-    }
-
-    /// Copies a preset mode into the unit so it can be edited without losing the other rows.
-    fn ensure_unit_mode(&mut self, unit: usize, mode: &str) -> Result<(), String> {
-        if self.map.units[unit]
-            .modes
-            .iter()
-            .any(|candidate| candidate.name == mode)
-        {
-            return Ok(());
-        }
-        let from_preset = self
-            .preset_of_unit(unit)
-            .and_then(|preset| preset.modes.iter().find(|m| m.name == mode).cloned());
-        if from_preset.is_none() {
-            return Err(format!("unknown mode `{mode}`"));
-        }
-        let mode = from_preset.unwrap();
-        self.map.units[unit].modes.push(mode);
-        Ok(())
-    }
-
-    fn with_bind<T>(
-        &mut self,
-        unit: usize,
-        mode: &str,
-        slot: &str,
-        edit: impl FnOnce(&mut RawModeBind) -> Result<T, String>,
-    ) -> Result<T, String> {
-        self.ensure_unit_mode(unit, mode)?;
-        let out = {
-            let modes = &mut self.map.units[unit].modes;
-            let mode_spec = modes
-                .iter_mut()
-                .find(|candidate| candidate.name == mode)
-                .ok_or_else(|| format!("unknown mode `{mode}`"))?;
-            let index = match mode_spec.binds.iter().position(|bind| bind.slot == slot) {
-                Some(index) => index,
-                None => {
-                    mode_spec.binds.push(empty_bind(slot));
-                    mode_spec.binds.len() - 1
-                }
-            };
-            edit(&mut mode_spec.binds[index])?
-        };
-        self.dirty = true;
-        self.recompile();
-        Ok(out)
+    fn bind_action(&self, unit: usize, mode: &str, slot: &str) -> Option<String> {
+        self.raw_bind(unit, mode, slot)?.action
     }
 
     // ---- columns ---------------------------------------------------------
 
-    /// Every deck group, global last: `deck1 … deckN`, then `global`.
-    fn deck_entries(&self) -> Vec<(Row, Option<usize>)> {
+    /// Deck-column rows: `global`, every deck, then the trailing `new` row.
+    fn deck_entries(&self) -> Vec<DeckEntry> {
         let mut decks: Vec<usize> = (0..self.decks).collect();
         for unit in &self.map.units {
             if let Some(deck) = unit.deck {
-                if !decks.contains(&usize::from(deck)) {
-                    decks.push(usize::from(deck));
-                }
+                decks.push(usize::from(deck));
             }
         }
+        decks.extend(self.extra_decks.iter().copied());
         decks.sort_unstable();
-        let mut rows: Vec<(Row, Option<usize>)> = decks
-            .into_iter()
-            .map(|deck| {
-                let units = self
-                    .map
-                    .units
-                    .iter()
-                    .filter(|unit| unit.deck.map(usize::from) == Some(deck))
-                    .count();
-                (
-                    Row {
-                        label: deck_label(Some(deck)),
-                        hint: format!("{units} unit{}", if units == 1 { "" } else { "s" }),
-                        muted: false,
-                    },
-                    Some(deck),
-                )
-            })
-            .collect();
-        let global = self
-            .map
-            .units
-            .iter()
-            .filter(|unit| unit.deck.is_none())
-            .count();
-        rows.push((
-            Row {
+        decks.dedup();
+
+        let mut rows = vec![DeckEntry {
+            row: Row {
                 label: "global".to_owned(),
-                hint: format!("{global} unit{}", if global == 1 { "" } else { "s" }),
                 muted: false,
             },
-            None,
-        ));
+            kind: DeckKind::Global,
+        }];
+        for deck in decks {
+            rows.push(DeckEntry {
+                row: Row {
+                    label: deck_label(Some(deck)),
+                    muted: false,
+                },
+                kind: DeckKind::Deck(deck),
+            });
+        }
+        rows.push(DeckEntry {
+            row: Row {
+                label: "new".to_owned(),
+                muted: false,
+            },
+            kind: DeckKind::New,
+        });
         rows
     }
 
-    /// The units of the focused deck group, with the trailing `add unit` row.
+    /// The units of the focused deck group, with the trailing `add unit` row. The `new` row has no
+    /// units: choosing it opens the new-deck menu instead.
     fn unit_entries(&self) -> Vec<UnitEntry> {
-        let deck = self.deck_entries();
-        let selected = deck.get(self.nav.deck.min(deck.len().saturating_sub(1)));
-        let deck = selected.and_then(|(_, deck)| *deck);
+        let decks = self.deck_entries();
+        let selected = decks.get(self.nav.deck.min(decks.len().saturating_sub(1)));
+        let deck = match selected.map(|entry| entry.kind) {
+            Some(DeckKind::Deck(deck)) => Some(deck),
+            Some(DeckKind::Global) => None,
+            Some(DeckKind::New) | None => return Vec::new(),
+        };
         let mut rows: Vec<UnitEntry> = self
             .map
             .units
@@ -886,10 +867,6 @@ impl Guide {
             .map(|(index, unit)| UnitEntry {
                 row: Row {
                     label: unit.id.clone(),
-                    hint: unit
-                        .preset
-                        .clone()
-                        .map_or_else(|| "no preset".to_owned(), |preset| format!("preset {preset}")),
                     muted: false,
                 },
                 unit: Some(index),
@@ -898,12 +875,6 @@ impl Guide {
         rows.push(UnitEntry {
             row: Row {
                 label: "add unit".to_owned(),
-                hint: if deck.is_some() {
-                    "from a deck preset"
-                } else {
-                    "from a global preset"
-                }
-                .to_owned(),
                 muted: true,
             },
             unit: None,
@@ -918,50 +889,13 @@ impl Guide {
         };
         let mut rows = Vec::new();
         for (index, slot) in self.unit_slots(unit).into_iter().enumerate() {
-            let endpoint_hint = if slot.endpoints.is_empty() {
-                "unbound".to_owned()
-            } else {
-                slot.endpoints
-                    .iter()
-                    .map(|(role, endpoint)| match role {
-                        EndpointRole::Main => endpoint_label(endpoint),
-                        EndpointRole::Press => format!("press {}", endpoint_label(endpoint)),
-                        EndpointRole::Turn => format!("turn {}", endpoint_label(endpoint)),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" + ")
-            };
-            let hint = match slot.role {
-                SlotRole::Action => format!("{:?} · {endpoint_hint}", slot.kind),
-                _ => format!("{} · {endpoint_hint}", mode_key_hint(&slot)),
-            };
             rows.push(SlotEntry {
                 row: Row {
                     label: slot.name.clone(),
-                    hint,
                     muted: false,
                 },
                 slot: Some(index),
-                part: None,
             });
-            if slot.kind == SlotKind::JogWheel && slot.role == SlotRole::Action {
-                for part in [ControlPart::Press, ControlPart::Turn] {
-                    let endpoint = slot
-                        .endpoints
-                        .iter()
-                        .find(|(role, _)| *role == part.role())
-                        .map(|(_, endpoint)| endpoint_label(endpoint));
-                    rows.push(SlotEntry {
-                        row: Row {
-                            label: part.label().to_owned(),
-                            hint: endpoint.unwrap_or_else(|| "unbound".to_owned()),
-                            muted: false,
-                        },
-                        slot: Some(index),
-                        part: Some(part),
-                    });
-                }
-            }
         }
         rows
     }
@@ -978,39 +912,12 @@ impl Guide {
         } else {
             self.nav.slot.min(slots - 1)
         };
-        let modes = self.current_unit_modes();
-        self.nav.mode = if modes.is_empty() {
-            0
-        } else {
-            self.nav.mode.min(modes.len() - 1)
-        };
-    }
-
-    /// `(index, count, name)` of the mode the info pane shows.
-    fn current_mode(&self) -> Option<(usize, usize, String)> {
-        let unit = self.selected_unit_key()?;
-        let modes = self.unit_modes(unit);
-        if modes.is_empty() {
-            return None;
-        }
-        let index = self.nav.mode.min(modes.len() - 1);
-        Some((index, modes.len(), modes[index].0.clone()))
-    }
-
-    fn current_unit_modes(&self) -> Vec<(String, usize, bool)> {
-        self.selected_unit_key()
-            .map(|unit| self.unit_modes(unit))
-            .unwrap_or_default()
     }
 
     fn current_slot(&self) -> Option<SlotInfo> {
         let unit = self.selected_unit_key()?;
         let slot = self.slot_entries().get(self.nav.slot)?.slot?;
         self.unit_slots(unit).into_iter().nth(slot)
-    }
-
-    fn current_part(&self) -> Option<ControlPart> {
-        self.slot_entries().get(self.nav.slot)?.part
     }
 
     /// `(unit, slot index)` of the selected slot row, if the row is a slot rather than `add unit`.
@@ -1059,12 +966,10 @@ impl Guide {
                 self.nav.deck = next;
                 self.nav.unit = 0;
                 self.nav.slot = 0;
-                self.nav.mode = 0;
             }
             ColumnFocus::Unit => {
                 self.nav.unit = next;
                 self.nav.slot = 0;
-                self.nav.mode = 0;
             }
             ColumnFocus::Slot => self.nav.slot = next,
         }
@@ -1083,14 +988,26 @@ impl Guide {
         self.nav.focus = next;
     }
 
-    /// `Enter`: drill into the focused column, or learn the focused slot.
+    /// `Enter`: drill into the focused column, open the `new`/`add unit` menu, or learn the
+    /// focused slot.
     pub fn enter(&mut self) -> Result<Entered, String> {
         match self.nav.focus {
             ColumnFocus::Deck => {
-                self.nav.focus = ColumnFocus::Unit;
-                Ok(Entered::Moved)
+                let decks = self.deck_entries();
+                match decks.get(self.nav.deck).map(|entry| entry.kind) {
+                    Some(DeckKind::New) => Ok(Entered::NewDeck),
+                    Some(_) => {
+                        self.nav.focus = ColumnFocus::Unit;
+                        Ok(Entered::Moved)
+                    }
+                    None => Ok(Entered::Moved),
+                }
             }
             ColumnFocus::Unit => {
+                let decks = self.deck_entries();
+                if decks.get(self.nav.deck).map(|entry| entry.kind) == Some(DeckKind::New) {
+                    return Ok(Entered::NewDeck);
+                }
                 if self.selected_unit_key().is_none() {
                     return Ok(Entered::AddUnit);
                 }
@@ -1107,23 +1024,36 @@ impl Guide {
         }
     }
 
-    /// Steps the mode the info pane shows, which is also the mode an action edit writes to.
-    pub fn step_mode(&mut self, delta: isize) {
-        let modes = self.current_unit_modes();
-        if modes.is_empty() {
-            self.message = Some("this unit has no modes".to_owned());
-            return;
+    /// Whether the slot column points at a real slot.
+    pub fn has_slot(&self) -> bool {
+        self.current_slot_key().is_some()
+    }
+
+    /// Points the deck column at one deck index.
+    pub fn select_deck(&mut self, deck: usize) {
+        if let Some(index) = self
+            .deck_entries()
+            .iter()
+            .position(|entry| entry.kind == DeckKind::Deck(deck))
+        {
+            self.nav.deck = index;
+            self.nav.unit = 0;
+            self.nav.slot = 0;
+            self.nav.focus = ColumnFocus::Unit;
+            self.clamp_nav();
         }
-        let next = (self.nav.mode as isize + delta).rem_euclid(modes.len() as isize) as usize;
-        self.nav.mode = next;
-        self.message = Some(format!("mode {}", modes[next].0));
     }
 
     /// Points every column at one unit.
     pub fn select_unit(&mut self, unit: usize) {
         let decks = self.deck_entries();
-        let deck = self.map.units.get(unit).and_then(|unit| unit.deck.map(usize::from));
-        if let Some(index) = decks.iter().position(|(_, deck_id)| *deck_id == deck) {
+        let deck = self
+            .map
+            .units
+            .get(unit)
+            .and_then(|unit| unit.deck.map(usize::from));
+        let wanted = deck.map_or(DeckKind::Global, DeckKind::Deck);
+        if let Some(index) = decks.iter().position(|entry| entry.kind == wanted) {
             self.nav.deck = index;
         }
         if let Some(index) = self
@@ -1134,7 +1064,6 @@ impl Guide {
             self.nav.unit = index;
         }
         self.nav.slot = 0;
-        self.nav.mode = 0;
         self.nav.focus = ColumnFocus::Unit;
         self.clamp_nav();
     }
@@ -1149,7 +1078,7 @@ impl Guide {
         if let Some(row) = self
             .slot_entries()
             .iter()
-            .position(|entry| entry.slot == Some(index) && entry.part.is_none())
+            .position(|entry| entry.slot == Some(index))
         {
             self.nav.slot = row;
         }
@@ -1164,68 +1093,107 @@ impl Guide {
             dirty: self.dirty,
             message: self.message.clone(),
             error: self.error.clone(),
-            decks: self.deck_entries().into_iter().map(|(row, _)| row).collect(),
-            units: self.unit_entries().into_iter().map(|entry| entry.row).collect(),
-            slots: self.slot_entries().into_iter().map(|entry| entry.row).collect(),
+            decks: self
+                .deck_entries()
+                .into_iter()
+                .map(|entry| entry.row)
+                .collect(),
+            units: self
+                .unit_entries()
+                .into_iter()
+                .map(|entry| entry.row)
+                .collect(),
+            slots: self
+                .slot_entries()
+                .into_iter()
+                .map(|entry| entry.row)
+                .collect(),
             nav: self.nav,
             details: self.details(),
             endpoints: self.endpoints(),
-            buttons: self.buttons(),
             capturing: self.capture.is_some(),
             candidate: self.candidate().copied(),
-            mode: self.current_mode(),
         }
     }
 
     fn details(&self) -> Vec<(String, String)> {
         let mut details = Vec::new();
-        let deck = self.deck_entries();
-        let deck = deck.get(self.nav.deck).map(|(row, _)| row.label.clone());
+        let decks = self.deck_entries();
+        let Some(entry) = decks.get(self.nav.deck) else {
+            return details;
+        };
+        if entry.kind == DeckKind::New {
+            details.push((
+                "new deck".to_owned(),
+                "clone a deck or start a new one".to_owned(),
+            ));
+            return details;
+        }
+        details.push(("deck".to_owned(), entry.row.label.clone()));
         if let Some(unit) = self.selected_unit_key() {
             let raw = &self.map.units[unit];
             details.push((
                 "unit".to_owned(),
                 format!(
-                    "{} · {}{}",
+                    "{}{}",
                     raw.id,
-                    deck.unwrap_or_else(|| "global".to_owned()),
                     raw.preset
                         .as_deref()
                         .map_or_else(String::new, |preset| format!(" · preset {preset}"))
                 ),
             ));
+            let modes = self.unit_modes(unit);
+            let names = modes
+                .iter()
+                .map(|(name, _, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            details.push((
+                "modes".to_owned(),
+                if modes.is_empty() {
+                    "0".to_owned()
+                } else {
+                    format!("{} · {names}", modes.len())
+                },
+            ));
+            if let Some(start) = self.unit_start(unit) {
+                if let Some((name, _, _)) = modes.get(start) {
+                    details.push(("start".to_owned(), name.clone()));
+                }
+            }
+            let slots = self.unit_slots(unit);
+            let bound = slots
+                .iter()
+                .filter(|slot| !slot.endpoints.is_empty())
+                .count();
+            details.push((
+                "slots".to_owned(),
+                format!("{} · {} bound", slots.len(), bound),
+            ));
         } else {
-            details.push((
-                "unit".to_owned(),
-                format!("— · {}", deck.unwrap_or_else(|| "global".to_owned())),
-            ));
-        }
-        if let Some((index, count, name)) = self.current_mode() {
-            let start = self
-                .selected_unit_key()
-                .and_then(|unit| self.unit_start(unit))
-                .is_some_and(|start| start == index);
-            details.push((
-                "mode".to_owned(),
-                format!(
-                    "‹ {name} ›  {}/{count}{}",
-                    index + 1,
-                    if start { " · start" } else { "" }
-                ),
-            ));
+            let units = self
+                .map
+                .units
+                .iter()
+                .filter(|unit| {
+                    unit.deck.map(usize::from)
+                        == match entry.kind {
+                            DeckKind::Deck(deck) => Some(deck),
+                            DeckKind::Global => None,
+                            DeckKind::New => None,
+                        }
+                })
+                .count();
+            details.push(("units".to_owned(), units.to_string()));
         }
         if let Some(slot) = self.current_slot() {
-            let source = if slot.from_preset { "preset" } else { "unit" };
-            match slot.role {
-                SlotRole::Action => details.push((
-                    "slot".to_owned(),
-                    format!("{:?} · {} · {source}", slot.kind, slot.name),
-                )),
-                _ => details.push((
-                    "slot".to_owned(),
-                    format!("{} · {}", mode_key_hint(&slot), slot.name),
-                )),
-            }
+            details.push((
+                "slot".to_owned(),
+                match slot.role {
+                    SlotRole::Action => format!("{:?} · {}", slot.kind, slot.name),
+                    _ => format!("{} · {}", mode_key_hint(&slot), slot.name),
+                },
+            ));
             details.push((
                 "endpoint".to_owned(),
                 if slot.endpoints.is_empty() {
@@ -1243,19 +1211,26 @@ impl Guide {
                 },
             ));
             if slot.role == SlotRole::Action {
-                if let (Some(unit), Some((_, _, mode))) =
-                    (self.selected_unit_key(), self.current_mode())
-                {
-                    let part = self.current_part();
-                    if let Some(part) = part {
-                        details.push(("part".to_owned(), part.label().to_owned()));
-                    }
-                    let action = self
-                        .bind_action(unit, &mode, &slot.name, part)
-                        .unwrap_or_else(|| "—".to_owned());
-                    details.push(("action".to_owned(), action));
-                    if let Some(edge) = self.bind_on(unit, &mode, &slot.name) {
-                        details.push(("on".to_owned(), format!("{edge:?}").to_lowercase()));
+                if let Some(unit) = self.selected_unit_key() {
+                    for (mode, _, _) in self.unit_modes(unit) {
+                        if slot.kind == SlotKind::JogWheel {
+                            let Some(bind) = self.raw_bind(unit, &mode, &slot.name) else {
+                                details.push((format!("action {mode}"), "—".to_owned()));
+                                continue;
+                            };
+                            let press = bind
+                                .press
+                                .or_else(|| bind.action.clone())
+                                .unwrap_or_else(|| "—".to_owned());
+                            let turn = bind.turn.or(bind.action).unwrap_or_else(|| "—".to_owned());
+                            details.push((format!("action {mode} press"), press));
+                            details.push((format!("action {mode} turn"), turn));
+                        } else {
+                            let action = self
+                                .bind_action(unit, &mode, &slot.name)
+                                .unwrap_or_else(|| "—".to_owned());
+                            details.push((format!("action {mode}"), action));
+                        }
                     }
                 }
             }
@@ -1267,53 +1242,10 @@ impl Guide {
         let Some(slot) = self.current_slot() else {
             return Vec::new();
         };
-        let part = self.current_part();
         slot.endpoints
             .iter()
-            .filter(|(role, _)| part.is_none_or(|part| *role == part.role()))
             .flat_map(|(_, endpoint)| endpoint_keys(endpoint))
             .collect()
-    }
-
-    /// The command row. Deliberately short: adding a unit is `Enter` on its row, and modes are not
-    /// edited in this front-end yet.
-    fn buttons(&self) -> Vec<TreeButton> {
-        if self.capture.is_some() {
-            return vec![
-                TreeButton::Confirm,
-                TreeButton::Cancel,
-                TreeButton::Mode,
-                TreeButton::Connect,
-                TreeButton::Open,
-                TreeButton::Save,
-                TreeButton::Exit,
-            ];
-        }
-        let mut buttons = Vec::new();
-        match self.nav.focus {
-            // Cloning is about decks: only a unit that owns a deck can be copied to another one.
-            ColumnFocus::Unit => {
-                if self
-                    .selected_unit_key()
-                    .is_some_and(|unit| self.map.units[unit].deck.is_some())
-                {
-                    buttons.push(TreeButton::Clone);
-                }
-            }
-            ColumnFocus::Slot => {
-                if self.current_slot_key().is_some() {
-                    buttons.push(TreeButton::Learn);
-                }
-            }
-            ColumnFocus::Deck => {}
-        }
-        buttons.extend([
-            TreeButton::Connect,
-            TreeButton::Open,
-            TreeButton::Save,
-            TreeButton::Exit,
-        ]);
-        buttons
     }
 
     // ---- learn -----------------------------------------------------------
@@ -1323,7 +1255,9 @@ impl Guide {
     }
 
     pub fn candidate(&self) -> Option<&Candidate> {
-        self.capture.as_ref().and_then(|capture| capture.candidate.as_ref())
+        self.capture
+            .as_ref()
+            .and_then(|capture| capture.candidate.as_ref())
     }
 
     pub fn cancel_learn(&mut self) {
@@ -1572,7 +1506,11 @@ impl Guide {
             let unit = capture.unit;
             self.with_map(|map| {
                 let unit = &mut map.units[unit];
-                match unit.controls.iter_mut().find(|control| control.slot == slot_name) {
+                match unit
+                    .controls
+                    .iter_mut()
+                    .find(|control| control.slot == slot_name)
+                {
                     Some(existing) => *existing = raw,
                     None => unit.controls.push(raw),
                 }
@@ -1605,7 +1543,11 @@ impl Guide {
         let unit = capture.unit;
         self.with_map(|map| {
             let unit = &mut map.units[unit];
-            match unit.controls.iter_mut().find(|control| control.slot == slot_name) {
+            match unit
+                .controls
+                .iter_mut()
+                .find(|control| control.slot == slot_name)
+            {
                 Some(existing) => *existing = raw,
                 None => unit.controls.push(raw),
             }
@@ -1614,330 +1556,55 @@ impl Guide {
         self.select_slot(unit, &slot_name);
         Ok(())
     }
-
-    // ---- edits -----------------------------------------------------------
-
-    /// The action line of the focused slot in the focused mode, if it has one.
-    pub fn action_text(&self) -> Option<String> {
-        let (unit, control) = self.current_slot_key()?;
-        let slot = self.unit_slots(unit).into_iter().nth(control)?;
-        let (_, _, mode) = self.current_mode()?;
-        self.bind_action(unit, &mode, &slot.name, self.current_part())
-    }
-
-    pub fn set_action(&mut self, text: String) -> Result<(), String> {
-        let (unit, control) = self
-            .current_slot_key()
-            .ok_or_else(|| "select a slot first".to_owned())?;
-        let slot = self
-            .unit_slots(unit)
-            .into_iter()
-            .nth(control)
-            .ok_or_else(|| "the slot disappeared".to_owned())?;
-        if slot.role != SlotRole::Action {
-            return Err("a mode key has no action".to_owned());
-        }
-        let (_, _, mode) = self
-            .current_mode()
-            .ok_or_else(|| "the unit has no modes".to_owned())?;
-        let part = self.current_part();
-        let slot_name = slot.name.clone();
-        let text = text.trim().to_owned();
-        self.with_bind(unit, &mode, &slot_name, |bind| {
-            match part {
-                None => bind.action = Some(text),
-                Some(ControlPart::Press) => bind.press = Some(text),
-                Some(ControlPart::Turn) => bind.turn = Some(text),
-            }
-            Ok(())
-        })
-    }
-
-    pub fn on(&self) -> Option<Edge> {
-        let (unit, control) = self.current_slot_key()?;
-        let slot = self.unit_slots(unit).into_iter().nth(control)?;
-        let (_, _, mode) = self.current_mode()?;
-        self.bind_on(unit, &mode, &slot.name)
-    }
-
-    pub fn set_on(&mut self, edge: Option<Edge>) -> Result<(), String> {
-        let (unit, control) = self
-            .current_slot_key()
-            .ok_or_else(|| "select a slot first".to_owned())?;
-        let slot = self
-            .unit_slots(unit)
-            .into_iter()
-            .nth(control)
-            .ok_or_else(|| "the slot disappeared".to_owned())?;
-        let (_, _, mode) = self
-            .current_mode()
-            .ok_or_else(|| "the unit has no modes".to_owned())?;
-        let slot_name = slot.name.clone();
-        self.with_bind(unit, &mode, &slot_name, |bind| {
-            bind.on = edge;
-            Ok(())
-        })
-    }
-
-    // ---- modes -----------------------------------------------------------
-
-    pub fn mode_names(&self) -> Vec<String> {
-        self.current_unit_modes()
-            .into_iter()
-            .map(|(name, _, _)| name)
-            .collect()
-    }
-
-    pub fn add_mode(&mut self, name: String) -> Result<(), String> {
-        let unit = self
-            .selected_unit_key()
-            .ok_or_else(|| "select a unit first".to_owned())?;
-        let name = name.trim().to_owned();
-        validate_name("mode", &name)?;
-        if self.unit_mode_names(unit).contains(&name) {
-            return Err(format!("mode `{name}` already exists"));
-        }
-        self.with_map(|map| {
-            map.units[unit].modes.push(RawMode {
-                name: name.clone(),
-                label: None,
-                binds: Vec::new(),
-            });
-            Ok(())
-        })?;
-        if let Some(index) = self
-            .unit_mode_names(unit)
-            .iter()
-            .position(|candidate| *candidate == name)
-        {
-            self.nav.mode = index;
-        }
-        Ok(())
-    }
-
-    pub fn delete_mode(&mut self) -> Result<(), String> {
-        let unit = self
-            .selected_unit_key()
-            .ok_or_else(|| "select a unit first".to_owned())?;
-        let (index, _, name) = self
-            .current_mode()
-            .ok_or_else(|| "the unit has no modes".to_owned())?;
-        if self.unit_modes(unit).get(index).is_some_and(|(_, _, from_preset)| !*from_preset)
-            && self.unit_modes(unit).len() == 1
-        {
-            return Err("a unit needs at least one mode".to_owned());
-        }
-        if self.unit_modes(unit).get(index).is_some_and(|(_, _, from_preset)| *from_preset) {
-            return Err(format!(
-                "`{name}` comes from the preset; add a unit mode of the same name to override it"
-            ));
-        }
-        self.with_map(|map| {
-            let unit = &mut map.units[unit];
-            unit.modes.retain(|candidate| candidate.name != name);
-            if let Some(order) = &mut unit.mode_order {
-                order.retain(|candidate| *candidate != name);
-            }
-            if unit.start.as_deref() == Some(name.as_str()) {
-                unit.start = None;
-            }
-            Ok(())
-        })?;
-        self.clamp_nav();
-        Ok(())
-    }
-
-    pub fn move_mode(&mut self, delta: isize) -> Result<(), String> {
-        let unit = self
-            .selected_unit_key()
-            .ok_or_else(|| "select a unit first".to_owned())?;
-        let names = self.unit_mode_names(unit);
-        if names.len() < 2 {
-            return Err("this unit has one mode".to_owned());
-        }
-        let current = self.nav.mode.min(names.len() - 1);
-        let target = (current as isize + delta).clamp(0, names.len() as isize - 1) as usize;
-        if target == current {
-            return Ok(());
-        }
-        let mut order = names;
-        let moved = order.remove(current);
-        order.insert(target, moved);
-        self.with_map(|map| {
-            map.units[unit].mode_order = Some(order);
-            Ok(())
-        })?;
-        self.nav.mode = target;
-        self.clamp_nav();
-        Ok(())
-    }
-
-    pub fn set_start(&mut self) -> Result<(), String> {
-        let unit = self
-            .selected_unit_key()
-            .ok_or_else(|| "select a unit first".to_owned())?;
-        let (_, _, name) = self
-            .current_mode()
-            .ok_or_else(|| "the unit has no modes".to_owned())?;
-        self.with_map(|map| {
-            map.units[unit].start = Some(name);
-            Ok(())
-        })
-    }
-
-    // ---- mode keys -------------------------------------------------------
-
-    /// Adds a mode-key control and starts learning its endpoint.
-    pub fn begin_mode_key(
-        &mut self,
-        trigger: bool,
-        target: Option<String>,
-    ) -> Result<(), String> {
-        let unit = self
-            .selected_unit_key()
-            .ok_or_else(|| "select a unit first".to_owned())?;
-        let role = if trigger {
-            let wanted = target
-                .as_deref()
-                .ok_or_else(|| "a mode key needs a target mode".to_owned())?;
-            if !self.unit_mode_names(unit).contains(&wanted.to_owned()) {
-                return Err(format!("unknown mode `{wanted}`"));
-            }
-            SlotRole::ModeTrigger
-        } else {
-            SlotRole::ModeCycle
-        };
-        let name = self.unique_slot_name(unit, if trigger { "mode" } else { "mode-next" });
-        self.capture = Some(Capture {
-            unit,
-            slot: name,
-            kind: SlotKind::Button,
-            part: JogPart::Press,
-            press: None,
-            selector: Some(SelectorCapture {
-                role,
-                target: target.clone(),
-            }),
-            candidate: None,
-            last_cc: None,
-            previous_cc: None,
-            two_point: false,
-            swept: false,
-        });
-        self.message = Some("press the mode key now".to_owned());
-        Ok(())
-    }
-
-    /// Repoints the focused mode key.
-    pub fn set_mode_key(&mut self, trigger: bool, target: Option<String>) -> Result<(), String> {
-        let (unit, control) = self
-            .current_slot_key()
-            .ok_or_else(|| "select a mode key first".to_owned())?;
-        let slot = self
-            .unit_slots(unit)
-            .into_iter()
-            .nth(control)
-            .ok_or_else(|| "unknown slot".to_owned())?;
-        if slot.role == SlotRole::Action {
-            return Err("that slot is not a mode key".to_owned());
-        }
-        let role = if trigger {
-            let wanted = target
-                .as_deref()
-                .ok_or_else(|| "a mode key needs a target mode".to_owned())?;
-            if !self.unit_mode_names(unit).contains(&wanted.to_owned()) {
-                return Err(format!("unknown mode `{wanted}`"));
-            }
-            SlotRole::ModeTrigger
-        } else {
-            SlotRole::ModeCycle
-        };
-        let name = slot.name;
-        self.with_map(|map| {
-            let Some(control) = map.units[unit]
-                .controls
-                .iter_mut()
-                .find(|candidate| candidate.slot == name)
-            else {
-                return Err("only a unit-owned mode key can be repointed".to_owned());
-            };
-            control.role = role;
-            control.target = target;
-            Ok(())
-        })
-    }
-
-    /// Removes the focused unit's `add unit` placeholder, or the focused slot.
-    pub fn delete_selected(&mut self) -> Result<(), String> {
-        match self.nav.focus {
-            ColumnFocus::Deck => Ok(()),
-            ColumnFocus::Unit => {
-                let Some(unit) = self.selected_unit_key() else {
-                    return Ok(());
-                };
-                self.with_map(|map| {
-                    map.units.remove(unit);
-                    Ok(())
-                })?;
-                self.nav.unit = self.nav.unit.saturating_sub(1);
-                self.clamp_nav();
-                Ok(())
-            }
-            ColumnFocus::Slot => {
-                let Some((unit, control)) = self.current_slot_key() else {
-                    return Ok(());
-                };
-                let slot = self
-                    .unit_slots(unit)
-                    .into_iter()
-                    .nth(control)
-                    .ok_or_else(|| "unknown slot".to_owned())?;
-                let name = slot.name;
-                self.with_map(|map| {
-                    map.units[unit].controls.retain(|control| control.slot != name);
-                    Ok(())
-                })?;
-                self.clamp_nav();
-                self.message = Some("slot unbound".to_owned());
-                Ok(())
-            }
-        }
-    }
-
-    fn unique_slot_name(&self, unit: usize, base: &str) -> String {
-        let taken: Vec<String> = self
-            .unit_slots(unit)
-            .into_iter()
-            .map(|slot| slot.name)
-            .collect();
-        if !taken.iter().any(|name| name == base) {
-            return base.to_owned();
-        }
-        for suffix in 2.. {
-            let candidate = format!("{base}-{suffix}");
-            if !taken.iter().any(|name| name == &candidate) {
-                return candidate;
-            }
-        }
-        unreachable!()
-    }
 }
 
-fn empty_bind(slot: &str) -> RawModeBind {
-    RawModeBind {
-        slot: slot.to_owned(),
-        action: None,
-        press: None,
-        turn: None,
-        down: None,
-        deck: None,
-        min: None,
-        max: None,
-        curve: None,
-        chain: None,
-        fx: None,
-        on: None,
+/// Copies one unit to `target_deck`, shifting every endpoint channel by `channel_offset`.
+fn copy_unit(
+    unit: &crate::map::RawUnit,
+    target_deck: usize,
+    channel_offset: i16,
+) -> Result<crate::map::RawUnit, String> {
+    let Some(old_deck) = unit.deck else {
+        return Err("a global unit has no deck to clone to".to_owned());
+    };
+    let target = target_deck as u8;
+    if old_deck == target {
+        return Err(format!(
+            "`{}` is already on deck {}",
+            unit.id,
+            target_deck + 1
+        ));
     }
+    let mut cloned = unit.clone();
+    cloned.id = clone_id(&unit.id, old_deck, target);
+    cloned.deck = Some(target);
+    for control in &mut cloned.controls {
+        let Some(one_or_many) = control.endpoint.as_mut() else {
+            continue;
+        };
+        match one_or_many {
+            crate::map::OneOrMany::One(endpoint) => {
+                endpoint.channel = shift_channel(endpoint.channel, channel_offset)?;
+            }
+            crate::map::OneOrMany::Many(endpoints) => {
+                for endpoint in endpoints.iter_mut() {
+                    endpoint.channel = shift_channel(endpoint.channel, channel_offset)?;
+                }
+            }
+        }
+    }
+    for mode in &mut cloned.modes {
+        for bind in &mut mode.binds {
+            if bind.deck == Some(old_deck) {
+                bind.deck = Some(target);
+            }
+            bind.chain = bind
+                .chain
+                .as_deref()
+                .map(|token| rewrite_chain(token, old_deck, target));
+        }
+    }
+    Ok(cloned)
 }
 
 fn raw_endpoints(control: &RawControl) -> Vec<(EndpointRole, RawEndpoint)> {
@@ -2098,10 +1765,6 @@ fn validate_name(what: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The action verbs the guide offers, straight from the shared table.
-pub fn action_names() -> Vec<&'static str> {
-    crate::map::ACTIONS.iter().map(|spec| spec.name).collect()
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2123,11 +1786,8 @@ mod tests {
     }
 
     fn tmp_path(name: &str) -> String {
-        let dir = std::env::temp_dir().join(format!(
-            "hypermixx-guide-{}-{}",
-            std::process::id(),
-            name
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hypermixx-guide-{}-{}", std::process::id(), name));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("map.toml").display().to_string()
     }
@@ -2143,7 +1803,7 @@ mod tests {
         let guide = Guide::empty(2).unwrap();
         let view = guide.view();
         let labels: Vec<&str> = view.decks.iter().map(|row| row.label.as_str()).collect();
-        assert_eq!(labels, vec!["deck1", "deck2", "global"]);
+        assert_eq!(labels, vec!["global", "deck1", "deck2", "new"]);
         assert_eq!(view.units.len(), 1, "only the add row");
         assert!(view.units[0].muted);
         assert!(view.slots.is_empty());
@@ -2153,10 +1813,10 @@ mod tests {
     fn a_deck_preset_needs_a_deck_and_a_global_one_refuses_it() {
         let mut guide = Guide::empty(2).unwrap();
         assert!(guide.new_unit("mixer", None, None).is_err());
-        assert!(guide.new_unit("output", Some(0), None).is_err());
-        guide.new_unit("output", None, None).unwrap();
+        assert!(guide.new_unit("outputfader", Some(0), None).is_err());
+        guide.new_unit("outputfader", None, None).unwrap();
         assert_eq!(guide.map.units[0].deck, None);
-        assert_eq!(guide.map.units[0].id, "global.output");
+        assert_eq!(guide.map.units[0].id, "global.outputfader");
     }
 
     #[test]
@@ -2170,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn the_slot_column_lists_the_preset_slots_and_jog_halves() {
+    fn the_slot_column_lists_the_preset_slots_without_synthetic_halves() {
         let mut guide = Guide::empty(2).unwrap();
         guide.new_unit("jog", Some(0), None).unwrap();
         let labels: Vec<String> = guide
@@ -2179,7 +1839,7 @@ mod tests {
             .into_iter()
             .map(|row| row.label)
             .collect();
-        assert_eq!(labels, vec!["jog", "press", "turn"]);
+        assert_eq!(labels, vec!["jog"]);
     }
 
     #[test]
@@ -2230,7 +1890,10 @@ mod tests {
         let mut guide = at_slot(guide, 0, "fader");
         guide.begin_learn().unwrap();
         // The fader sends its MSB (#9) then its LSB (#41) a millisecond apart.
-        assert_eq!(guide.feed_at(&cc(0, 9, 64), Some(1_000)), GuideStep::Captured);
+        assert_eq!(
+            guide.feed_at(&cc(0, 9, 64), Some(1_000)),
+            GuideStep::Captured
+        );
         assert_eq!(
             guide.feed_at(&cc(0, 41, 10), Some(1_001)),
             GuideStep::RelativeDetected
@@ -2263,7 +1926,7 @@ mod tests {
     fn learning_a_two_point_encoder_picks_that_encoding() {
         let mut guide = Guide::empty(2).unwrap();
         guide.new_unit("browser", Some(0), None).unwrap();
-        let mut guide = at_slot(guide, 0, "browse");
+        let mut guide = at_slot(guide, 0, "choose");
         guide.begin_learn().unwrap();
         guide.feed(&cc(0, 7, 1));
         assert_eq!(guide.feed(&cc(0, 7, 127)), GuideStep::RelativeDetected);
@@ -2307,88 +1970,6 @@ mod tests {
         assert_eq!(endpoints[0].id, Some(80));
         assert_eq!(endpoints[1].role, EndpointRole::Turn);
         assert_eq!(endpoints[1].encoding, Encoding::TwoPoint);
-    }
-
-    #[test]
-    fn a_jog_half_highlights_only_its_own_endpoint() {
-        let mut guide = Guide::empty(2).unwrap();
-        guide.new_unit("jog", Some(0), None).unwrap();
-        let mut guide = at_slot(guide, 0, "jog");
-        guide.begin_learn().unwrap();
-        guide.feed(&note(0, 80));
-        guide.confirm_learn().unwrap();
-        guide.feed(&cc(0, 6, 1));
-        guide.feed(&cc(0, 6, 127));
-        guide.confirm_learn().unwrap();
-
-        guide.select_slot(0, "jog");
-        guide.move_cursor(1); // press
-        assert_eq!(guide.view().endpoints.len(), 1);
-        guide.move_cursor(1); // turn
-        assert_eq!(guide.view().endpoints.len(), 1);
-    }
-
-    #[test]
-    fn editing_an_action_materializes_the_whole_mode() {
-        let mut guide = Guide::empty(2).unwrap();
-        guide.new_unit("mixer", Some(0), None).unwrap();
-        let mut guide = at_slot(guide, 0, "fader");
-        assert_eq!(guide.action_text().as_deref(), Some("fader flow"));
-        guide.set_action("fader gain".to_owned()).unwrap();
-
-        let mode = guide.map.units[0]
-            .modes
-            .iter()
-            .find(|mode| mode.name == "default")
-            .expect("materialized mode");
-        assert!(mode.binds.iter().any(|bind| bind.slot == "load"));
-        let fader = mode.binds.iter().find(|bind| bind.slot == "fader").unwrap();
-        assert_eq!(fader.action.as_deref(), Some("fader gain"));
-    }
-
-    #[test]
-    fn the_mode_pane_steps_and_scopes_the_action_edit() {
-        let mut guide = Guide::empty(2).unwrap();
-        guide.new_unit("jog", Some(0), None).unwrap();
-        let mut guide = at_slot(guide, 0, "jog");
-        assert_eq!(guide.view().mode.as_ref().map(|(_, _, name)| name.as_str()), Some("vinyl"));
-        guide.step_mode(1);
-        assert_eq!(guide.view().mode.as_ref().map(|(_, _, name)| name.as_str()), Some("slip"));
-        // The slip mode binds the two jog halves separately, so the slot itself has no action.
-        assert_eq!(guide.action_text(), None);
-        guide.move_cursor(1); // the press half
-        assert_eq!(guide.action_text().as_deref(), Some("vinyl slip"));
-        guide.move_cursor(1); // the turn half
-        assert_eq!(guide.action_text().as_deref(), Some("vinyl"));
-    }
-
-    #[test]
-    fn a_mode_key_is_learned_and_repointed() {
-        let mut guide = Guide::empty(2).unwrap();
-        guide.new_unit("pad", Some(0), None).unwrap();
-        guide.begin_mode_key(true, Some("beatloop".to_owned())).unwrap();
-        guide.feed(&note(0, 40));
-        guide.confirm_learn().unwrap();
-
-        let control = guide.map.units[0]
-            .controls
-            .iter()
-            .find(|control| {
-                control.role == SlotRole::ModeTrigger && control.target.as_deref() == Some("beatloop")
-            })
-            .expect("learned mode key");
-        let slot = control.slot.clone();
-        assert_eq!(control.endpoint.as_ref().unwrap().as_slice()[0].id, Some(40));
-
-        guide.select_slot(0, &slot);
-        guide.set_mode_key(false, None).expect("repoint to cycle");
-        let control = guide.map.units[0]
-            .controls
-            .iter()
-            .find(|control| control.slot == slot)
-            .expect("the repointed key");
-        assert_eq!(control.role, SlotRole::ModeCycle);
-        assert_eq!(control.target, None);
     }
 
     #[test]
@@ -2436,10 +2017,142 @@ chain = "deck1"
     #[test]
     fn a_four_deck_map_shows_four_decks() {
         let mut guide = Guide::empty(4).unwrap();
-        let labels: Vec<String> = guide.view().decks.into_iter().map(|row| row.label).collect();
-        assert_eq!(labels, vec!["deck1", "deck2", "deck3", "deck4", "global"]);
+        let labels: Vec<String> = guide
+            .view()
+            .decks
+            .into_iter()
+            .map(|row| row.label)
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["global", "deck1", "deck2", "deck3", "deck4", "new"]
+        );
         guide.new_unit("transport", Some(3), None).unwrap();
         assert_eq!(guide.map.units[0].id, "deck4.transport");
+    }
+
+    #[test]
+    fn the_pad_preset_has_the_four_documented_modes_and_stem_pads() {
+        let mut guide = Guide::empty(2).unwrap();
+        guide.new_unit("pad", Some(0), None).unwrap();
+        let modes = guide.unit_mode_names_for_test(0);
+        assert_eq!(modes, vec!["hotcue", "loop", "beatjump", "stems"]);
+        for slot in ["pad1", "pad2", "pad3", "pad4"] {
+            assert!(
+                guide
+                    .raw_bind(0, "stems", slot)
+                    .and_then(|bind| bind.action)
+                    .is_some(),
+                "{slot} should toggle a stem"
+            );
+        }
+        for slot in ["pad5", "pad6", "pad7", "pad8"] {
+            assert!(
+                guide
+                    .raw_bind(0, "stems", slot)
+                    .and_then(|bind| bind.action)
+                    .is_none(),
+                "{slot} should be empty in stems mode"
+            );
+        }
+    }
+
+    #[test]
+    fn the_deckfx_presets_compile_before_the_mixer_exposes_fx_names() {
+        let mut guide = Guide::empty(2).unwrap();
+        for preset in ["deckfx1", "deckfx2", "deckfx3"] {
+            guide.new_unit(preset, Some(0), None).unwrap();
+        }
+        assert!(guide.error.is_none(), "{:?}", guide.error);
+        assert_eq!(guide.map.units.len(), 3);
+    }
+
+    #[test]
+    fn delete_removes_a_unit_or_unbinds_a_slot() {
+        let mut guide = Guide::empty(1).unwrap();
+        guide.new_unit("transport", Some(0), None).unwrap();
+        guide.select_slot(0, "play");
+        guide.begin_learn().unwrap();
+        guide.feed(&note(0, 16));
+        guide.confirm_learn().unwrap();
+        guide.delete_selected().unwrap();
+        assert!(
+            guide.map.units[0]
+                .controls
+                .iter()
+                .all(|control| control.slot != "play"),
+            "the slot control should be gone"
+        );
+        assert!(guide.error.is_none(), "{:?}", guide.error);
+
+        guide.select_unit(0);
+        guide.delete_selected().unwrap();
+        assert!(guide.map.units.is_empty());
+    }
+
+    #[test]
+    fn a_new_deck_starts_empty_and_gets_a_unit_from_a_preset() {
+        let mut guide = Guide::empty(2).unwrap();
+        guide.move_column(-1);
+        // Walk to the trailing `new` row.
+        for _ in 0..guide.view().decks.len() {
+            if guide.selected_group_label() == "new" {
+                break;
+            }
+            guide.move_cursor(1);
+        }
+        assert_eq!(guide.selected_group_label(), "new");
+        guide.move_cursor(-1);
+        let target = guide.start_deck();
+        assert_eq!(target, 2);
+        assert_eq!(guide.selected_group_label(), "deck3");
+        guide.add_unit_selected("transport").unwrap();
+        assert_eq!(guide.map.units[0].id, "deck3.transport");
+    }
+
+    #[test]
+    fn cloning_a_deck_copies_every_unit_and_shifts_the_deck_distance() {
+        let mut guide = Guide::empty(2).unwrap();
+        guide.new_unit("transport", Some(0), None).unwrap();
+        guide.new_unit("jog", Some(0), None).unwrap();
+        guide.select_slot(1, "jog");
+        guide.begin_learn().unwrap();
+        guide.feed(&note(0, 80));
+        guide.confirm_learn().unwrap();
+        guide.feed(&cc(0, 6, 1));
+        guide.feed(&cc(0, 6, 127));
+        guide.confirm_learn().unwrap();
+        let target = guide.clone_deck(0).unwrap();
+        assert_eq!(target, 2);
+        assert_eq!(
+            guide
+                .map
+                .units
+                .iter()
+                .filter(|unit| unit.deck == Some(2))
+                .count(),
+            2
+        );
+        let jog = guide
+            .map
+            .units
+            .iter()
+            .find(|unit| unit.deck == Some(2) && unit.preset.as_deref() == Some("jog"))
+            .expect("cloned jog");
+        assert_eq!(jog.id, "deck3.jog");
+        let turn = jog
+            .controls
+            .iter()
+            .find(|control| control.slot == "jog")
+            .and_then(|control| control.endpoint.as_ref())
+            .and_then(|endpoints| {
+                endpoints
+                    .as_slice()
+                    .iter()
+                    .find(|e| e.role == EndpointRole::Turn)
+            })
+            .expect("turn endpoint");
+        assert_eq!(turn.channel, 2);
     }
 
     #[test]
@@ -2476,7 +2189,7 @@ chain = "deck1"
         let names = guide.preset_names();
         assert!(names.contains(&"pad".to_owned()));
         assert!(names.contains(&"crossfader".to_owned()));
-        assert_eq!(guide.preset_scope("output"), PresetScope::Global);
+        assert_eq!(guide.preset_scope("outputfader"), PresetScope::Global);
         assert_eq!(guide.preset_scope("browser"), PresetScope::Both);
         assert_eq!(guide.preset_scope("mixer"), PresetScope::Deck);
     }

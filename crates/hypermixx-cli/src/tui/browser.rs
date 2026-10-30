@@ -150,10 +150,7 @@ impl Browser {
     }
 
     /// Loads an explicit source list and opens the first one.
-    pub fn load_sources(
-        db: &LibraryDb,
-        sources: Vec<Source>,
-    ) -> hypermixx_library::Result<Self> {
+    pub fn load_sources(db: &LibraryDb, sources: Vec<Source>) -> hypermixx_library::Result<Self> {
         let mut browser = Self::new();
         browser.columns = vec![Column::sources(sources.clone())];
         if let Some(source) = sources.first() {
@@ -207,8 +204,16 @@ impl Browser {
     pub fn hit_column(&self, x: u16, y: u16) -> Option<(usize, usize)> {
         let len = self.columns.len();
         let candidates = [
-            (len.checked_sub(2), self.layout.left1, &self.layout.left1_lines),
-            (len.checked_sub(1), self.layout.left2, &self.layout.left2_lines),
+            (
+                len.checked_sub(2),
+                self.layout.left1,
+                &self.layout.left1_lines,
+            ),
+            (
+                len.checked_sub(1),
+                self.layout.left2,
+                &self.layout.left2_lines,
+            ),
         ];
         for (column, rect, lines) in candidates {
             let Some(column) = column else { continue };
@@ -764,7 +769,12 @@ mod tests {
     fn track_columns_fit_the_available_width() {
         for width in [30usize, 40, 61, 120] {
             let widths = track_widths(width);
-            let gaps = widths.iter().filter(|width| **width > 0).count().saturating_sub(1) * 2;
+            let gaps = widths
+                .iter()
+                .filter(|width| **width > 0)
+                .count()
+                .saturating_sub(1)
+                * 2;
             assert!(
                 widths.iter().sum::<usize>() + gaps <= width,
                 "width {width}: {widths:?}"

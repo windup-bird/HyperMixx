@@ -25,13 +25,10 @@ pub mod preset;
 pub mod router;
 pub mod translate;
 
-pub use guide::{
-    action_names, Candidate, Column, ControlPart, Entered, Guide, GuideStep, Nav, Row, TreeButton,
-    View,
-};
+pub use guide::{Candidate, Column, Entered, Guide, GuideStep, Nav, Row, View};
 pub use map::{
-    manifest, Action, ActionSpec, BindingSpec, Encoding, Map, MapError, Meta, SlotKind, SlotRole,
-    Target, ACTIONS,
+    manifest, Action, ActionSpec, BindingSpec, Encoding, FxParamRef, Map, MapError, Meta, SlotKind,
+    SlotRole, Target, ACTIONS,
 };
 pub use msg::{Decoder, Event};
 pub use ports::{list_ports, Input, PortInfo, Received};

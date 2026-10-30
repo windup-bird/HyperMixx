@@ -689,10 +689,10 @@ fn handle_overlay(app: &mut App, key: KeyEvent, dispatcher: &Dispatcher) {
                         FilePurpose::MidiMap => {
                             app.midi_map = Some(path);
                             app.connect_midi(
-                            dispatcher.command_tx.clone(),
-                            &dispatcher.notices,
-                            dispatcher,
-                        );
+                                dispatcher.command_tx.clone(),
+                                &dispatcher.notices,
+                                dispatcher,
+                            );
                         }
                     }
                 }

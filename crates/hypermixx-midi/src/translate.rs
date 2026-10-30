@@ -11,8 +11,8 @@ use hypermixx_core::{
 };
 
 use crate::map::{
-    Action, BindingSpec, Curve, Edge, Encoding, EventKind, FxAction, LoopAction, Map, SyncAction,
-    DEFAULT_NUDGE_SECONDS,
+    Action, BindingSpec, Curve, Edge, Encoding, EventKind, FxAction, FxParamRef, LoopAction, Map,
+    SyncAction, DEFAULT_NUDGE_SECONDS,
 };
 use crate::msg::Event;
 
@@ -377,11 +377,17 @@ impl<'a> BindingOut<'a> {
                 let Some(index) = self.map.fx_slot(chain, &fx) else {
                     return;
                 };
-                self.out.push(Command::SetFxParam {
-                    slot: FxSlotRef { chain, index },
-                    name: param,
-                    value: command_value(self.spec, norm),
-                });
+                let value = command_value(self.spec, norm);
+                let slot = FxSlotRef { chain, index };
+                match param {
+                    FxParamRef::Name(name) => {
+                        self.out.push(Command::SetFxParam { slot, name, value })
+                    }
+                    FxParamRef::Index(index) => {
+                        self.out
+                            .push(Command::SetFxParamIndex { slot, index, value })
+                    }
+                }
             }
             _ => {}
         }
@@ -756,11 +762,7 @@ mod tests {
         }
     }
 
-    fn apply_one(
-        spec: &BindingSpec,
-        state: &mut BindState,
-        event: &Event,
-    ) -> Vec<Command> {
+    fn apply_one(spec: &BindingSpec, state: &mut BindState, event: &Event) -> Vec<Command> {
         let map = Map::empty();
         let mut commands = Vec::new();
         let mut browser = Vec::new();
@@ -1017,7 +1019,7 @@ mod tests {
             Action::Fx(FxAction::Param {
                 chain: FxChainId::Deck(0),
                 fx: "eq".into(),
-                param: "low".into(),
+                param: FxParamRef::Name("low".into()),
             }),
             Encoding::Absolute,
         );

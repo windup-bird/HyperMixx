@@ -71,9 +71,11 @@ impl FilePicker {
                     });
                 }
                 self.entries.sort_by(|a, b| {
-                    b.is_dir
-                        .cmp(&a.is_dir)
-                        .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+                    b.is_dir.cmp(&a.is_dir).then_with(|| {
+                        a.name
+                            .to_ascii_lowercase()
+                            .cmp(&b.name.to_ascii_lowercase())
+                    })
                 });
             }
             Err(err) => self.error = Some(err.to_string()),
@@ -139,7 +141,9 @@ impl FilePicker {
         path.extension()
             .map(|ext| {
                 let ext = ext.to_string_lossy();
-                self.extensions.iter().any(|wanted| wanted.eq_ignore_ascii_case(&ext))
+                self.extensions
+                    .iter()
+                    .any(|wanted| wanted.eq_ignore_ascii_case(&ext))
             })
             .unwrap_or(false)
     }
@@ -281,7 +285,8 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("hypermixx-picker-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hypermixx-picker-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("sub")).unwrap();
         fs::write(dir.join("a.toml"), "x = 1").unwrap();

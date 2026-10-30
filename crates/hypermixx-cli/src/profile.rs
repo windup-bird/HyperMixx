@@ -226,7 +226,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(profile.mixer.as_deref(), Some("profile/../sets/club.toml"));
-        assert_eq!(profile.live.as_deref(), Some("/etc/hypermixx/live.toml"), "absolute stays");
+        assert_eq!(
+            profile.live.as_deref(),
+            Some("/etc/hypermixx/live.toml"),
+            "absolute stays"
+        );
         // A profile at the root of the tree resolves against the root.
         let (profile, _) =
             Profile::from_toml_str("mixer = \"profile/mixer.toml\"\n", Path::new(".")).unwrap();
@@ -249,17 +253,27 @@ mod tests {
         );
         // The shipped map names the development controller, so there is nothing to warn about.
         let device = profile.midi.device.clone();
-        assert_eq!(device.is_none(), notes.iter().any(|note| note.contains("device")));
+        assert_eq!(
+            device.is_none(),
+            notes.iter().any(|note| note.contains("device"))
+        );
 
         // The old inline settings table is refused with a migration message.
         let error = parse("[midi]\ndevice = \"DDJ-400\"\nmap = \"m.toml\"\n").unwrap_err();
-        assert!(error.contains("inline") && error.contains("map file"), "{error}");
+        assert!(
+            error.contains("inline") && error.contains("map file"),
+            "{error}"
+        );
     }
 
     #[test]
     fn an_empty_profile_means_the_defaults() {
         let (profile, notes) = parse("").unwrap();
-        assert_eq!(profile, Profile::default(), "nothing named, nothing overridden");
+        assert_eq!(
+            profile,
+            Profile::default(),
+            "nothing named, nothing overridden"
+        );
         assert!(notes.is_empty());
         // A section that is present but empty is the same as absent.
         let (profile, notes) = parse("[preference]\n").unwrap();
@@ -276,7 +290,9 @@ mod tests {
 
     #[test]
     fn typos_and_wrong_types_are_errors() {
-        assert!(parse("[mixr]\npath = \"x\"\n").unwrap_err().contains("mixr"));
+        assert!(parse("[mixr]\npath = \"x\"\n")
+            .unwrap_err()
+            .contains("mixr"));
         assert!(parse("mixer = 3\n").unwrap_err().contains("mixer"));
         // A section header where a path belongs gets a message about the spelling, not about types.
         let err = parse("[mixer]\nfile = \"x\"\n").unwrap_err();
@@ -323,7 +339,10 @@ mod tests {
         // Each pointer resolved against the profile's own folder, so the files really are there.
         for path in [profile.mixer, profile.live] {
             let path = path.expect("the shipped profile names its files");
-            assert!(path.ends_with("mixer.toml") || path.ends_with("live.toml"), "{path}");
+            assert!(
+                path.ends_with("mixer.toml") || path.ends_with("live.toml"),
+                "{path}"
+            );
             assert!(Path::new(&path).exists(), "{path}");
         }
         assert!(root.join(DEFAULT_MIDI).exists());
@@ -339,10 +358,8 @@ mod tests {
     }
     #[test]
     fn a_map_file_carries_its_device_and_old_shapes_are_refused() {
-        let dir = std::env::temp_dir().join(format!(
-            "hypermixx-midi-profile-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hypermixx-midi-profile-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("midi.toml");
         std::fs::write(
@@ -375,5 +392,4 @@ map = "m.toml"
         assert!(error.contains("two-part"), "{error}");
         std::fs::remove_dir_all(&dir).ok();
     }
-
 }

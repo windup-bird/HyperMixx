@@ -357,11 +357,7 @@ fn part(spans: Vec<Span<'static>>) -> (usize, Vec<Span<'static>>) {
     (width, spans)
 }
 
-fn loop_badge(
-    state: &DeckState,
-    grid: Option<&BeatGrid>,
-    sample_rate: u32,
-) -> Option<String> {
+fn loop_badge(state: &DeckState, grid: Option<&BeatGrid>, sample_rate: u32) -> Option<String> {
     let mut parts = Vec::new();
     if state.loop_range.is_some() {
         if let Some(length) = loop_length(state, grid, sample_rate) {
@@ -1015,12 +1011,16 @@ mod tests {
         app.states[0].key = Some("8A".to_owned());
         app.key_format = hypermixx_core::KeyFormat::Camelot;
         let buffer = render_buffer(&mut app);
-        let text: String = (0..buffer.area.height).map(|y| row_text(&buffer, y)).collect();
+        let text: String = (0..buffer.area.height)
+            .map(|y| row_text(&buffer, y))
+            .collect();
         assert!(text.contains("8A"), "camelot missing: {text}");
 
         app.key_format = hypermixx_core::KeyFormat::Traditional;
         let buffer = render_buffer(&mut app);
-        let text: String = (0..buffer.area.height).map(|y| row_text(&buffer, y)).collect();
+        let text: String = (0..buffer.area.height)
+            .map(|y| row_text(&buffer, y))
+            .collect();
         assert!(text.contains("Am"), "classic missing: {text}");
     }
 

@@ -18,9 +18,8 @@ use hypermixx_audio::fx::FxKind;
 use hypermixx_audio::{AudioPipeline, Command, SAMPLE_RATE};
 use hypermixx_core::{
     Backend, BeatLen, CommandResponse, CueOp, FxChainId, FxSlotRef, HotCueOp, KeylockMode,
-    LiveConfig,
-    LoopEditOp, LoopOp, LoopQuantum, NudgeOp, OutputOp, PhaseMode, Shared, Stem, StemOp,
-    StemPreset, SyncOp, TrackAnalysis, VinylOp,
+    LiveConfig, LoopEditOp, LoopOp, LoopQuantum, NudgeOp, OutputOp, PhaseMode, Shared, Stem,
+    StemOp, StemPreset, SyncOp, TrackAnalysis, VinylOp,
 };
 use hypermixx_library::LibraryDb;
 use hypermixx_media::ChunkedStreams;
@@ -206,18 +205,12 @@ impl Dispatcher {
 
     /// The MIDI mode sender, if an input is attached.
     pub fn midi_control(&self) -> Option<Sender<RouterCommand>> {
-        self.midi_control
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
+        self.midi_control.lock().ok().and_then(|slot| slot.clone())
     }
 
     /// The current MIDI mode snapshot, if an input is attached.
     pub fn midi_state(&self) -> Option<Arc<Mutex<RouterState>>> {
-        self.midi_state
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
+        self.midi_state.lock().ok().and_then(|slot| slot.clone())
     }
 
     /// Attaches the library cache for the `library` command family.
@@ -870,10 +863,7 @@ fn output_command<'a>(
 
 /// The `midi` family: port listing and the live unit-mode controls. Opening an input still happens
 /// at launch (or F2), because a mapping is wired to the running engine once.
-fn midi_command<'a>(
-    words: &mut impl Iterator<Item = &'a str>,
-    dispatcher: &Dispatcher,
-) -> Action {
+fn midi_command<'a>(words: &mut impl Iterator<Item = &'a str>, dispatcher: &Dispatcher) -> Action {
     match words.next() {
         Some("ports") | Some("list") => match hypermixx_midi::list_ports() {
             Ok(ports) if ports.is_empty() => Action::Message("midi: no input ports".into()),
@@ -893,10 +883,7 @@ fn midi_command<'a>(
 
 /// `midi mode` lists every unit, `midi mode <unit>` shows one, and `midi mode <unit> <mode|next>`
 /// changes it. The router is the authority; the snapshot is only used for validation and listing.
-fn midi_mode<'a>(
-    words: &mut impl Iterator<Item = &'a str>,
-    dispatcher: &Dispatcher,
-) -> Action {
+fn midi_mode<'a>(words: &mut impl Iterator<Item = &'a str>, dispatcher: &Dispatcher) -> Action {
     let Some(state) = dispatcher.midi_state() else {
         return Action::Failed("midi: no input attached".into());
     };

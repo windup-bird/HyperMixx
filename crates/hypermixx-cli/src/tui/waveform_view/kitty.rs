@@ -60,12 +60,7 @@ pub fn place(id: u32, placement: u32, area: Rect, source: SourceRect) -> String 
         out,
         "\x1b_Ga=p,i={id},p={placement},q=2,z=-1,C=1,c={},r={},\
          x={},y={},w={},h={}\x1b\\",
-        area.width,
-        area.height,
-        source.x,
-        source.y,
-        source.width,
-        source.height
+        area.width, area.height, source.x, source.y, source.width, source.height
     )
     .expect("writing to a String cannot fail");
     // `C=1` leaves the cursor on the image's top-left cell; ratatui thinks the forced-width symbol
@@ -79,8 +74,7 @@ pub fn delete(id: u32) -> String {
     format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\")
 }
 
-const ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn base64(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
@@ -151,9 +145,15 @@ mod tests {
         assert!(seq.contains("i=7") && seq.contains("p=1"));
         assert!(seq.contains("x=20,y=0,w=40,h=8"));
         assert!(seq.contains("z=-1") && seq.contains("C=1"));
-        assert!(!seq.contains("f=32"), "placement must not carry pixels: {seq}");
+        assert!(
+            !seq.contains("f=32"),
+            "placement must not carry pixels: {seq}"
+        );
         assert!(!seq.contains("a=T"));
-        assert!(!seq.contains("\x1b7"), "placement must not clear the deck: {seq}");
+        assert!(
+            !seq.contains("\x1b7"),
+            "placement must not clear the deck: {seq}"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# An 8-pad grid with three modes. The mode slots are ordinary controls: the unit binds one note
+# An 8-pad grid with four modes. The mode slots are ordinary controls: the unit binds one note
 # each, and pressing one switches the unit's mode without emitting a command.
 [[preset]]
 name = "pad"
@@ -36,15 +36,20 @@ type = "Button"
 role = "mode_trigger"
 target = "hotcue"
 [[preset.slot]]
-slot = "mode-beatloop"
+slot = "mode-loop"
 type = "Button"
 role = "mode_trigger"
-target = "beatloop"
+target = "loop"
 [[preset.slot]]
 slot = "mode-beatjump"
 type = "Button"
 role = "mode_trigger"
 target = "beatjump"
+[[preset.slot]]
+slot = "mode-stems"
+type = "Button"
+role = "mode_trigger"
+target = "stems"
 [[preset.slot]]
 slot = "mode-next"
 type = "Button"
@@ -79,7 +84,7 @@ action = "hotcue trigger 8"
 
 # Beat-loop lengths, shortest first: 1/4, 1/2, 1, 2, 4, 8, 16, 32 beats.
 [[preset.mode]]
-name = "beatloop"
+name = "loop"
 [[preset.mode.bind]]
 slot = "pad1"
 action = "loop 1/4"
@@ -109,25 +114,41 @@ action = "loop 32"
 name = "beatjump"
 [[preset.mode.bind]]
 slot = "pad1"
-action = "beatjump -16"
+action = "beatjump -2"
 [[preset.mode.bind]]
 slot = "pad2"
-action = "beatjump -8"
+action = "beatjump 2"
 [[preset.mode.bind]]
 slot = "pad3"
 action = "beatjump -4"
 [[preset.mode.bind]]
 slot = "pad4"
-action = "beatjump -2"
-[[preset.mode.bind]]
-slot = "pad5"
-action = "beatjump 2"
-[[preset.mode.bind]]
-slot = "pad6"
 action = "beatjump 4"
 [[preset.mode.bind]]
-slot = "pad7"
+slot = "pad5"
+action = "beatjump -8"
+[[preset.mode.bind]]
+slot = "pad6"
 action = "beatjump 8"
+[[preset.mode.bind]]
+slot = "pad7"
+action = "beatjump -16"
 [[preset.mode.bind]]
 slot = "pad8"
 action = "beatjump 16"
+
+# Pads 1-4 latch the four stems' mute; 5-8 are deliberately unbound in this mode.
+[[preset.mode]]
+name = "stems"
+[[preset.mode.bind]]
+slot = "pad1"
+action = "drums mute"
+[[preset.mode.bind]]
+slot = "pad2"
+action = "bass mute"
+[[preset.mode.bind]]
+slot = "pad3"
+action = "other mute"
+[[preset.mode.bind]]
+slot = "pad4"
+action = "vocals mute"

@@ -35,7 +35,7 @@ fn main() {
     // The guide is a self-contained editor: no audio engine, no mixer. It runs before the topology
     // is read, so mapping a controller never depends on a working sound card.
     if let Some(path) = args.midi_guide.as_deref() {
-        let decks = args.decks.unwrap_or(DECK_COUNT);
+        let decks = args.decks.unwrap_or(1);
         // The file is the source of truth for the guide: its `[meta].device` wins, and only an
         // explicit `--midi` overrides it. A profile device belongs to the engine session, not to a
         // map file the user picked here.
@@ -292,7 +292,7 @@ struct CliArgs {
     midi_map: Option<String>,
     /// `--midi-guide <file>`: run the unit map guide instead of the engine.
     midi_guide: Option<String>,
-    /// `--decks <n>`: how many deck units the guide offers when cloning.
+    /// `--decks <n>`: how many deck groups the guide shows; `new` allocates beyond them.
     decks: Option<usize>,
     /// `--live <file>`: this machine's settings (engine rate, ring sizes, stem defaults).
     live: Option<String>,

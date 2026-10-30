@@ -127,7 +127,7 @@ max = 1.0
 
 # RelKnob：一个方向一个 action
 [[unit.mode.bind]]
-slot = "browse"
+slot = "choose"
 action = "browser up"
 down = "browser down"
 
@@ -205,8 +205,15 @@ slot = "pad1"
 action = "hotcue trigger 1"
 ```
 
-内置 preset：`browser`(both) `crossfader`(global) `deckfx` `jog` `manualjump` `manualloop` `mixer`
-`output`(global) `pad` `tempofader` `transport`。
+内置 preset：`browser`(both) `crossfader`(global) `deckfx1` `deckfx2` `deckfx3` `jog`
+`manualjump` `manualloop` `mixer` `outputfader`(global) `pad` `tempofader` `transport`。
+
+- `pad` 有四个 mode：`hotcue` / `loop` / `beatjump` / `stems`，以及四个 trigger 和一个 cycle。
+  `stems` 的 pad1–4 切换 drums/bass/other/vocals 的 mute，pad5–8 在该 mode 下留空。
+- `deckfx1/2/3` 是三个通用 deck FX 段，slot 名为 `toggle` / `param1` / `param2`，分别引用
+  `fx1` / `fx2` / `fx3`。参数按序号绑定（`fx param 1` / `fx param 2`），这样以后换掉指针
+  指向的效果时 MIDI map 不用改。
+- `mixer` 没有 `load` slot；`cue` 叫 `cue-toggle`。
 
 用户 preset 放在 `[meta] presets = ["presets/my.toml"]` 列出的文件里（相对 map 所在目录）；
 同名 preset 整体覆盖内置。
@@ -226,19 +233,50 @@ CLI 启动时用 `ListFx` 拿到每条链的槽位名，再 `Map::resolve_fx` �
 
 `chain` 省略时用 unit 的 deck，所以同一个 `mixer` preset 在 deck1 和 deck2 上各指各的链。
 
+### 参数名与参数序号
+
+- `fx param low`：按效果自己声明的参数名。
+- `fx param 1`：按参数序号（1-based），适合 `fx1/fx2/fx3` 这种将来可切换效果的指针槽。
+  引擎用效果当前的参数顺序解析；序号超出范围会报错，不会静默丢弃。
+
+`fader` / `crossfader` / `gain` 不是 FX 槽：`fader flow`、`fader cross`、`fader gain` 是
+通道 fader，和 `fx = "gain"` 这种插入效果分开。`deckfx1/2/3` 只控制 deck 链；stem 自己的
+FX 链要用 `chain = "vocals"` / `chain = "deck1/vocals"`，这次不提供 stemfx preset。
+
+`fx1` / `fx2` / `fx3` 是给未来可变 FX 指针预留的稳定槽位名。当前默认 `mixer.toml` 还没有
+暴露这些名字，所以真实运行时会提示 unresolved 并跳过对应绑定；guide 仍可保存和编辑它们。
+
 ## 9. 打开与编辑
 
 - `--midi <port> [--midi-map <file>]`：启动时打开端口并按映射翻译。
 - `--tui` 下 `F2` 选端口、`F3` 选映射文件。
 - `--midi-guide <file> [--midi <port>] [--decks <n>]`：learn 模式编辑器，不启动音频引擎。
-  三列 `deck | unit | slot`：`←→` 换列、`↑↓` 换行、`Enter` 下钻 / 在 `add unit` 上开 preset 菜单 /
-  在 slot 上进 learn、`Tab` 到命令行（再按 Tab/`←→` 换按钮、`Enter` 执行、`Esc` 回列）、
-  `[`/`]` 换当前 mode、`PgUp`/`PgDn` 翻 raw 监视器。
-  命令行只保留 `Clone`（仅 deck unit）、`Learn`（仅 slot）和常驻的 `Connect` / `Open` / `Save` / `Exit`；
-  加 unit 用 `add unit` 行回车，mode 编辑暂不做。
-  进入 learn 后按下/转动控件 → `Confirm`。`JogWheel` 分两步：先按盘，再转轮。
-  `Encoding` 按钮在 `absolute` / `two_point` / `twos_complement` / `offset64` / `direction`
-  之间切换候选。
+  顶栏显示 file/controller；下面是带边框的 `deck | unit | slot`、`info | watch dog`、
+  灰色键位提示和居中 command 按钮。
+
+  导航：
+
+  - `←→` 换栏，`↑↓` 换行；非当前栏保留灰色高亮。
+  - `Enter`：deck/unit 下钻；`new` 上打开新 deck 菜单；`add unit` 上打开 preset 菜单；
+    slot 上进入 learn。
+  - `Tab` / `Shift+Tab` 进入并切换 command；`Esc` 回到栏目。
+  - 任意方向键移动栏目时，command 焦点回到左一按钮。
+  - `PgUp` / `PgDn` 回看 raw MIDI。
+
+  command 固定六个：
+
+  ```text
+  [Enter | Learn | Confirm]  Delete  Connect  File  Save  Exit
+  ```
+
+  - deck/unit：左一是 `Enter`
+  - slot：左一是 `Learn`；learn 中变成 `Confirm`
+  - `Delete`：删除选中的 unit，或把选中的 slot 从 unit 解绑；preset 自带且没有 unit 覆盖的 slot 不删
+  - `new` 菜单固定两项：`clone from deck1` / `map a new one`；deck1 没有 unit 时 clone 会在
+    watch dog 里提示
+  - `add unit` 只列内置 preset，按 deck/global 过滤
+  - learn 中选中 slot 行会闪烁；再次 `Enter` 确认，`Esc` 取消
+  - 不提供 mode 编辑、action 编辑、selector 编辑或 encoding 切换；这些直接改 TOML
 
 ### 14-bit 的自动识别
 

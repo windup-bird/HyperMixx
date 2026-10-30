@@ -990,7 +990,7 @@ turn = "nudge 0.15"
         assert!(feed.commands.is_empty(), "a mode key emits nothing");
         assert!(feed.state_changed);
         router.feed(&note(0, 25, false));
-        assert_eq!(router.snapshot().units[0].current, "beatloop");
+        assert_eq!(router.snapshot().units[0].current, "loop");
 
         let feed = router.feed(&note(0, 16, true));
         assert!(matches!(

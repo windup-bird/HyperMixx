@@ -4,8 +4,8 @@
 # control with `role = "mode_trigger"` or `role = "mode_cycle"`; it switches the unit's mode and
 # emits no command. Endpoints are unique across the whole file.
 #
-# Built-in presets: browser | crossfader | deckfx | jog | manualjump | manualloop | mixer | output |
-# pad | tempofader | transport
+# Built-in presets: browser | crossfader | deckfx1 | deckfx2 | deckfx3 | jog | manualjump |
+# manualloop | mixer | outputfader | pad | tempofader | transport
 
 [meta]
 name = "example"
@@ -50,9 +50,9 @@ role = "mode_trigger"
 target = "hotcue"
 endpoint = { midi = "note", channel = 0, id = 24 }
 [[unit.control]]
-slot = "mode-beatloop"
+slot = "mode-loop"
 role = "mode_trigger"
-target = "beatloop"
+target = "loop"
 endpoint = { midi = "note", channel = 0, id = 25 }
 [[unit.control]]
 slot = "mode-beatjump"
@@ -60,9 +60,14 @@ role = "mode_trigger"
 target = "beatjump"
 endpoint = { midi = "note", channel = 0, id = 26 }
 [[unit.control]]
+slot = "mode-stems"
+role = "mode_trigger"
+target = "stems"
+endpoint = { midi = "note", channel = 0, id = 27 }
+[[unit.control]]
 slot = "mode-next"
 role = "mode_cycle"
-endpoint = { midi = "note", channel = 0, id = 27 }
+endpoint = { midi = "note", channel = 0, id = 28 }
 
 # ---- deck 2 pad grid -------------------------------------------------------------------------
 [[unit]]
@@ -101,9 +106,9 @@ role = "mode_trigger"
 target = "hotcue"
 endpoint = { midi = "note", channel = 1, id = 24 }
 [[unit.control]]
-slot = "mode-beatloop"
+slot = "mode-loop"
 role = "mode_trigger"
-target = "beatloop"
+target = "loop"
 endpoint = { midi = "note", channel = 1, id = 25 }
 [[unit.control]]
 slot = "mode-beatjump"
@@ -111,9 +116,14 @@ role = "mode_trigger"
 target = "beatjump"
 endpoint = { midi = "note", channel = 1, id = 26 }
 [[unit.control]]
+slot = "mode-stems"
+role = "mode_trigger"
+target = "stems"
+endpoint = { midi = "note", channel = 1, id = 27 }
+[[unit.control]]
 slot = "mode-next"
 role = "mode_cycle"
-endpoint = { midi = "note", channel = 1, id = 27 }
+endpoint = { midi = "note", channel = 1, id = 28 }
 
 # ---- transport -------------------------------------------------------------------------------
 [[unit]]
@@ -179,11 +189,8 @@ endpoint = { midi = "cc", channel = 0, id = 11 }
 slot = "filter"
 endpoint = { midi = "cc", channel = 0, id = 12 }
 [[unit.control]]
-slot = "cue"
+slot = "cue-toggle"
 endpoint = { midi = "note", channel = 0, id = 13 }
-[[unit.control]]
-slot = "load"
-endpoint = { midi = "note", channel = 0, id = 14 }
 
 [[unit]]
 id = "deck2.mixer"
@@ -209,11 +216,8 @@ endpoint = { midi = "cc", channel = 1, id = 11 }
 slot = "filter"
 endpoint = { midi = "cc", channel = 1, id = 12 }
 [[unit.control]]
-slot = "cue"
+slot = "cue-toggle"
 endpoint = { midi = "note", channel = 1, id = 13 }
-[[unit.control]]
-slot = "load"
-endpoint = { midi = "note", channel = 1, id = 14 }
 
 # ---- tempo faders ----------------------------------------------------------------------------
 [[unit]]
@@ -299,50 +303,8 @@ slot = "autoloop"
 endpoint = { midi = "cc", encoding = "two_point", channel = 1, id = 37 }
 
 # ---- deck FX ---------------------------------------------------------------------------------
-[[unit]]
-id = "deck1.deckfx"
-preset = "deckfx"
-deck = 1
-
-[[unit.control]]
-slot = "toggle"
-endpoint = { midi = "note", channel = 0, id = 40 }
-[[unit.control]]
-slot = "param1"
-endpoint = { midi = "cc", channel = 0, id = 20 }
-[[unit.control]]
-slot = "param2"
-endpoint = { midi = "cc", channel = 0, id = 21 }
-
-[[unit.control]]
-slot = "mode-filter"
-type = "Button"
-role = "mode_trigger"
-target = "filter"
-endpoint = { midi = "note", channel = 0, id = 41 }
-
-[[unit.control]]
-slot = "mode-eq"
-type = "Button"
-role = "mode_trigger"
-target = "eq"
-endpoint = { midi = "note", channel = 0, id = 42 }
-
-# This one uses the user preset from `presets/example.toml` to show the override path.
-[[unit]]
-id = "deck2.deckfx"
-preset = "mydeckfx"
-deck = 2
-
-[[unit.control]]
-slot = "toggle"
-endpoint = { midi = "note", channel = 1, id = 40 }
-[[unit.control]]
-slot = "knob1"
-endpoint = { midi = "cc", channel = 1, id = 20 }
-[[unit.control]]
-slot = "knob2"
-endpoint = { midi = "cc", channel = 1, id = 21 }
+# The shipped topology does not define fx1/fx2/fx3 yet. The deckfx1/2/3 presets are available in
+# the guide; add units for them once the mixer exposes those stable slot names.
 
 # ---- jog wheels ------------------------------------------------------------------------------
 [[unit]]
@@ -372,7 +334,7 @@ endpoint = [
 # ---- shared controls -------------------------------------------------------------------------
 [[unit]]
 id = "global.output"
-preset = "output"
+preset = "outputfader"
 
 [[unit.control]]
 slot = "master"
@@ -394,7 +356,7 @@ id = "global.browser"
 preset = "browser"
 
 [[unit.control]]
-slot = "browse"
+slot = "choose"
 endpoint = { midi = "cc", encoding = "two_point", reverse = true, channel = 15, id = 0 }
 [[unit.control]]
 slot = "open"

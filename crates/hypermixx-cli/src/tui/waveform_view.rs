@@ -341,12 +341,7 @@ impl WaveformView {
                 clear_cells(&mut sequence, area);
             }
             sequence.push_str(&kitty::transmit(&image, &palette, new_id));
-            sequence.push_str(&kitty::place(
-                new_id,
-                state.placement,
-                area,
-                source,
-            ));
+            sequence.push_str(&kitty::place(new_id, state.placement, area, source));
             // Free the image from the *previous* rebuild now; keep the immediately superseded one
             // for one more frame so the terminal has definitely rendered the replacement.
             if let Some(old) = state.pending_delete.take() {
@@ -362,7 +357,10 @@ impl WaveformView {
             });
             sequence
         } else {
-            let strip = state.strip.as_ref().expect("a strip exists when not rebuilding");
+            let strip = state
+                .strip
+                .as_ref()
+                .expect("a strip exists when not rebuilding");
             let max_offset = strip.width.saturating_sub(viewport_width);
             let offset = offset.min(max_offset);
             let mut sequence = kitty::place(
@@ -388,7 +386,6 @@ impl WaveformView {
         state.last = Some(Instant::now());
         state.last_playhead = Some(playhead_bits);
     }
-
 }
 
 fn overlay_of(state: &DeckState) -> raster::Overlay {
@@ -510,7 +507,15 @@ fn render_braille(
                     colors,
                 );
             }
-            draw_cue_lines(ctx, overlay, playhead, frames_per_dot, center_x, dots_x, dots_y);
+            draw_cue_lines(
+                ctx,
+                overlay,
+                playhead,
+                frames_per_dot,
+                center_x,
+                dots_x,
+                dots_y,
+            );
             ctx.draw(&CanvasLine::new(
                 center_x,
                 0.0,
@@ -520,7 +525,13 @@ fn render_braille(
             ));
         });
     frame.render_widget(canvas, area);
-    paint_loop_bg(frame, area, playhead_frame, frames_per_cell, overlay.loop_range);
+    paint_loop_bg(
+        frame,
+        area,
+        playhead_frame,
+        frames_per_cell,
+        overlay.loop_range,
+    );
 }
 
 fn draw_cue_lines(
@@ -683,7 +694,7 @@ fn draw_beats(
 mod tests {
     use super::*;
     use crate::preference::{WaveformBackend, WaveformColors};
-    use hypermixx_core::{HOT_CUE_SLOTS, KeylockMode, StemStatus};
+    use hypermixx_core::{KeylockMode, StemStatus, HOT_CUE_SLOTS};
     use hypermixx_library::{BandPeaks, StereoPeaks};
 
     fn deck_state(frame: u64) -> DeckState {
@@ -801,7 +812,8 @@ mod tests {
         };
         let backend = ratatui::backend::TestBackend::new(40, 6);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut draw = |terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>, frames_per_cell| {
+        let mut draw = |terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+                        frames_per_cell| {
             terminal
                 .draw(|frame| {
                     view.render(
@@ -815,7 +827,13 @@ mod tests {
                     );
                 })
                 .unwrap();
-            terminal.backend().buffer().cell((0, 0)).unwrap().symbol().to_owned()
+            terminal
+                .backend()
+                .buffer()
+                .cell((0, 0))
+                .unwrap()
+                .symbol()
+                .to_owned()
         };
         let first = draw(&mut terminal, 2048.0);
         assert!(first.contains("a=t") && first.contains("a=p"));
@@ -837,7 +855,10 @@ mod tests {
         assert!(third.contains("a=p") && third.contains("a=d,d=I"));
         let place = third.find("a=p").unwrap();
         let delete = third.find("a=d").unwrap();
-        assert!(place < delete, "the old image is deleted after the new placement");
+        assert!(
+            place < delete,
+            "the old image is deleted after the new placement"
+        );
     }
 
     /// Rough per-frame cost of the two image paths. Ignored by default; run with
@@ -874,7 +895,8 @@ mod tests {
         let mut encode_ms = 0.0f64;
         for _ in 0..rounds.min(6) {
             let t0 = Instant::now();
-            let image = raster::rasterize(Some(&waveform), None, 128.0, 2048.0 / 8.0, 2832, 112, false);
+            let image =
+                raster::rasterize(Some(&waveform), None, 128.0, 2048.0 / 8.0, 2832, 112, false);
             raster_ms += t0.elapsed().as_secs_f64() * 1000.0;
             let t1 = Instant::now();
             let _ = kitty::transmit(&image, &palette, 1);
@@ -894,7 +916,6 @@ mod tests {
             "kitty placement: {:.3} ms/frame",
             start.elapsed().as_secs_f64() * 1000.0 / f64::from(rounds)
         );
-
     }
 
     #[test]
@@ -914,12 +935,10 @@ mod tests {
         let image = raster::rasterize(Some(&left), None, 128.0, 1.0, 21, 13, false);
         let center = image.height / 2;
         assert!((0..center).any(|y| {
-            (0..image.width)
-                .any(|x| image.indices[(y * image.width + x) as usize] != raster::BG)
+            (0..image.width).any(|x| image.indices[(y * image.width + x) as usize] != raster::BG)
         }));
         assert!(!(center + 1..image.height).any(|y| {
-            (0..image.width)
-                .any(|x| image.indices[(y * image.width + x) as usize] != raster::BG)
+            (0..image.width).any(|x| image.indices[(y * image.width + x) as usize] != raster::BG)
         }));
     }
 }

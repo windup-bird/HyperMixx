@@ -744,6 +744,24 @@ pub enum SyncAction {
     Unlock,
 }
 
+/// A parameter inside an FX slot: its effect-specific name, or a 0-based index in the effect's
+/// declared parameter order. The index form is what a mutable slot (`fx1`) needs: swapping the
+/// effect must not invalidate the knob binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FxParamRef {
+    Name(String),
+    Index(usize),
+}
+
+impl std::fmt::Display for FxParamRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FxParamRef::Name(name) => f.write_str(name),
+            FxParamRef::Index(index) => write!(f, "{}", index + 1),
+        }
+    }
+}
+
 /// FX actions address a chain and a slot by name. Slot indices are resolved by the CLI after it
 /// has asked the engine for each chain, never written into the file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -771,7 +789,7 @@ pub enum FxAction {
     Param {
         chain: FxChainId,
         fx: String,
-        param: String,
+        param: FxParamRef,
     },
 }
 
@@ -1782,11 +1800,12 @@ fn parse_action(line: &str, ctx: &ActionCtx<'_>) -> Result<Action, String> {
         }
         ["fx", "param", param] => {
             let (chain, fx) = fx_address(ctx, named_chain)?;
-            Ok(Action::Fx(FxAction::Param {
-                chain,
-                fx,
-                param: (*param).to_owned(),
-            }))
+            let param = match param.parse::<usize>() {
+                Ok(0) => return Err("`fx param` indexes start at 1".to_owned()),
+                Ok(value) => FxParamRef::Index(value - 1),
+                Err(_) => FxParamRef::Name((*param).to_owned()),
+            };
+            Ok(Action::Fx(FxAction::Param { chain, fx, param }))
         }
         ["fx", "param"] => Err("`fx param` needs the parameter name (`fx param value`)".to_owned()),
         _ => Err(format!("unknown action `{line}`")),
@@ -2297,6 +2316,32 @@ action = "loop 1/4"
     }
 
     #[test]
+    fn an_fx_param_can_be_addressed_by_one_based_index() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "param"
+type = "Knob"
+endpoint = { midi = "cc", channel = 0, id = 7 }
+
+[[unit.mode]]
+name = "m"
+[[unit.mode.bind]]
+slot = "param"
+action = "fx param 2"
+fx = "fx1"
+"#,
+        );
+        let map = parse(&text).expect("param index");
+        let bind = map.units[0].binding(0, 0).expect("binding");
+        assert!(matches!(
+            &bind.actions.main,
+            Some(Action::Fx(FxAction::Param { param: FxParamRef::Index(1), fx, .. }))
+                if fx == "fx1"
+        ));
+    }
+
+    #[test]
     fn a_preset_slot_supplies_the_kind_and_the_mode_keys() {
         let text = r#"
 [[unit]]
@@ -2306,12 +2351,12 @@ deck = 1
 "#;
         let map = parse(text).expect("pad preset");
         let unit = &map.units[0];
-        assert_eq!(unit.controls.len(), 12);
-        assert_eq!(unit.modes.len(), 3);
+        assert_eq!(unit.controls.len(), 13);
+        assert_eq!(unit.modes.len(), 4);
         // Unbound mode keys produce no selector until the guide learns their endpoint.
         assert_eq!(unit.selectors.len(), 0);
         assert_eq!(unit.controls[8].role, SlotRole::ModeTrigger);
-        assert_eq!(unit.controls[11].role, SlotRole::ModeCycle);
+        assert_eq!(unit.controls[12].role, SlotRole::ModeCycle);
     }
 
     #[test]
@@ -2352,7 +2397,7 @@ action = "play"
 "#;
         let map = parse(text).expect("extra slot");
         let unit = &map.units[0];
-        assert_eq!(unit.controls.len(), 9);
+        assert_eq!(unit.controls.len(), 8);
         assert_eq!(unit.controls.last().unwrap().slot, "extra");
         let mine = unit
             .modes
@@ -2380,7 +2425,7 @@ start = "beatjump"
         let unit = &map.units[0];
         assert_eq!(unit.modes[0].name, "beatjump");
         assert_eq!(unit.modes[1].name, "hotcue");
-        assert_eq!(unit.modes[2].name, "beatloop");
+        assert_eq!(unit.modes[2].name, "loop");
         assert_eq!(unit.start, 0);
     }
 

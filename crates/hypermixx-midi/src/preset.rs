@@ -15,12 +15,14 @@ use crate::map::{Meta, RawMode, SlotKind, SlotRole};
 const BUILTINS: &[(&str, &str)] = &[
     ("browser", include_str!("../presets/browser.toml")),
     ("crossfader", include_str!("../presets/crossfader.toml")),
-    ("deckfx", include_str!("../presets/deckfx.toml")),
+    ("deckfx1", include_str!("../presets/deckfx1.toml")),
+    ("deckfx2", include_str!("../presets/deckfx2.toml")),
+    ("deckfx3", include_str!("../presets/deckfx3.toml")),
     ("jog", include_str!("../presets/jog.toml")),
     ("manualjump", include_str!("../presets/manualjump.toml")),
     ("manualloop", include_str!("../presets/manualloop.toml")),
     ("mixer", include_str!("../presets/mixer.toml")),
-    ("output", include_str!("../presets/output.toml")),
+    ("outputfader", include_str!("../presets/outputfader.toml")),
     ("pad", include_str!("../presets/pad.toml")),
     ("tempofader", include_str!("../presets/tempofader.toml")),
     ("transport", include_str!("../presets/transport.toml")),
@@ -95,6 +97,7 @@ fn is_action_role(role: &SlotRole) -> bool {
 #[derive(Clone, Debug, Default)]
 pub struct PresetRegistry {
     presets: HashMap<String, Preset>,
+    builtins: std::collections::HashSet<String>,
 }
 
 fn check_preset_name(name: &str) -> Result<(), String> {
@@ -109,11 +112,13 @@ fn check_preset_name(name: &str) -> Result<(), String> {
 impl PresetRegistry {
     pub fn load(meta: Option<&Meta>, base: &Path) -> Result<Self, String> {
         let mut presets = HashMap::new();
+        let mut builtins = std::collections::HashSet::new();
         for (source, text) in BUILTINS {
-            let file: PresetFile = toml::from_str(text)
-                .map_err(|err| format!("built-in preset `{source}`: {err}"))?;
+            let file: PresetFile =
+                toml::from_str(text).map_err(|err| format!("built-in preset `{source}`: {err}"))?;
             for preset in file.presets {
                 check_preset_name(&preset.name)?;
+                builtins.insert(preset.name.clone());
                 presets.insert(preset.name.clone(), preset);
             }
         }
@@ -126,15 +131,15 @@ impl PresetRegistry {
                 };
                 let text = std::fs::read_to_string(&full)
                     .map_err(|err| format!("{}: {err}", full.display()))?;
-                let file: PresetFile = toml::from_str(&text)
-                    .map_err(|err| format!("{}: {err}", full.display()))?;
+                let file: PresetFile =
+                    toml::from_str(&text).map_err(|err| format!("{}: {err}", full.display()))?;
                 for preset in file.presets {
                     check_preset_name(&preset.name)?;
                     presets.insert(preset.name.clone(), preset);
                 }
             }
         }
-        Ok(Self { presets })
+        Ok(Self { presets, builtins })
     }
 
     pub fn get(&self, name: &str) -> Option<&Preset> {
@@ -149,6 +154,11 @@ impl PresetRegistry {
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.presets.keys().map(String::as_str)
     }
+
+    /// Built-in preset names only; the add-unit menu deliberately hides user-defined presets.
+    pub fn builtin_names(&self) -> impl Iterator<Item = &str> {
+        self.builtins.iter().map(String::as_str)
+    }
 }
 
 #[cfg(test)]
@@ -162,12 +172,14 @@ mod tests {
         for name in [
             "browser",
             "crossfader",
-            "deckfx",
+            "deckfx1",
+            "deckfx2",
+            "deckfx3",
             "jog",
             "manualjump",
             "manualloop",
             "mixer",
-            "output",
+            "outputfader",
             "pad",
             "tempofader",
             "transport",
@@ -178,10 +190,8 @@ mod tests {
 
     #[test]
     fn a_user_file_replaces_a_builtin_with_the_same_name() {
-        let dir = std::env::temp_dir().join(format!(
-            "hypermixx-preset-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hypermixx-preset-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path: PathBuf = dir.join("my-presets.toml");
         std::fs::write(

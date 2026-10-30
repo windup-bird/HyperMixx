@@ -513,6 +513,7 @@ fn route(mixer: &mut Mixer, sync: &mut SyncGroup, command: Command) -> Option<Co
         | SetFxEnabled { .. }
         | ToggleFx { .. }
         | SetFxParam { .. }
+        | SetFxParamIndex { .. }
         | FxTrigger { .. }
         | PadPress { .. }
         | PadRelease { .. }

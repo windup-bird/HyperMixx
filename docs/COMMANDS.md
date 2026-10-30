@@ -23,11 +23,11 @@ cargo run -p hypermixx-cli -- [flags]
 | `--midi <port>` | 启动时打开 MIDI 输入端口（端口号或名字，`midi ports` 可列） |
 | `--midi-map <file>` | 映射文件，缺省 `midi-map.toml`；显式给时必须与 `--midi` 同给，否则报错（profile 里的 `[midi]` 不受此限） |
 | `--midi-guide [<file>]` | learn 模式地图编辑器（**不启动音频引擎**）；文件缺省 `midi-map.toml` |
-| `--decks <n>` | 仅作用于 `--midi-guide` 的目标清单宽度，缺省 2 |
+| `--decks <n>` | 仅作用于 `--midi-guide` 的 deck 栏宽度，缺省 1 |
 
 - 未知参数是硬错误（`error: unknown argument …`），不会静默忽略。
-- `--midi-guide` 即使不跟 `--midi` 也能在 TUI 里选端口/文件；`--tui` 下 `F2` 选端口、
-  `F3` 选映射文件，`--midi/--midi-map` 只是免选择的快捷方式。
+- `--midi-guide` 即使不跟 `--midi` 也能在 TUI 里选端口/文件；给了路径/端口时启动即尝试打开，
+  失败会留在 watch dog 里等待 `File` / `Connect`。
 - deck 数量启动时从引擎查询（自定义拓扑可配任意通道数），不是固定常量。
 
 ---
@@ -256,6 +256,8 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 
 - `<slot>` 可以是**索引**或**效果名**（启动时已 `ListFx` 预载，无需先 `list`）。
   效果名按链内第一个同名槽解析。
+- MIDI map 的 `fx param` 可以写参数名，也可以写 1-based 序号（`fx param 1`）；序号按效果
+  当前声明的参数顺序解析，给可切换效果的 `fx1/fx2/fx3` 指针槽使用。
 - 内置效果与参数（`fx help` 输出，来自 `FxKind::ALL` 注册表）：
 
 | kind | 别名 | 参数 |
@@ -425,7 +427,7 @@ output refresh   （别名 reload/reopen）重试所有不可用的目的地，�
 
 映射文件里的 `action` 就是**一条去掉目标的会话命令**（`"beatjump 4"`、`"vocals mute"`、
 `"sync phase pid"`），目标取 binding 的 `deck` 字段。语法表只有一份
-（`hypermixx-core::action::ACTIONS`），guide 的目标清单与 `docs/MIDI.md` 都由它生成；
+（`hypermixx-core::action::ACTIONS`），`docs/MIDI.md` 的 action 表由它维护；
 CLI 侧有一个测试逐一断言每个 action 都有对应的会话动词。
 
 ```

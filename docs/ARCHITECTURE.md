@@ -396,8 +396,10 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   文件、`load` 不带路径弹文件浏览器;`Load` 完成后 `App::connect_midi` 连上,`--midi/--midi-map`
   仅是免选择的快捷方式
 - `--midi-guide [<file>] [--midi <port>] [--decks <n>]` — learn 模式地图编辑器(`src/tui/guide.rs`),
-  **不启动引擎**;左目标清单/右原始事件监视器(PgUp/PgDn 滚动)/底部提示,键位
-  `↑↓ Enter 空格 m x s p f q`,端口/文件也可在 TUI 里选;逻辑在 `hypermixx_midi::guide`(纯状态机)
+  **不启动引擎**;`deck | unit | slot` 三栏、`info | watch dog`、灰色键位提示、居中 command
+  (`Enter/Learn/Confirm` + `Delete/Connect/File/Save/Exit`)。方向键换栏/换行,Tab 切 command,
+  Enter 下钻/学习,new 菜单负责 clone/new deck,add unit 只列内置 preset;逻辑在
+  `hypermixx_midi::guide`(纯状态机)
 
 ### 脚本
 - `scripts/phase_probe.sh` — 双 deck 反复 `beatjump`,看相位差**增量**是否恒定(跳转精度)

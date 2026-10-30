@@ -626,6 +626,13 @@ pub enum Command {
         name: String,
         value: f32,
     },
+    /// Sets the parameter at `index` in the effect's declared parameter order. A mutable FX slot
+    /// uses this form because its parameter names change when the effect is swapped.
+    SetFxParamIndex {
+        slot: FxSlotRef,
+        index: usize,
+        value: f32,
+    },
     /// Fires the effect's one-shot hook (re-trigger an envelope, restart a sweep).
     FxTrigger {
         slot: FxSlotRef,
@@ -841,6 +848,12 @@ impl std::fmt::Debug for Command {
                 .debug_struct("SetFxParam")
                 .field("slot", slot)
                 .field("name", name)
+                .field("value", value)
+                .finish(),
+            Command::SetFxParamIndex { slot, index, value } => f
+                .debug_struct("SetFxParamIndex")
+                .field("slot", slot)
+                .field("index", index)
                 .field("value", value)
                 .finish(),
             Command::FxTrigger { slot } => f.debug_struct("FxTrigger").field("slot", slot).finish(),
