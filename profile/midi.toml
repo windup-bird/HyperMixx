@@ -1,149 +1,504 @@
-# The shipped minimum for the development controller (Numark Party Mix III).
-#
-# Every unit binds one cluster of physical controls. Deck numbers are 1-based here and 0-based
-# inside the engine. Re-learn a slot in the guide if a controller number differs.
 [meta]
 name = "shipped-minimum"
 device = "Numark Party Mix III:Numark Party Mix III MIDI 1 24:0"
 
-# ---- deck 1 ----------------------------------------------------------------------------------
 [[unit]]
-id = "deck1.transport"
-preset = "transport"
-deck = 1
+id = "global.browser"
+preset = "browser"
+mode = []
 
 [[unit.control]]
-slot = "play"
-endpoint = { midi = "note", channel = 0, id = 0 }
+slot = "choose"
+type = "RelKnob"
+
+[unit.control.endpoint]
+midi = "cc"
+encoding = "two_point"
+channel = 15
+id = 0
+
+[[unit.control]]
+slot = "open"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 15
+id = 7
+
+[[unit]]
+id = "global.crossfader"
+preset = "crossfader"
+mode = []
+
+[[unit.control]]
+slot = "fader"
+type = "BipolKnob"
+
+[unit.control.endpoint]
+midi = "cc"
+channel = 15
+id = 8
+
+[[unit]]
+id = "global.outputfader"
+preset = "outputfader"
+mode = []
+
+[[unit.control]]
+slot = "master"
+type = "Knob"
+
+[unit.control.endpoint]
+midi = "cc"
+channel = 15
+id = 10
+
 [[unit.control]]
 slot = "cue"
-endpoint = { midi = "note", channel = 0, id = 1 }
-[[unit.control]]
-slot = "sync"
-endpoint = { midi = "note", channel = 0, id = 2 }
-[[unit.control]]
-slot = "keylock"
-endpoint = { midi = "note", channel = 0, id = 3 }
+type = "Knob"
+
+[unit.control.endpoint]
+midi = "cc"
+channel = 15
+id = 12
 
 [[unit]]
 id = "deck1.jog"
 preset = "jog"
 deck = 1
+mode = []
 
 [[unit.control]]
 slot = "jog"
-endpoint = [
-  { role = "press", midi = "note", channel = 0, id = 80 },
-  { role = "turn", midi = "cc", encoding = "two_point", channel = 0, id = 6 },
-]
+type = "JogWheel"
+
+[[unit.control.endpoint]]
+role = "press"
+midi = "note"
+channel = 0
+id = 80
+
+[[unit.control.endpoint]]
+role = "turn"
+midi = "cc"
+encoding = "two_point"
+channel = 0
+id = 6
 
 [[unit]]
 id = "deck1.mixer"
 preset = "mixer"
 deck = 1
+mode = []
 
-[[unit.control]]
-slot = "fader"
-endpoint = { midi = "cc", channel = 0, id = 28 }
-[[unit.control]]
-slot = "low"
-endpoint = { midi = "cc", channel = 0, id = 25 }
-[[unit.control]]
-slot = "mid"
-endpoint = { midi = "cc", channel = 0, id = 24 }
 [[unit.control]]
 slot = "high"
-endpoint = { midi = "cc", channel = 0, id = 23 }
-[[unit.control]]
-slot = "filter"
-endpoint = { midi = "cc", channel = 0, id = 26 }
-[[unit.control]]
-slot = "cue-toggle"
-endpoint = { midi = "note", channel = 0, id = 27 }
+type = "Knob"
 
-[[unit]]
-id = "deck1.browser"
-preset = "browser"
-deck = 1
+[unit.control.endpoint]
+midi = "cc"
+channel = 0
+id = 23
 
 [[unit.control]]
-slot = "choose"
-endpoint = { midi = "cc", encoding = "two_point", reverse = true, channel = 15, id = 0 }
-[[unit.control]]
-slot = "open"
-endpoint = { midi = "note", channel = 15, id = 7 }
+slot = "mid"
+type = "Knob"
 
-# ---- tempo faders ----------------------------------------------------------------------------
-# The fader sends a 14-bit pair: #9 is the MSB, #41 the LSB.
-[[unit]]
-id = "deck1.tempo"
-preset = "tempofader"
-deck = 1
+[unit.control.endpoint]
+midi = "cc"
+channel = 0
+id = 24
+
+[[unit.control]]
+slot = "low"
+type = "Knob"
+
+[unit.control.endpoint]
+midi = "cc"
+channel = 0
+id = 25
 
 [[unit.control]]
 slot = "fader"
-endpoint = { midi = "cc", lsb = 41, channel = 0, id = 9 }
+type = "Knob"
 
-# ---- deck 2 ----------------------------------------------------------------------------------
+[unit.control.endpoint]
+midi = "cc"
+channel = 0
+id = 28
+
+[[unit.control]]
+slot = "cue-toggle"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 0
+id = 27
+
+[[unit.control]]
+slot = "filter"
+type = "BipolKnob"
+
+[unit.control.endpoint]
+midi = "cc"
+channel = 0
+id = 26
+
 [[unit]]
-id = "deck2.transport"
+id = "deck1.pad"
+preset = "pad"
+deck = 1
+mode = []
+
+[[unit.control]]
+slot = "pad1"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 4
+id = 20
+
+[[unit.control]]
+slot = "pad2"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 4
+id = 21
+
+[[unit.control]]
+slot = "pad3"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 4
+id = 22
+
+[[unit.control]]
+slot = "pad4"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 4
+id = 23
+
+[[unit.control]]
+slot = "pad5"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 4
+id = 24
+
+[[unit.control]]
+slot = "pad6"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 4
+id = 25
+
+[[unit.control]]
+slot = "pad7"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 4
+id = 26
+
+[[unit.control]]
+slot = "pad8"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 4
+id = 27
+
+[[unit.control]]
+slot = "mode-next"
+type = "Button"
+role = "mode_cycle"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 4
+id = 0
+
+[[unit]]
+id = "deck1.tempofader"
+preset = "tempofader"
+deck = 1
+mode = []
+
+[[unit.control]]
+slot = "fader"
+type = "BipolKnob"
+
+[unit.control.endpoint]
+midi = "cc"
+lsb = 41
+channel = 0
+id = 9
+
+[[unit]]
+id = "deck1.transport"
 preset = "transport"
-deck = 2
+deck = 1
+mode = []
 
 [[unit.control]]
 slot = "play"
-endpoint = { midi = "note", channel = 1, id = 0 }
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 0
+id = 0
+
 [[unit.control]]
 slot = "cue"
-endpoint = { midi = "note", channel = 1, id = 1 }
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 0
+id = 1
+
 [[unit.control]]
 slot = "sync"
-endpoint = { midi = "note", channel = 1, id = 2 }
-[[unit.control]]
-slot = "keylock"
-endpoint = { midi = "note", channel = 1, id = 3 }
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 0
+id = 2
 
 [[unit]]
 id = "deck2.jog"
 preset = "jog"
 deck = 2
+mode = []
 
 [[unit.control]]
 slot = "jog"
-endpoint = [
-  { role = "press", midi = "note", channel = 1, id = 80 },
-  { role = "turn", midi = "cc", encoding = "two_point", channel = 1, id = 6 },
-]
+type = "JogWheel"
+
+[[unit.control.endpoint]]
+role = "press"
+midi = "note"
+channel = 1
+id = 80
+
+[[unit.control.endpoint]]
+role = "turn"
+midi = "cc"
+encoding = "two_point"
+channel = 1
+id = 6
 
 [[unit]]
 id = "deck2.mixer"
 preset = "mixer"
 deck = 2
+mode = []
 
-[[unit.control]]
-slot = "fader"
-endpoint = { midi = "cc", channel = 1, id = 28 }
-[[unit.control]]
-slot = "low"
-endpoint = { midi = "cc", channel = 1, id = 25 }
-[[unit.control]]
-slot = "mid"
-endpoint = { midi = "cc", channel = 1, id = 24 }
 [[unit.control]]
 slot = "high"
-endpoint = { midi = "cc", channel = 1, id = 23 }
-[[unit.control]]
-slot = "filter"
-endpoint = { midi = "cc", channel = 1, id = 26 }
-[[unit.control]]
-slot = "cue-toggle"
-endpoint = { midi = "note", channel = 1, id = 27 }
+type = "Knob"
 
-[[unit]]
-id = "deck2.tempo"
-preset = "tempofader"
-deck = 2
+[unit.control.endpoint]
+midi = "cc"
+channel = 1
+id = 23
+
+[[unit.control]]
+slot = "mid"
+type = "Knob"
+
+[unit.control.endpoint]
+midi = "cc"
+channel = 1
+id = 24
+
+[[unit.control]]
+slot = "low"
+type = "Knob"
+
+[unit.control.endpoint]
+midi = "cc"
+channel = 1
+id = 25
 
 [[unit.control]]
 slot = "fader"
-endpoint = { midi = "cc", lsb = 41, channel = 1, id = 9 }
+type = "Knob"
+
+[unit.control.endpoint]
+midi = "cc"
+channel = 1
+id = 28
+
+[[unit.control]]
+slot = "cue-toggle"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 1
+id = 27
+
+[[unit.control]]
+slot = "filter"
+type = "BipolKnob"
+
+[unit.control.endpoint]
+midi = "cc"
+channel = 1
+id = 26
+
+[[unit]]
+id = "deck2.pad"
+preset = "pad"
+deck = 2
+mode = []
+
+[[unit.control]]
+slot = "pad1"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 5
+id = 20
+
+[[unit.control]]
+slot = "pad2"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 5
+id = 21
+
+[[unit.control]]
+slot = "pad3"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 5
+id = 22
+
+[[unit.control]]
+slot = "pad4"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 5
+id = 23
+
+[[unit.control]]
+slot = "pad5"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 5
+id = 24
+
+[[unit.control]]
+slot = "pad6"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 5
+id = 25
+
+[[unit.control]]
+slot = "pad7"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 5
+id = 26
+
+[[unit.control]]
+slot = "pad8"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 5
+id = 27
+
+[[unit.control]]
+slot = "mode-next"
+type = "Button"
+role = "mode_cycle"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 5
+id = 0
+
+[[unit]]
+id = "deck2.tempofader"
+preset = "tempofader"
+deck = 2
+mode = []
+
+[[unit.control]]
+slot = "fader"
+type = "BipolKnob"
+
+[unit.control.endpoint]
+midi = "cc"
+lsb = 41
+channel = 1
+id = 9
+
+[[unit]]
+id = "deck2.transport"
+preset = "transport"
+deck = 2
+mode = []
+
+[[unit.control]]
+slot = "play"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 1
+id = 0
+
+[[unit.control]]
+slot = "cue"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 1
+id = 1
+
+[[unit.control]]
+slot = "sync"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 1
+id = 2
