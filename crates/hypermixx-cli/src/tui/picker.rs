@@ -1,18 +1,16 @@
 //! In-TUI pickers: a filesystem browser and a MIDI-port chooser.
 //!
-//! Both front-ends (`--tui` and `--midi-guide`) embed these, so a path or a port can be chosen
-//! without a startup flag. The widgets only read state; navigation is small mutators, which keeps
-//! them unit-testable without a terminal. Rendering is a centred popup the caller draws last.
+//! Both front-ends embed these, so a path or a port can be chosen without a startup flag. The
+//! widgets only read state; navigation is small mutators, which keeps them unit-testable without a
+//! terminal. Drawing is [`View`](crate::tui::popup::View) construction — the same flat list every
+//! other modal uses.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use hypermixx_midi::PortInfo;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
-use ratatui::Frame;
+
+use crate::tui::popup::{Row, View};
 
 /// One row in a [`FilePicker`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,6 +113,7 @@ impl FilePicker {
         self.filename.is_some()
     }
 
+    #[cfg(test)]
     pub fn filename(&self) -> Option<&str> {
         self.filename.as_deref()
     }
@@ -169,6 +168,7 @@ impl FilePicker {
         }
     }
 
+    #[cfg(test)]
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -177,14 +177,17 @@ impl FilePicker {
         &self.title
     }
 
+    #[cfg(test)]
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
 
+    #[cfg(test)]
     pub fn selected(&self) -> usize {
         self.selected
     }
 
+    #[cfg(test)]
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -241,104 +244,64 @@ impl PortList {
         self.ports.get(self.selected).cloned()
     }
 
-    pub fn selected(&self) -> usize {
-        self.selected
-    }
+}
 
-    pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+impl FilePicker {
+    /// The modal for this picker: directories first, `name/` for a directory, a dim path in the
+    /// note column so it is obvious where Enter writes.
+    pub fn view(&self) -> View {
+        let mut rows: Vec<Row> = Vec::with_capacity(self.entries.len());
+        if self.entries.is_empty() {
+            rows.push(
+                Row::new(self.error.as_deref().unwrap_or("(empty)"))
+                    .note(self.dir.display().to_string())
+                    .dim(),
+            );
+        }
+        for entry in &self.entries {
+            let label = if entry.is_dir {
+                format!("{}/", entry.name)
+            } else {
+                entry.name.clone()
+            };
+            rows.push(Row::new(label));
+        }
+        let mut view = View::new(format!(" {} — {} ", self.title, self.dir.display()), rows)
+            .cursor(self.selected)
+            .hint(match self.save_mode() {
+                true => "↑↓ move · → open · ⌦ up · ← back · ⌫ name · Enter save",
+                false => "↑↓ move · →/Enter open · ⌦ up · ← back · Esc close",
+            });
+        if let Some(name) = &self.filename {
+            view = view.footer(format!("name: {name}▌"));
+        }
+        view
     }
 }
 
-/// Draws `picker` as a centred popup over `area`.
-pub fn render_file_picker(frame: &mut Frame, area: Rect, picker: &FilePicker) {
-    let popup = centered(area, 72, 72);
-    frame.render_widget(Clear, popup);
-    let block = Block::bordered()
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(format!(
-            " {} — {} ",
-            picker.title(),
-            picker.dir().display()
-        ));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-
-    let chunks = if picker.save_mode() {
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(inner)
-    } else {
-        Layout::vertical([Constraint::Fill(1)]).split(inner)
-    };
-    let items: Vec<ListItem> = if picker.entries().is_empty() {
-        let text = picker.error().unwrap_or("(empty)");
-        vec![ListItem::new(text.to_owned()).style(Style::default().fg(Color::Red))]
-    } else {
-        picker
-            .entries()
-            .iter()
-            .map(|entry| {
-                let (label, style) = if entry.is_dir {
-                    (format!("{}/", entry.name), Style::default().fg(Color::Cyan))
-                } else {
-                    (entry.name.clone(), Style::default())
-                };
-                ListItem::new(label).style(style)
-            })
-            .collect()
-    };
-    let list = List::new(items)
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("> ");
-    let mut state = ListState::default().with_selected(Some(picker.selected()));
-    frame.render_stateful_widget(list, chunks[0], &mut state);
-
-    if let Some(name) = picker.filename() {
-        let line = Line::from(vec![
-            Span::styled(" name: ", Style::default().fg(Color::Cyan)),
-            Span::raw(name.to_owned()),
-            Span::styled("▌", Style::default().fg(Color::Cyan)),
-        ]);
-        frame.render_widget(Paragraph::new(line), chunks[1]);
-    }
-}
-
-/// Draws the port list as a centred popup. `title` lets the caller say what connecting means.
-pub fn render_port_list(frame: &mut Frame, area: Rect, ports: &PortList, title: &str) {
-    let popup = centered(area, 72, 50);
-    frame.render_widget(Clear, popup);
-    let items: Vec<ListItem> = if ports.ports.is_empty() {
-        let text = ports
-            .error()
-            .map(str::to_owned)
-            .unwrap_or_else(|| "no MIDI input ports".to_owned());
-        vec![ListItem::new(text).style(Style::default().fg(Color::Red))]
-    } else {
-        ports
+impl PortList {
+    /// The modal for the port list. `title` is the screen's own title, e.g. `controller › input`.
+    pub fn view(&self, title: &str) -> View {
+        let mut rows: Vec<Row> = self
             .ports
             .iter()
-            .map(|port| ListItem::new(format!("  {}  {}", port.index, port.name)))
-            .collect()
-    };
-    let list = List::new(items)
-        .block(
-            Block::bordered()
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(format!(" {title} ")),
-        )
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("> ");
-    let mut state = ListState::default().with_selected(Some(ports.selected()));
-    frame.render_stateful_widget(list, popup, &mut state);
+            .map(|port| Row::new(port.name.clone()).note(port.index.to_string()))
+            .collect();
+        if rows.is_empty() {
+            rows.push(
+                Row::new(
+                    self.error
+                        .as_deref()
+                        .unwrap_or("no MIDI input ports found")
+                        .to_owned(),
+                )
+                .dim(),
+            );
+        }
+        View::new(title, rows)
+            .cursor(self.selected)
+            .hint("↑↓ move · →/Enter connect · Esc close")
+    }
 }
 
 fn resolve_start(start: Option<&Path>) -> PathBuf {
@@ -352,23 +315,6 @@ fn resolve_start(start: Option<&Path>) -> PathBuf {
         },
         None => cwd(),
     }
-}
-
-fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let percent_x = percent_x.min(100);
-    let percent_y = percent_y.min(100);
-    let vertical = Layout::vertical([
-        Constraint::Percentage((100 - percent_y) / 2),
-        Constraint::Percentage(percent_y),
-        Constraint::Percentage((100 - percent_y) / 2),
-    ])
-    .split(area);
-    Layout::horizontal([
-        Constraint::Percentage((100 - percent_x) / 2),
-        Constraint::Percentage(percent_x),
-        Constraint::Percentage((100 - percent_x) / 2),
-    ])
-    .split(vertical[1])[1]
 }
 
 #[cfg(test)]

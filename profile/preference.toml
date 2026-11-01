@@ -28,6 +28,16 @@ high_hz = 4000
 # mid = "#00ff00"
 # high = "#ffffff"
 
+# The interface colours. Every panel draws from these six slots, so a theme change restyles the whole
+# TUI without touching code. `#rgb` or `#rrggbb`.
+[theme]
+# accent = "#00ffff"    # focused borders, header badge, active pads, playhead
+# dim = "#444444"       # unfocused borders, hints, secondary text
+# text = "#ffffff"      # body text
+# error = "#ff0000"     # errors in the response log
+# warn = "#ffff00"      # cue meter, warnings, the inline editor
+# pad = "#406080"       # pads that are not set (a filled block, not a word)
+
 # Library sources. A category that is absent or empty is neither scanned nor displayed.
 # local: formats found in local user locations (`~/Music`, `~/.VirtualDJ`, ...)
 # usb: formats found on automatically discovered/mounted removable media

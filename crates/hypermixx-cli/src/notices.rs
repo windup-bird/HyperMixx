@@ -16,7 +16,7 @@ pub fn send(tx: &NoticeTx, line: LogLine) {
     let _ = tx.send(line);
 }
 
-/// Informational progress (e.g. `[analyse] deck0: running Stratum...`).
+/// Informational progress (e.g. `[analyse] deck1: running Stratum...`).
 pub fn info(tx: &NoticeTx, text: impl Into<String>) {
     send(tx, LogLine::info(text));
 }

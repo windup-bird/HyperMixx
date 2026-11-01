@@ -145,21 +145,27 @@ impl SyncGroup {
     /// contradict a lock that is already running.
     fn track(&mut self, leader: DeckId, target: DeckId) -> Result<(), String> {
         if leader == target {
-            return Err(format!("deck{target} cannot sync to itself"));
+            return Err(format!(
+                "{} cannot sync to itself",
+                hypermixx_core::deck_label(target)
+            ));
         }
         if let Some(follower) = self.follower {
             let known = self.leader;
             if known == Some(target) && follower == leader {
                 return Err(format!(
-                    "deck{target} and deck{leader} would follow each other — deck{leader} already \
-                     tracks deck{target}; `sync unlock` first"
+                    "{} and {} would follow each other — {} already tracks {}; `sync unlock` first",
+                    hypermixx_core::deck_label(target),
+                    hypermixx_core::deck_label(leader),
+                    hypermixx_core::deck_label(leader),
+                    hypermixx_core::deck_label(target)
                 ));
             }
             if self.mode != SyncMode::Free && !(known == Some(leader) && follower == target) {
                 return Err(format!(
-                    "deck{l} → deck{f} is already locked — `sync unlock` first",
-                    l = known.unwrap_or(target),
-                    f = follower
+                    "{} → {} is already locked — `sync unlock` first",
+                    hypermixx_core::deck_label(known.unwrap_or(target)),
+                    hypermixx_core::deck_label(follower)
                 ));
             }
         }
@@ -178,16 +184,19 @@ impl SyncGroup {
         match self.leader {
             Some(leader) if leader != target => Ok(leader),
             Some(leader) if self.explicit => Err(format!(
-                "deck{target} is the leader (deck{leader}) — sync another deck to it, or move the \
-                 lead with `deck<id> sync set-leader`"
+                "{} is the leader ({}) — sync another deck to it, or move the lead with \
+                 `deckN sync set-leader`",
+                hypermixx_core::deck_label(target),
+                hypermixx_core::deck_label(leader)
             )),
             _ => {
                 let mut others = (0..mixer.channel_count() as DeckId).filter(|&id| id != target);
                 match (others.next(), others.next()) {
                     (Some(only), None) => Ok(only),
                     _ => Err(format!(
-                        "no leader for deck{target} — with this many decks pick one with \
-                         `deck<id> sync set-leader`"
+                        "no leader for {} — with this many decks pick one with \
+                         `deckN sync set-leader`",
+                        hypermixx_core::deck_label(target)
                     )),
                 }
             }
@@ -209,7 +218,8 @@ impl SyncGroup {
         }
         if theirs <= 0.0 {
             return Err(format!(
-                "leader deck{leader} has no beat grid — `analyse` it first"
+                "leader {} has no beat grid — `analyse` it first",
+                hypermixx_core::deck_label(leader)
             ));
         }
         Ok((theirs, own))
@@ -273,9 +283,9 @@ impl SyncGroup {
         Self::require_track(mixer, deck_id)?;
         if self.mode != SyncMode::Free {
             return Err(format!(
-                "already locked (deck{} → deck{}) — `sync unlock` first",
-                self.leader.unwrap_or(deck_id),
-                self.follower.unwrap_or(deck_id)
+                "already locked ({} → {}) — `sync unlock` first",
+                hypermixx_core::deck_label(self.leader.unwrap_or(deck_id)),
+                hypermixx_core::deck_label(self.follower.unwrap_or(deck_id))
             ));
         }
         self.leader = Some(deck_id);
@@ -332,7 +342,10 @@ impl SyncGroup {
         let leader = self.resolve_leader(mixer, deck_id)?;
         let (leader_bpm, own_bpm) = Self::match_bpm(mixer, leader, deck_id)?;
         self.track(leader, deck_id)?;
-        let leader_tempo = mixer.deck(leader as usize).map(crate::deck::Deck::tempo).unwrap_or(1.0);
+        let leader_tempo = mixer
+            .deck(leader as usize)
+            .map(crate::deck::Deck::tempo)
+            .unwrap_or(1.0);
         self.mode = SyncMode::Tempolock;
         // Seed the group with the leader's current tempo: locking must not nudge anything.
         self.group_bpm = leader_tempo * leader_bpm;
@@ -357,7 +370,10 @@ impl SyncGroup {
         let leader = self.resolve_leader(mixer, deck_id)?;
         let (leader_bpm, own_bpm) = Self::match_bpm(mixer, leader, deck_id)?;
         self.track(leader, deck_id)?;
-        let leader_tempo = mixer.deck(leader as usize).map(crate::deck::Deck::tempo).unwrap_or(1.0);
+        let leader_tempo = mixer
+            .deck(leader as usize)
+            .map(crate::deck::Deck::tempo)
+            .unwrap_or(1.0);
         self.mode = SyncMode::Phaselock;
         self.group_bpm = leader_tempo * leader_bpm;
         // The leader is the source of truth, so it is *not* group-driven; only the follower is.
@@ -401,9 +417,7 @@ impl SyncGroup {
         let leader_phase = mixer
             .deck(leader as usize)
             .and_then(crate::deck::Deck::beat_phase)
-            .ok_or_else(|| {
-                format!("leader deck{leader} has no beat grid — `analyse` it first")
-            })?;
+            .ok_or_else(|| format!("leader deck{leader} has no beat grid — `analyse` it first"))?;
         let deck = mixer
             .deck(deck_id as usize)
             .ok_or_else(|| crate::mixer::unknown_deck(deck_id, mixer.channel_count()))?;
@@ -439,7 +453,12 @@ impl SyncGroup {
     /// * `phaselock`, following deck — ignored, its rate belongs to the leader.
     /// * `tempolock` — writes the shared BPM instead of one deck, so the other follows next block.
     /// * anything else — the deck's own `tempo`.
-    pub fn set_tempo(&mut self, mixer: &mut Mixer, deck_id: DeckId, rate: f32) -> Result<(), String> {
+    pub fn set_tempo(
+        &mut self,
+        mixer: &mut Mixer,
+        deck_id: DeckId,
+        rate: f32,
+    ) -> Result<(), String> {
         Self::require_track(mixer, deck_id)?;
         if !rate.is_finite() || rate <= 0.0 {
             return Err(format!("tempo must be a positive ratio, got {rate}"));
@@ -452,7 +471,9 @@ impl SyncGroup {
             .deck(deck_id as usize)
             .map(crate::deck::Deck::bpm_at_frame)
             .unwrap_or(0.0);
-        let locked = mixer.deck(deck_id as usize).is_some_and(crate::deck::Deck::lock);
+        let locked = mixer
+            .deck(deck_id as usize)
+            .is_some_and(crate::deck::Deck::lock);
         if self.mode == SyncMode::Tempolock && locked && own_bpm > 0.0 {
             self.group_bpm = rate * own_bpm;
         }

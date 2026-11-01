@@ -40,7 +40,32 @@ fn main() {
         // explicit `--midi` overrides it. A profile device belongs to the engine session, not to a
         // map file the user picked here.
         let guide_port = args.midi.clone();
-        if let Err(err) = tui::guide::run(path, guide_port.as_deref(), decks) {
+        // The guide never starts an engine, so it cannot ask the mixer what the outputs are. Probing
+        // cpal here is enough to show the devices and whether each takes the configured rate — the
+        // question a controller mapping session actually has ("will my interface work?").
+        let live_path = args
+            .live
+            .clone()
+            .unwrap_or_else(|| "profile/live.toml".to_owned());
+        let rate = command::read_live_config(&live_path)
+            .map(|(live, _)| live.audio.sample_rate)
+            .unwrap_or(hypermixx_core::SAMPLE_RATE);
+        // `Output` in the guide writes the mixer file, so hand it the path the session would use.
+        let mixer_path = args
+            .config
+            .clone()
+            .unwrap_or_else(|| profile::DEFAULT_MIXER.to_owned());
+        let outputs = tui::guide::Outputs {
+            // The guide draws its modals through the same popup as the TUI, so it needs the same
+            // colours: the profile's own `preference.toml`, not always the shipped path.
+            preference: tui::preference_path(args.profile.as_deref()),
+            mixer_path,
+            devices: hypermixx_audio::output_devices(Some(rate)),
+            engine_rate: rate,
+            // Filled from the map (or the port) once the guide has opened it.
+            controller: guide_port.clone(),
+        };
+        if let Err(err) = tui::guide::run(path, guide_port.as_deref(), decks, outputs) {
             eprintln!("error: {err}");
             std::process::exit(1);
         }
@@ -61,20 +86,20 @@ fn main() {
     // MIDI comes from the profile too: naming a controller there is what makes `--profile dj` bring
     // up a whole rig rather than just a topology. Explicit flags still win.
     //
-    // When the profile names neither a device nor a map, the folder default (`profile/midi.toml`)
+    // When the profile names neither a device nor a map, the folder default (`profile/controller.toml`)
     // applies — the same shape as `mixer.toml` / `live.toml`. A missing file means "no MIDI", which
     // is the shipped state: no controller is assumed.
     let midi_from_profile = match profile.as_ref().map(|profile| profile.midi.clone()) {
         Some(midi) if !midi.device.is_none() || midi.map.is_some() => midi,
-        _ => match profile::load_midi(profile::DEFAULT_MIDI) {
+        _ => match profile::load_midi(profile::default_midi_path()) {
             Ok((midi, notes)) => {
                 for note in &notes {
-                    eprintln!("warning: {}: {note}", profile::DEFAULT_MIDI);
+                    eprintln!("warning: {}: {note}", profile::default_midi_path());
                 }
                 midi
             }
             Err(err) => {
-                eprintln!("warning: {}: {err}", profile::DEFAULT_MIDI);
+                eprintln!("warning: {}: {err}", profile::default_midi_path());
                 profile::MidiSettings::default()
             }
         },
@@ -107,7 +132,7 @@ fn main() {
     if args.midi_map.is_some() && midi_port.is_none() {
         eprintln!(
             "warning: `{midi_map}` has no `[meta].device`; no MIDI input will open \
-             (use --midi or F2)"
+             (use --controller or F2)"
         );
     }
 
@@ -189,7 +214,9 @@ fn main() {
     // The TUI attaches MIDI itself (and can pick a port/map at runtime), so its session lives in
     // the app rather than here. The REPL has no picker, so its session is attached up front — a bad
     // port or map still fails the launch cleanly.
-    if args.tui {
+    // The terminal UI is the default front-end; `--cli` asks for the line REPL instead (`--tui` is
+    // still accepted so an old command line keeps working).
+    if !args.cli {
         tui::run(
             &pipeline,
             session::Session {
@@ -227,11 +254,11 @@ fn main() {
         ) {
             Ok(session) => Some(session),
             Err(err) if explicit_midi => {
-                eprintln!("error: midi: {err}");
+                eprintln!("error: controller: {err}");
                 std::process::exit(1);
             }
             Err(err) => {
-                eprintln!("warning: midi: {err}; continuing without it");
+                eprintln!("warning: controller: {err}; continuing without it");
                 None
             }
         },
@@ -276,9 +303,11 @@ fn main() {
 
 /// Reads `--config <path>` (topology file), `--print-config` (emit the reference TOML and exit),
 /// `--backend auto|stratum|timestretch` (default `auto`), `--tui` (terminal UI),
-/// `--midi <port>` (open a MIDI input onto the engine) and `--midi-map <file>` (the mapping file,
-/// default `midi-map.toml`; the map's `[meta].device` can supply the port) and `--midi-guide <file>`
-/// (the unit map guide, no engine). Unknown flags are errors rather than silently ignored:
+/// `--controller <port>` (open a controller input onto the engine), `--controller-map <file>` (the
+/// mapping file, default `midi-map.toml`; the map's `[meta].device` can supply the port) and
+/// `--guide <file>` (the unit map guide, no engine). The terminal UI is the default front-end;
+/// `--cli` asks for the line REPL.
+/// Unknown flags are errors rather than silently ignored:
 /// a typo'd `--conifg` that launches the default topology instead is the kind of surprise nobody
 /// wants mid-set.
 #[derive(Debug, Default)]
@@ -286,12 +315,15 @@ struct CliArgs {
     config: Option<String>,
     print_config: bool,
     backend: Backend,
-    tui: bool,
-    /// `--midi <port>`: a port name or index, opened and mapped onto the engine.
+    /// `--cli`: the line REPL instead of the terminal UI.
+    cli: bool,
+    /// `--controller <port>` (alias `--midi`): a port name or index, opened and mapped onto the
+    /// engine.
     midi: Option<String>,
-    /// `--midi-map <file>`: only meaningful with `--midi`.
+    /// `--controller-map <file>` (alias `--midi-map`): only meaningful with a port.
     midi_map: Option<String>,
-    /// `--midi-guide <file>`: run the unit map guide instead of the engine.
+    /// `--controller-guide <file>` (alias `--midi-guide`): run the unit map guide instead of the
+    /// engine.
     midi_guide: Option<String>,
     /// `--decks <n>`: how many deck groups the guide shows; `new` allocates beyond them.
     decks: Option<usize>,
@@ -308,7 +340,7 @@ impl CliArgs {
         while let Some(arg) = raw.next() {
             match arg.as_str() {
                 "--print-config" => args.print_config = true,
-                "--tui" => args.tui = true,
+                "--cli" => args.cli = true,
                 "--backend" => {
                     args.backend = match raw.next().as_deref() {
                         Some("stratum") => Backend::Stratum,
@@ -340,21 +372,25 @@ impl CliArgs {
                         std::process::exit(1);
                     });
                 }
-                "--midi" => {
+                // `--controller*` is the current spelling; `--midi*` stays as an alias so existing
+                // scripts and profiles keep working. The engine still speaks MIDI — only the
+                // user-facing name of the thing that sends it changed.
+                "--controller" => {
                     args.midi = raw.next().or_else(|| {
                         eprintln!(
-                            "error: --midi needs a port name or index (`midi ports` lists them)"
+                            "error: --controller needs a port name or index \
+                             (`controller ports` lists them)"
                         );
                         std::process::exit(1);
                     });
                 }
-                "--midi-map" => {
+                "--controller-map" => {
                     args.midi_map = raw.next().or_else(|| {
-                        eprintln!("error: --midi-map needs a path");
+                        eprintln!("error: --controller-map needs a path");
                         std::process::exit(1);
                     });
                 }
-                "--midi-guide" => {
+                "--guide" => {
                     // Path is optional: without one the conventional map is edited, and the TUI's
                     // file picker can choose another.
                     args.midi_guide = Some(match raw.peek() {
@@ -374,8 +410,9 @@ impl CliArgs {
                 }
                 other => {
                     eprintln!(
-                        "error: unknown argument `{other}` (--config, --print-config, --profile, \
-                         --live, --backend, --tui, --midi, --midi-map, --midi-guide, --decks)"
+                        "error: unknown argument `{other}`\n  flags: --config, --print-config, \
+                         --profile, --live, --backend, --cli,\n         --guide, --controller, \
+                         --controller-map, --decks"
                     );
                     std::process::exit(1);
                 }

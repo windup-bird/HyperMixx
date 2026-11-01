@@ -46,7 +46,8 @@ pub fn format_response(response: &CommandResponse, sample_rate: u32) -> Vec<LogL
             deck_id,
             total_frames,
         } => vec![LogLine::info(format!(
-            "deck{deck_id} loaded: {total_frames} frames ({})",
+            "{} loaded: {total_frames} frames ({})",
+            hypermixx_core::deck_label(*deck_id),
             time(*total_frames, sample_rate)
         ))],
         CommandResponse::State(state) => vec![LogLine::info(deck_line(state, sample_rate))],
@@ -81,6 +82,7 @@ pub fn format_response(response: &CommandResponse, sample_rate: u32) -> Vec<LogL
             }
             out
         }
+        CommandResponse::FxState { .. } => Vec::new(),
         CommandResponse::Outputs(outputs) => {
             outputs.iter().map(output_line).map(LogLine::info).collect()
         }
@@ -151,8 +153,8 @@ pub fn deck_line(state: &DeckState, sample_rate: u32) -> String {
     let tempo = bpm_label(state);
     let key = state.key.as_deref().unwrap_or("--");
     let mut line = format!(
-        "deck{}  {transport:<7} {} / {duration}  [{}/{}]  {tempo}  {key}  keylock {}",
-        state.deck_id,
+        "{}  {transport:<7} {} / {duration}  [{}/{}]  {tempo}  {key}  keylock {}",
+        hypermixx_core::deck_label(state.deck_id),
         time(state.current_frame, sample_rate),
         state.current_frame,
         state.total_frames,
@@ -238,13 +240,13 @@ pub fn stems_badge(status: &StemStatus) -> Option<String> {
 pub fn stem_report(state: &DeckState) -> Vec<String> {
     if !state.stems.ready {
         return vec![format!(
-            "deck{}: no stems — `stem separate` splits the loaded track into four",
-            state.deck_id
+            "{}: no stems — `stem separate` splits the loaded track into four",
+            hypermixx_core::deck_label(state.deck_id)
         )];
     }
     let mut out = vec![format!(
-        "deck{}  stems  {}{}   (level 0.0 = unity, -1.0 = silence; S solo, M mute)",
-        state.deck_id,
+        "{}  stems  {}{}   (level 0.0 = unity, -1.0 = silence; S solo, M mute)",
+        hypermixx_core::deck_label(state.deck_id),
         stems_badge(&state.stems).unwrap_or_default(),
         // How much of the track is *separated*: a chunked job installs its set before the first
         // chunk lands, so "four streams exist" is not "there are stems yet".
@@ -349,7 +351,7 @@ pub fn help_text(decks: usize) -> String {
   [deck] <stem> level <-1..1>  one stem's level (0 = unity, -1 = silence)
   [deck] <stem> mute [on|off]  mute one stem (solo still wins)
   [deck] <stem> solo [on|off]  add/remove one stem from the solo set
-  [deck] <stem> fx ...         inserts on *that stem's* chain, e.g. `deck0 vocals fx add filter`
+  [deck] <stem> fx ...         inserts on that stem's chain, e.g. `deck1 vocals fx add filter`
                                (<stem> = drums | bass | other | vocals)
   output list|refresh          output destinations and their bindings
   live show|reload [<file>]    this machine's settings (engine rate, ring, stem defaults)
@@ -364,12 +366,13 @@ pub fn help_text(decks: usize) -> String {
   zoom in|out|fit              waveform zoom (UI only)
   quit                         exit
 
-In the TUI: `load` with no path opens a file picker; F2 picks a MIDI port and F3 the map file.
-With the browser target only `browser ...` commands are accepted. Arrows navigate the Miller
-columns; Enter on a list opens it, Enter on a track opens the deck chooser, Esc goes back.
+In the TUI: `load` with no path opens a file picker; F2 picks a controller port and F3 the map
+file; F9 opens the settings screen. The browser is a soft focus: it takes the arrow keys (Miller
+columns; Enter opens a list or the deck chooser, Esc goes back) but a typed deck command still goes
+to the focused deck.
 
-A leading `deck0` / `0` selects a deck, `master` the summed output. Without one the command
-follows the focused deck (TUI: `Tab` cycles the command target deck0 → deck1 → browser).
+A leading `deck1` / `1` selects a deck (numbers are 1-based), `master` the summed output. Without
+one the command follows the focused deck (TUI: `Tab` cycles deck1 → deck2 → browser).
 startup flags: --config <file> (custom topology), --profile <name|file> (which files to use),
                --print-config (reference TOML), --live <file> (engine rate, ring, stem defaults),
                --backend auto|stratum|timestretch, --tui (terminal UI),
@@ -398,11 +401,11 @@ pub fn stem_help_text() -> String {
   stem cache prune [--keep <n>]  drop all but the n most recent (default 4); `clear` = all
 
 One stem at a time (target it directly):
-  deck0 vocals level -0.5        that stem's level (0 = unity, -1 = exact silence)
-  deck0 vocals mute [on|off]     mute it (a solo elsewhere still wins)
-  deck0 vocals solo [on|off]     add/remove it from the solo set
-  deck0 vocals unsolo            leave the solo set
-  deck0 vocals fx add filter     inserts on *that stem's* chain
+  deck1 vocals level -0.5        that stem's level (0 = unity, -1 = exact silence)
+  deck1 vocals mute [on|off]     mute it (a solo elsewhere still wins)
+  deck1 vocals solo [on|off]     add/remove it from the solo set
+  deck1 vocals unsolo            leave the solo set
+  deck1 vocals fx add filter     inserts on *that stem's* chain
 
 Separation is offline and asynchronous: the deck keeps playing the mix (stream 0) until the first
 block lands, then turns into stems window by window. Re-running a separated track is served from the

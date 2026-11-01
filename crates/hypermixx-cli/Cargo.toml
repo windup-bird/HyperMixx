@@ -18,6 +18,9 @@ hypermixx-stems = { path = "../hypermixx-stems" }
 hypermixx-midi = { path = "../hypermixx-midi" }
 crossbeam-channel = { workspace = true }
 toml = { workspace = true }
+# Comment-preserving TOML rewrite for the settings screen: `toml` alone would drop every comment
+# and reorder a hand-written config.
+toml_edit = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 sysinfo = { workspace = true }

@@ -33,8 +33,8 @@ impl FxChainId {
     pub fn label(&self) -> String {
         match self {
             // Deck numbers are 1-based everywhere a user reads them; the id itself is 0-based.
-            FxChainId::Deck(deck_id) => format!("deck{}", deck_id + 1),
-            FxChainId::Stem { deck, stem } => format!("deck{}/{stem}", deck + 1),
+            FxChainId::Deck(deck_id) => crate::deck_label(*deck_id),
+            FxChainId::Stem { deck, stem } => format!("{}/{stem}", crate::deck_label(*deck)),
             FxChainId::Master => "master".into(),
         }
     }
@@ -666,6 +666,12 @@ pub enum Command {
     ListFx {
         chain: FxChainId,
     },
+    /// As [`Command::ListFx`], but meant to be polled: a front-end that shows a live knob value
+    /// asks this every few ticks and renders the answer *without* echoing it to the response log.
+    /// The payload is identical; the variant exists so the two uses stay distinguishable.
+    GetFxState {
+        chain: FxChainId,
+    },
     /// The output destinations: list them, or retry the ones that could not be bound.
     Output {
         op: OutputOp,
@@ -702,6 +708,11 @@ pub enum CommandResponse {
     },
     /// The answer to [`Command::ListFx`].
     FxListed {
+        chain: FxChainId,
+        slots: Vec<FxSlotStatus>,
+    },
+    /// The answer to [`Command::GetFxState`]: a live read, not a command echo.
+    FxState {
         chain: FxChainId,
         slots: Vec<FxSlotStatus>,
     },
@@ -894,6 +905,9 @@ impl std::fmt::Debug for Command {
                 f.debug_struct("PadRelease").field("slot", slot).finish()
             }
             Command::ListFx { chain } => f.debug_struct("ListFx").field("chain", chain).finish(),
+            Command::GetFxState { chain } => {
+                f.debug_struct("GetFxState").field("chain", chain).finish()
+            }
             Command::Output { op } => f.debug_struct("Output").field("op", op).finish(),
             Command::MixerReload { text } => f
                 .debug_struct("MixerReload")

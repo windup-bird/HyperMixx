@@ -1,5 +1,4 @@
 [meta]
-name = "shipped-minimum"
 device = "Numark Party Mix III:Numark Party Mix III MIDI 1 24:0"
 
 [[unit]]
@@ -27,22 +26,13 @@ channel = 15
 id = 7
 
 [[unit.control]]
-slot = "exit"
-type = "Button"
-
-[unit.control.endpoint]
-midi = "note"
-channel = 15
-id = 13
-
-[[unit.control]]
 slot = "load-1"
 type = "Button"
 
 [unit.control.endpoint]
 midi = "note"
 channel = 15
-id = 9
+id = 2
 
 [[unit.control]]
 slot = "load-2"
@@ -51,7 +41,7 @@ type = "Button"
 [unit.control.endpoint]
 midi = "note"
 channel = 15
-id = 11
+id = 3
 
 [[unit]]
 id = "global.crossfader"
@@ -174,6 +164,46 @@ channel = 0
 id = 26
 
 [[unit]]
+id = "deck1.manualjump"
+preset = "manualjump"
+deck = 1
+mode = []
+
+[[unit.control]]
+slot = "forward"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 0
+id = 70
+
+[[unit.control]]
+slot = "backward"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 0
+id = 72
+
+[[unit]]
+id = "deck1.tempofader"
+preset = "tempofader"
+deck = 1
+mode = []
+
+[[unit.control]]
+slot = "fader"
+type = "BipolKnob"
+
+[unit.control.endpoint]
+midi = "cc"
+lsb = 41
+channel = 0
+id = 9
+
+[[unit]]
 id = "deck1.pad"
 preset = "pad"
 deck = 1
@@ -260,22 +290,6 @@ role = "mode_cycle"
 midi = "note"
 channel = 4
 id = 0
-
-[[unit]]
-id = "deck1.tempofader"
-preset = "tempofader"
-deck = 1
-mode = []
-
-[[unit.control]]
-slot = "fader"
-type = "BipolKnob"
-
-[unit.control.endpoint]
-midi = "cc"
-lsb = 41
-channel = 0
-id = 9
 
 [[unit]]
 id = "deck1.transport"
@@ -394,6 +408,46 @@ channel = 1
 id = 26
 
 [[unit]]
+id = "deck2.manualjump"
+preset = "manualjump"
+deck = 2
+mode = []
+
+[[unit.control]]
+slot = "forward"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 1
+id = 70
+
+[[unit.control]]
+slot = "backward"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 1
+id = 72
+
+[[unit]]
+id = "deck2.tempofader"
+preset = "tempofader"
+deck = 2
+mode = []
+
+[[unit.control]]
+slot = "fader"
+type = "BipolKnob"
+
+[unit.control.endpoint]
+midi = "cc"
+lsb = 41
+channel = 1
+id = 9
+
+[[unit]]
 id = "deck2.pad"
 preset = "pad"
 deck = 2
@@ -480,22 +534,6 @@ role = "mode_cycle"
 midi = "note"
 channel = 5
 id = 0
-
-[[unit]]
-id = "deck2.tempofader"
-preset = "tempofader"
-deck = 2
-mode = []
-
-[[unit.control]]
-slot = "fader"
-type = "BipolKnob"
-
-[unit.control.endpoint]
-midi = "cc"
-lsb = 41
-channel = 1
-id = 9
 
 [[unit]]
 id = "deck2.transport"

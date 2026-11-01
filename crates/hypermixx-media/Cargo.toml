@@ -9,3 +9,6 @@ description = "PCM sources: decoding (symphonia) and the in-memory pool"
 hypermixx-core = { path = "../hypermixx-core" }
 symphonia = { workspace = true }
 arc-swap = { workspace = true }
+# Cover art: decode the embedded JPEG/PNG into a thumbnail for the deck header. Only the two
+# formats artwork actually ships in, so the dependency stays small.
+image = { workspace = true }

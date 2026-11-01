@@ -10,8 +10,8 @@
 //! braille whenever detection is unconvincing.
 
 mod detect;
-mod kitty;
-mod raster;
+pub(crate) mod kitty;
+pub(crate) mod raster;
 
 use std::fmt::Write;
 use std::num::NonZeroU16;
@@ -61,7 +61,7 @@ const UNIT_WIDTH: CellDiffOption = CellDiffOption::ForcedWidth(NonZeroU16::new(1
 static NEXT_IMAGE_ID: AtomicU32 = AtomicU32::new(0x484D_0001);
 static NEXT_PLACEMENT_ID: AtomicU32 = AtomicU32::new(1);
 
-fn next_image_id() -> u32 {
+pub(crate) fn next_image_id() -> u32 {
     NEXT_IMAGE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -176,8 +176,37 @@ impl WaveformView {
         self.backend
     }
 
+    /// The cell size in pixels the image backends assume.
+    pub fn cell_px(&self) -> CellPx {
+        self.cell
+    }
+
+    /// Drops every cached image: after [`kitty::delete_all`] the terminal holds nothing, so the next
+    /// frame has to transmit again. Used when a modal opens (and would be drawn over the images).
+    pub fn forget_images(&mut self) {
+        for deck in &mut self.decks {
+            deck.strip = None;
+            deck.last = None;
+            deck.last_playhead = None;
+            // The terminal already deleted everything, so nothing is pending either.
+            deck.pending_delete = None;
+        }
+    }
+
+    /// Forces a transport. Only tests use this: at runtime the backend comes from `detect`.
+    #[cfg(test)]
+    pub fn force_backend(&mut self, backend: Backend) {
+        self.backend = backend;
+    }
+
     /// Draws one deck. `frames_per_cell` is backend-independent; image backends derive their
     /// frames-per-pixel from it.
+    /// Draws one deck.
+    ///
+    /// `suppress_images` is set while a modal overlay is open: the terminal draws an image under
+    /// the text, so a popup over one shows the waveform through its own cells. Braille is drawn
+    /// instead, and the cached strip is dropped so the next frame re-transmits and re-places —
+    /// which is also what removes the stale image left at the waveform after a popup closes.
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -188,12 +217,28 @@ impl WaveformView {
         grid: Option<&BeatGrid>,
         state: &DeckState,
         frames_per_cell: f64,
+        suppress_images: bool,
     ) {
         if area.width == 0 || area.height == 0 {
             return;
         }
         let overlay = overlay_of(state);
         let playhead_frame = state.current_frame as f64;
+        if suppress_images && self.backend == Backend::Kitty {
+            // The caller deleted every image in the terminal and called `forget_images` when the
+            // overlay opened, so there is nothing left to hide here: draw braille and wait.
+            render_braille(
+                frame,
+                area,
+                waveform,
+                grid,
+                playhead_frame,
+                frames_per_cell,
+                self.settings.colors,
+                &overlay,
+            );
+            return;
+        }
         match self.backend {
             Backend::Braille => render_braille(
                 frame,
@@ -534,6 +579,7 @@ fn render_braille(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_cue_lines(
     ctx: &mut Context,
     overlay: &raster::Overlay,
@@ -792,6 +838,7 @@ mod tests {
                     None,
                     &deck_state(128),
                     2048.0,
+                    false,
                 );
             })
             .unwrap();
@@ -826,6 +873,7 @@ mod tests {
                         None,
                         &deck_state(0),
                         frames_per_cell,
+                        false,
                     );
                 })
                 .unwrap();

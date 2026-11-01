@@ -8,9 +8,14 @@
 pub mod app;
 pub mod browser;
 pub mod completer;
+pub mod devices;
 pub mod guide;
+pub mod image_slot;
 pub mod input;
+pub mod overview;
 pub mod picker;
+pub mod popup;
+pub mod settings;
 pub mod text;
 pub mod view;
 pub mod waveform_view;
@@ -31,7 +36,8 @@ use app::App;
 /// ~60Hz. The image waveform transports can use the extra ticks; braille is still cheap at this
 /// rate, and the engine block (5.8ms) is comfortably inside it.
 const TICK: Duration = Duration::from_millis(16);
-/// Ask for meters every sixth tick (~10Hz): enough for a readable meter, far from chatty.
+/// Ask for meters every sixth tick (~10Hz): enough for a readable meter, far from chatty. The FX
+/// slot poll that feeds the knobs rides the same cadence.
 const METERS_EVERY: u64 = 6;
 
 /// Runs the TUI until the user quits. Restores the terminal and stops the engine on the way out.
@@ -62,8 +68,11 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     if let (Some(control), Some(state)) = (midi_control, midi_state) {
         dispatcher.set_midi(control, state);
     }
+    // The settings screen keeps the paths after the dispatcher takes them.
+    let topology_path = topology.clone();
+    let live_path = live_source.clone();
     dispatcher.with_topology(topology);
-    dispatcher.with_profile(profile);
+    dispatcher.with_profile(profile.clone());
     let ring_frames = live.audio.ring_frames;
     let sample_rate = live.audio.sample_rate;
     dispatcher.with_live(live, live_source);
@@ -75,9 +84,18 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     // The header reports the configured ring and rate, not the compile-time defaults.
     app.ring_frames = ring_frames;
     app.sample_rate = sample_rate;
+    // The settings screen edits the same files the session was started from.
+    app.profile_path = profile.clone();
+    // Probe here, not in the settings screen: cpal's ALSA/JACK backends print warnings to stderr, and
+    // anything printed after `ratatui::try_init` lands on top of the alternate screen.
+    app.devices = hypermixx_audio::output_devices(Some(sample_rate));
+    app.preference_path = preference_path.clone();
+    app.live_path = live_path;
+    app.mixer_path = topology_path;
     match preference::load(&preference_path) {
         Ok((preference, notes)) => {
             app.waveform = preference.waveform;
+            app.theme = preference.theme;
             app.key_format = preference.display.key_format;
             for note in notes {
                 app.push_log(LogLine::info(format!("[preference] {note}")));
@@ -135,7 +153,7 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
 
 /// Preferences live next to the profile that names them, so a profile folder carries its own
 /// colours. No profile means the shipped default path.
-fn preference_path(profile: Option<&str>) -> String {
+pub(crate) fn preference_path(profile: Option<&str>) -> String {
     profile
         .and_then(|path| Path::new(path).parent())
         .map(|dir| dir.join("preference.toml"))
@@ -194,6 +212,22 @@ fn event_loop(
         }
         if ticks.is_multiple_of(METERS_EVERY) {
             app.meters = pipeline.meters();
+            // One poll in flight at a time, like the state poll: a stalled engine must not queue
+            // knob reads. `GetFxState` is silent, so this never touches the response log.
+            if app.fx_pending == 0 {
+                app.fx_pending = app.decks;
+                for deck in 0..app.decks {
+                    let chain = hypermixx_core::FxChainId::Deck(deck as u8);
+                    if dispatcher
+                        .command_tx
+                        .send(Command::GetFxState { chain })
+                        .is_err()
+                    {
+                        app.fx_pending = 0;
+                        break;
+                    }
+                }
+            }
         }
         // Once a second; kept after the draw so a sysinfo read never sits in the input path.
         app.process.refresh();

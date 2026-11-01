@@ -357,7 +357,8 @@ impl MixerConfig {
     /// *construction* error ([`MixerError::UnknownFx`] from `build_chains`), surfaced when a mixer
     /// is built rather than when the text is read, because that is where the registry is consulted.
     pub fn from_toml_str(text: &str) -> Result<Self, MixerError> {
-        let file: MixerFile = toml::from_str(text).map_err(|err| MixerError::Parse(err.to_string()))?;
+        let file: MixerFile =
+            toml::from_str(text).map_err(|err| MixerError::Parse(err.to_string()))?;
         Ok(file.into())
     }
 }
@@ -445,7 +446,10 @@ pub fn simple_dj() -> MixerConfig {
 pub fn reference_toml() -> &'static str {
     // The reference topology ships as a file so there is exactly one source of truth: this text,
     // `--print-config` and `profile/mixer.toml` are the same bytes.
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../profile/mixer.toml"))
+    include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../profile/mixer.toml"
+    ))
 }
 
 /// A single-channel config with no outputs at all: the mixer computes and writes nothing, which is
@@ -491,7 +495,6 @@ pub fn build_chain(names: &[String]) -> Result<FxChain, MixerError> {
     Ok(FxChain::from_slots(build_slots(names)?))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,7 +510,10 @@ mod tests {
         for channel in &cfg.channels {
             assert_eq!(channel.deck_fx, vec!["eq".to_owned(), "filter".to_owned()]);
             // A cue that only sounds when you send to it is not a cue.
-            assert!(channel.cue_send > -1.0, "channels must reach the headphones");
+            assert!(
+                channel.cue_send > -1.0,
+                "channels must reach the headphones"
+            );
             assert_eq!(channel.flow_fader, 0.0, "both decks start at unity");
             assert_eq!(channel.gain, 0.0, "no channel starts with a trim");
         }
@@ -515,7 +521,10 @@ mod tests {
             cfg.channels[0].side, cfg.channels[1].side,
             "two decks on one crossfader must be opposite sides"
         );
-        assert!(cfg.master_limiter, "the safety stage must be wired by default");
+        assert!(
+            cfg.master_limiter,
+            "the safety stage must be wired by default"
+        );
     }
 
     #[test]
@@ -540,10 +549,14 @@ mod tests {
             .unwrap_or_else(|err| panic!("reference toml does not parse: {err}"));
         for (index, output) in parsed.outputs.iter_mut().enumerate() {
             output.id = index as OutputId;
+            // The device is a *machine* fact: a user who edits `profile/mixer.toml` to name their
+            // interface must not break this contract, which is about the mixer's shape.
+            output.device = None;
         }
         let mut expected = simple_dj();
         for (index, output) in expected.outputs.iter_mut().enumerate() {
             output.id = index as OutputId;
+            output.device = None;
         }
         assert_eq!(parsed, expected);
         // And it must actually build: chains resolve, limiter wires.
@@ -567,24 +580,40 @@ mod tests {
         let channel = &cfg.channels[0];
         assert_eq!(channel.flow_fader, 0.0, "unity by default");
         assert_eq!(channel.deck_fader, 0.0);
-        assert_eq!(channel.cue_send, 0.0, "a default channel does not spam the cue");
+        assert_eq!(
+            channel.cue_send, 0.0,
+            "a default channel does not spam the cue"
+        );
         assert_eq!(channel.cue_tap, CueTap::PostDeckFader);
         assert_eq!(channel.gain, 0.0, "the trim starts at 0 dB");
-        assert_eq!(cfg.crossfader.place, CrossfaderPlace::Deck, "the crossfader is last by default");
+        assert_eq!(
+            cfg.crossfader.place,
+            CrossfaderPlace::Deck,
+            "the crossfader is last by default"
+        );
         assert_eq!(cfg.crossfader.curve, CrossfaderCurve::Classic);
         assert_eq!(cfg.crossfader.start, 0.0);
         assert_eq!(cfg.crossfader.cut_width, crate::mixer::DEFAULT_CUT_WIDTH);
-        assert_eq!(cfg.cue.blend, -1.0, "a default cue carries the cue and nothing else");
+        assert_eq!(
+            cfg.cue.blend, -1.0,
+            "a default cue carries the cue and nothing else"
+        );
         assert!(channel.flow_fx.is_empty() && channel.deck_fx.is_empty());
         assert_eq!(cfg.outputs[0].channels, (0, 1));
         assert_eq!(cfg.outputs[0].gain, 1.0);
         assert_eq!(cfg.cue_fader, 0.0);
-        assert!(!cfg.master_limiter, "the safety stage is opt-in from a file");
+        assert!(
+            !cfg.master_limiter,
+            "the safety stage is opt-in from a file"
+        );
         assert_eq!(cfg.master_fader, 0.0);
         // The struct default and the `dj` helper agree with the parsed channel above.
         let default = ChannelConfig::default();
         assert!(default.flow_fx.is_empty() && default.deck_fx.is_empty());
-        assert_eq!(default.cue_send, 0.0, "a default channel must not spam the cue");
+        assert_eq!(
+            default.cue_send, 0.0,
+            "a default channel must not spam the cue"
+        );
         assert_eq!(default.side, DeckSide::default());
         let dj = ChannelConfig::dj(["eq"]);
         assert_eq!(dj.deck_fx, vec!["eq".to_owned()]);
@@ -594,15 +623,16 @@ mod tests {
     #[test]
     fn toml_errors_name_their_location_and_refuse_unknown_keys() {
         // A syntax error carries the line; a typo'd key is refused rather than ignored.
-        let err = MixerConfig::from_toml_str("[[channel]]
-side = \"spinward\"").unwrap_err();
+        let err = MixerConfig::from_toml_str(
+            "[[channel]]
+side = \"spinward\"",
+        )
+        .unwrap_err();
         assert!(matches!(err, MixerError::Parse(_)));
         assert!(err.message().contains("spinward"), "got: {}", err.message());
 
-        let err = MixerConfig::from_toml_str(
-            "[[channel]]\nside = \"left\"\nbass_boost = 12.0\n",
-        )
-        .unwrap_err();
+        let err = MixerConfig::from_toml_str("[[channel]]\nside = \"left\"\nbass_boost = 12.0\n")
+            .unwrap_err();
         assert!(
             err.message().contains("bass_boost"),
             "unknown keys must be named, got: {}",
@@ -614,7 +644,10 @@ side = \"spinward\"").unwrap_err();
         // Every error variant is displayable.
         for err in [
             MixerError::UnknownFx("x".into()),
-            MixerError::BadParam { kind: "eq".into(), name: "low".into() },
+            MixerError::BadParam {
+                kind: "eq".into(),
+                name: "low".into(),
+            },
             MixerError::Empty,
             MixerError::Output("boom".into()),
         ] {
@@ -665,7 +698,10 @@ side = \"spinward\"").unwrap_err();
                 assert_eq!(kinds, vec!["gain"], "{stem} follows the template");
             }
         }
-        assert_eq!(cfg.channels[0].chain_names(Stem::Drums), ["gain".to_owned()]);
+        assert_eq!(
+            cfg.channels[0].chain_names(Stem::Drums),
+            ["gain".to_owned()]
+        );
         assert_eq!(
             cfg.channels[0].chain_names(Stem::Vocals),
             ["filter".to_owned(), "gain".to_owned()]
@@ -695,14 +731,20 @@ side = \"spinward\"").unwrap_err();
             vocals = ["filter"]
         "#;
         let cfg = MixerConfig::from_toml_str(text).expect("parses");
-        assert_eq!(cfg.channels[0].chain_names(Stem::Vocals), ["filter".to_owned()]);
-        assert_eq!(cfg.channels[0].chain_names(Stem::Other), ["gain".to_owned()]);
+        assert_eq!(
+            cfg.channels[0].chain_names(Stem::Vocals),
+            ["filter".to_owned()]
+        );
+        assert_eq!(
+            cfg.channels[0].chain_names(Stem::Other),
+            ["gain".to_owned()]
+        );
         assert!(cfg.build_chains().is_ok());
         // An unknown stem name is a parse error, not a silently ignored key.
-        assert!(MixerConfig::from_toml_str(
-            "[[channel]]\n[channel.stem_fx]\nguitar = [\"eq\"]\n"
-        )
-        .is_err());
+        assert!(
+            MixerConfig::from_toml_str("[[channel]]\n[channel.stem_fx]\nguitar = [\"eq\"]\n")
+                .is_err()
+        );
     }
 
     #[test]
@@ -719,14 +761,25 @@ side = \"spinward\"").unwrap_err();
             channels: (4, 5),
             ..OutputConfig::master(0, "x")
         };
-        assert_eq!(cfg.channel_pair(2), (0, 1), "a 2ch device clamps rather than indexing out");
+        assert_eq!(
+            cfg.channel_pair(2),
+            (0, 1),
+            "a 2ch device clamps rather than indexing out"
+        );
         assert_eq!(cfg.channel_pair(8), (4, 5));
-        assert_eq!(OutputConfig::master(0, "m").channel_pair(1), (0, 1), "1ch writes the sum to ch0");
+        assert_eq!(
+            OutputConfig::master(0, "m").channel_pair(1),
+            (0, 1),
+            "1ch writes the sum to ch0"
+        );
     }
 
     #[test]
     fn an_output_opens_enough_device_channels_for_its_pair() {
-        assert_eq!(OutputConfig::master(0, "stereo").wanted_device_channels(), 2);
+        assert_eq!(
+            OutputConfig::master(0, "stereo").wanted_device_channels(),
+            2
+        );
         let cue = OutputConfig {
             channels: (2, 3),
             ..OutputConfig::cue(1, "cue")

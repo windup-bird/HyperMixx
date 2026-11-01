@@ -26,12 +26,12 @@ pub use deck::{Deck, LoopRange, Seek};
 pub use flow::{Direction, Playing, PitchShiftEngine};
 pub use fx::{Fx, FxChain, FxContext, FxError, FxKind, FxSlot, FxTarget, Param};
 pub use mixer::{
-    reference_toml, silent_test_channel, simple_dj, Bus, Channel, ChannelConfig,
-    CrossfaderConfig, CrossfaderCurve, CrossfaderPlace, CueMixConfig, CueTap, MasterBus, Mixer,
-    MixerConfig, MixerError, Output, OutputConfig, OutputError, OutputId, OutputRole, OutputState,
-    OutputStatus, Outputs,
+    output_devices, reference_toml, silent_test_channel, simple_dj, Bus, Channel, ChannelConfig,
+    CrossfaderConfig, CrossfaderCurve, CrossfaderPlace, CueMixConfig, CueTap, DeviceInfo,
+    MasterBus, Mixer, MixerConfig, MixerError, Output, OutputConfig, OutputError, OutputId,
+    OutputRole, OutputState, OutputStatus, Outputs,
 };
-pub use pipeline::{AudioPipeline, AudioTuning, Meters, PipelineError};
+pub use pipeline::{AudioPipeline, AudioTuning, ChannelLevels, Meters, PipelineError};
 pub use ringbuf::AudioRingBuffer;
 pub use sync::{SyncGroup, SyncMode};
 

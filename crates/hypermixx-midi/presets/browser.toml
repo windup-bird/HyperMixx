@@ -34,9 +34,10 @@ action = "browser open"
 [[preset.mode.bind]]
 slot = "exit"
 action = "browser exit"
+# Each load slot names its deck: the unit is global, so there is no deck to inherit.
 [[preset.mode.bind]]
 slot = "load-1"
-action = "browser load"
+action = "browser load 1"
 [[preset.mode.bind]]
 slot = "load-2"
-action = "browser load"
+action = "browser load 2"

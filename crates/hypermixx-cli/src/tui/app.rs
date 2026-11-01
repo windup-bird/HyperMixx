@@ -12,8 +12,8 @@ use std::time::Instant;
 use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::{AudioPipeline, Meters};
 use hypermixx_core::{
-    Backend, BeatGrid, BrowserAction, Command, CommandResponse, DeckState, KeyFormat, KeylockMode,
-    StemStatus,
+    Backend, BeatGrid, BrowserAction, Command, CommandResponse, DeckState, FxChainId, FxSlotStatus,
+    KeyFormat, KeylockMode, StemStatus,
 };
 use hypermixx_library::{
     detect_source_kinds, ImportCalibration, LibraryDb, Source, SourceKind, SourceOrigin,
@@ -21,7 +21,7 @@ use hypermixx_library::{
 
 use crate::command::{Slots, UiEvent};
 use crate::notices::NoticeTx;
-use crate::preference::{LibrarySettings, WaveformSettings};
+use crate::preference::{LibrarySettings, Theme, WaveformSettings};
 use crate::procmon::ProcessMonitor;
 use crate::response::{self, LogLine};
 use crate::tui::browser::Browser;
@@ -53,10 +53,10 @@ pub enum Target {
 }
 
 impl Target {
-    /// The prefix shown on the command rule: `deck0`, `deck1`, … or empty for the browser.
+    /// The label shown on the command rule: `deck1`, `deck2`, … or `browser`.
     pub fn prefix(self) -> String {
         match self {
-            Self::Deck(index) => format!("deck{index}"),
+            Self::Deck(index) => hypermixx_core::deck_label(index as u8),
             Self::Browser => String::new(),
         }
     }
@@ -64,7 +64,7 @@ impl Target {
     /// Full tab label used by the command rule.
     pub fn label(self) -> String {
         match self {
-            Self::Deck(index) => format!("deck{index}"),
+            Self::Deck(index) => hypermixx_core::deck_label(index as u8),
             Self::Browser => "browser".to_owned(),
         }
     }
@@ -72,7 +72,7 @@ impl Target {
     /// Short tab label for a narrow command panel.
     pub fn compact_label(self) -> String {
         match self {
-            Self::Deck(index) => format!("d{index}"),
+            Self::Deck(index) => format!("d{}", index + 1),
             Self::Browser => "br".to_owned(),
         }
     }
@@ -86,15 +86,17 @@ pub struct CompletionState {
 
 /// A modal picker drawn over the UI. While set, the keyboard belongs to it.
 pub enum Overlay {
-    /// Choosing a MIDI input port.
+    /// Choosing a controller (MIDI input) port.
     Ports { list: PortList },
-    /// Choosing a file: a track to load, or a MIDI map.
+    /// Choosing a file: a track to load, or a controller map.
     Files {
         picker: FilePicker,
         purpose: FilePurpose,
     },
     /// The small deck chooser opened by double-clicking a track.
     LoadTarget { x: u16, y: u16, selected: usize },
+    /// The settings screen: one column of files, one of fields.
+    Settings(Box<crate::tui::settings::SettingsScreen>),
 }
 
 /// What the file picker's choice means.
@@ -102,8 +104,205 @@ pub enum Overlay {
 pub enum FilePurpose {
     /// Decode and install into this deck.
     Load { deck: usize },
-    /// Use as the MIDI mapping file (and connect if a port is known).
+    /// Use as the controller mapping file (and connect if a port is known).
     MidiMap,
+}
+
+/// Which command set the eight pads currently fire. Front-end state: the engine only knows the
+/// three commands, and a DJ switches between them per deck.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PadMode {
+    /// Set on an empty pad, trigger on a filled one.
+    #[default]
+    HotCue,
+    /// `1/4 1/2 1 2 4 8 16 32` beats.
+    BeatLoop,
+    /// `-16 -8 -4 -2 +2 +4 +8 +16` beats.
+    BeatJump,
+}
+
+impl PadMode {
+    pub const ALL: [Self; 3] = [Self::HotCue, Self::BeatLoop, Self::BeatJump];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::HotCue => "cue",
+            Self::BeatLoop => "loop",
+            Self::BeatJump => "jump",
+        }
+    }
+
+    /// The eight pad labels, in pad order.
+    pub fn pads(self) -> [&'static str; 8] {
+        match self {
+            Self::HotCue => ["1", "2", "3", "4", "5", "6", "7", "8"],
+            Self::BeatLoop => ["1/4", "1/2", "1", "2", "4", "8", "16", "32"],
+            Self::BeatJump => ["-16", "-8", "-4", "-2", "+2", "+4", "+8", "+16"],
+        }
+    }
+
+    /// Loop length per pad, in beats (only meaningful for [`PadMode::BeatLoop`]). Quarter and half
+    /// beats are exact: `BeatLen` is a rational, so `1/4` is not 0.25 of a rounded frame count.
+    pub fn loop_beats(self, pad: usize) -> Option<hypermixx_core::BeatLen> {
+        // Written as exact fractions rather than a float: `1/4` is a rational beat length all the
+        // way down, so a quarter-beat loop lands on the grid instead of on a rounded frame count.
+        let table: [(u32, u32); 8] = [
+            (1, 4),
+            (1, 2),
+            (1, 1),
+            (2, 1),
+            (4, 1),
+            (8, 1),
+            (16, 1),
+            (32, 1),
+        ];
+        table
+            .get(pad)
+            .and_then(|(num, den)| hypermixx_core::BeatLen::fraction(*num, *den))
+    }
+
+    /// Jump size per pad, in beats (only meaningful for [`PadMode::BeatJump`]).
+    pub fn jump_beats(self, pad: usize) -> Option<i64> {
+        [-16, -8, -4, -2, 2, 4, 8, 16].get(pad).copied()
+    }
+}
+
+/// What the middle of the beat block is showing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BeatMode {
+    /// Tempo fader and bend.
+    #[default]
+    Tempo,
+    /// Manual loop: in / toggle / out, with the loop length under the pads' `loop` mode.
+    ManualLoop,
+    /// Beat jump: backward / forward by the current step.
+    ManualJump,
+}
+
+impl BeatMode {
+    pub const ALL: [Self; 3] = [Self::Tempo, Self::ManualLoop, Self::ManualJump];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tempo => "bpm",
+            Self::ManualLoop => "loop",
+            Self::ManualJump => "jump",
+        }
+    }
+}
+
+/// One clickable region of the drawn interface.
+///
+/// Rebuilt by the renderer on every frame and consumed by the mouse handler, which is the only way
+/// a pointer can reach a control: the command line keeps the keyboard, exactly as before.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Hit {
+    /// Pad `index` (0-based) on `deck`.
+    Pad {
+        deck: usize,
+        index: usize,
+    },
+    PadMode {
+        deck: usize,
+        mode: PadMode,
+    },
+    BeatMode {
+        deck: usize,
+        mode: BeatMode,
+    },
+    /// One step of the tempo fader (`direction` -1 / +1).
+    TempoFader {
+        deck: usize,
+        direction: i8,
+    },
+    /// A bend press (`direction` -1 / +1) that releases itself.
+    Bend {
+        deck: usize,
+        direction: i8,
+    },
+    /// Halve (`true`) or double (`false`) the loop length.
+    LoopBeats {
+        deck: usize,
+        halve: bool,
+    },
+    /// Halve (`true`) or double (`false`) the jump length.
+    JumpBeats {
+        deck: usize,
+        halve: bool,
+    },
+    /// Manual loop transport.
+    Loop {
+        deck: usize,
+        op: LoopHit,
+    },
+    /// Beat jump backward / forward.
+    Jump {
+        deck: usize,
+        direction: i8,
+    },
+    Transport {
+        deck: usize,
+        action: TransportHit,
+    },
+    /// A knob set to an absolute position, `-1.0..=1.0`.
+    Knob {
+        deck: usize,
+        knob: Knob,
+        value: f32,
+    },
+    /// A channel fader set to an absolute position, `-1.0..=1.0` (top = 0 dB). The band draws the
+    /// deck fader; the flow fader (the per-stream level a separated track exposes) stays
+    /// command-only, because one cell cannot mean two things.
+    Fader {
+        deck: usize,
+        value: f32,
+    },
+    /// The crossfader, `-1.0..=1.0` (centre = 0).
+    Crossfader {
+        value: f32,
+    },
+    /// The header button that opens the settings screen.
+    Settings,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoopHit {
+    In,
+    Out,
+    Toggle,
+    Exit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportHit {
+    Sync,
+    Cue,
+    Play,
+    Keylock,
+}
+
+/// The five mixer knobs a channel has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Knob {
+    Gain,
+    High,
+    Mid,
+    Low,
+    Filter,
+}
+
+impl Knob {
+    pub const ALL: [Self; 5] = [Self::Gain, Self::High, Self::Mid, Self::Low, Self::Filter];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gain => "gain",
+            Self::High => "high",
+            Self::Mid => "mid",
+            Self::Low => "low",
+            Self::Filter => "filt",
+        }
+    }
 }
 
 /// A deck's transport, as the TUI sees it. Mirrors [`DeckState`] plus front-end-only data.
@@ -119,8 +318,23 @@ pub struct App {
     pub target: Target,
     /// The browser pane: Miller columns plus the current list's tracks.
     pub browser: Browser,
+    /// Whether the deck's images are currently deleted because a modal is open. The transition, not
+    /// the state, is what does the work.
+    pub images_hidden: bool,
+    /// Output devices probed before the terminal was taken over, for the settings screen.
+    pub devices: Vec<hypermixx_audio::DeviceInfo>,
+    /// The profile file this session was started from, for the settings screen.
+    pub profile_path: Option<String>,
+    /// Where `preference.toml` lives, for the settings screen.
+    pub preference_path: String,
+    /// Where the live settings came from, for the settings screen.
+    pub live_path: Option<String>,
+    /// Where the mixer topology came from, for the settings screen.
+    pub mixer_path: Option<String>,
     /// How keys are rendered across the TUI.
     pub key_format: KeyFormat,
+    /// The colour slots every panel draws from.
+    pub theme: Theme,
     /// The library cache. `None` when startup could not open it; the browser then stays empty.
     pub library: Option<Arc<LibraryDb>>,
     /// Sources the configured preference categories allow. Everything else stays in the cache but
@@ -137,6 +351,19 @@ pub struct App {
     pub states: Vec<DeckState>,
     /// File name per deck (from the load tap), for the deck header.
     pub titles: Vec<Option<String>>,
+    /// Embedded artwork per deck, read off the UI thread when a track loads.
+    pub covers: Vec<Option<Arc<hypermixx_media::Cover>>>,
+    /// Which command set each deck's pads show.
+    pub pad_mode: Vec<PadMode>,
+    /// What each deck's beat block is showing.
+    pub beat_mode: Vec<BeatMode>,
+    /// Live FX slot state per deck, polled with [`Command::GetFxState`] so the knobs show the
+    /// engine's values rather than a local guess.
+    pub deck_fx: Vec<Vec<FxSlotStatus>>,
+    /// Outstanding `GetFxState` requests, so a stalled engine cannot build a backlog.
+    pub fx_pending: usize,
+    /// Every clickable region of the last frame, in draw order.
+    pub hits: Vec<(ratatui::layout::Rect, Hit)>,
     pub waveforms: Vec<Option<Arc<hypermixx_library::Waveform>>>,
     pub grids: Vec<Option<BeatGrid>>,
 
@@ -148,6 +375,8 @@ pub struct App {
     pub waveform: WaveformSettings,
     /// The selected waveform transport (braille / kitty) and its per-deck image state.
     pub waveform_view: WaveformView,
+    /// The still images (cover, overview) each deck shows through the same image backend.
+    pub deck_images: Vec<crate::tui::image_slot::DeckImages>,
 
     pub log: VecDeque<LogLine>,
     /// Lines scrolled up from the bottom (0 = following).
@@ -159,7 +388,7 @@ pub struct App {
     pub history: Vec<String>,
     pub history_pos: Option<usize>,
 
-    /// Slot kinds per chain label (`"deck0"`, `"master"`), shared with the dispatcher; feeds
+    /// Slot kinds per chain label (`"deck1"`, `"master"`), shared with the dispatcher; feeds
     /// name resolution and param completion.
     pub fx_slots: Slots,
 
@@ -192,6 +421,8 @@ pub struct App {
     browser_rx: Receiver<BrowserAction>,
     waveform_tx: Sender<(usize, Arc<hypermixx_library::Waveform>)>,
     waveform_rx: Receiver<(usize, Arc<hypermixx_library::Waveform>)>,
+    cover_tx: Sender<(usize, Option<Arc<hypermixx_media::Cover>>)>,
+    cover_rx: Receiver<(usize, Option<Arc<hypermixx_media::Cover>>)>,
 }
 
 impl App {
@@ -204,6 +435,7 @@ impl App {
     ) -> Self {
         let decks = decks.max(1);
         let (waveform_tx, waveform_rx) = crossbeam_channel::unbounded();
+        let (cover_tx, cover_rx) = crossbeam_channel::unbounded();
         let (browser_tx, browser_rx) = crossbeam_channel::unbounded();
         let browser = Browser::new();
         Self {
@@ -213,9 +445,18 @@ impl App {
             ring_frames: hypermixx_audio::OUTPUT_RING_CAPACITY,
             decks,
             focused: 0,
-            target: Target::Deck(0),
+            // A session starts in the library. The browser is a soft focus: it takes the arrow keys
+            // but not the command line, so a typed deck command still lands on the last focused deck.
+            target: Target::Browser,
             browser,
+            images_hidden: false,
+            devices: Vec::new(),
+            profile_path: None,
+            preference_path: crate::preference::DEFAULT_PATH.to_owned(),
+            live_path: None,
+            mixer_path: None,
             key_format: KeyFormat::Camelot,
+            theme: Theme::default(),
             library: None,
             allowed_sources: HashSet::new(),
             usb_formats: Vec::new(),
@@ -256,11 +497,20 @@ impl App {
                 })
                 .collect(),
             titles: vec![None; decks],
+            covers: vec![None; decks],
+            pad_mode: vec![PadMode::default(); decks],
+            beat_mode: vec![BeatMode::default(); decks],
+            deck_fx: vec![Vec::new(); decks],
+            fx_pending: 0,
+            hits: Vec::new(),
             waveforms: vec![None; decks],
             grids: vec![None; decks],
             frames_per_cell: DEFAULT_FRAMES_PER_CELL,
             wave_width_cells: 200,
             waveform: WaveformSettings::default(),
+            deck_images: (0..decks)
+                .map(|_| crate::tui::image_slot::DeckImages::new())
+                .collect(),
             waveform_view: WaveformView::new(WaveformSettings::default(), decks),
             log: VecDeque::new(),
             log_offset: 0,
@@ -288,6 +538,8 @@ impl App {
             browser_rx,
             waveform_tx,
             waveform_rx,
+            cover_tx,
+            cover_rx,
         }
     }
 
@@ -313,12 +565,12 @@ impl App {
         let mut map = match crate::midi::read_map(&map_path) {
             Ok(map) => map,
             Err(err) => {
-                self.push_log(LogLine::error(format!("midi: {err}")));
+                self.push_log(LogLine::error(format!("controller: {err}")));
                 self.overlay = Some(Overlay::Files {
                     picker: FilePicker::new(
                         Some(std::path::Path::new(&map_path)),
                         &["toml"],
-                        "midi map",
+                        "controller map",
                     ),
                     purpose: FilePurpose::MidiMap,
                 });
@@ -336,11 +588,11 @@ impl App {
                 dispatcher.set_midi(session.control(), session.state());
                 self.midi = Some(session);
                 self.push_log(LogLine::info(format!(
-                    "[midi] connected `{port}` ({map_path})"
+                    "[controller] connected `{port}` ({map_path})"
                 )));
             }
             Err(err) => {
-                self.push_log(LogLine::error(format!("midi: {err}")));
+                self.push_log(LogLine::error(format!("controller: {err}")));
                 self.overlay = Some(Overlay::Ports {
                     list: PortList::refresh(),
                 });
@@ -520,6 +772,12 @@ impl App {
     /// else is echoed to the log, exactly as the REPL would print it.
     pub fn on_response(&mut self, response: &CommandResponse, pipeline: &AudioPipeline) {
         let sample_rate = self.sample_rate;
+        if matches!(response, CommandResponse::Error(_)) {
+            // An engine error may be the answer to a knob poll (an FX chain that does not exist on
+            // a custom topology). Drop the in-flight count so the poll keeps going instead of
+            // stalling behind a response that will never come.
+            self.fx_pending = 0;
+        }
         match response {
             CommandResponse::States(states) => {
                 for state in states {
@@ -537,6 +795,16 @@ impl App {
                 }
                 self.spawn_waveform(*deck_id, pipeline);
                 self.push_lines(response::format_response(response, sample_rate));
+            }
+            CommandResponse::FxState { chain, slots } => {
+                // A poll, not a command: record it silently, or a 10Hz knob read would flood the
+                // response log.
+                if let FxChainId::Deck(deck_id) = chain {
+                    if let Some(slot) = self.deck_fx.get_mut(*deck_id as usize) {
+                        *slot = slots.clone();
+                    }
+                }
+                self.fx_pending = self.fx_pending.saturating_sub(1);
             }
             CommandResponse::FxListed { .. } => {
                 self.fx_slots.record(response);
@@ -581,6 +849,86 @@ impl App {
             .ok();
     }
 
+    /// Reads the embedded cover off the UI thread. Missing artwork is a normal answer (`None`), not
+    /// an error: most WAV files have none, and the header falls back to a colour block.
+    fn spawn_cover(&mut self, deck: usize, path: String) {
+        if let Some(slot) = self.covers.get_mut(deck) {
+            *slot = None;
+        }
+        let tx = self.cover_tx.clone();
+        std::thread::Builder::new()
+            .name(format!("hypermixx-cover-{deck}"))
+            .spawn(move || {
+                let cover = hypermixx_media::read_cover(&path).map(Arc::new);
+                let _ = tx.send((deck, cover));
+            })
+            .ok();
+    }
+
+    /// The value a knob currently shows, or `None` when the deck's chain has no such slot (a custom
+    /// topologies may omit `eq`/`filter` entirely).
+    pub fn knob_value(&self, deck: usize, knob: Knob) -> Option<f32> {
+        if knob == Knob::Gain {
+            return self
+                .meters
+                .as_ref()
+                .and_then(|meters| meters.channels.get(deck))
+                .map(|levels| levels.gain);
+        }
+        let (kind, param) = match knob {
+            Knob::Gain => unreachable!("handled above"),
+            Knob::High => ("eq", "high"),
+            Knob::Mid => ("eq", "mid"),
+            Knob::Low => ("eq", "low"),
+            Knob::Filter => ("filter", "value"),
+        };
+        self.deck_fx
+            .get(deck)?
+            .iter()
+            .find(|slot| slot.kind.eq_ignore_ascii_case(kind))
+            .and_then(|slot| {
+                slot.params
+                    .iter()
+                    .find(|(name, _)| name == param)
+                    .map(|(_, value)| *value)
+            })
+    }
+
+    /// The slot index of a knob's effect in the deck chain, for [`Command::SetFxParam`].
+    pub fn knob_slot(&self, deck: usize, knob: Knob) -> Option<usize> {
+        let kind = match knob {
+            Knob::Gain => return None,
+            Knob::High | Knob::Mid | Knob::Low => "eq",
+            Knob::Filter => "filter",
+        };
+        self.deck_fx
+            .get(deck)?
+            .iter()
+            .find(|slot| slot.kind.eq_ignore_ascii_case(kind))
+            .map(|slot| slot.index)
+    }
+
+    /// The mixer's position for a deck's channel fader.
+    pub fn fader_value(&self, deck: usize) -> Option<f32> {
+        self.meters
+            .as_ref()?
+            .channels
+            .get(deck)
+            .map(|levels| levels.deck)
+    }
+
+    /// Master peak and cue peak, linear.
+    pub fn peaks(&self) -> (f32, f32, Vec<f32>) {
+        match self.meters.as_ref() {
+            Some(meters) => (
+                meters.master_peak,
+                meters.cue_peak,
+                meters.deck_peaks.clone(),
+            ),
+            None => (0.0, 0.0, Vec::new()),
+        }
+    }
+
     /// Drains every side channel without blocking. Returns true if anything changed.
     pub fn drain(&mut self) -> bool {
         let mut changed = false;
@@ -596,12 +944,19 @@ impl App {
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned());
                     }
+                    self.spawn_cover(deck_id as usize, path);
                 }
                 UiEvent::Grid { deck_id, analysis } => {
                     if let Some(grid) = self.grids.get_mut(deck_id as usize) {
                         *grid = Some(analysis.beatgrid);
                     }
                 }
+            }
+            changed = true;
+        }
+        while let Ok((index, cover)) = self.cover_rx.try_recv() {
+            if let Some(slot) = self.covers.get_mut(index) {
+                *slot = cover;
             }
             changed = true;
         }
@@ -733,7 +1088,8 @@ impl App {
         let slots = self.fx_slots.snapshot();
         let ctx = Ctx {
             decks: self.decks,
-            chain: format!("deck{}", self.default_deck()),
+            // The chain label the engine reports, which is 1-based.
+            chain: hypermixx_core::deck_label(self.default_deck() as u8),
             slots: &slots,
         };
         self.completion = completer::complete(&self.command, self.cursor, &ctx).map(|completion| {

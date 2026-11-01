@@ -172,6 +172,40 @@ impl Default for DisplaySettings {
     }
 }
 
+/// The colour slots the whole TUI is drawn from.
+///
+/// Every panel asks the theme instead of naming a colour, which is what makes `[theme]` in
+/// `preference.toml` (and the settings screen) able to restyle the interface at all. The defaults
+/// are the historical look: cyan accent, dark grey chrome, white text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Theme {
+    /// Focused borders, the header badge, active pads, the playhead of a focused panel.
+    pub accent: Color,
+    /// Unfocused borders, hints, secondary text.
+    pub dim: Color,
+    /// Body text.
+    pub text: Color,
+    /// Errors and the response log's error level.
+    pub error: Color,
+    /// Warnings: a fader that will clip, a missing cover, a disabled output.
+    pub warn: Color,
+    /// Pads that are set/armed but not focused.
+    pub pad: Color,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            accent: Color::Cyan,
+            dim: Color::DarkGray,
+            text: Color::White,
+            error: Color::Red,
+            warn: Color::Yellow,
+            pad: Color::Rgb(64, 96, 128),
+        }
+    }
+}
+
 /// The TUI's preferences. Kept as one struct so adding a tab/theme later does not change every
 /// call site.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -179,6 +213,7 @@ pub struct Preference {
     pub waveform: WaveformSettings,
     pub library: LibrarySettings,
     pub display: DisplaySettings,
+    pub theme: Theme,
 }
 
 /// Reads a preference file. A missing file is not an error: the defaults apply.
@@ -221,6 +256,12 @@ pub fn parse(text: &str) -> Result<(Preference, Vec<String>), String> {
                     .ok_or_else(|| "`display` must be a table".to_owned())?;
                 parse_display(table, &mut preference.display, &mut notes);
             }
+            "theme" => {
+                let table = value
+                    .as_table()
+                    .ok_or_else(|| "`theme` must be a table".to_owned())?;
+                parse_theme(table, &mut preference.theme, &mut notes);
+            }
             other => notes.push(format!("unknown preference section `[{other}]` ignored")),
         }
     }
@@ -245,6 +286,29 @@ fn parse_display(
                 _ => notes.push("display.key must be camelot | classic".to_owned()),
             },
             other => notes.push(format!("unknown display key `{other}` ignored")),
+        }
+    }
+}
+
+fn parse_theme(table: &toml::value::Table, theme: &mut Theme, notes: &mut Vec<String>) {
+    for (key, value) in table {
+        let slot = match key.as_str() {
+            "accent" => &mut theme.accent,
+            "dim" => &mut theme.dim,
+            "text" => &mut theme.text,
+            "error" => &mut theme.error,
+            "warn" => &mut theme.warn,
+            "pad" => &mut theme.pad,
+            other => {
+                notes.push(format!("unknown theme key `{other}` ignored"));
+                continue;
+            }
+        };
+        match value.as_str().and_then(parse_color) {
+            Some(color) => *slot = color,
+            None => notes.push(format!(
+                "theme.{key} must be #rrggbb or #rgb; using the default"
+            )),
         }
     }
 }
@@ -589,6 +653,41 @@ mod tests {
         let (preference, notes) = parse("[display]\nkey = \"classic\"").unwrap();
         assert_eq!(preference.display.key_format, KeyFormat::Traditional);
         assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn theme_colours_are_read_and_bad_ones_are_notes() {
+        let (preference, notes) = parse(
+            r##"
+            [theme]
+            accent = "#00e5ff"
+            dim = "444"
+            text = "#ffffff"
+            error = "#b00020"
+            warn = "#ffcc00"
+            pad = "#204060"
+            "##,
+        )
+        .unwrap();
+        assert_eq!(preference.theme.accent, Color::Rgb(0x00, 0xE5, 0xFF));
+        assert_eq!(preference.theme.dim, Color::Rgb(0x44, 0x44, 0x44));
+        assert_eq!(preference.theme.error, Color::Rgb(0xB0, 0x00, 0x20));
+        assert!(notes.is_empty());
+
+        let (preference, notes) = parse("[theme]\naccent = \"cyan\"\nextra = 1").unwrap();
+        assert_eq!(preference.theme, Theme::default());
+        assert!(notes.iter().any(|note| note.contains("theme.accent")));
+        assert!(notes.iter().any(|note| note.contains("unknown theme key")));
+    }
+
+    #[test]
+    fn the_shipped_preference_file_parses_without_notes() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = root.join(DEFAULT_PATH);
+        let (preference, notes) =
+            load(&path.to_string_lossy()).expect("the shipped preference parses");
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(preference.theme, Theme::default());
     }
 
     #[test]

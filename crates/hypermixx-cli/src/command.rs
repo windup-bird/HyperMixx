@@ -1,7 +1,7 @@
 //! Line parsing and dispatch, shared by the REPL and the TUI.
 //!
 //! Syntax is target-first: the target is the TUI's selected deck (its prefix is shown on the
-//! command panel's divider line), and can be overridden per line with `deck0` / `0` / `master`. So
+//! command panel's divider line), and can be overridden per line with `deck1` / `1` / `master`. So
 //! in the TUI `play` means "play the selected deck" while `deck1 play` or `master fx list` address
 //! something else. The engine's [`Command`] protocol is unchanged — this is purely the front-end's
 //! grammar.
@@ -136,7 +136,7 @@ pub type Slots = Arc<SlotBook>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Target {
     Deck(u8),
-    /// One stem of a deck: `deck0 vocals`. Everything a deck takes still applies to its deck (the
+    /// One stem of a deck: `deck1 vocals`. Everything a deck takes still applies to its deck (the
     /// next word decides), and the stem-scoped verbs (`level`, `mute`, `solo`) use the stem.
     Stem(u8, Stem),
     Master,
@@ -331,7 +331,7 @@ pub fn dispatch(
     };
     // A leading deck/chain word overrides the focused deck; otherwise the verb is the first word.
     // A deck word may be followed by a stem name, which narrows the target to one stem:
-    // `deck0 vocals mute`, `deck0 vocals fx add filter`.
+    // `deck1 vocals mute`, `deck1 vocals fx add filter`.
     let (mut target, verb) = match parse_target(first, decks) {
         Some(target) => (target, words.next().unwrap_or_default()),
         None => (Target::Deck(focused), first),
@@ -397,68 +397,60 @@ pub fn dispatch(
                 _ => Action::Failed("usage: [deck] jump <frame>".into()),
             }
         }),
-        "beatjump" => with_deck(target, "beatjump", |deck_id| {
-            match words.next() {
-                Some("forward") => send(
-                    command_tx,
-                    Command::BeatJumpStep {
-                        deck_id,
-                        direction: 1,
-                    },
-                ),
-                Some("backward") => send(
-                    command_tx,
-                    Command::BeatJumpStep {
-                        deck_id,
-                        direction: -1,
-                    },
-                ),
-                Some(raw) => match raw.parse::<i64>() {
-                    Ok(beats) => send(command_tx, Command::BeatJump { deck_id, beats }),
-                    Err(_) => Action::Failed(
-                        "usage: [deck] beatjump <beats|forward|backward>".into(),
-                    ),
+        "beatjump" => with_deck(target, "beatjump", |deck_id| match words.next() {
+            Some("forward") => send(
+                command_tx,
+                Command::BeatJumpStep {
+                    deck_id,
+                    direction: 1,
                 },
-                None => Action::Failed("usage: [deck] beatjump <beats|forward|backward>".into()),
-            }
+            ),
+            Some("backward") => send(
+                command_tx,
+                Command::BeatJumpStep {
+                    deck_id,
+                    direction: -1,
+                },
+            ),
+            Some(raw) => match raw.parse::<i64>() {
+                Ok(beats) => send(command_tx, Command::BeatJump { deck_id, beats }),
+                Err(_) => Action::Failed("usage: [deck] beatjump <beats|forward|backward>".into()),
+            },
+            None => Action::Failed("usage: [deck] beatjump <beats|forward|backward>".into()),
         }),
-        "jumpbeats" => with_deck(target, "jumpbeats", |deck_id| {
-            match words.next() {
-                Some("double") => send(
-                    command_tx,
-                    Command::ScaleJumpBeats {
-                        deck_id,
-                        halve: false,
-                    },
-                ),
-                Some("halve") => send(
-                    command_tx,
-                    Command::ScaleJumpBeats {
-                        deck_id,
-                        halve: true,
-                    },
-                ),
-                _ => Action::Failed("usage: [deck] jumpbeats double|halve".into()),
-            }
+        "jumpbeats" => with_deck(target, "jumpbeats", |deck_id| match words.next() {
+            Some("double") => send(
+                command_tx,
+                Command::ScaleJumpBeats {
+                    deck_id,
+                    halve: false,
+                },
+            ),
+            Some("halve") => send(
+                command_tx,
+                Command::ScaleJumpBeats {
+                    deck_id,
+                    halve: true,
+                },
+            ),
+            _ => Action::Failed("usage: [deck] jumpbeats double|halve".into()),
         }),
-        "loopbeats" => with_deck(target, "loopbeats", |deck_id| {
-            match words.next() {
-                Some("double") => send(
-                    command_tx,
-                    Command::ScaleLoopBeats {
-                        deck_id,
-                        halve: false,
-                    },
-                ),
-                Some("halve") => send(
-                    command_tx,
-                    Command::ScaleLoopBeats {
-                        deck_id,
-                        halve: true,
-                    },
-                ),
-                _ => Action::Failed("usage: [deck] loopbeats double|halve".into()),
-            }
+        "loopbeats" => with_deck(target, "loopbeats", |deck_id| match words.next() {
+            Some("double") => send(
+                command_tx,
+                Command::ScaleLoopBeats {
+                    deck_id,
+                    halve: false,
+                },
+            ),
+            Some("halve") => send(
+                command_tx,
+                Command::ScaleLoopBeats {
+                    deck_id,
+                    halve: true,
+                },
+            ),
+            _ => Action::Failed("usage: [deck] loopbeats double|halve".into()),
         }),
         "tempo" => with_deck(target, "tempo", |deck_id| {
             match words.next().map(str::parse::<f32>) {
@@ -534,7 +526,7 @@ pub fn dispatch(
         "mixer" => mixer_command(&mut words, dispatcher),
         "live" => live_command(&mut words, dispatcher),
         "profile" => profile_command(&mut words, dispatcher),
-        "midi" => midi_command(&mut words, dispatcher),
+        "controller" | "midi" => midi_command(&mut words, dispatcher),
         "help" | "h" | "?" => Action::Message(help_text(decks)),
         "quit" | "exit" => Action::Quit,
         other => Action::Failed(format!("unknown command `{other}` — `help` lists them")),
@@ -825,6 +817,15 @@ fn profile_report(dispatcher: &Dispatcher) -> String {
 /// re-reads the file and says so rather than pretending a running engine can change its clock. The
 /// stem defaults it carries do apply to the next separation, which is why a reload is worth doing
 /// even mid-session.
+/// Applies `live reload [path]` without a command line. The settings screen picks the file and then
+/// asks for exactly what the typed command would have done.
+pub fn reload_live(dispatcher: &Dispatcher, path: Option<&str>) -> Action {
+    match path {
+        Some(path) => live_command(&mut ["reload", path].into_iter(), dispatcher),
+        None => live_command(&mut ["reload"].into_iter(), dispatcher),
+    }
+}
+
 fn live_command<'a>(words: &mut impl Iterator<Item = &'a str>, dispatcher: &Dispatcher) -> Action {
     let Some(sub) = words.next() else {
         return Action::Message(live_report(&dispatcher.live(), None));
@@ -920,21 +921,23 @@ fn output_command<'a>(
 
 /// The `midi` family: port listing and the live unit-mode controls. Opening an input still happens
 /// at launch (or F2), because a mapping is wired to the running engine once.
+/// `controller ...` — the port and mode questions. `midi ...` still parses: the protocol is MIDI,
+/// the thing the user plugs in is a controller.
 fn midi_command<'a>(words: &mut impl Iterator<Item = &'a str>, dispatcher: &Dispatcher) -> Action {
     match words.next() {
         Some("ports") | Some("list") => match hypermixx_midi::list_ports() {
-            Ok(ports) if ports.is_empty() => Action::Message("midi: no input ports".into()),
+            Ok(ports) if ports.is_empty() => Action::Message("controller: no input ports".into()),
             Ok(ports) => {
-                let mut text = String::from("midi input ports:");
+                let mut text = String::from("controller input ports:");
                 for port in ports {
                     text.push_str(&format!("\n  {}  {}", port.index, port.name));
                 }
                 Action::Message(text)
             }
-            Err(err) => Action::Failed(format!("midi: {err}")),
+            Err(err) => Action::Failed(format!("controller: {err}")),
         },
         Some("mode") | Some("modes") => midi_mode(words, dispatcher),
-        _ => Action::Message("usage: midi ports | midi mode [unit [mode|next]]".into()),
+        _ => Action::Message("usage: controller ports | controller mode [unit [mode|next]]".into()),
     }
 }
 
@@ -956,7 +959,7 @@ fn midi_mode<'a>(words: &mut impl Iterator<Item = &'a str>, dispatcher: &Dispatc
         for unit in &snapshot.units {
             let deck = unit
                 .deck
-                .map_or_else(|| "global".to_owned(), |deck| format!("deck{deck}"));
+                .map_or_else(|| "global".to_owned(), hypermixx_core::deck_label);
             text.push_str(&format!(
                 "\n  {}  [{deck}]  {}  ({})",
                 unit.id,
@@ -1284,7 +1287,7 @@ fn loop_edit_op<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<LoopEdi
 }
 
 /// The `fx` family. The chain comes from the line's target, not from an argument:
-/// `fx add eq`, `deck1 fx list`, `deck0 vocals fx add filter`, `master fx add limiter`.
+/// `fx add eq`, `deck1 fx list`, `deck1 vocals fx add filter`, `master fx add limiter`.
 fn fx<'a>(
     mut words: impl Iterator<Item = &'a str>,
     dispatcher: &Dispatcher,
@@ -1443,7 +1446,7 @@ fn list_kinds(kinds: &[String]) -> String {
 fn deck_only(target: Target) -> Result<u8, String> {
     match target {
         Target::Deck(deck_id) => Ok(deck_id),
-        // `deck0 vocals play` is unambiguous — the stem only narrows *stem* commands — so it plays
+        // `deck1 vocals play` is unambiguous — the stem only narrows *stem* commands — so it plays
         // deck 0 rather than making the user retype the line.
         Target::Stem(deck_id, _) => Ok(deck_id),
         Target::Master => Err("`master` only takes `fx` commands".into()),
@@ -1478,7 +1481,9 @@ fn send(command_tx: &Sender<Command>, command: Command) -> Action {
     }
 }
 
-/// Parses a leading deck/chain token: `master`/`m`, or `deck0`/`d0`/`0`.
+/// Parses a leading deck/chain token: `master`/`m`, or `deck1`/`d1`/`1`.
+/// Parses a leading target word. Deck numbers are **1-based** (`deck1`, `d1`, `1`), which is what
+/// every label in the interface shows; the id handed to the engine is one less.
 fn parse_target(token: &str, decks: usize) -> Option<Target> {
     let lower = token.to_ascii_lowercase();
     if lower == "master" || lower == "m" {
@@ -1488,8 +1493,9 @@ fn parse_target(token: &str, decks: usize) -> Option<Target> {
         .strip_prefix("deck")
         .or_else(|| lower.strip_prefix('d'))
         .unwrap_or(&lower);
-    let id: u8 = digits.parse().ok()?;
-    ((id as usize) < decks).then_some(Target::Deck(id))
+    let number: usize = digits.parse().ok()?;
+    let id = number.checked_sub(1)?;
+    (id < decks).then_some(Target::Deck(id as u8))
 }
 
 /// The `stem` family on a deck: `stem separate`, `stem status`, `stem acapella`, …
@@ -1665,11 +1671,15 @@ fn stem_family<'a>(
                 Some(cancelled) => {
                     cancelled.cancel();
                     Action::Message(format!(
-                        "deck{deck_id}: cancelling the separation (it stops at the end of the \
-                         current model window)"
+                        "{}: cancelling the separation (it stops at the end of the current model \
+                         window)",
+                        hypermixx_core::deck_label(deck_id)
                     ))
                 }
-                None => Action::Message(format!("deck{deck_id}: no separation is running")),
+                None => Action::Message(format!(
+                    "{}: no separation is running",
+                    hypermixx_core::deck_label(deck_id)
+                )),
             }
         }
         "clear" => send(
@@ -1695,7 +1705,7 @@ fn stem_family<'a>(
     }
 }
 
-/// The verbs a stem sub-target takes: `deck0 vocals mute on`, `deck0 vocals level -0.5`, …
+/// The verbs a stem sub-target takes: `deck1 vocals mute on`, `deck1 vocals level -0.5`, …
 fn dispatch_stem<'a>(
     mut words: impl Iterator<Item = &'a str>,
     target: Target,
@@ -1707,7 +1717,9 @@ fn dispatch_stem<'a>(
     };
     let Some(verb) = words.next() else {
         return Action::Failed(format!(
-            "`deck{deck_id} {stem}` needs a verb (level|mute|solo|unsolo|fx)"
+            "{} {} needs a verb (level|mute|solo|unsolo|fx)",
+            hypermixx_core::deck_label(deck_id),
+            stem.name()
         ));
     };
     let on_off = |raw: Option<&str>| -> Result<bool, String> {
@@ -1721,7 +1733,10 @@ fn dispatch_stem<'a>(
     let op = match verb {
         "level" | "fader" => {
             let Some(raw) = words.next() else {
-                return Action::Failed(format!("usage: deck{deck_id} {stem} level <position>"));
+                return Action::Failed(format!(
+                    "usage: {} {stem} level <position>",
+                    hypermixx_core::deck_label(deck_id)
+                ));
             };
             match raw.parse::<f32>() {
                 Ok(position) if position.is_finite() => StemOp::Level { stem, position },
@@ -1789,9 +1804,15 @@ pub(crate) fn spawn_separate(
             });
             if let Err(err) = out {
                 if err == hypermixx_stems::StemError::Cancelled {
-                    notices::info(&notices_tx, format!("[stem] deck{deck_id}: cancelled"));
+                    notices::info(
+                        &notices_tx,
+                        format!("[stem] {}: cancelled", hypermixx_core::deck_label(deck_id)),
+                    );
                 } else {
-                    notices::error(&notices_tx, format!("[stem] deck{deck_id}: {err}"));
+                    notices::error(
+                        &notices_tx,
+                        format!("[stem] {}: {err}", hypermixx_core::deck_label(deck_id)),
+                    );
                 }
             }
             if let Ok(mut running) = cancellations.lock() {
@@ -1877,8 +1898,9 @@ fn separate_into_deck(job: SeparateJob<'_>) -> Result<(), hypermixx_stems::StemE
     notices::info(
         notices_tx,
         format!(
-            "[stem] deck{deck_id}: {} blocks of {:.1}s as the model finishes them — the deck plays \
-             the mix until the first one lands",
+            "[stem] {}: {} blocks of {:.1}s as the model finishes them — the deck plays the mix \
+             until the first one lands",
+            hypermixx_core::deck_label(deck_id),
             total.div_ceil(block_frames.max(1)),
             block_frames as f32 / SAMPLE_RATE as f32,
         ),
@@ -1887,10 +1909,15 @@ fn separate_into_deck(job: SeparateJob<'_>) -> Result<(), hypermixx_stems::StemE
         notices_tx,
         if hypermixx_stems::model_path(model).exists() {
             // The file is there; verifying it is a size check.
-            format!("[stem] deck{deck_id}: checking the {} model...", model.name)
+            format!(
+                "[stem] {}: checking the {} model...",
+                hypermixx_core::deck_label(deck_id),
+                model.name
+            )
         } else {
             format!(
-                "[stem] deck{deck_id}: fetching the {} model ({:.0} MB) — this happens once...",
+                "[stem] {}: fetching the {} model ({:.0} MB) — this happens once...",
+                hypermixx_core::deck_label(deck_id),
                 model.name,
                 model.bytes as f32 / 1_000_000.0
             )
@@ -1906,7 +1933,10 @@ fn separate_into_deck(job: SeparateJob<'_>) -> Result<(), hypermixx_stems::StemE
             let previous = last.load(std::sync::atomic::Ordering::Relaxed);
             if percent >= previous + 10 {
                 last.store(percent, std::sync::atomic::Ordering::Relaxed);
-                notices::info(&notices_tx, format!("[stem] deck{deck_id}: {percent}%"));
+                notices::info(
+                    &notices_tx,
+                    format!("[stem] {}: {percent}%", hypermixx_core::deck_label(deck_id)),
+                );
             }
         }) as hypermixx_stems::ProgressSink
     };
@@ -1917,7 +1947,8 @@ fn separate_into_deck(job: SeparateJob<'_>) -> Result<(), hypermixx_stems::StemE
     notices::info(
         notices_tx,
         format!(
-            "[stem] deck{deck_id}: {} (shifts {}, overlap {}, {}, threads {})",
+            "[stem] {}: {} (shifts {}, overlap {}, {}, threads {})",
+            hypermixx_core::deck_label(deck_id),
             separator.id(),
             options.shifts,
             options.overlap,
@@ -1950,8 +1981,9 @@ fn separate_into_deck(job: SeparateJob<'_>) -> Result<(), hypermixx_stems::StemE
         Ok(()) => notices::info(
             notices_tx,
             format!(
-                "[stem] deck{deck_id}: {separated}/{total} frames separated in {:.0}s ({:.0}%), \
-                 {blocks} blocks{}",
+                "[stem] {}: {separated}/{total} frames separated in {:.0}s ({:.0}%), {blocks} \
+                 blocks{}",
+                hypermixx_core::deck_label(deck_id),
                 started.elapsed().as_secs_f32(),
                 separated as f32 / total.max(1) as f32 * 100.0,
                 if separated >= total {
@@ -1966,7 +1998,8 @@ fn separate_into_deck(job: SeparateJob<'_>) -> Result<(), hypermixx_stems::StemE
         Err(_) => notices::info(
             notices_tx,
             format!(
-                "[stem] deck{deck_id}: stopping at {separated}/{total} frames after {:.0}s",
+                "[stem] {}: stopping at {separated}/{total} frames after {:.0}s",
+                hypermixx_core::deck_label(deck_id),
                 started.elapsed().as_secs_f32()
             ),
         ),
@@ -1989,8 +2022,8 @@ impl hypermixx_stems::StemBlockSink for DeckSink<'_> {
             notices::error(
                 self.notices_tx,
                 format!(
-                    "[stem] deck{}: a block carried {} streams, expected {}; stopping",
-                    self.deck_id,
+                    "[stem] {}: a block carried {} streams, expected {}; stopping",
+                    hypermixx_core::deck_label(self.deck_id),
                     blocks.len(),
                     Stem::COUNT
                 ),
@@ -2002,7 +2035,10 @@ impl hypermixx_stems::StemBlockSink for DeckSink<'_> {
         if let Err(err) = self.growing.append(start_frame, buffers) {
             notices::error(
                 self.notices_tx,
-                format!("[stem] deck{}: {err}; stopping", self.deck_id),
+                format!(
+                    "[stem] {}: {err}; stopping",
+                    hypermixx_core::deck_label(self.deck_id)
+                ),
             );
             return false;
         }
@@ -2015,8 +2051,8 @@ impl hypermixx_stems::StemBlockSink for DeckSink<'_> {
             notices::info(
                 self.notices_tx,
                 format!(
-                    "[stem] deck{}: block {} — {:.0}% separated ({:.0}s)",
-                    self.deck_id,
+                    "[stem] {}: block {} — {:.0}% separated ({:.0}s)",
+                    hypermixx_core::deck_label(self.deck_id),
                     self.blocks,
                     separated as f32 / total as f32 * 100.0,
                     self.started.elapsed().as_secs_f32()
@@ -2193,7 +2229,10 @@ pub(crate) fn spawn_load_with(
     // command was ignored.
     notices::info(
         &notices_tx,
-        format!("[load] deck{deck_id}: decoding {path}..."),
+        format!(
+            "[load] {}: decoding {path}...",
+            hypermixx_core::deck_label(deck_id)
+        ),
     );
     std::thread::Builder::new()
         .name(format!("hypermixx-load-{deck_id}"))
@@ -2322,7 +2361,10 @@ fn spawn_analyse(deck_id: u8, source: Shared, backend: Backend, dispatcher: &Dis
         .spawn(move || {
             notices::info(
                 &notices_tx,
-                format!("[analyse] deck{deck_id}: running {backend:?}..."),
+                format!(
+                    "[analyse] {}: running {backend:?}...",
+                    hypermixx_core::deck_label(deck_id)
+                ),
             );
             match hypermixx_library::analyser::analyze(source, sample_rate, backend) {
                 Ok(analysis) => {
@@ -2333,7 +2375,10 @@ fn spawn_analyse(deck_id: u8, source: Shared, backend: Backend, dispatcher: &Dis
                         .unwrap_or_else(|| "--".into());
                     notices::info(
                         &notices_tx,
-                        format!("[analyse] deck{deck_id}: {bpm:.1} BPM, {key}"),
+                        format!(
+                            "[analyse] {}: {bpm:.1} BPM, {key}",
+                            hypermixx_core::deck_label(deck_id)
+                        ),
                     );
                     if let Some(tap) = &events {
                         let _ = tap.send(UiEvent::Grid {
@@ -2343,7 +2388,10 @@ fn spawn_analyse(deck_id: u8, source: Shared, backend: Backend, dispatcher: &Dis
                     }
                     let _ = command_tx.send(Command::SetAnalysis { deck_id, analysis });
                 }
-                Err(err) => notices::error(&notices_tx, format!("[analyse] deck{deck_id}: {err}")),
+                Err(err) => notices::error(
+                    &notices_tx,
+                    format!("[analyse] {}: {err}", hypermixx_core::deck_label(deck_id)),
+                ),
             }
         })
         .ok();
@@ -2633,7 +2681,7 @@ mod tests {
             let Some(line) = counterpart(spec.name) else {
                 panic!("no session counterpart for `{}`", spec.name);
             };
-            let full = format!("deck0 {line}");
+            let full = format!("deck1 {line}");
             if let Action::Failed(message) =
                 dispatch(&full, &dispatcher, &pipeline, Backend::Auto, 2, 0)
             {
@@ -2642,14 +2690,14 @@ mod tests {
         }
         // The keylock registry row takes `on|off|toggle`; the loop above only exercises `on`.
         if let Action::Failed(message) = dispatch(
-            "deck0 keylock toggle",
+            "deck1 keylock toggle",
             &dispatcher,
             &pipeline,
             Backend::Auto,
             2,
             0,
         ) {
-            panic!("`deck0 keylock toggle` failed: {message}");
+            panic!("`deck1 keylock toggle` failed: {message}");
         }
     }
 

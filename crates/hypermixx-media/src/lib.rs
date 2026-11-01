@@ -7,10 +7,12 @@
 //! No timing, no transport — those are `audio`'s job.
 
 mod chunked;
+mod cover;
 mod decoder;
 mod pool;
 
 pub use chunked::{ChunkedStreams, DEFAULT_FADE_FRAMES};
+pub use cover::{read_cover, Cover};
 pub use decoder::{decode_file, decode_file_at, decoder_start_ms, DecodedAudio};
 pub use pool::PcmPool;
 

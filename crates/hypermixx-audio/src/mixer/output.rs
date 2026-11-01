@@ -130,7 +130,12 @@ impl Output {
         sample_rate: u32,
         block_frames: usize,
     ) -> Result<Self, OutputError> {
-        Self::open_with(cfg, sample_rate, block_frames, crate::mixer::OutputTuning::default())
+        Self::open_with(
+            cfg,
+            sample_rate,
+            block_frames,
+            crate::mixer::OutputTuning::default(),
+        )
     }
 
     /// As [`Output::open`], with the ring and prefill sizes spelled out (they come from the live
@@ -151,7 +156,12 @@ impl Output {
                 cfg.name,
                 describe_rates(&cfg.sample_rates)
             );
-            return Ok(Self::placeholder(cfg, block_frames, OutputState::Disabled, None));
+            return Ok(Self::placeholder(
+                cfg,
+                block_frames,
+                OutputState::Disabled,
+                None,
+            ));
         }
         // A named device that is not there, or a device that cannot take the rate we need, are
         // *states*, not errors: the engine keeps running with the destination unrouted and a
@@ -159,8 +169,16 @@ impl Output {
         // stream is an error.
         let found = match resolve_device(&host, cfg.device.as_deref()) {
             DeviceLookup::Default(None) => {
-                eprintln!("[audio] {}: no output device, writing to a silent sink", cfg.name);
-                return Ok(Self::placeholder(cfg, block_frames, OutputState::Sink, None));
+                eprintln!(
+                    "[audio] {}: no output device, writing to a silent sink",
+                    cfg.name
+                );
+                return Ok(Self::placeholder(
+                    cfg,
+                    block_frames,
+                    OutputState::Sink,
+                    None,
+                ));
             }
             DeviceLookup::Named(None) => {
                 eprintln!(
@@ -168,7 +186,12 @@ impl Output {
                     cfg.name,
                     cfg.device.as_deref().unwrap_or_default()
                 );
-                return Ok(Self::placeholder(cfg, block_frames, OutputState::Missing, None));
+                return Ok(Self::placeholder(
+                    cfg,
+                    block_frames,
+                    OutputState::Missing,
+                    None,
+                ));
             }
             DeviceLookup::Default(Some(device)) | DeviceLookup::Named(Some(device)) => device,
         };
@@ -185,7 +208,12 @@ impl Output {
                  disabling it",
                 cfg.name
             );
-            return Ok(Self::placeholder(cfg, block_frames, OutputState::Disabled, Some(device_name)));
+            return Ok(Self::placeholder(
+                cfg,
+                block_frames,
+                OutputState::Disabled,
+                Some(device_name),
+            ));
         };
         let (device_channels, format) = (config.channels() as usize, config.sample_format());
         eprintln!(
@@ -220,8 +248,7 @@ impl Output {
         // device, and every lost race is a silence gap the listener hears as a click. Half a
         // ring of silence buys the producer a standing head start; the mix simply starts
         // ~46 ms later, which nothing can hear.
-        let prefill = (tuning.prefill_frames * ring_channels)
-            .min(ring_frames * ring_channels / 2);
+        let prefill = (tuning.prefill_frames * ring_channels).min(ring_frames * ring_channels / 2);
         if prefill > 0 {
             let silence = vec![0.0f32; prefill];
             push_samples(&mut producer, &silence);
@@ -326,7 +353,8 @@ impl Output {
 
     /// Frames of room in this output, in the device's channel layout. `None` for a sink.
     pub fn free_frames(&self) -> Option<usize> {
-        self.free_samples().map(|free| free / self.device_channels.max(1))
+        self.free_samples()
+            .map(|free| free / self.device_channels.max(1))
     }
 
     /// Producer-side overruns since construction: writes whose whole block could not fit in the
@@ -425,6 +453,107 @@ fn match_device(names: &[String], pattern: &str) -> Option<usize> {
     names
         .iter()
         .position(|name| name.to_ascii_lowercase().contains(&needle))
+}
+
+/// One host output device, as a front-end reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceInfo {
+    /// The PCM name the host uses (`sysdefault:CARD=III`, `hw:3,0`, `USB Headset`).
+    pub name: String,
+    /// The card's own description, when the host has one (`Numark Party Mix III`). A USB interface
+    /// is usually named after its card *id* in the PCM name, which is exactly what a user cannot
+    /// recognise in a list.
+    pub description: String,
+    /// Whether this is the host's default output.
+    pub is_default: bool,
+    /// The rate span the device advertises (`44100Hz..192000Hz`), or a note when it will not say.
+    pub rates: String,
+    /// Whether the device accepts the rate the caller asked about.
+    pub accepts: Option<bool>,
+    /// The widest channel count any config of this device offers. A 4-channel interface can carry
+    /// the master on one stereo pair and the cue on another, so the front-end needs this to offer
+    /// the choice.
+    pub channels: u16,
+}
+
+/// Enumerates the host's output devices with the rates each one accepts.
+///
+/// No stream is opened: this is what lets the controller guide answer "will this device take the
+/// engine's rate?" before a session exists. Empty when the host has no outputs at all (a container
+/// or a headless machine), which is a normal answer rather than an error.
+pub fn output_devices(wanted_rate: Option<u32>) -> Vec<DeviceInfo> {
+    let host = cpal::default_host();
+    let default = host
+        .default_output_device()
+        .map(|device| device_name(&device));
+    let Ok(devices) = host.output_devices() else {
+        return Vec::new();
+    };
+    let mut out: Vec<DeviceInfo> = devices
+        .map(|device| {
+            let name = device_name(&device);
+            let channels = device
+                .supported_output_configs()
+                .map(|configs| configs.map(|config| config.channels()).max().unwrap_or(0))
+                .unwrap_or(0);
+            let accepts = wanted_rate.map(|rate| {
+                device
+                    .supported_output_configs()
+                    .map(|ranges| {
+                        ranges.into_iter().any(|range| {
+                            range.min_sample_rate().0 <= rate && range.max_sample_rate().0 >= rate
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+            let description = card_description(&name);
+            DeviceInfo {
+                is_default: default.as_deref() == Some(name.as_str()),
+                rates: describe_device_rates(&device),
+                name,
+                description,
+                accepts,
+                channels,
+            }
+        })
+        .collect();
+    out.truncate(64);
+    out
+}
+
+/// The short card description behind a PCM name, on Linux only.
+///
+/// ALSA names a USB interface after its card id (`sysdefault:CARD=III`), so the list would otherwise
+/// show `III` where the user is looking for "Party Mix". `/proc/asound/cards` has the long name; on
+/// any other platform (and for PCMs that do not name a card) this returns an empty string and the
+/// front-end simply shows the PCM name alone.
+fn card_description(pcm_name: &str) -> String {
+    let Some((_, after)) = pcm_name.split_once("CARD=") else {
+        return String::new();
+    };
+    let card_id = after.split(',').next().unwrap_or(after);
+    let Ok(text) = std::fs::read_to_string("/proc/asound/cards") else {
+        return String::new();
+    };
+    // Each card is two lines: ` 2 [III            ]: USB-Audio - Numark Party Mix III` then an
+    // indented detail line. The id sits in the brackets *before* the colon.
+    for line in text.lines() {
+        let Some((head, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some((_, bracketed)) = head.split_once('[') else {
+            continue;
+        };
+        let id = bracketed.split(']').next().unwrap_or("").trim();
+        if id != card_id {
+            continue;
+        }
+        let Some((_, description)) = rest.split_once(" - ") else {
+            continue;
+        };
+        return description.trim().to_owned();
+    }
+    String::new()
 }
 
 /// A device's name, or a stand-in when the backend will not say.
@@ -570,7 +699,9 @@ fn build_stream(
         }
     };
     let stream = built.map_err(|err| OutputError::Stream(err.to_string()))?;
-    stream.play().map_err(|err| OutputError::Stream(err.to_string()))?;
+    stream
+        .play()
+        .map_err(|err| OutputError::Stream(err.to_string()))?;
     Ok(stream)
 }
 
@@ -758,7 +889,11 @@ mod tests {
             ..OutputConfig::master(0, "48k-only")
         };
         let out = Output::open(&wrong_rate, SAMPLE_RATE, BLOCK_SIZE).expect("builds");
-        assert_eq!(out.state(), OutputState::Disabled, "a rate mismatch disables the output");
+        assert_eq!(
+            out.state(),
+            OutputState::Disabled,
+            "a rate mismatch disables the output"
+        );
         assert!(wrong_rate.allows_engine_rate(48_000));
         assert!(!wrong_rate.allows_engine_rate(SAMPLE_RATE));
     }
@@ -767,17 +902,34 @@ mod tests {
     #[test]
     fn the_default_rate_allow_list_is_the_engine_rate() {
         let cfg = OutputConfig::master(0, "x");
-        assert!(cfg.sample_rates.is_empty(), "the default is empty, not a literal 44.1k");
+        assert!(
+            cfg.sample_rates.is_empty(),
+            "the default is empty, not a literal 44.1k"
+        );
         assert!(cfg.allows_engine_rate(SAMPLE_RATE));
-        assert!(cfg.allows_engine_rate(48_000), "an empty list follows the engine's rate");
+        assert!(
+            cfg.allows_engine_rate(48_000),
+            "an empty list follows the engine's rate"
+        );
     }
 
     #[test]
     fn a_requested_device_buffer_is_clamped_to_the_backend_range() {
-        let range = cpal::SupportedBufferSize::Range { min: 128, max: 2048 };
+        let range = cpal::SupportedBufferSize::Range {
+            min: 128,
+            max: 2048,
+        };
         assert_eq!(clamp_device_buffer(512, &range), 512);
-        assert_eq!(clamp_device_buffer(64, &range), 128, "too small is raised to the minimum");
-        assert_eq!(clamp_device_buffer(9999, &range), 2048, "too large is lowered to the maximum");
+        assert_eq!(
+            clamp_device_buffer(64, &range),
+            128,
+            "too small is raised to the minimum"
+        );
+        assert_eq!(
+            clamp_device_buffer(9999, &range),
+            2048,
+            "too large is lowered to the maximum"
+        );
         assert_eq!(
             clamp_device_buffer(512, &cpal::SupportedBufferSize::Unknown),
             512,
@@ -793,9 +945,48 @@ mod tests {
         match Output::open(&cfg, crate::SAMPLE_RATE, BLOCK_SIZE) {
             Ok(out) => {
                 // A sink means "no device"; anything else means a started stream.
-                assert_eq!(!out.is_live(), out._stream.is_none(), "state/stream disagree");
+                assert_eq!(
+                    !out.is_live(),
+                    out._stream.is_none(),
+                    "state/stream disagree"
+                );
             }
             Err(err) => assert!(!err.message().is_empty()),
         }
+    }
+}
+
+#[cfg(test)]
+mod device_probe {
+    use super::*;
+
+    /// Prints what the host offers: `cargo test -p hypermixx-audio output_devices_probe --
+    /// --ignored --nocapture`. A debugging aid for "my interface is not in the list".
+    #[test]
+    #[ignore]
+    fn output_devices_probe() {
+        let devices = output_devices(Some(hyper_mixx_rate()));
+        println!("{} output device(s):", devices.len());
+        for device in &devices {
+            println!(
+                "  {}{}  [{}]  accepts={:?}  channels={}  rates={}",
+                device.name,
+                if device.is_default { "  [default]" } else { "" },
+                device.description,
+                device.accepts,
+                device.channels,
+                device.rates
+            );
+        }
+        let host = cpal::default_host();
+        println!("host: {:?}", host.id());
+        if let Ok(all) = host.output_devices() {
+            let names: Vec<String> = all.map(|device| device_name(&device)).collect();
+            println!("cpal sees {} device(s)", names.len());
+        }
+    }
+
+    fn hyper_mixx_rate() -> u32 {
+        44_100
     }
 }

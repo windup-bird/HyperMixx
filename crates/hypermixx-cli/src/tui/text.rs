@@ -50,6 +50,18 @@ pub fn pad_to_width(text: &str, max: usize) -> String {
     out
 }
 
+/// Centres `text` in exactly `max` cells, truncating with `…` when it does not fit.
+pub fn center_to_width(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let clipped = truncate_to_width(text, max);
+    let used = width(&clipped);
+    let left = (max - used) / 2;
+    let right = max - used - left;
+    format!("{}{clipped}{}", " ".repeat(left), " ".repeat(right))
+}
+
 /// Word-aware wrapping on terminal cells. A word longer than `max` is hard-broken; CJK text has no
 /// spaces and therefore breaks by character width. An empty input produces one empty line.
 pub fn wrap_to_width(text: &str, max: usize) -> Vec<String> {
@@ -107,7 +119,7 @@ mod tests {
 
     #[test]
     fn ascii_is_measured_and_clipped_by_columns() {
-        assert_eq!(width("deck0"), 5);
+        assert_eq!(width("deck1"), 5);
         assert_eq!(truncate_to_width("abcdef", 4), "abc…");
         assert_eq!(truncate_to_width("abc", 4), "abc");
     }

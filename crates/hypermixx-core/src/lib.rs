@@ -24,7 +24,7 @@ pub use command::{
     FxSlotStatus, HotCueOp, KeylockMode, LoopEditOp, LoopOp, LoopQuantum, NudgeOp, PhaseMode,
     SyncOp, VinylOp,
 };
-pub use deck::{DeckId, DeckState, HotCue, HOT_CUE_SLOTS};
+pub use deck::{deck_label, DeckId, DeckState, HotCue, HOT_CUE_SLOTS};
 pub use key::{Key, KeyFormat, KeyMode};
 pub use live::{AudioSettings, KeylockSettings, LiveConfig, StemSettings};
 pub use output::{OutputOp, OutputRole, OutputState, OutputStatus};

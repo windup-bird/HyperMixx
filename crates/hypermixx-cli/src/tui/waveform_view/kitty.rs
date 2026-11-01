@@ -27,8 +27,12 @@ pub struct SourceRect {
 /// Transmit the strip without displaying it. The image stays invisible until [`place`] runs, so the
 /// previous image can keep covering the deck while this payload arrives.
 pub fn transmit(raster: &Raster, palette: &Palette, id: u32) -> String {
-    let rgba = raster.rgba(palette);
-    let encoded = base64(&rgba);
+    transmit_rgba(&raster.rgba(palette), raster.width, raster.height, id)
+}
+
+/// As [`transmit`] for a straight RGBA buffer: cover art is not palette-indexed.
+pub fn transmit_rgba(rgba: &[u8], width: u32, height: u32, id: u32) -> String {
+    let encoded = base64(rgba);
     let mut out = String::with_capacity(encoded.len() + 128);
 
     const CHUNK: usize = 4096;
@@ -37,12 +41,8 @@ pub fn transmit(raster: &Raster, palette: &Palette, id: u32) -> String {
     for (index, chunk) in chunks.enumerate() {
         out.push_str("\x1b_G");
         if index == 0 {
-            write!(
-                out,
-                "i={id},a=t,f=32,s={},v={},q=2,",
-                raster.width, raster.height
-            )
-            .expect("writing to a String cannot fail");
+            write!(out, "i={id},a=t,f=32,s={width},v={height},q=2,")
+                .expect("writing to a String cannot fail");
         } else {
             out.push_str("q=2,");
         }
@@ -72,6 +72,16 @@ pub fn place(id: u32, placement: u32, area: Rect, source: SourceRect) -> String 
 /// Delete an image and all of its placements after the replacement is visible.
 pub fn delete(id: u32) -> String {
     format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\")
+}
+
+/// Delete every image the terminal is holding for us.
+///
+/// Kitty images live *under* the text layer, so redrawing cells does not remove them: a modal drawn
+/// over a deck would still show the waveform and the artwork through its own background. One
+/// escape at the moment the overlay opens is the whole fix, and it is cheaper than hiding each
+/// image by id.
+pub fn delete_all() -> String {
+    "\x1b_Ga=d,d=A,q=2\x1b\\".to_owned()
 }
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

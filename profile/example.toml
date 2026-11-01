@@ -5,12 +5,13 @@
 
 mixer = "mixer.toml"
 live = "live.toml"
-midi = "midi.toml"
+controller = "partymix3.toml"
 
 # Or point at something else entirely:
 # mixer = "../sets/club.toml"
 
-# `midi` points at a map file; its `[meta].device` names the input port.
+# `controller` points at a map file; its `[meta].device` names the input port. The old `midi =`
+# spelling still parses.
 
 # Reserved (see profile/preference.toml).
 [preference]

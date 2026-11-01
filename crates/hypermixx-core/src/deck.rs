@@ -7,6 +7,14 @@ use crate::stem::StemStatus;
 /// and the producer can index its fixed deck array directly.
 pub type DeckId = u8;
 
+/// The name a user reads for a deck: `deck1`, `deck2`, …
+///
+/// The engine and the protocol keep **0-based** ids (`DeckId`), because they index arrays; every
+/// string that reaches a human goes through here so the two conventions cannot drift apart again.
+pub fn deck_label(deck_id: DeckId) -> String {
+    format!("deck{}", deck_id + 1)
+}
+
 /// Slots the engine exposes for hot cues. The front-end may import fewer; unused slots stay empty.
 pub const HOT_CUE_SLOTS: usize = 8;
 

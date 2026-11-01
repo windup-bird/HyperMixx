@@ -103,7 +103,7 @@ impl From<OutputError> for PipelineError {
 /// Modelled as a query rather than a pushed response: a UI wants the meters when it draws, and a
 /// front-end that never asks pays nothing. The values are the fields `Mixer::process` already
 /// maintains, so reading them costs no DSP work.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Meters {
     /// Peak of the last master block, linear (1.0 = full scale).
     pub master_peak: f32,
@@ -112,6 +112,28 @@ pub struct Meters {
     /// Output writes whose block did not fully fit in the ring, summed over all outputs. This
     /// counts overrun events, not the samples inside them.
     pub overruns: u64,
+    /// Peak of every channel after its deck fader, in channel order (one per deck). Empty when the
+    /// mixer has no channels. This is what a per-deck meter or a fader LED ladder reads.
+    pub deck_peaks: Vec<f32>,
+    /// Every channel's fader positions and trim, in channel order.
+    pub channels: Vec<ChannelLevels>,
+}
+
+/// One channel's performance controls, as the mixer holds them. Positions are the same
+/// `-1.0..=1.0` (or `0.0..=1.0` for the send) values a front-end writes, so a slider can be drawn
+/// from this without tracking its own copy.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ChannelLevels {
+    /// The flow fader (stream 0's position while stems exist).
+    pub flow: f32,
+    /// The deck fader.
+    pub deck: f32,
+    /// The crossfader's contribution on this channel (fixed by the channel's `side`).
+    pub crossfader: f32,
+    /// The cue send, linear `0.0..=1.0`.
+    pub cue_send: f32,
+    /// The channel trim (`0.0` = 0 dB, `1.0` = +6 dB).
+    pub gain: f32,
 }
 
 /// Owns the producer thread and the mixer it drives.
@@ -367,6 +389,22 @@ fn drain_queries(mixer: &mut Mixer, rx: &Receiver<(Query, Sender<QueryResponse>)
                 cue_peak: mixer.cue_peak(),
                 // `Outputs` has no aggregate today; summing here keeps the change to this file.
                 overruns: mixer.outputs().iter().map(|output| output.overruns()).sum(),
+                deck_peaks: (0..mixer.channel_count())
+                    .map(|index| mixer.channel(index).map_or(0.0, |channel| channel.peak()))
+                    .collect(),
+                channels: (0..mixer.channel_count())
+                    .filter_map(|index| mixer.channel(index))
+                    .map(|channel| {
+                        let (flow, deck, crossfader, cue_send, gain) = channel.levels();
+                        ChannelLevels {
+                            flow,
+                            deck,
+                            crossfader,
+                            cue_send,
+                            gain,
+                        }
+                    })
+                    .collect(),
             }),
         };
         // A dropped receiver means the caller gave up; not an error here.
@@ -529,6 +567,7 @@ fn route(mixer: &mut Mixer, sync: &mut SyncGroup, command: Command) -> Option<Co
         | FxTrigger { .. }
         | PadPress { .. }
         | PadRelease { .. }
+        | GetFxState { .. }
         | ListFx { .. }) => Some(mixer.handle_fx_command(fx)),
         Quit => None,
     }

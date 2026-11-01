@@ -320,11 +320,7 @@ pub struct RawModeBind {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub down: Option<String>,
     /// Written 1-based in TOML; stored 0-based internally.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "deck_number"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "deck_number")]
     pub deck: Option<DeckId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min: Option<f32>,
@@ -362,11 +358,7 @@ pub struct RawUnit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
     /// The deck this unit targets by default, written 1-based in TOML. Omit for a global unit.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "deck_number"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "deck_number")]
     pub deck: Option<DeckId>,
     /// The mode the unit starts in. Defaults to the preset's `start`, then the first mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -421,7 +413,11 @@ impl Endpoint {
         (
             self.kind,
             self.channel,
-            if self.kind == EventKind::Bend { 0 } else { self.id },
+            if self.kind == EventKind::Bend {
+                0
+            } else {
+                self.id
+            },
         )
     }
 
@@ -905,8 +901,8 @@ impl Map {
     /// Parses text with a base folder for `[meta] presets`.
     pub fn from_toml_str_at(text: &str, base: &Path) -> Result<Self, MapError> {
         let file = MapFile::from_toml_str(text)?;
-        let presets = crate::preset::PresetRegistry::load(file.meta.as_ref(), base)
-            .map_err(MapError::new)?;
+        let presets =
+            crate::preset::PresetRegistry::load(file.meta.as_ref(), base).map_err(MapError::new)?;
         let mut units = Vec::new();
         let mut ids = HashSet::new();
         for raw in &file.units {
@@ -1030,7 +1026,10 @@ fn compile_unit(raw: &RawUnit, presets: &crate::preset::PresetRegistry) -> Resul
     let mut unit_controls: HashMap<String, &RawControl> = HashMap::new();
     for control in &raw.controls {
         check_name("slot", &control.slot)?;
-        if unit_controls.insert(control.slot.clone(), control).is_some() {
+        if unit_controls
+            .insert(control.slot.clone(), control)
+            .is_some()
+        {
             return Err(format!("slot `{}` is declared twice", control.slot));
         }
         if !preset_slots.contains_key(&control.slot) {
@@ -1039,7 +1038,9 @@ fn compile_unit(raw: &RawUnit, presets: &crate::preset::PresetRegistry) -> Resul
     }
 
     // Modes: preset defaults, same-name unit modes replace, new names append.
-    let mut modes: Vec<RawMode> = preset.map(|preset| preset.modes.clone()).unwrap_or_default();
+    let mut modes: Vec<RawMode> = preset
+        .map(|preset| preset.modes.clone())
+        .unwrap_or_default();
     let mut seen_modes = HashSet::new();
     for mode in &modes {
         check_name("mode", &mode.name)?;
@@ -1245,7 +1246,11 @@ fn compile_control(
 }
 
 /// Which endpoint roles a slot kind needs.
-fn validate_endpoint_roles(slot: &str, kind: SlotKind, endpoints: &[Endpoint]) -> Result<(), String> {
+fn validate_endpoint_roles(
+    slot: &str,
+    kind: SlotKind,
+    endpoints: &[Endpoint],
+) -> Result<(), String> {
     if endpoints.is_empty() {
         return Ok(());
     }
@@ -1259,13 +1264,19 @@ fn validate_endpoint_roles(slot: &str, kind: SlotKind, endpoints: &[Endpoint]) -
             let press = endpoints
                 .iter()
                 .find(|endpoint| endpoint.role == EndpointRole::Press)
-                .ok_or_else(|| format!("slot `{slot}`: a JogWheel needs an endpoint with `role = \"press\"`"))?;
+                .ok_or_else(|| {
+                    format!("slot `{slot}`: a JogWheel needs an endpoint with `role = \"press\"`")
+                })?;
             let turn = endpoints
                 .iter()
                 .find(|endpoint| endpoint.role == EndpointRole::Turn)
-                .ok_or_else(|| format!("slot `{slot}`: a JogWheel needs an endpoint with `role = \"turn\"`"))?;
+                .ok_or_else(|| {
+                    format!("slot `{slot}`: a JogWheel needs an endpoint with `role = \"turn\"`")
+                })?;
             if press.kind == EventKind::Bend {
-                return Err(format!("slot `{slot}`: a jog press is a note or a button CC"));
+                return Err(format!(
+                    "slot `{slot}`: a jog press is a note or a button CC"
+                ));
             }
             if turn.kind != EventKind::Cc || !turn.encoding.is_relative() {
                 return Err(format!(
@@ -1275,7 +1286,9 @@ fn validate_endpoint_roles(slot: &str, kind: SlotKind, endpoints: &[Endpoint]) -
         }
         _ => {
             if endpoints.len() != 1 {
-                return Err(format!("slot `{slot}`: one endpoint, or none while unbound"));
+                return Err(format!(
+                    "slot `{slot}`: one endpoint, or none while unbound"
+                ));
             }
             if endpoints[0].role != EndpointRole::Main {
                 return Err(format!(
@@ -1289,7 +1302,10 @@ fn validate_endpoint_roles(slot: &str, kind: SlotKind, endpoints: &[Endpoint]) -
 
 fn compile_endpoint(slot: &str, raw: &RawEndpoint) -> Result<Endpoint, String> {
     if raw.channel > 15 {
-        return Err(format!("slot `{slot}`: channel {} is out of range (0..=15)", raw.channel));
+        return Err(format!(
+            "slot `{slot}`: channel {} is out of range (0..=15)",
+            raw.channel
+        ));
     }
     let mut encoding = raw.encoding;
     if raw.midi != EventKind::Cc {
@@ -1299,15 +1315,17 @@ fn compile_endpoint(slot: &str, raw: &RawEndpoint) -> Result<Endpoint, String> {
             ));
         }
         if raw.lsb.is_some() {
-            return Err(format!(
-                "slot `{slot}`: `lsb` is only for `midi = \"cc\"`"
-            ));
+            return Err(format!("slot `{slot}`: `lsb` is only for `midi = \"cc\"`"));
         }
     }
     let id = match (raw.midi, raw.id) {
         (EventKind::Bend, _) => 0,
         (_, Some(id)) => id,
-        (_, None) => return Err(format!("slot `{slot}`: add `id` (a CC controller or note key)")),
+        (_, None) => {
+            return Err(format!(
+                "slot `{slot}`: add `id` (a CC controller or note key)"
+            ))
+        }
     };
     if let Some(lsb) = raw.lsb {
         if lsb == id {
@@ -1486,7 +1504,9 @@ fn validate_binding(
     match control.kind {
         SlotKind::Button => {
             if main.is_continuous() {
-                return Err(format!("slot `{slot}`: a Button cannot drive a continuous action"));
+                return Err(format!(
+                    "slot `{slot}`: a Button cannot drive a continuous action"
+                ));
             }
             if actions.down.is_some() {
                 return Err(format!("slot `{slot}`: `down` is for a RelKnob"));
@@ -1651,8 +1671,8 @@ fn parse_action(line: &str, ctx: &ActionCtx<'_>) -> Result<Action, String> {
         }
         ["keylock", what @ ("on" | "off")] => {
             deck("keylock")?;
-            let mode = KeylockMode::parse(what)
-                .ok_or_else(|| format!("unknown keylock mode `{what}`"))?;
+            let mode =
+                KeylockMode::parse(what).ok_or_else(|| format!("unknown keylock mode `{what}`"))?;
             Ok(Action::Keylock(mode))
         }
         ["key", semitones] => {
@@ -1681,13 +1701,29 @@ fn parse_action(line: &str, ctx: &ActionCtx<'_>) -> Result<Action, String> {
                 other => return Err(format!("unknown hotcue action `{other}`")),
             }))
         }
-        ["browser", what] => Ok(Action::Browser(match *what {
+        ["browser", what, rest @ ..] => Ok(Action::Browser(match *what {
             "up" => BrowserAction::Up,
             "down" => BrowserAction::Down,
             "open" => BrowserAction::Open,
             "exit" => BrowserAction::Exit,
             "refresh" => BrowserAction::Refresh,
-            "load" => BrowserAction::Load { deck: ctx.deck },
+            // `browser load` targets the unit's deck; `browser load 2` names one outright, written
+            // 1-based like every deck label, so `load-2` buttons can address deck 2 on a unit that
+            // has no deck of its own (the browser is global).
+            "load" => BrowserAction::Load {
+                deck: match rest.first() {
+                    Some(word) => Some(
+                        word.parse::<usize>()
+                            .ok()
+                            .and_then(|number| number.checked_sub(1))
+                            .and_then(|id| DeckId::try_from(id).ok())
+                            .ok_or_else(|| {
+                                format!("`browser load {word}`: decks are numbered from 1")
+                            })?,
+                    ),
+                    None => ctx.deck,
+                },
+            },
             other => return Err(format!("unknown browser action `{other}`")),
         })),
         ["cue"] => {
@@ -1900,7 +1936,10 @@ fn fx_action(
 
 /// The `chain` + `fx` address every FX action carries: the chain from the action line if it named
 /// one, else from the row's `chain` field, else the slot's deck.
-fn fx_address(ctx: &ActionCtx<'_>, named: Option<FxChainId>) -> Result<(FxChainId, String), String> {
+fn fx_address(
+    ctx: &ActionCtx<'_>,
+    named: Option<FxChainId>,
+) -> Result<(FxChainId, String), String> {
     let chain = match named {
         Some(chain) => chain,
         None => match ctx.chain {
@@ -2242,7 +2281,10 @@ name = "beatloop"
             SelectorBehavior::Trigger { mode } if unit.modes[mode].name == "hotcue"
         ));
         assert_eq!(unit.selectors[0].slot, "mode-hotcue");
-        assert!(matches!(unit.selectors[1].behavior, SelectorBehavior::Cycle));
+        assert!(matches!(
+            unit.selectors[1].behavior,
+            SelectorBehavior::Cycle
+        ));
 
         let bad = text.replace(
             "[[unit.mode]]\nname = \"hotcue\"",
@@ -2335,6 +2377,58 @@ on = "release"
         );
         let error = parse(&text).expect_err("cue uses both edges");
         assert!(error.message().contains("both edges"), "{error}");
+    }
+
+    #[test]
+    fn a_load_button_can_name_its_deck() {
+        // The browser unit is global, so `load-1`/`load-2` have to name their deck. Numbers are
+        // 1-based, like every deck label in the interface.
+        let map = parse(
+            r#"
+[meta]
+name = "two load buttons"
+
+[[unit]]
+id = "global.browser"
+preset = "browser"
+
+[[unit.control]]
+slot = "load-1"
+type = "Button"
+[unit.control.endpoint]
+midi = "note"
+channel = 15
+id = 2
+
+[[unit.control]]
+slot = "load-2"
+type = "Button"
+[unit.control.endpoint]
+midi = "note"
+channel = 15
+id = 3
+"#,
+        )
+        .expect("the shipped browser preset binds both load slots");
+        let unit = &map.units[0];
+        assert!(unit.deck.is_none(), "the browser unit is global");
+        let deck_of = |slot: &str| {
+            let index = unit
+                .controls
+                .iter()
+                .position(|control| control.slot == slot)
+                .expect("the slot exists");
+            // `binds` is parallel to `controls`.
+            let bind = unit.modes[0].binds[index]
+                .as_ref()
+                .unwrap_or_else(|| panic!("{slot} is bound in the default mode"));
+            match bind.actions.main {
+                Some(Action::Browser(BrowserAction::Load { deck })) => deck,
+                ref other => panic!("{slot}: unexpected action {other:?}"),
+            }
+        };
+        assert_eq!(deck_of("load-1"), Some(0), "load 1 -> deck 1");
+        assert_eq!(deck_of("load-2"), Some(1), "load 2 -> deck 2");
     }
 
     #[test]
@@ -2478,12 +2572,23 @@ start = "beatjump"
     #[test]
     fn the_repositorys_default_maps_parse() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        for name in ["profile/midi.toml", "profile/midi-map.toml"] {
+        // `controller.toml` is the shipped map (the name predates the rename); the other two are
+        // optional examples, and a checkout without them is not a failure.
+        let mut checked = 0;
+        for name in [
+            "profile/controller.toml",
+            "profile/midi.toml",
+            "profile/midi-map.toml",
+        ] {
             let path = root.join(name);
-            let text = std::fs::read_to_string(&path).expect("default map");
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             Map::from_toml_str_at(&text, path.parent().unwrap())
                 .unwrap_or_else(|err| panic!("{name}: {err}"));
+            checked += 1;
         }
+        assert!(checked > 0, "no default map in the repository");
     }
 
     #[test]

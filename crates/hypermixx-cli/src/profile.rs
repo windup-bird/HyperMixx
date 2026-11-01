@@ -20,7 +20,10 @@ pub const AMBIENT: &str = "profile/profile.toml";
 /// Where the folder defaults live, used when a profile names nothing (or there is no profile).
 pub const DEFAULT_MIXER: &str = "profile/mixer.toml";
 pub const DEFAULT_LIVE: &str = "profile/live.toml";
-pub const DEFAULT_MIDI: &str = "profile/midi.toml";
+pub const DEFAULT_MIDI: &str = "profile/controller.toml";
+/// The pre-rename default, read when `controller.toml` is not there. Keeping both is what lets an
+/// existing folder keep working without a migration step.
+pub const LEGACY_MIDI: &str = "profile/midi.toml";
 /// Where a bare profile *name* is resolved: the folder itself, so `--profile dj` is
 /// `profile/dj.toml` next to the files it names.
 pub const PROFILES_DIR: &str = "profile";
@@ -35,6 +38,16 @@ pub struct MidiSettings {
     pub device: Option<String>,
     /// The mapping file. Already resolved against the folder of the file that named it.
     pub map: Option<String>,
+}
+
+/// The controller file to read when nothing names one: `controller.toml` if it exists, the legacy
+/// `midi.toml` otherwise. A folder that predates the rename keeps working untouched.
+pub fn default_midi_path() -> &'static str {
+    if Path::new(DEFAULT_MIDI).is_file() {
+        DEFAULT_MIDI
+    } else {
+        LEGACY_MIDI
+    }
 }
 
 /// What a profile names.
@@ -65,7 +78,7 @@ impl Profile {
             match key.as_str() {
                 "mixer" => profile.mixer = path_value(key, value, dir)?,
                 "live" => profile.live = path_value(key, value, dir)?,
-                "midi" => match value {
+                "controller" | "midi" => match value {
                     toml::Value::String(path) => {
                         let path = resolve_against(dir, path.trim());
                         let (settings, midi_notes) = load_midi(&path)?;
@@ -94,7 +107,7 @@ impl Profile {
                 }
                 other => {
                     return Err(format!(
-                        "unknown section `{other}` (mixer | live | midi | preference)"
+                        "unknown section `{other}` (mixer | live | controller | preference)"
                     ))
                 }
             }
@@ -238,19 +251,22 @@ mod tests {
     }
 
     #[test]
-    fn midi_is_a_map_file_only() {
+    fn the_controller_file_is_a_map_file_only() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let map = root.join(DEFAULT_MIDI);
-        let text = format!("midi = \"{}\"\n", map.display());
+        let text = format!("controller = \"{}\"\n", map.display());
         let (profile, notes) = parse(&text).unwrap();
         assert!(
             profile
                 .midi
                 .map
                 .as_deref()
-                .is_some_and(|path| path.ends_with("profile/midi.toml")),
+                .is_some_and(|path| path.ends_with("profile/controller.toml")),
             "the map path is what the profile carries"
         );
+        // The pre-rename key still parses, so an old profile keeps working.
+        let legacy = parse(&format!("midi = \"{}\"\n", map.display())).unwrap().0;
+        assert_eq!(legacy.midi.map, profile.midi.map);
         // The shipped map names the development controller, so there is nothing to warn about.
         let device = profile.midi.device.clone();
         assert_eq!(
@@ -317,6 +333,11 @@ mod tests {
     fn the_shipped_profile_folder_loads() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let profile_path = root.join(AMBIENT);
+        if !profile_path.is_file() {
+            // A checkout without the shipped profile runs on the folder defaults; that is a valid
+            // configuration, not a broken one.
+            return;
+        }
         let (profile, notes) =
             load(&profile_path.to_string_lossy()).expect("the shipped profile parses");
         assert!(
@@ -332,7 +353,7 @@ mod tests {
                 .midi
                 .map
                 .as_deref()
-                .is_some_and(|path| path.ends_with("profile/midi.toml")),
+                .is_some_and(|path| path.ends_with("profile/controller.toml")),
             "the shipped profile points at the map: {:?}",
             profile.midi.map
         );

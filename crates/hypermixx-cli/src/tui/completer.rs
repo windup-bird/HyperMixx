@@ -2,7 +2,7 @@
 //!
 //! Pure functions over the current buffer: given the text, the cursor and a little context, return
 //! the range to replace and the candidates for it. The grammar mirrors `command.rs`: an optional
-//! leading target (`deck0` / `0` / `master`), then a verb, then its arguments. Slot candidates carry
+//! leading target (`deck1` / `1` / `master`), then a verb, then its arguments. Slot candidates carry
 //! the effect name as the primary text and the index as a hint, so `fx remove` is usable without
 //! memorising numbers.
 
@@ -31,7 +31,7 @@ pub struct Completion {
 /// Dynamic inputs the completer cannot know on its own.
 pub struct Ctx<'a> {
     pub decks: usize,
-    /// Chain the focused deck targets, e.g. `"deck0"`.
+    /// Chain the focused deck targets, e.g. `"deck1"`.
     pub chain: String,
     /// Chain label -> slot kinds, from the last `fx list`.
     pub slots: &'a HashMap<String, Vec<String>>,
@@ -151,11 +151,11 @@ pub fn complete(command: &[char], cursor: usize, ctx: &Ctx) -> Option<Completion
 }
 
 fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
-    // Peel off a leading target word, if any, then a stem name if one follows: `deck0 vocals fx …`
-    // addresses `deck0/vocals`, and the slot book is keyed by exactly that label.
+    // Peel off a leading target word, if any, then a stem name if one follows: `deck1 vocals fx …`
+    // addresses `deck1/vocals`, and the slot book is keyed by exactly that label.
     let (mut chain, mut rest) = match prior.first() {
         Some(token) => match parse_target(token, ctx.decks) {
-            Some(Target::Deck(deck_id)) => (format!("deck{deck_id}"), &prior[1..]),
+            Some(Target::Deck(deck_id)) => (hypermixx_core::deck_label(deck_id as u8), &prior[1..]),
             Some(Target::Master) => ("master".to_owned(), &prior[1..]),
             None => (ctx.chain.clone(), prior),
         },
@@ -177,7 +177,7 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
             return pairs(&[("fx", "effect chain commands")], partial);
         }
         let mut items = pairs(VERBS, partial);
-        // A stem name narrows the target: `deck0 vocals mute`. Offered alongside the verbs, because
+        // A stem name narrows the target: `deck1 vocals mute`. Offered alongside the verbs, because
         // that is the position it occupies on the line.
         items.extend(pairs(STEMS, partial));
         items.extend(targets(ctx.decks, partial));
@@ -196,8 +196,8 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
                 ],
                 partial,
             ),
-            // `deck0 vocals fx …` completes against this stem's own chain, which the slot book
-            // keys by `deck0/vocals`.
+            // `deck1 vocals fx …` completes against this stem's own chain, which the slot book
+            // keys by `deck1/vocals`.
             Some("fx") => fx_candidates(&rest[1..], partial, &chain, ctx),
             Some(_) => Vec::new(),
         };
@@ -495,7 +495,7 @@ fn targets(decks: usize, partial: &str) -> Vec<Candidate> {
     }];
     for index in 0..decks {
         items.push(Candidate {
-            text: format!("deck{index}"),
+            text: hypermixx_core::deck_label(index as u8),
             hint: "target deck".to_owned(),
         });
     }
@@ -596,7 +596,7 @@ mod tests {
         fn new() -> Self {
             let mut slots = HashMap::new();
             slots.insert(
-                "deck0".to_owned(),
+                "deck1".to_owned(),
                 vec!["eq".to_owned(), "filter".to_owned()],
             );
             Self { slots }
@@ -605,7 +605,7 @@ mod tests {
         fn ctx(&self) -> Ctx<'_> {
             Ctx {
                 decks: 2,
-                chain: "deck0".to_owned(),
+                chain: "deck1".to_owned(),
                 slots: &self.slots,
             }
         }

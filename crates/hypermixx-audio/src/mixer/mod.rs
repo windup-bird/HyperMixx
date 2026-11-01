@@ -32,7 +32,9 @@ pub use config::{
     ChannelConfig, CrossfaderConfig, CueMixConfig, MixerConfig, MixerError, OutputConfig,
 };
 pub use hypermixx_core::{OutputRole, OutputState, OutputStatus};
-pub use output::{Output, OutputError, OutputId, OutputTuning, Outputs};
+pub use output::{
+    output_devices, DeviceInfo, Output, OutputError, OutputId, OutputTuning, Outputs,
+};
 
 use hypermixx_core::{CommandResponse, FxChainId, FxSlotStatus, KeylockSettings, StemOp, StemSet};
 
@@ -675,6 +677,10 @@ impl Mixer {
             },
             Command::ListFx { chain } => match self.list_fx(chain) {
                 Some(slots) => CommandResponse::FxListed { chain, slots },
+                None => CommandResponse::Error(unknown_chain(&chain)),
+            },
+            Command::GetFxState { chain } => match self.list_fx(chain) {
+                Some(slots) => CommandResponse::FxState { chain, slots },
                 None => CommandResponse::Error(unknown_chain(&chain)),
             },
             Command::SetStems { deck_id, stems } => match self.set_stems(deck_id, stems) {

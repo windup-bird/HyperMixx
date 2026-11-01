@@ -41,9 +41,13 @@ symphonia = { version = "0.5", default-features = false, features = [
     "vorbis",
 ] }
 crossbeam-channel = "0.5"
+# Cover art decoding. `jpeg` + `png` only: those are what ID3/FLAC artwork uses, and the default
+# feature set would drag in every animation/webp/tiff decoder for a 48px thumbnail.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 arc-swap = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+toml_edit = "0.22"
 # TUI only. Minimal features: `crossterm` pulls in std + the widgets crate; the default
 # `all-widgets` would drag in the calendar/time stack we never draw.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }

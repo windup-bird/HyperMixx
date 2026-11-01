@@ -2204,12 +2204,22 @@ chain = "deck1"
     #[test]
     fn the_shipped_maps_open_in_the_guide() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        for name in ["profile/midi.toml", "profile/midi-map.toml"] {
+        let mut checked = 0;
+        for name in [
+            "profile/controller.toml",
+            "profile/midi.toml",
+            "profile/midi-map.toml",
+        ] {
             let path = root.join(name);
+            if !path.exists() {
+                continue;
+            }
             let guide = Guide::new(Some(&path.display().to_string()), 2)
                 .unwrap_or_else(|err| panic!("{name}: {err}"));
             assert!(guide.error.is_none(), "{name}: {:?}", guide.error);
             assert!(!guide.view().decks.is_empty());
+            checked += 1;
         }
+        assert!(checked > 0, "no map to open in the repository");
     }
 }
