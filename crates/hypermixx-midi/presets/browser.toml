@@ -1,7 +1,7 @@
-# Library navigation. `both` scope: a browser strip can be global or live on one deck.
+# Library navigation. Global only: every load button is a separate slot.
 [[preset]]
 name = "browser"
-scope = "both"
+scope = "global"
 start = "default"
 
 # A two-point encoder: 1 = one step, 127 = the other. Reversed once here because the shipped
@@ -16,7 +16,10 @@ type = "Button"
 slot = "exit"
 type = "Button"
 [[preset.slot]]
-slot = "load"
+slot = "load-1"
+type = "Button"
+[[preset.slot]]
+slot = "load-2"
 type = "Button"
 
 [[preset.mode]]
@@ -32,5 +35,8 @@ action = "browser open"
 slot = "exit"
 action = "browser exit"
 [[preset.mode.bind]]
-slot = "load"
+slot = "load-1"
+action = "browser load"
+[[preset.mode.bind]]
+slot = "load-2"
 action = "browser load"

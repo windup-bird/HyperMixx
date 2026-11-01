@@ -107,7 +107,7 @@ fn render_top(frame: &mut Frame, area: Rect, app: &App) {
     let ring_ms = app.ring_frames as f64 * 1000.0 / f64::from(app.sample_rate);
 
     let white = Style::default().fg(Color::White);
-    let mut spans = vec![
+    let spans = vec![
         Span::styled(
             format!(" HYPERMIXX {} ", app.version),
             Style::default()
@@ -133,21 +133,6 @@ fn render_top(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(format!(" cue {} ", db(cue)), white),
         Span::styled(format!(" drop {overruns} "), white),
     ];
-    // The active mode is the one piece of MIDI state the player cannot see on a non-LED
-    // controller. Keep it on the header, one `unit=mode` pair per mapped unit.
-    if let Some(midi) = &app.midi {
-        if let Ok(snapshot) = midi.state().lock() {
-            if !snapshot.units.is_empty() {
-                let modes = snapshot
-                    .units
-                    .iter()
-                    .map(|unit| format!("{}={}", unit.id, unit.current))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                spans.push(Span::styled(format!(" midi {modes} "), white));
-            }
-        }
-    }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 

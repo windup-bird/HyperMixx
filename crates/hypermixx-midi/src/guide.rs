@@ -1820,13 +1820,11 @@ mod tests {
     }
 
     #[test]
-    fn a_both_preset_can_be_global_or_per_deck() {
+    fn a_global_only_preset_refuses_a_deck() {
         let mut guide = Guide::empty(2).unwrap();
         guide.new_unit("browser", None, None).unwrap();
-        guide.new_unit("browser", Some(0), None).unwrap();
         assert_eq!(guide.map.units[0].id, "global.browser");
-        assert_eq!(guide.map.units[1].id, "deck1.browser");
-        assert_eq!(guide.map.units[1].deck, Some(0));
+        assert!(guide.new_unit("browser", Some(0), None).is_err());
     }
 
     #[test]
@@ -1925,7 +1923,7 @@ mod tests {
     #[test]
     fn learning_a_two_point_encoder_picks_that_encoding() {
         let mut guide = Guide::empty(2).unwrap();
-        guide.new_unit("browser", Some(0), None).unwrap();
+        guide.new_unit("browser", None, None).unwrap();
         let mut guide = at_slot(guide, 0, "choose");
         guide.begin_learn().unwrap();
         guide.feed(&cc(0, 7, 1));
@@ -2055,6 +2053,15 @@ chain = "deck1"
                 "{slot} should be empty in stems mode"
             );
         }
+    }
+
+    #[test]
+    fn unbound_manual_loop_and_jump_presets_compile() {
+        let mut guide = Guide::empty(1).unwrap();
+        guide.new_unit("manualloop", Some(0), None).unwrap();
+        guide.new_unit("manualjump", Some(0), None).unwrap();
+        assert!(guide.error.is_none(), "{:?}", guide.error);
+        assert_eq!(guide.map.units.len(), 2);
     }
 
     #[test]
@@ -2190,7 +2197,7 @@ chain = "deck1"
         assert!(names.contains(&"pad".to_owned()));
         assert!(names.contains(&"crossfader".to_owned()));
         assert_eq!(guide.preset_scope("outputfader"), PresetScope::Global);
-        assert_eq!(guide.preset_scope("browser"), PresetScope::Both);
+        assert_eq!(guide.preset_scope("browser"), PresetScope::Global);
         assert_eq!(guide.preset_scope("mixer"), PresetScope::Deck);
     }
 

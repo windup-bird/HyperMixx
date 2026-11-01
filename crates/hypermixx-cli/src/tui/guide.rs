@@ -73,7 +73,6 @@ enum Overlay {
     Ports(PortList),
     Files(FilePicker),
     Menu(Menu),
-    Text(TextPrompt),
 }
 
 struct Menu {
@@ -92,11 +91,6 @@ enum MenuAction {
     CloneDeck(usize),
     StartDeck,
     AddUnit(String),
-}
-
-struct TextPrompt {
-    title: String,
-    buffer: String,
 }
 
 impl Session {
@@ -500,10 +494,17 @@ fn save(session: &mut Session) {
             Err(err) => session.error(err),
         }
     } else {
-        session.overlay = Overlay::Text(TextPrompt {
-            title: "save as".to_owned(),
-            buffer: session.open_hint.clone(),
-        });
+        let start = Path::new(&session.open_hint);
+        let default_name = start
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("midi-map.toml");
+        session.overlay = Overlay::Files(FilePicker::new_save(
+            Some(start),
+            &["toml"],
+            "save map",
+            default_name,
+        ));
     }
 }
 
@@ -532,6 +533,58 @@ fn handle_overlay(session: &mut Session, key: KeyEvent) {
                 }
             }
             _ => session.overlay = Overlay::Ports(list),
+        },
+        Overlay::Files(mut picker) if picker.save_mode() => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                picker.move_selection(-1);
+                session.overlay = Overlay::Files(picker);
+            }
+            KeyCode::Down => {
+                picker.move_selection(1);
+                session.overlay = Overlay::Files(picker);
+            }
+            KeyCode::Left => {
+                picker.up();
+                session.overlay = Overlay::Files(picker);
+            }
+            KeyCode::Right => {
+                if let Some(entry) = picker.selected_entry() {
+                    if entry.is_dir {
+                        picker.activate();
+                    } else {
+                        picker.set_filename(entry.name);
+                    }
+                }
+                session.overlay = Overlay::Files(picker);
+            }
+            KeyCode::Backspace => {
+                picker.pop_filename_char();
+                session.overlay = Overlay::Files(picker);
+            }
+            KeyCode::Enter => {
+                if let Some(path) = picker.save_path() {
+                    let path_text = path.display().to_string();
+                    match session.guide.save_as(&path_text) {
+                        Ok(()) => {
+                            session.open_hint = path_text.clone();
+                            session.ok(format!("saved {path_text}"));
+                        }
+                        Err(err) => {
+                            session.error(err);
+                            session.overlay = Overlay::Files(picker);
+                        }
+                    }
+                } else {
+                    session.error("save needs a file name");
+                    session.overlay = Overlay::Files(picker);
+                }
+            }
+            KeyCode::Char(ch) => {
+                picker.push_filename_char(ch);
+                session.overlay = Overlay::Files(picker);
+            }
+            _ => session.overlay = Overlay::Files(picker),
         },
         Overlay::Files(mut picker) => match key.code {
             KeyCode::Esc => {}
@@ -595,32 +648,6 @@ fn handle_overlay(session: &mut Session, key: KeyEvent) {
                 }
             }
             _ => session.overlay = Overlay::Menu(menu),
-        },
-        Overlay::Text(mut prompt) => match key.code {
-            KeyCode::Esc => {}
-            KeyCode::Backspace => {
-                prompt.buffer.pop();
-                session.overlay = Overlay::Text(prompt);
-            }
-            KeyCode::Enter => {
-                let path = prompt.buffer.trim().to_owned();
-                if path.is_empty() {
-                    session.error("save as needs a path");
-                } else {
-                    match session.guide.save_as(&path) {
-                        Ok(()) => {
-                            session.open_hint = path.clone();
-                            session.ok(format!("saved {path}"));
-                        }
-                        Err(err) => session.error(err),
-                    }
-                }
-            }
-            KeyCode::Char(ch) => {
-                prompt.buffer.push(ch);
-                session.overlay = Overlay::Text(prompt);
-            }
-            _ => session.overlay = Overlay::Text(prompt),
         },
     }
     session.sync_feedback();
@@ -694,7 +721,6 @@ fn render(frame: &mut Frame, session: &mut Session) {
         Overlay::Ports(list) => picker::render_port_list(frame, area, list, "MIDI device (Enter)"),
         Overlay::Files(picker) => picker::render_file_picker(frame, area, picker),
         Overlay::Menu(menu) => render_menu(frame, area, menu),
-        Overlay::Text(prompt) => render_text(frame, area, prompt),
     }
 }
 
@@ -952,26 +978,6 @@ fn render_menu(frame: &mut Frame, area: Rect, menu: &Menu) {
     frame.render_stateful_widget(list, popup, &mut state);
 }
 
-fn render_text(frame: &mut Frame, area: Rect, prompt: &TextPrompt) {
-    let width = (area.width * 2 / 3).clamp(30, area.width.saturating_sub(2));
-    let popup = centered(area, width, 3);
-    frame.render_widget(Clear, popup);
-    let text = Line::from(vec![
-        Span::raw(prompt.buffer.clone()),
-        Span::styled("▌", Style::default().fg(Color::Cyan)),
-    ]);
-    frame.render_widget(
-        Paragraph::new(Text::from(text))
-            .block(
-                Block::bordered()
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .title(prompt.title.clone()),
-            )
-            .wrap(Wrap { trim: false }),
-        popup,
-    );
-}
-
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
@@ -1095,6 +1101,17 @@ mod tests {
             &command_labels(&view, false)[1..],
             &["Delete", "Connect", "File", "Save", "Exit"]
         );
+    }
+
+    #[test]
+    fn save_without_a_path_opens_a_named_file_picker() {
+        let mut session = test_session();
+        save(&mut session);
+        let Overlay::Files(picker) = &session.overlay else {
+            panic!("expected the save picker");
+        };
+        assert!(picker.save_mode());
+        assert_eq!(picker.filename(), Some("does-not-exist.toml"));
     }
 
     #[test]

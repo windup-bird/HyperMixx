@@ -38,6 +38,11 @@ const LOOP_NO_GRID: &str = "loop needs a beat grid — `analyse` the track, or l
 /// Upper bound on catch-up blocks for a looper/shadow: 64 blocks ≈ 372 ms, beyond any real
 /// seek/pre-roll.
 const MAX_CATCHUP_BLOCKS: usize = 64;
+/// Default beatjump/beatloop step, in beats.
+const DEFAULT_BEAT_STEP: i64 = 8;
+const MAX_BEAT_STEP: i64 = 64;
+const MIN_LOOP_UNITS: u32 = 1; // 1/32 beat
+const MAX_LOOP_UNITS: u32 = 64 * 32;
 /// One-pole smoothing for the wheel's signed rate. At 256-frame blocks this is ~25 ms.
 const VINYL_RATE_SMOOTHING: f64 = 0.22;
 
@@ -88,6 +93,10 @@ pub struct Deck {
     loop_arm: Option<LoopArm>,
     /// Out-point quantization for `loop out`, the looper's provisional range, and edits.
     loop_quantum: LoopQuantum,
+    /// Persistent manual beatjump step, in whole beats.
+    jump_beats: i64,
+    /// Persistent beatloop length used by `loop toggle`.
+    loop_beats: BeatLen,
     /// Transport every spawned flow inherits: a tempo (or profile) the DJ set must survive jumps.
     ///
     /// Split in two on purpose: `tempo` is what the fader, `sync tempo` and a lock write, and
@@ -169,6 +178,8 @@ impl Deck {
             analysis: ArcSwapOption::empty(),
             loop_arm: None,
             loop_quantum: LoopQuantum::default(),
+            jump_beats: DEFAULT_BEAT_STEP,
+            loop_beats: BeatLen::beats(DEFAULT_BEAT_STEP as u32),
             playhead: Playhead::new(),
             applied_rate: 1.0,
             sync: None,
@@ -579,7 +590,32 @@ impl Deck {
     ///
     /// Does nothing when the deck has no beat grid yet — a wrong grid is worse than no grid.
     pub fn beatjump(&mut self, beats: i64) {
+        if beats != 0 {
+            self.jump_beats = beats.abs().clamp(1, MAX_BEAT_STEP);
+        }
         self.seek(Seek::Beats(beats));
+    }
+
+    /// Jump by the persistent step: `direction` is positive for forward, negative for backward.
+    pub fn beatjump_step(&mut self, direction: i8) {
+        let sign = i64::from(direction.signum());
+        if sign != 0 {
+            self.seek(Seek::Beats(self.jump_beats * sign));
+        }
+    }
+
+    /// The last explicit beatjump step, in whole beats.
+    pub fn jump_beats(&self) -> i64 {
+        self.jump_beats
+    }
+
+    /// Double or halve the persistent beatjump step.
+    pub fn scale_jump_beats(&mut self, halve: bool) {
+        self.jump_beats = if halve {
+            (self.jump_beats / 2).max(1)
+        } else {
+            (self.jump_beats * 2).min(MAX_BEAT_STEP)
+        };
     }
 
     /// Non-blocking seek from a musical [`Seek`]; no-op if it can't be resolved (empty grid).
@@ -1053,6 +1089,31 @@ impl Deck {
         self.loop_quantum
     }
 
+    /// The persistent beatloop length used by `loop toggle`.
+    pub fn loop_beats_value(&self) -> BeatLen {
+        self.loop_beats
+    }
+
+    /// Double or halve the persistent loop length, retiming an active loop in place.
+    pub fn scale_loop_beats(&mut self, halve: bool) -> Result<(), String> {
+        let next = scaled_beatlen(self.loop_beats, halve);
+        if self.loop_range.is_some() {
+            self.loop_beats_impl(next, false, false)?;
+        } else {
+            self.loop_beats = next;
+        }
+        Ok(())
+    }
+
+    /// Toggle a loop using the persistent `loop_beats` value.
+    pub fn loop_toggle(&mut self) -> Result<(), String> {
+        if self.loop_range.is_some() {
+            self.loop_exit()
+        } else {
+            self.loop_beats_impl(self.loop_beats, false, false)
+        }
+    }
+
     /// True once `playing` ran out of audio. A looping deck is never "at the end".
     pub fn is_at_end(&self) -> bool {
         self.loop_range.is_none() && self.playing.reached_end()
@@ -1075,6 +1136,7 @@ impl Deck {
             }
             LoopOp::Exit => self.loop_exit(),
             LoopOp::Beats(beats) => self.loop_beats(beats),
+            LoopOp::Toggle => self.loop_toggle(),
             LoopOp::Edit(edit) => self.loop_edit(edit),
             LoopOp::SetQuantum(quantum) => {
                 self.loop_quantum = quantum;
@@ -1176,6 +1238,7 @@ impl Deck {
                 self.loop_range = Some(range);
                 self.shadow = None;
             }
+            self.sync_loop_beats(range);
             self.playhead.suppress();
             Ok(())
         } else {
@@ -1212,6 +1275,7 @@ impl Deck {
                 .min(self.total_frames())
                 .max(range.in_frame + 1);
             self.set_active_loop_range(LoopRange::new(range.in_frame, out));
+            self.loop_beats = beats;
             return Ok(());
         }
         self.disarm_loop();
@@ -1223,6 +1287,7 @@ impl Deck {
             .min(self.total_frames())
             .max(p_in + 1);
         self.open_loop(p_in, out, slip, reverse);
+        self.loop_beats = beats;
         Ok(())
     }
 
@@ -1326,6 +1391,21 @@ impl Deck {
         Ok(())
     }
 
+    /// Keeps `loop_beats` in step with the audible range. Manual in/out loops are quantized to a
+    /// fraction of a beat, so this rounds to 1/32-beat units.
+    fn sync_loop_beats(&mut self, range: LoopRange) {
+        let Some(analysis) = self.analysis() else {
+            return;
+        };
+        let grid = &analysis.beatgrid;
+        let beat = grid.beat_width(grid.floor_beat(range.in_frame)).max(1) as f64;
+        let beats = range.len() as f64 / beat;
+        let units = (beats * 32.0)
+            .round()
+            .clamp(f64::from(MIN_LOOP_UNITS), f64::from(MAX_LOOP_UNITS)) as u32;
+        self.loop_beats = beatlen_from_units(units);
+    }
+
     /// The analysis a loop (or a sync command) needs: present *and* non-empty (quantization is
     /// meaningless without beats — same rule as `beatjump`).
     pub fn require_grid(&self) -> Result<Arc<TrackAnalysis>, String> {
@@ -1374,12 +1454,14 @@ impl Deck {
             self.loop_range = Some(range);
             self.shadow = None;
         }
+        self.sync_loop_beats(range);
         self.playhead.suppress();
     }
 
     /// Stores a new range on the active flow — the in-loop edit primitive (one atomic store).
     fn set_active_loop_range(&mut self, range: LoopRange) {
         self.loop_range = Some(range);
+        self.sync_loop_beats(range);
         if let Some(shadow) = &self.shadow {
             if shadow.slip {
                 shadow.playing.set_loop_range(Some(range));
@@ -1437,6 +1519,28 @@ impl Deck {
             driven += 1;
         }
     }
+}
+
+/// Builds a BeatLen from 1/32-beat units, reducing the fraction.
+fn beatlen_from_units(mut units: u32) -> BeatLen {
+    units = units.clamp(MIN_LOOP_UNITS, MAX_LOOP_UNITS);
+    let mut den = 32u32;
+    while units.is_multiple_of(2) && units > 1 && den > 1 {
+        units /= 2;
+        den /= 2;
+    }
+    BeatLen::fraction(units, den).unwrap_or(BeatLen::beats(DEFAULT_BEAT_STEP as u32))
+}
+
+/// The 1/32..64 beat domain for `loopbeats double|halve`.
+fn scaled_beatlen(value: BeatLen, halve: bool) -> BeatLen {
+    let units = (value.to_beats() * 32.0).round().max(1.0) as u32;
+    let units = if halve {
+        (units / 2).max(MIN_LOOP_UNITS)
+    } else {
+        (units.saturating_mul(2)).min(MAX_LOOP_UNITS)
+    };
+    beatlen_from_units(units)
 }
 
 #[cfg(test)]
@@ -2307,6 +2411,38 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         panic!("the loop never engaged");
+    }
+
+    #[test]
+    fn beatjump_and_loop_toggle_use_their_persistent_steps() {
+        let total = crate::SAMPLE_RATE as u64 * 60;
+        let mut deck = loop_deck(total);
+        assert_eq!(deck.jump_beats(), 8);
+        deck.beatjump(4);
+        assert_eq!(deck.jump_beats(), 4, "an explicit beatjump remembers its size");
+        deck.scale_jump_beats(false);
+        assert_eq!(deck.jump_beats(), 8);
+        deck.scale_jump_beats(true);
+        assert_eq!(deck.jump_beats(), 4);
+
+        assert_eq!(deck.loop_beats_value(), BeatLen::beats(8));
+        deck.scale_loop_beats(false).unwrap();
+        assert_eq!(deck.loop_beats_value(), BeatLen::beats(16));
+
+        deck.apply_loop(LoopOp::Toggle).expect("toggle opens a loop");
+        let range = deck.loop_range().expect("loop engaged");
+        let grid = deck.analysis().expect("grid").beatgrid.clone();
+        let b = grid.floor_beat(range.in_frame);
+        let beats_from_in = |n: u64| grid.frame_at_beat(b + n) - grid.frame_at_beat(b);
+        assert_eq!(range.len(), beats_from_in(16));
+        deck.apply_loop(LoopOp::Toggle).expect("toggle exits");
+        assert!(deck.loop_range().is_none());
+
+        deck.apply_loop(LoopOp::Beats(BeatLen::beats(2))).expect("explicit loop");
+        assert_eq!(deck.loop_beats_value(), BeatLen::beats(2));
+        deck.scale_loop_beats(true).unwrap();
+        assert_eq!(deck.loop_beats_value(), BeatLen::beats(1));
+        assert_eq!(deck.loop_range().expect("still looping").len(), beats_from_in(1));
     }
 
     #[test]

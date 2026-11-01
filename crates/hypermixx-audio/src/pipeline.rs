@@ -446,6 +446,15 @@ fn route(mixer: &mut Mixer, sync: &mut SyncGroup, command: Command) -> Option<Co
             target_frame,
         } => transport(mixer, deck_id, move |deck| deck.jump(target_frame)),
         BeatJump { deck_id, beats } => transport(mixer, deck_id, move |deck| deck.beatjump(beats)),
+        BeatJumpStep { deck_id, direction } => {
+            transport(mixer, deck_id, move |deck| deck.beatjump_step(direction))
+        }
+        ScaleJumpBeats { deck_id, halve } => {
+            transport(mixer, deck_id, move |deck| deck.scale_jump_beats(halve))
+        }
+        ScaleLoopBeats { deck_id, halve } => {
+            transport_result(mixer, deck_id, move |deck| deck.scale_loop_beats(halve))
+        }
         SetTempo { deck_id, tempo } => answered(sync.set_tempo(mixer, deck_id, tempo)),
         SetTempoFader { deck_id, position } => {
             answered(sync.set_tempo_fader(mixer, deck_id, position))
@@ -575,6 +584,8 @@ fn state_of(deck_id: DeckId, channel: &crate::mixer::Channel, sync: &SyncGroup) 
             .loop_range()
             .map(|range| (range.in_frame, range.out_frame)),
         loop_in_armed: deck.loop_in_armed(),
+        jump_beats: deck.jump_beats(),
+        loop_beats: deck.loop_beats_value(),
         tempo: deck.tempo() as f32,
         tempo_fader: deck.tempo_fader() as f32,
         tempo_range: deck.tempo_range() as f32,

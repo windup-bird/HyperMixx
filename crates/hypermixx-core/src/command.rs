@@ -214,6 +214,8 @@ pub enum LoopOp {
     /// Beat loop: with no loop engaged, open an N-beat loop at the quantized current beat; while
     /// looping, re-time the current loop's `out` to `in + N` beats (halve/double), in place.
     Beats(BeatLen),
+    /// Toggle a loop using the deck's `loop_beats`: no loop opens one, an active loop exits.
+    Toggle,
     /// Arm a slip loop: `playing` keeps its slip clock, `shadow` is the audible loop.
     SlipIn,
     /// Engage the armed slip loop.
@@ -504,6 +506,21 @@ pub enum Command {
         deck_id: DeckId,
         beats: i64,
     },
+    /// Jump by the deck's `jump_beats`, positive for forward and negative for backward.
+    BeatJumpStep {
+        deck_id: DeckId,
+        direction: i8,
+    },
+    /// Double or halve the deck's persistent `jump_beats` step.
+    ScaleJumpBeats {
+        deck_id: DeckId,
+        halve: bool,
+    },
+    /// Double or halve the deck's persistent `loop_beats`, retiming an active loop in place.
+    ScaleLoopBeats {
+        deck_id: DeckId,
+        halve: bool,
+    },
     /// Sets the tempo (0.25 = quarter speed, 1.0 = unity, 4.0 = quadruple).
     SetTempo {
         deck_id: DeckId,
@@ -751,6 +768,21 @@ impl std::fmt::Debug for Command {
                 .debug_struct("BeatJump")
                 .field("deck_id", deck_id)
                 .field("beats", beats)
+                .finish(),
+            Command::BeatJumpStep { deck_id, direction } => f
+                .debug_struct("BeatJumpStep")
+                .field("deck_id", deck_id)
+                .field("direction", direction)
+                .finish(),
+            Command::ScaleJumpBeats { deck_id, halve } => f
+                .debug_struct("ScaleJumpBeats")
+                .field("deck_id", deck_id)
+                .field("halve", halve)
+                .finish(),
+            Command::ScaleLoopBeats { deck_id, halve } => f
+                .debug_struct("ScaleLoopBeats")
+                .field("deck_id", deck_id)
+                .field("halve", halve)
                 .finish(),
             Command::SetTempo { deck_id, tempo } => f
                 .debug_struct("SetTempo")

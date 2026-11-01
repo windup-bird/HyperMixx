@@ -398,9 +398,66 @@ pub fn dispatch(
             }
         }),
         "beatjump" => with_deck(target, "beatjump", |deck_id| {
-            match words.next().map(str::parse::<i64>) {
-                Some(Ok(beats)) => send(command_tx, Command::BeatJump { deck_id, beats }),
-                _ => Action::Failed("usage: [deck] beatjump <beats>".into()),
+            match words.next() {
+                Some("forward") => send(
+                    command_tx,
+                    Command::BeatJumpStep {
+                        deck_id,
+                        direction: 1,
+                    },
+                ),
+                Some("backward") => send(
+                    command_tx,
+                    Command::BeatJumpStep {
+                        deck_id,
+                        direction: -1,
+                    },
+                ),
+                Some(raw) => match raw.parse::<i64>() {
+                    Ok(beats) => send(command_tx, Command::BeatJump { deck_id, beats }),
+                    Err(_) => Action::Failed(
+                        "usage: [deck] beatjump <beats|forward|backward>".into(),
+                    ),
+                },
+                None => Action::Failed("usage: [deck] beatjump <beats|forward|backward>".into()),
+            }
+        }),
+        "jumpbeats" => with_deck(target, "jumpbeats", |deck_id| {
+            match words.next() {
+                Some("double") => send(
+                    command_tx,
+                    Command::ScaleJumpBeats {
+                        deck_id,
+                        halve: false,
+                    },
+                ),
+                Some("halve") => send(
+                    command_tx,
+                    Command::ScaleJumpBeats {
+                        deck_id,
+                        halve: true,
+                    },
+                ),
+                _ => Action::Failed("usage: [deck] jumpbeats double|halve".into()),
+            }
+        }),
+        "loopbeats" => with_deck(target, "loopbeats", |deck_id| {
+            match words.next() {
+                Some("double") => send(
+                    command_tx,
+                    Command::ScaleLoopBeats {
+                        deck_id,
+                        halve: false,
+                    },
+                ),
+                Some("halve") => send(
+                    command_tx,
+                    Command::ScaleLoopBeats {
+                        deck_id,
+                        halve: true,
+                    },
+                ),
+                _ => Action::Failed("usage: [deck] loopbeats double|halve".into()),
             }
         }),
         "tempo" => with_deck(target, "tempo", |deck_id| {
@@ -1137,7 +1194,7 @@ fn loop_command<'a>(
     deck_id: u8,
     command_tx: &Sender<Command>,
 ) -> Action {
-    let usage = "usage: [deck] loop in | out | <beats|num/den> | slip in | slip out | slip <beats> | slip roll <beats> | exit | cancel | halve | double | edit <len|move|in|out> <beats> | quantum <beat|half|quarter|eighth>";
+    let usage = "usage: [deck] loop in | out | toggle | <beats|num/den> | slip in | slip out | slip <beats> | slip roll <beats> | exit | cancel | halve | double | edit <len|move|in|out> <beats> | quantum <beat|half|quarter|eighth>";
     let Some(sub) = words.next() else {
         return Action::Message(usage.into());
     };
@@ -1145,6 +1202,7 @@ fn loop_command<'a>(
         "in" => LoopOp::In,
         "out" => LoopOp::Out,
         "cancel" => LoopOp::Cancel,
+        "toggle" => LoopOp::Toggle,
         "exit" | "off" => LoopOp::Exit,
         "slip" => match words.next() {
             Some("in") => LoopOp::SlipIn,
@@ -2510,6 +2568,8 @@ mod tests {
                 "vinyl" => "vinyl",
                 "vinyl slip" => "vinyl slip",
                 "beatjump" => "beatjump 4",
+                "jumpbeats" => "jumpbeats double",
+                "loopbeats" => "loopbeats double",
                 "fader flow" => "fader flow -0.5",
                 "vocals fader" => "vocals fader -0.5",
                 "vocals mute" => "vocals mute on",

@@ -709,6 +709,8 @@ mod tests {
             virtual_frame: frame,
             loop_range: None,
             loop_in_armed: None,
+            jump_beats: 8,
+            loop_beats: hypermixx_core::BeatLen::beats(8),
             tempo: 1.0,
             tempo_fader: 0.0,
             tempo_range: 0.1,

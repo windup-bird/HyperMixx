@@ -365,5 +365,8 @@ endpoint = { midi = "note", channel = 15, id = 90 }
 slot = "exit"
 endpoint = { midi = "note", channel = 15, id = 91 }
 [[unit.control]]
-slot = "load"
+slot = "load-1"
 endpoint = { midi = "note", channel = 15, id = 92 }
+[[unit.control]]
+slot = "load-2"
+endpoint = { midi = "note", channel = 15, id = 93 }

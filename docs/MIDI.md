@@ -205,8 +205,15 @@ slot = "pad1"
 action = "hotcue trigger 1"
 ```
 
-内置 preset：`browser`(both) `crossfader`(global) `deckfx1` `deckfx2` `deckfx3` `jog`
+内置 preset：`browser`(global) `crossfader`(global) `deckfx1` `deckfx2` `deckfx3` `jog`
 `manualjump` `manualloop` `mixer` `outputfader`(global) `pad` `tempofader` `transport`。
+
+- `browser` 只允许 global；slot 为 `choose` / `open` / `exit` / `load-1` / `load-2`。
+- `manualloop` 的 `toggleloop` 用 deck 的 `loop_beats`；`double`/`halve` 改这个值，
+  正在 loop 时同时重设当前 loop。`autoloop` 的转轮做同样的事。
+- `manualjump` 的 `forward`/`backward` 用 deck 的 `jump_beats`；`double`/`halve` 改这个值，
+  `autojump` 的转轮按当前步长向前/向后跳。
+- `jump_beats` / `loop_beats` 默认都是 8，只存在于运行中的 deck 状态，不写 TOML。
 
 - `pad` 有四个 mode：`hotcue` / `loop` / `beatjump` / `stems`，以及四个 trigger 和一个 cycle。
   `stems` 的 pad1–4 切换 drums/bass/other/vocals 的 mute，pad5–8 在该 mode 下留空。
@@ -272,6 +279,7 @@ FX 链要用 `chain = "vocals"` / `chain = "deck1/vocals"`，这次不提供 ste
   - deck/unit：左一是 `Enter`
   - slot：左一是 `Learn`；learn 中变成 `Confirm`
   - `Delete`：删除选中的 unit，或把选中的 slot 从 unit 解绑；preset 自带且没有 unit 覆盖的 slot 不删
+  - `Save` 没有文件路径时打开文件选择器；底部可输入文件名，Enter 直接覆盖（测试用）
   - `new` 菜单固定两项：`clone from deck1` / `map a new one`；deck1 没有 unit 时 clone 会在
     watch dog 里提示
   - `add unit` 只列内置 preset，按 deck/global 过滤
@@ -297,8 +305,11 @@ learn 模式下，同一个 slot 在 120ms 内收到两个相差 32 的控制器
 | `vinyl [frames_per_tick]` | 是 | 唱盘：press = 贴盘/松手，turn = 转轮 |
 | `vinyl slip` | 是 | 下一次贴盘算 slip scratch |
 | `hotcue set\|trigger\|clear <1..8>` | 是 | hot cue |
-| `beatjump <±beats>` | 是 | 按整拍 seek，保持相位 |
-| `loop <beats\|num/den>` | 是 | beat loop；`1/4`、`1/2` 是分数拍 |
+| `beatjump <±beats\|forward\|backward>` | 是 | 按整拍 seek；显式数字会更新 `jump_beats` |
+| `jumpbeats double\|halve` | 是 | 改 `jump_beats`（1..64） |
+| `loop <beats\|num/den>` | 是 | beat loop；同时更新 `loop_beats` |
+| `loop toggle` | 是 | 用 `loop_beats` 开/关 loop |
+| `loopbeats double\|halve` | 是 | 改 `loop_beats`；正在 loop 时同步重设 |
 | `loop in` / `loop out` / `loop exit` / `loop cancel` | 是 | 手动 loop |
 | `loop halve` / `loop double` | 是 | 当前 loop ÷2 / ×2 |
 | `fader flow` / `deck` / `gain` / `cuesend` | 是 | 通道电平类 |

@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use hypermixx_midi::PortInfo;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 /// One row in a [`FilePicker`].
@@ -32,6 +33,9 @@ pub struct FilePicker {
     extensions: Vec<String>,
     title: String,
     error: Option<String>,
+    /// `Some` in save mode: the file name to write in the current directory. Typing edits it; Enter
+    /// overwrites that path. Open mode leaves it `None`.
+    filename: Option<String>,
 }
 
 impl FilePicker {
@@ -47,8 +51,22 @@ impl FilePicker {
                 .collect(),
             title: title.to_owned(),
             error: None,
+            filename: None,
         };
         picker.reload();
+        picker
+    }
+
+    /// A save-as picker: the same browser plus an editable file name. The default name is used when
+    /// the caller has a hint (the current map path) but no loaded file.
+    pub fn new_save(
+        start: Option<&Path>,
+        extensions: &[&str],
+        title: &str,
+        default_name: &str,
+    ) -> Self {
+        let mut picker = Self::new(start, extensions, title);
+        picker.filename = Some(default_name.to_owned());
         picker
     }
 
@@ -93,6 +111,43 @@ impl FilePicker {
     }
 
     /// Descends into the highlighted directory, or returns the highlighted file.
+    pub fn save_mode(&self) -> bool {
+        self.filename.is_some()
+    }
+
+    pub fn filename(&self) -> Option<&str> {
+        self.filename.as_deref()
+    }
+
+    pub fn push_filename_char(&mut self, ch: char) {
+        if let Some(name) = &mut self.filename {
+            name.push(ch);
+        }
+    }
+
+    pub fn pop_filename_char(&mut self) {
+        if let Some(name) = &mut self.filename {
+            name.pop();
+        }
+    }
+
+    pub fn set_filename(&mut self, name: impl Into<String>) {
+        if self.filename.is_some() {
+            self.filename = Some(name.into());
+        }
+    }
+
+    /// The path Enter writes in save mode: the typed name in the current directory.
+    pub fn save_path(&self) -> Option<PathBuf> {
+        let name = self.filename.as_deref()?.trim();
+        (!name.is_empty()).then(|| self.dir.join(name))
+    }
+
+    /// The highlighted row, cloned so the caller can decide whether it is a directory.
+    pub fn selected_entry(&self) -> Option<Entry> {
+        self.entries.get(self.selected).cloned()
+    }
+
     pub fn activate(&mut self) -> Option<PathBuf> {
         let entry = self.entries.get(self.selected)?.clone();
         if entry.is_dir {
@@ -199,6 +254,21 @@ impl PortList {
 pub fn render_file_picker(frame: &mut Frame, area: Rect, picker: &FilePicker) {
     let popup = centered(area, 72, 72);
     frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(
+            " {} — {} ",
+            picker.title(),
+            picker.dir().display()
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = if picker.save_mode() {
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(inner)
+    } else {
+        Layout::vertical([Constraint::Fill(1)]).split(inner)
+    };
     let items: Vec<ListItem> = if picker.entries().is_empty() {
         let text = picker.error().unwrap_or("(empty)");
         vec![ListItem::new(text.to_owned()).style(Style::default().fg(Color::Red))]
@@ -208,7 +278,7 @@ pub fn render_file_picker(frame: &mut Frame, area: Rect, picker: &FilePicker) {
             .iter()
             .map(|entry| {
                 let (label, style) = if entry.is_dir {
-                    (format!("{}/", entry.name), Style::default().fg(Color::Blue))
+                    (format!("{}/", entry.name), Style::default().fg(Color::Cyan))
                 } else {
                     (entry.name.clone(), Style::default())
                 };
@@ -216,13 +286,25 @@ pub fn render_file_picker(frame: &mut Frame, area: Rect, picker: &FilePicker) {
             })
             .collect()
     };
-    let title = format!(" {} — {} ", picker.title(), picker.dir().display());
     let list = List::new(items)
-        .block(Block::bordered().title(title))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▶ ");
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
     let mut state = ListState::default().with_selected(Some(picker.selected()));
-    frame.render_stateful_widget(list, popup, &mut state);
+    frame.render_stateful_widget(list, chunks[0], &mut state);
+
+    if let Some(name) = picker.filename() {
+        let line = Line::from(vec![
+            Span::styled(" name: ", Style::default().fg(Color::Cyan)),
+            Span::raw(name.to_owned()),
+            Span::styled("▌", Style::default().fg(Color::Cyan)),
+        ]);
+        frame.render_widget(Paragraph::new(line), chunks[1]);
+    }
 }
 
 /// Draws the port list as a centred popup. `title` lets the caller say what connecting means.
@@ -243,9 +325,18 @@ pub fn render_port_list(frame: &mut Frame, area: Rect, ports: &PortList, title: 
             .collect()
     };
     let list = List::new(items)
-        .block(Block::bordered().title(format!(" {title} ")))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▶ ");
+        .block(
+            Block::bordered()
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(format!(" {title} ")),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
     let mut state = ListState::default().with_selected(Some(ports.selected()));
     frame.render_stateful_widget(list, popup, &mut state);
 }
@@ -332,6 +423,21 @@ mod tests {
         let picker = FilePicker::new(Some(Path::new("midi-map.toml")), &["toml"], "map");
         assert_eq!(picker.dir(), std::env::current_dir().unwrap().as_path());
         assert!(picker.error().is_none(), "{:?}", picker.error());
+    }
+
+    #[test]
+    fn save_mode_edits_a_filename_in_the_current_directory() {
+        let dir = temp_dir("save");
+        let mut picker = FilePicker::new_save(Some(&dir), &["toml"], "save", "map.toml");
+        assert!(picker.save_mode());
+        picker.pop_filename_char();
+        picker.pop_filename_char();
+        picker.pop_filename_char();
+        picker.pop_filename_char();
+        picker.push_filename_char('x');
+        assert_eq!(picker.filename(), Some("map.x"));
+        assert_eq!(picker.save_path(), Some(dir.join("map.x")));
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

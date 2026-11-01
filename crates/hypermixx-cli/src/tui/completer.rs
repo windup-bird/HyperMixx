@@ -50,13 +50,15 @@ const VERBS: &[(&str, &str)] = &[
         "platter: touch pauses, turn scrubs, release resumes",
     ),
     ("jump", "seek to frame"),
-    ("beatjump", "seek by beats"),
+    ("beatjump", "seek by beats (or forward/backward)"),
+    ("jumpbeats", "scale the persistent jump step"),
     ("tempo", "set the tempo"),
     ("tempofader", "pitch fader position"),
     ("temporange", "fader range (0.1 = ±10%)"),
     ("keylock", "keylock profile"),
     ("key", "pitch shift (placeholder)"),
     ("loop", "loop family"),
+    ("loopbeats", "scale the persistent loop length"),
     ("sync", "beat-sync against the other deck"),
     ("nudge", "temporary rate bend"),
     (
@@ -301,12 +303,33 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
             }
         }
         "key" => Vec::new(),
+        "beatjump" => {
+            if rest.len() == 1 {
+                pairs(
+                    &[
+                        ("forward", "jump by jump_beats"),
+                        ("backward", "jump back by jump_beats"),
+                    ],
+                    partial,
+                )
+            } else {
+                Vec::new()
+            }
+        }
+        "jumpbeats" | "loopbeats" => {
+            if rest.len() == 1 {
+                pairs(&[("double", "×2"), ("halve", "÷2")], partial)
+            } else {
+                Vec::new()
+            }
+        }
         "loop" => {
             if rest.len() == 1 {
                 pairs(
                     &[
                         ("in", "arm loop in"),
                         ("out", "engage at out"),
+                        ("toggle", "toggle loop_beats"),
                         ("exit", "leave the loop"),
                         ("cancel", "drop armed in"),
                         ("halve", "÷2 the loop"),
@@ -604,7 +627,7 @@ mod tests {
     #[test]
     fn root_words() {
         let fixture = Fixture::new();
-        assert_eq!(fixture.complete("lo", 2), vec!["load", "loop"]);
+        assert_eq!(fixture.complete("lo", 2), vec!["load", "loop", "loopbeats"]);
         assert!(fixture.complete("p", 1).contains(&"play".to_owned()));
         assert!(fixture.complete("ma", 2).contains(&"master".to_owned()));
     }

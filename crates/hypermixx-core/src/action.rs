@@ -91,8 +91,22 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "beatjump",
         deck: true,
         momentary: false,
-        args: &[arg("beats", false, "a signed whole number")],
+        args: &[arg("beats|forward|backward", false, "a signed whole number or a direction")],
         doc: "seek by whole beats, keeping the phase",
+    },
+    ActionSpec {
+        name: "jumpbeats",
+        deck: true,
+        momentary: false,
+        args: &[arg("double|halve", true, "the persistent jump step")],
+        doc: "scale the manual beatjump step",
+    },
+    ActionSpec {
+        name: "loopbeats",
+        deck: true,
+        momentary: false,
+        args: &[arg("double|halve", true, "the persistent loop length")],
+        doc: "scale the `loop toggle` length",
     },
     ActionSpec {
         name: "fader flow",

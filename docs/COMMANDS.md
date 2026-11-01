@@ -129,7 +129,9 @@ folders = ["./mp3"]
                              按 tick 移动播放头，空手时是 pitch bend），`release` = 松手（恢复
                              被 touch 打断的走带）。bare = touch
 [deck] jump <frame>         按帧 seek（1 秒 = 44100 帧）
-[deck] beatjump <beats>     按整拍 seek，保持相位（i64，负数回跳）
+[deck] beatjump <beats|forward|backward>
+                            按整拍 seek；显式数字同时更新 jump_beats（缺省 8）
+[deck] jumpbeats double|halve  改 jump_beats（1..64）
 [deck] tempo <ratio>        设 tempo 绝对值（1.0 = 原速，0.25..4.0）
 [deck] tempofader <-1..1>   推子位置，tempo = 1 + pos × temporange（MIDI 走这条）
 [deck] temporange <0..1>    推子满量程（缺省 0.1 = ±10%）；只改映射，不动当前 tempo
@@ -218,7 +220,9 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 ```
 [deck] loop in                    武装 in 点（按拍量化），后台准备 looper
 [deck] loop out                   按量化后的 out 点硬切入
-[deck] loop <beats>               N 拍循环（u64 ≥ 1）；循环中 = 只调 out 到 in+N
+[deck] loop <beats>               N 拍循环；同时更新 loop_beats
+[deck] loop toggle                用 loop_beats 开/关循环
+[deck] loopbeats double|halve     改 loop_beats（1/32..64）；循环中同步重设
 [deck] loop slip in               武装 slip loop：playing 继续跑，shadow 出声
 [deck] loop slip out              切入 slip loop
 [deck] loop slip <beats>          N 拍 slip loop（playing 不丢弃）

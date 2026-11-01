@@ -445,6 +445,18 @@ impl<'a> BindingOut<'a> {
                 deck_id: deck,
                 beats,
             }),
+            Action::BeatJumpStep { forward } => self.out.push(Command::BeatJumpStep {
+                deck_id: deck,
+                direction: if forward { 1 } else { -1 },
+            }),
+            Action::ScaleJumpBeats { halve } => self.out.push(Command::ScaleJumpBeats {
+                deck_id: deck,
+                halve,
+            }),
+            Action::ScaleLoopBeats { halve } => self.out.push(Command::ScaleLoopBeats {
+                deck_id: deck,
+                halve,
+            }),
             Action::Nudge { delta, seconds } => self.out.push(Command::Nudge {
                 deck_id: deck,
                 op: NudgeOp::Start { delta, seconds },
@@ -630,6 +642,7 @@ fn loop_op(op: LoopAction) -> LoopOp {
         LoopAction::Halve => LoopOp::Edit(LoopEditOp::Halve),
         LoopAction::Double => LoopOp::Edit(LoopEditOp::Double),
         LoopAction::Beats(beats) => LoopOp::Beats(beats),
+        LoopAction::Toggle => LoopOp::Toggle,
     }
 }
 

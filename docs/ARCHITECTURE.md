@@ -371,8 +371,10 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 会话命令(target-first:行首 `deck0`/`0`/`master` 选目标,缺省用焦点 deck):
 - `load <path> [bpm]` — 后台解码;给 bpm 则建常网格跳过分析
 - `analyse` — 后台跑 `library::analyser::analyze`,完成后 `SetAnalysis`
-- `play / cue [play|back|set] / jump <frame> / beatjump <beats> / tempo / tempofader / temporange / keylock on|off / key / state / quit`
-- `loop` 族:`loop in|out|<n>|exit|cancel|halve|double|edit <len|move|in|out> <beats>|quantum <q>`
+- `play / cue [play|back|set] / jump <frame> / beatjump <beats|forward|backward> /
+  jumpbeats double|halve / tempo / tempofader / temporange / keylock on|off / key / state / quit`
+- `loop` 族:`loop in|out|toggle|<n>|exit|cancel|halve|double|edit <len|move|in|out> <beats>|quantum <q>`;
+  `loopbeats double|halve` 改持久值,`loop toggle` 用它开/关
   (手动 in/out 带量化与 looper 预喂,`<n>` 循环中 = 只调 out,halve/double = 当前长度
   ÷2/×2、域 1/32..64 拍,循环中编辑原地原子 store,exit 无缝续播越过 out)
 - `fx` 族:`fx add|remove|list|set|on|off|trigger|pad press|release`,chain 地址

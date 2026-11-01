@@ -1,4 +1,5 @@
-# Manual loop keys plus a relative knob that doubles and halves the running loop.
+# Manual loop keys plus a persistent loop length. `toggleloop` opens/closes a loop at
+# `loop_beats`; double/halve change that value (and retime a running loop).
 [[preset]]
 name = "manualloop"
 scope = "deck"
@@ -12,6 +13,9 @@ slot = "out"
 type = "Button"
 [[preset.slot]]
 slot = "exit"
+type = "Button"
+[[preset.slot]]
+slot = "toggleloop"
 type = "Button"
 [[preset.slot]]
 slot = "double"
@@ -35,12 +39,15 @@ action = "loop out"
 slot = "exit"
 action = "loop exit"
 [[preset.mode.bind]]
+slot = "toggleloop"
+action = "loop toggle"
+[[preset.mode.bind]]
 slot = "double"
-action = "loop double"
+action = "loopbeats double"
 [[preset.mode.bind]]
 slot = "halve"
-action = "loop halve"
+action = "loopbeats halve"
 [[preset.mode.bind]]
 slot = "autoloop"
-action = "loop double"
-down = "loop halve"
+action = "loopbeats double"
+down = "loopbeats halve"

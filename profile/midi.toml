@@ -26,6 +26,33 @@ midi = "note"
 channel = 15
 id = 7
 
+[[unit.control]]
+slot = "exit"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 15
+id = 13
+
+[[unit.control]]
+slot = "load-1"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 15
+id = 9
+
+[[unit.control]]
+slot = "load-2"
+type = "Button"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 15
+id = 11
+
 [[unit]]
 id = "global.crossfader"
 preset = "crossfader"

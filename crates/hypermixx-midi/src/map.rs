@@ -637,6 +637,18 @@ pub enum Action {
     BeatJump {
         beats: i64,
     },
+    /// Jump by the deck's persistent `jump_beats`.
+    BeatJumpStep {
+        forward: bool,
+    },
+    /// Double or halve the deck's persistent `jump_beats`.
+    ScaleJumpBeats {
+        halve: bool,
+    },
+    /// Double or halve the deck's persistent `loop_beats`.
+    ScaleLoopBeats {
+        halve: bool,
+    },
     Fader(FaderTarget),
     /// Latch one channel's cue send between off and full.
     ToggleCueSend,
@@ -723,6 +735,7 @@ pub enum LoopAction {
     Halve,
     Double,
     Beats(BeatLen),
+    Toggle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1432,7 +1445,7 @@ fn validate_binding(
     let actions = &binding.actions;
     let relative = control
         .endpoint_index(endpoints, EndpointRole::Main)
-        .is_some_and(|index| endpoints[index].encoding.is_relative());
+        .map(|index| endpoints[index].encoding.is_relative());
 
     if control.role != SlotRole::Action {
         return Err(format!("slot `{slot}`: a mode slot does not emit commands"));
@@ -1480,7 +1493,7 @@ fn validate_binding(
             }
         }
         SlotKind::BipolKnob => {
-            if relative {
+            if relative == Some(true) {
                 return Err(format!(
                     "slot `{slot}`: a BipolKnob needs an absolute endpoint, not a relative encoding"
                 ));
@@ -1498,10 +1511,18 @@ fn validate_binding(
             if main.is_continuous() {
                 return Ok(());
             }
-            if !relative {
+            if relative == Some(false) {
                 return Err(format!(
                     "slot `{slot}`: `{main:?}` needs a relative `encoding`"
                 ));
+            }
+            if relative.is_none() {
+                if actions.down.is_some() {
+                    return Err(format!(
+                        "slot `{slot}`: `down` is for a RelKnob; a Knob's detent is a delta"
+                    ));
+                }
+                return Ok(());
             }
             if !matches!(
                 main,
@@ -1518,10 +1539,14 @@ fn validate_binding(
             }
         }
         SlotKind::RelKnob => {
-            if !relative {
+            if relative == Some(false) {
                 return Err(format!(
                     "slot `{slot}`: a RelKnob needs a relative `encoding`"
                 ));
+            }
+            if relative.is_none() {
+                // An unbound preset slot has no encoding to check yet. The guide learns one later.
+                return Ok(());
             }
             match &actions.down {
                 Some(down) => {
@@ -1686,6 +1711,26 @@ fn parse_action(line: &str, ctx: &ActionCtx<'_>) -> Result<Action, String> {
                 frames_per_tick: step,
             })
         }
+        ["beatjump", "forward"] => {
+            deck("beatjump forward")?;
+            Ok(Action::BeatJumpStep { forward: true })
+        }
+        ["beatjump", "backward"] => {
+            deck("beatjump backward")?;
+            Ok(Action::BeatJumpStep { forward: false })
+        }
+        ["jumpbeats", what @ ("double" | "halve")] => {
+            deck("jumpbeats")?;
+            Ok(Action::ScaleJumpBeats {
+                halve: *what == "halve",
+            })
+        }
+        ["loopbeats", what @ ("double" | "halve")] => {
+            deck("loopbeats")?;
+            Ok(Action::ScaleLoopBeats {
+                halve: *what == "halve",
+            })
+        }
         ["beatjump", beats] => {
             deck("beatjump")?;
             let beats = beats
@@ -1733,7 +1778,7 @@ fn parse_action(line: &str, ctx: &ActionCtx<'_>) -> Result<Action, String> {
             let seconds = number(words.get(2).copied(), "nudge seconds")?;
             Ok(Action::Nudge { delta, seconds })
         }
-        ["loop", what @ ("in" | "out" | "exit" | "cancel" | "halve" | "double")] => {
+        ["loop", what @ ("in" | "out" | "exit" | "cancel" | "halve" | "double" | "toggle")] => {
             deck("loop")?;
             Ok(Action::Loop(match *what {
                 "in" => LoopAction::In,
@@ -1741,6 +1786,7 @@ fn parse_action(line: &str, ctx: &ActionCtx<'_>) -> Result<Action, String> {
                 "exit" => LoopAction::Exit,
                 "cancel" => LoopAction::Cancel,
                 "halve" => LoopAction::Halve,
+                "toggle" => LoopAction::Toggle,
                 _ => LoopAction::Double,
             }))
         }

@@ -1,6 +1,6 @@
 //! Deck identity and the state snapshot the producer reports.
 
-use crate::command::KeylockMode;
+use crate::command::{BeatLen, KeylockMode};
 use crate::stem::StemStatus;
 
 /// Identifies one of the pipeline's decks. Kept as a plain `u8` so commands can carry it by value
@@ -41,6 +41,10 @@ pub struct DeckState {
     pub loop_range: Option<(u64, u64)>,
     /// A manual loop-in point waiting for its out press, as the quantized `in` frame.
     pub loop_in_armed: Option<u64>,
+    /// The last explicit beatjump step, in whole beats (always positive; direction decides the sign).
+    pub jump_beats: i64,
+    /// The loop length used by `loop toggle`, and kept in step with the audible loop while one runs.
+    pub loop_beats: BeatLen,
     /// The stable tempo: what the DJ's fader, `sync tempo` and a lock's group recompute write.
     /// This is the rate that survives `sync unlock`.
     pub tempo: f32,

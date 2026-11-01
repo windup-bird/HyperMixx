@@ -309,7 +309,9 @@ pub fn help_text(decks: usize) -> String {
   [deck] hotcue set|trigger|clear <1..8>
                                one hot-cue slot (A..H); trigger keeps the transport state
   [deck] jump <frame>          seek to a frame (1 second = the engine rate in frames)
-  [deck] beatjump <beats>      seek by whole beats, keeping the phase
+  [deck] beatjump <beats|forward|backward>
+                               seek by whole beats; an explicit number updates jump_beats
+  [deck] jumpbeats double|halve  scale the persistent beatjump step (1..64)
   [deck] tempo <ratio>         set the tempo (1.0 = unity, 0.5 = half speed)
   [deck] tempofader <-1..1>    pitch fader position (tempo = 1 + position × range)
   [deck] temporange <range>    fader range (default 0.1 = ±10%)
@@ -326,7 +328,9 @@ pub fn help_text(decks: usize) -> String {
   [deck] keylock on|off        keylock profile (default: on; window in live.toml)
   [deck] key <semitones>       pitch shift (placeholder: stored, not yet audible)
   [deck] loop in | out         manual loop: arm at the beat, engage at the quantized out
-  [deck] loop <beats>          beat loop; while looping it re-times out to in+n (halve/double)
+  [deck] loop <beats>          beat loop; updates the persistent loop_beats
+  [deck] loop toggle          open/close a loop using loop_beats
+  [deck] loopbeats double|halve  scale loop_beats (1/32 .. 64); an active loop is retimed
   [deck] loop exit | cancel    leave the loop (slip resumes) / drop an armed in
   [deck] loop edit <len|move|in|out> <beats>   retime a running loop in place (no gap)
   [deck] loop halve | double     ÷2 / ×2 the running loop's length (clamped 1/32 .. 64 beats)
@@ -488,6 +492,8 @@ mod tests {
             virtual_frame: 0,
             loop_range: None,
             loop_in_armed: None,
+            jump_beats: 8,
+            loop_beats: hypermixx_core::BeatLen::beats(8),
             tempo: 1.0,
             tempo_fader: 0.0,
             tempo_range: 0.1,
