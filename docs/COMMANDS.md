@@ -454,15 +454,16 @@ live reload [<file>]  重读 live 文件（缺省 --live 的路径，否则 ./pr
 | 键 | 缺省 | 说明 |
 |---|---|---|
 | `[audio] sample_rate` | 44100 | 引擎渲染率，同时也是向每个设备请求的率；素材在装载时重采样到它 |
-| `[audio] ring_frames` | 4096 | 输出 ring 容量（帧）：更多余量 = 更多延迟（44.1k 下 ~93 ms） |
-| `[audio] prefill_frames` | 2048 | 开流前预填的静音，避免设备等第一个块；上限为 ring 的一半 |
+| `[audio] ring_frames` | 4096 | 输出 ring 容量（帧）：更多余量 = 更多延迟；随附的 `profile/live.toml` 用 1024（~23 ms） |
+| `[audio] prefill_frames` | 2048 | 开流前预填的静音，避免设备等第一个块；上限为 ring 的一半；随附 profile 用 512 |
+| `[audio] device_buffer_frames` | 后端默认 | 以 `BufferSize::Fixed(n)` 交给 cpal；ALSA 的 period 为 `n/4`。随附 profile 用 512（~2.9 ms period / ~11.6 ms buffer）；`0` 表示后端默认 |
 | `[stems] model` | htdemucs | 模型名（`stem model list` 可列） |
 | `[stems] provider` | cpu | `cpu` 或 `cuda`（`--features cuda` 构建） |
 | `[stems] overlap` / `shifts` | 0.25 / 1 | 分离窗口重叠与集成趟数。`overlap` 同时决定块长 `(1−overlap)×7.8s`；`shifts 1` 才流式，`2` 退回整轨一块 |
 | `[stems] threads` / `low_memory` | 0 / true | 分离可用的线程数（0 = 自动）与内存取舍（低内存档峰值 5.6→2.1 GB，代价 ~11% 速度） |
 | `[stems] model` | htdemucs | 模型名，或本地 `.onnx` 路径（`stem model list` 列名字） |
 
-- **采样率与 ring 需要重启**：引擎的时钟与 ring 在启动时定下（`live reload` 会明说这一点），
+- **采样率、ring 与设备 buffer 需要重启**：引擎的时钟与缓冲在启动时定下（`live reload` 会明说这一点），
   但 `[stems]` 的默认值下一次分离就生效。未知键报错（拼错的 `sample_rat` 静默按 44.1k 跑才是灾难），
   越界的值被夹到有效范围并打印一行警告。
 - **分开分离仍要求引擎率为 44.1 kHz**：内置模型是 44.1k 导出、缓存也按这个率做 key，

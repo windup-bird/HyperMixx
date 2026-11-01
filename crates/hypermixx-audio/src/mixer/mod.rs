@@ -100,9 +100,12 @@ impl Mixer {
     /// engine: losing the headphones should not stop a performance. A *device-less* machine is not a
     /// failure at all — [`Output::open`] already returns a sink for that. Two outputs that land on
     /// the same physical device are also resolved here: the server (PipeWire's graph, ALSA's dmix)
-    /// sums two streams with no limiter in sight, so the second stream is dropped and its bus
-    /// simply goes unrouted — otherwise "main + headphones on the default device" plays both buses
-    /// on top of each other and clips the DAC even though the master meter reads −1 dBFS.
+    /// sums two streams with no limiter in sight, so a second stream that would write the *same*
+    /// device channels is dropped and its bus simply goes unrouted — otherwise "main + headphones
+    /// on the default device" plays both buses on top of each other and clips the DAC even though
+    /// the master meter reads −1 dBFS. Disjoint channel pairs on one multi-channel interface are
+    /// allowed: `(0, 1)` can carry main and `(2, 3)` cue without either stream touching the other's
+    /// channels.
     pub fn new(cfg: MixerConfig, sample_rate: u32) -> Result<Self, MixerError> {
         Self::with_tuning(cfg, sample_rate, OutputTuning::default())
     }
@@ -172,9 +175,8 @@ impl Mixer {
     ///
     /// Every output is reopened, not just the unavailable ones: that is what makes a *changed*
     /// device take effect (a different card now matching the same pattern, a rate the device started
-    /// reporting). The old streams are dropped first, before the new ones open, because two streams
-    /// on one device is exactly what the duplicate rule below exists to prevent — opening the
-    /// replacement while the old one still holds the device would fail on ALSA.
+    /// reporting). The old streams are dropped first, before the new ones open: opening the
+    /// replacement while the old one still holds the same device channel pair would fail on ALSA.
     pub fn refresh_outputs(&mut self) -> Vec<OutputStatus> {
         self.outputs = Outputs::new();
         let routed = build_outputs(&self.config, self.sample_rate, self.block_frames, self.tuning);
@@ -719,28 +721,45 @@ fn build_outputs(
             }
         }
     }
-    // One stream per physical device. The first output on a device wins; later ones are downgraded
-    // to sinks and left unrouted, which is also the honest state: two *logical* outputs on one
-    // device would be summed by the server outside the limiter.
+    // One live stream per device *channel pair*. Two logical outputs on the same pair would be
+    // summed by the server outside the limiter, so the later one is downgraded to a sink. A
+    // multi-channel interface may still carry main on `(0, 1)` and cue on `(2, 3)`: the pairs are
+    // disjoint, and each stream writes silence to the channels it does not own.
     let mut duplicate = vec![false; opened.len()];
     {
-        let mut first_on_device = std::collections::HashMap::<String, usize>::new();
+        let mut streams_on_device =
+            std::collections::HashMap::<String, Vec<(usize, (u16, u16))>>::new();
         for (index, output) in opened.iter().enumerate() {
-            if let Some(device) = output.device() {
-                match first_on_device.get(device) {
-                    Some(&first) => {
-                        eprintln!(
-                            "[audio] {}: `{}` is already on {device}; dropping this stream \
-                             so the server does not sum two buses outside the limiter \
-                             (give this output its own `device`)",
-                            cfg.outputs[index].name, cfg.outputs[first].name
-                        );
-                        duplicate[index] = true;
-                    }
-                    None => {
-                        first_on_device.insert(device.to_owned(), index);
-                    }
-                }
+            // A disabled/missing/sink destination owns no channel, so it must not reserve one.
+            if !output.is_live() {
+                continue;
+            }
+            let Some(device) = output.device() else {
+                continue;
+            };
+            let pair = output.channels;
+            let clash = streams_on_device.get(device).and_then(|streams| {
+                streams
+                    .iter()
+                    .find(|(_, existing)| channel_pairs_overlap(pair, *existing))
+                    .copied()
+            });
+            if let Some((first, _)) = clash {
+                eprintln!(
+                    "[audio] {}: `{}` is already on {device} channels {}-{}; dropping this stream \
+                     so the server does not sum two buses outside the limiter \
+                     (give this output its own `device` or a disjoint `channels` pair)",
+                    cfg.outputs[index].name,
+                    cfg.outputs[first].name,
+                    pair.0,
+                    pair.1
+                );
+                duplicate[index] = true;
+            } else {
+                streams_on_device
+                    .entry(device.to_owned())
+                    .or_default()
+                    .push((index, pair));
             }
         }
     }
@@ -785,6 +804,14 @@ fn build_outputs(
         master_outputs,
         cue_outputs,
     }
+}
+
+/// Whether two `(left, right)` device mappings touch at least one of the same channels.
+///
+/// The duplicate-output rule uses this instead of the device name alone: a 4-channel interface can
+/// carry main on `(0, 1)` and cue on `(2, 3)` without the two streams overlapping.
+fn channel_pairs_overlap(a: (u16, u16), b: (u16, u16)) -> bool {
+    a.0 == b.0 || a.0 == b.1 || a.1 == b.0 || a.1 == b.1
 }
 
 fn slot_error(target: &FxTarget) -> String {
@@ -1254,6 +1281,14 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_outputs_are_judged_by_device_channels_not_just_device_name() {
+        assert!(!channel_pairs_overlap((0, 1), (2, 3)));
+        assert!(!channel_pairs_overlap((0, 2), (1, 3)), "interleaved pairs do not share a channel");
+        assert!(channel_pairs_overlap((0, 1), (1, 2)));
+        assert!(channel_pairs_overlap((2, 3), (2, 3)));
+    }
+
+    #[test]
     fn master_and_cue_routes_follow_the_configured_roles() {
         let cfg = MixerConfig {
             outputs: vec![
@@ -1266,8 +1301,8 @@ mod tests {
         let mixer = Mixer::new(cfg.clone(), SAMPLE_RATE);
         if let Ok(mixer) = mixer {
             assert_eq!(mixer.master().outputs, vec![0]);
-            // On a machine where both outputs land on the same physical device, the headphones
-            // stream is dropped (one stream per device) and the cue goes unrouted; on a headless
+            // On a machine where both outputs land on the same device and channel pair, the
+            // headphones stream is dropped and the cue goes unrouted; on a headless
             // machine both are sinks and the configured route stands.
             assert!(
                 mixer.cue().outputs == vec![1] || mixer.cue().outputs.is_empty(),

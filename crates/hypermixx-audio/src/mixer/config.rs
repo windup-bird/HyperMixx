@@ -9,7 +9,7 @@
 //! a mixer that quietly dropped the limiter the user configured is worse than one that refuses to
 //! start.
 
-use hypermixx_core::{OutputRole, Stem};
+use hypermixx_core::{OutputRole, Stem, CHANNELS};
 
 use super::channel::{CrossfaderCurve, CrossfaderPlace, CueTap, DeckSide};
 use super::output::OutputId;
@@ -280,13 +280,18 @@ impl OutputConfig {
         }
     }
 
-    /// Whether this destination may run at `rate`: the engine rate has to be one of the allowed
-    /// ones, which defaults to the engine rate alone.
-    pub fn allows_rate(&self, rate: u32) -> bool {
-        if self.sample_rates.is_empty() {
-            return rate == hypermixx_core::SAMPLE_RATE;
-        }
-        self.sample_rates.contains(&rate)
+    /// Whether this destination may run at the engine's rate. An empty `sample_rates` means
+    /// "whatever the engine runs at", which is why the engine rate is the argument: comparing
+    /// against a hard-coded 44.1 kHz disabled every output on a 48 kHz engine.
+    pub fn allows_engine_rate(&self, engine_rate: u32) -> bool {
+        self.sample_rates.is_empty() || self.sample_rates.contains(&engine_rate)
+    }
+
+    /// How many device channels this destination needs: at least stereo, and enough to hold both
+    /// configured indices. A cue on `(2, 3)` therefore opens a 4-channel stream, while `(0, 1)`
+    /// still opens stereo on a stereo-only device.
+    pub fn wanted_device_channels(&self) -> usize {
+        (self.channels.0.max(self.channels.1) as usize + 1).max(CHANNELS)
     }
 
     /// The mapping to use against a device with `device_channels` outputs: the configured pair if it
@@ -717,5 +722,21 @@ side = \"spinward\"").unwrap_err();
         assert_eq!(cfg.channel_pair(2), (0, 1), "a 2ch device clamps rather than indexing out");
         assert_eq!(cfg.channel_pair(8), (4, 5));
         assert_eq!(OutputConfig::master(0, "m").channel_pair(1), (0, 1), "1ch writes the sum to ch0");
+    }
+
+    #[test]
+    fn an_output_opens_enough_device_channels_for_its_pair() {
+        assert_eq!(OutputConfig::master(0, "stereo").wanted_device_channels(), 2);
+        let cue = OutputConfig {
+            channels: (2, 3),
+            ..OutputConfig::cue(1, "cue")
+        };
+        assert_eq!(cue.wanted_device_channels(), 4);
+        // Reversed or high indices still ask for the channel they name, not one past it.
+        let high = OutputConfig {
+            channels: (5, 4),
+            ..OutputConfig::master(0, "high")
+        };
+        assert_eq!(high.wanted_device_channels(), 6);
     }
 }

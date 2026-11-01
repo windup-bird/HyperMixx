@@ -48,8 +48,9 @@ limiter = true                # the safety stage; strongly recommended
 # cut_width = 0.05
 
 # One [[output]] per destination. `name` and `role` are required; the rest has defaults.
-# `device` omitted = the system default device. Two outputs landing on one physical device: the
-# second is dropped (the server would sum both buses outside the limiter) — give it its own device.
+# `device` omitted = the system default device. Two outputs landing on one physical device with
+# overlapping `channels` are summed by the server outside the limiter, so the later stream is
+# dropped. Disjoint pairs are allowed on a multi-channel interface: main on [0, 1] and cue on [2, 3].
 [[output]]
 name = "main"
 role = "master"               # master | cue
@@ -62,3 +63,4 @@ role = "master"               # master | cue
 name = "headphones"
 role = "cue"
 # device = "Headphones"
+# channels = [2, 3]           # e.g. a 4-channel interface, disjoint from main

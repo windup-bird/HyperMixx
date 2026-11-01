@@ -22,6 +22,11 @@ pub const DEFAULT_PREFILL_FRAMES: usize = 2048;
 pub const MIN_RING_FRAMES: usize = 512;
 /// Largest ring: past this, the latency a user hears is worse than any dropout it prevents.
 pub const MAX_RING_FRAMES: usize = 65_536;
+/// Smallest device buffer worth asking cpal for. Below this, a period is so short that ordinary
+/// scheduler jitter turns into an xrun.
+pub const MIN_DEVICE_BUFFER_FRAMES: usize = 64;
+/// Largest device buffer: the same ceiling as the ring, for the same reason.
+pub const MAX_DEVICE_BUFFER_FRAMES: usize = 65_536;
 
 /// Keylock STFT window defaults: 2048/512 at 44.1 kHz is ~46 ms of read-ahead.
 pub const DEFAULT_KEYLOCK_BLOCK: usize = 2048;
@@ -51,6 +56,12 @@ pub struct AudioSettings {
     pub ring_frames: usize,
     /// Frames of silence written into each ring before its stream starts.
     pub prefill_frames: usize,
+    /// Device buffer in frames, handed to cpal as `BufferSize::Fixed`. `None` keeps the backend
+    /// default (on ALSA: 25 ms period / 100 ms buffer), which is the wrong default for a DJ tool
+    /// but the only one guaranteed to open on every device. `Some(n)` asks for an n-frame buffer;
+    /// ALSA uses `n / 4` as its period, so `Some(512)` is a ~2.9 ms period / ~11.6 ms buffer at
+    /// 44.1 kHz.
+    pub device_buffer_frames: Option<usize>,
 }
 
 impl Default for AudioSettings {
@@ -59,6 +70,7 @@ impl Default for AudioSettings {
             sample_rate: DEFAULT_SAMPLE_RATE,
             ring_frames: DEFAULT_RING_FRAMES,
             prefill_frames: DEFAULT_PREFILL_FRAMES,
+            device_buffer_frames: None,
         }
     }
 }
@@ -151,6 +163,11 @@ impl LiveConfig {
         }
         audio.ring_frames = audio.ring_frames.clamp(MIN_RING_FRAMES, MAX_RING_FRAMES);
         audio.prefill_frames = audio.prefill_frames.min(audio.ring_frames / 2);
+        // `0` is the file's spelling of "backend default", not a request for a zero-frame buffer.
+        audio.device_buffer_frames = audio
+            .device_buffer_frames
+            .filter(|frames| *frames > 0)
+            .map(|frames| frames.clamp(MIN_DEVICE_BUFFER_FRAMES, MAX_DEVICE_BUFFER_FRAMES));
         let keylock = &mut self.keylock;
         // Signalsmith's FFT needs a power-of-two block, and the hop cannot exceed half of it.
         keylock.block = keylock
@@ -186,8 +203,14 @@ impl LiveConfig {
     pub fn report(&self) -> Vec<String> {
         vec![
             format!(
-                "audio  sample_rate {}Hz  ring {} frames  prefill {} frames",
-                self.audio.sample_rate, self.audio.ring_frames, self.audio.prefill_frames
+                "audio  sample_rate {}Hz  ring {} frames  prefill {} frames  device buffer {}",
+                self.audio.sample_rate,
+                self.audio.ring_frames,
+                self.audio.prefill_frames,
+                match self.audio.device_buffer_frames {
+                    Some(frames) => format!("{frames} frames"),
+                    None => "backend default".to_owned(),
+                }
             ),
             format!(
                 "keylock block {} interval {} frames (~{:.0} ms read-ahead at {}Hz)",
@@ -232,11 +255,13 @@ mod tests {
         let live = LiveConfig::default();
         assert_eq!(live.audio.sample_rate, DEFAULT_SAMPLE_RATE);
         assert_eq!(live.audio.ring_frames, DEFAULT_RING_FRAMES);
+        assert_eq!(live.audio.device_buffer_frames, None, "the backend default is the safe default");
         assert_eq!(live.keylock, KeylockSettings::default());
         assert_eq!(live.stems.provider, "cpu", "a machine without a GPU never needs a flag");
 
         assert_eq!(live.report().len(), 3);
         assert!(live.report()[0].contains("44100Hz"));
+        assert!(live.report()[0].contains("device buffer backend default"));
         assert!(live.report()[1].contains("keylock block 2048 interval 512"));
     }
 
@@ -247,6 +272,7 @@ mod tests {
                 sample_rate: 7,
                 ring_frames: 99,
                 prefill_frames: 999_999,
+                device_buffer_frames: Some(1),
             },
             keylock: KeylockSettings {
                 block: 3_000,
@@ -263,6 +289,11 @@ mod tests {
         assert_eq!(live.audio.sample_rate, DEFAULT_SAMPLE_RATE, "an impossible rate is replaced");
         assert_eq!(live.audio.ring_frames, MIN_RING_FRAMES, "clamped up");
         assert!(live.audio.prefill_frames <= live.audio.ring_frames / 2, "prefill cannot fill the ring");
+        assert_eq!(
+            live.audio.device_buffer_frames,
+            Some(MIN_DEVICE_BUFFER_FRAMES),
+            "a one-frame device buffer is clamped up"
+        );
         assert_eq!(live.stems.overlap, 0.5, "clamped to the useful range");
         assert_eq!(live.stems.shifts, 2, "two passes is the most worth offering");
         assert!(live.stems.low_memory, "a small device is the default assumption");
@@ -300,6 +331,7 @@ mod tests {
         let live = LiveConfig {
             audio: AudioSettings {
                 ring_frames: usize::MAX,
+                device_buffer_frames: Some(usize::MAX),
                 ..Default::default()
             },
             stems: StemSettings {
@@ -310,6 +342,21 @@ mod tests {
         }
         .sanitised();
         assert_eq!(live.audio.ring_frames, MAX_RING_FRAMES);
+        assert_eq!(live.audio.device_buffer_frames, Some(MAX_DEVICE_BUFFER_FRAMES));
         assert_eq!(live.stems.overlap, StemSettings::default().overlap);
+        // Explicit zero means "backend default", not an impossible zero-length buffer.
+        assert_eq!(
+            LiveConfig {
+                audio: AudioSettings {
+                    device_buffer_frames: Some(0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+            .sanitised()
+            .audio
+            .device_buffer_frames,
+            None
+        );
     }
 }

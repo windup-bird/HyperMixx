@@ -4,7 +4,7 @@ use rtrb::{Consumer, Producer};
 
 use crate::CHANNELS;
 
-/// SPSC ring buffer sized in frames (one frame = [`CHANNELS`] samples).
+/// SPSC ring buffer sized in frames of `channels` interleaved samples.
 ///
 /// rtrb handles are single-owner (not `Clone`), so the two ends are handed to their threads with
 /// [`split`](Self::split) rather than cloned — that keeps the audio callback lock-free.
@@ -14,8 +14,19 @@ pub struct AudioRingBuffer {
 }
 
 impl AudioRingBuffer {
+    /// A stereo ring: one frame is [`CHANNELS`] samples.
     pub fn new(capacity_frames: usize) -> Self {
-        let (producer, consumer) = rtrb::RingBuffer::new(capacity_frames * CHANNELS);
+        Self::with_channels(capacity_frames, CHANNELS)
+    }
+
+    /// A ring whose frames have `channels` interleaved samples.
+    ///
+    /// The output path writes the device's channel layout (2 on a stereo card, 4 when a cue sits on
+    /// `(2, 3)`), so the ring has to be allocated in that shape. Passing a stereo-shaped ring to a
+    /// 4-channel output silently halves its frame capacity.
+    pub fn with_channels(capacity_frames: usize, channels: usize) -> Self {
+        let channels = channels.max(1);
+        let (producer, consumer) = rtrb::RingBuffer::new(capacity_frames * channels);
         Self { producer, consumer }
     }
 
@@ -80,6 +91,14 @@ mod tests {
         let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         assert_eq!(ring.push(&data), 2);
         assert_eq!(ring.available(), 2);
+    }
+
+    #[test]
+    fn a_multichannel_ring_is_sized_in_its_own_frames() {
+        // Four frames of four interleaved samples each: 16 slots, not the stereo ring's 8.
+        let mut ring = AudioRingBuffer::with_channels(4, 4);
+        assert_eq!(ring.push(&[0.0; 20]), 16);
+        assert_eq!(ring.available(), 16);
     }
 
     #[test]

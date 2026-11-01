@@ -159,6 +159,7 @@ fn main() {
         hypermixx_audio::AudioTuning {
             ring_frames: live.audio.ring_frames,
             prefill_frames: live.audio.prefill_frames,
+            device_buffer_frames: live.audio.device_buffer_frames,
             keylock: live.keylock,
         },
     ) {

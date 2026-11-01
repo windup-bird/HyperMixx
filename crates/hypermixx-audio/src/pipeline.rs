@@ -38,6 +38,8 @@ pub struct AudioTuning {
     pub ring_frames: usize,
     /// Frames of silence pushed before each stream starts.
     pub prefill_frames: usize,
+    /// Device buffer in frames, or `None` for the backend's own default.
+    pub device_buffer_frames: Option<usize>,
     /// Keylock STFT window, read from `live.toml` at startup.
     pub keylock: KeylockSettings,
 }
@@ -47,6 +49,7 @@ impl From<AudioTuning> for crate::mixer::OutputTuning {
         Self {
             ring_frames: tuning.ring_frames,
             prefill_frames: tuning.prefill_frames,
+            device_buffer_frames: tuning.device_buffer_frames,
         }
     }
 }

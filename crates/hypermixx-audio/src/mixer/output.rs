@@ -32,6 +32,10 @@ pub struct OutputTuning {
     /// Frames of silence pushed before the stream starts, so the device never waits on the first
     /// block. Capped at half the ring.
     pub prefill_frames: usize,
+    /// Device buffer in frames, or `None` for whatever the backend chooses. On ALSA the backend
+    /// default is a 25 ms period and a 100 ms buffer; `Some(512)` asks for a 128-frame period
+    /// (~2.9 ms) and a 512-frame buffer (~11.6 ms).
+    pub device_buffer_frames: Option<usize>,
 }
 
 impl Default for OutputTuning {
@@ -39,6 +43,7 @@ impl Default for OutputTuning {
         Self {
             ring_frames: OUTPUT_RING_CAPACITY,
             prefill_frames: PREFILL_FRAMES,
+            device_buffer_frames: None,
         }
     }
 }
@@ -139,7 +144,7 @@ impl Output {
         let host = cpal::default_host();
         // The config's own rate allow-list is checked first: it is a mistake in the file, and it is
         // worth reporting as such whether or not a device happens to be plugged in.
-        if !cfg.allows_rate(sample_rate) {
+        if !cfg.allows_engine_rate(sample_rate) {
             eprintln!(
                 "[audio] {}: the engine runs at {sample_rate}Hz, which its `sample_rates` does not \
                  allow ({}); disabling it",
@@ -172,7 +177,8 @@ impl Output {
         // The device has to offer the engine's rate. Refused rather than papered over: a device
         // pinned to 48k while the engine produces 44.1k plays every track 8.8% slow, which is worse
         // than silence because it sounds intentional.
-        let Some(config) = preferred_config(&found, sample_rate) else {
+        let Some(config) = preferred_config(&found, sample_rate, cfg.wanted_device_channels())
+        else {
             let offered = describe_device_rates(&found);
             eprintln!(
                 "[audio] {}: {device_name} does not accept {sample_rate}Hz (offers {offered}); \
@@ -206,19 +212,28 @@ impl Output {
         };
 
         let ring_frames = tuning.ring_frames.max(block_frames);
-        let (mut producer, consumer) = AudioRingBuffer::new(ring_frames * CHANNELS).split();
+        let ring_channels = output.device_channels.max(1);
+        let (mut producer, consumer) =
+            AudioRingBuffer::with_channels(ring_frames, ring_channels).split();
         // Prefill: the callback starts draining the instant the stream is built. Without a
         // cushion the first seconds are a race between the producer's first blocks and the
         // device, and every lost race is a silence gap the listener hears as a click. Half a
         // ring of silence buys the producer a standing head start; the mix simply starts
         // ~46 ms later, which nothing can hear.
-        let prefill = (tuning.prefill_frames * CHANNELS).min(ring_frames * CHANNELS / 2);
+        let prefill = (tuning.prefill_frames * ring_channels)
+            .min(ring_frames * ring_channels / 2);
         if prefill > 0 {
             let silence = vec![0.0f32; prefill];
             push_samples(&mut producer, &silence);
         }
         output.producer = Some(producer);
-        let stream = build_stream(&found, &config, consumer, &cfg.name)?;
+        let stream = build_stream(
+            &found,
+            &config,
+            consumer,
+            &cfg.name,
+            tuning.device_buffer_frames,
+        )?;
         output._stream = Some(stream);
         Ok(output)
     }
@@ -309,7 +324,7 @@ impl Output {
         self.producer.as_ref().map(Producer::slots)
     }
 
-    /// Frames of room in this output, assuming a stereo-shaped ring. `None` for a sink.
+    /// Frames of room in this output, in the device's channel layout. `None` for a sink.
     pub fn free_frames(&self) -> Option<usize> {
         self.free_samples().map(|free| free / self.device_channels.max(1))
     }
@@ -420,7 +435,7 @@ fn device_name(device: &cpal::Device) -> String {
 /// `[44100]` / `[44100, 48000]` / `any` — for a warning that has to be readable.
 fn describe_rates(rates: &[u32]) -> String {
     if rates.is_empty() {
-        return format!("defaults to {}Hz", hypermixx_core::SAMPLE_RATE);
+        return "defaults to the engine's rate".to_owned();
     }
     rates
         .iter()
@@ -449,23 +464,46 @@ fn describe_device_rates(device: &cpal::Device) -> String {
         .join("..")
 }
 
-/// Asks the device for `sample_rate` stereo, preferring native f32.
+/// Asks the device for `sample_rate` with at least `wanted_channels`, preferring native f32 and
+/// the smallest channel count that can hold the configured mapping.
 ///
 /// Unlike the old version this does **not** fall back to the device's default config: a device that
 /// cannot run at the engine's rate is refused (and the output disabled), because a silent fallback
 /// to another rate plays everything at the wrong speed.
-fn preferred_config(device: &cpal::Device, sample_rate: u32) -> Option<cpal::SupportedStreamConfig> {
+fn preferred_config(
+    device: &cpal::Device,
+    sample_rate: u32,
+    wanted_channels: usize,
+) -> Option<cpal::SupportedStreamConfig> {
     let ranges = device.supported_output_configs().ok()?;
-    let wanted = CHANNELS as u16;
+    let wanted = wanted_channels.max(CHANNELS) as u16;
     ranges
         .filter(|range| {
-            range.channels() == wanted
+            range.channels() >= wanted
                 && range.min_sample_rate().0 <= sample_rate
                 && range.max_sample_rate().0 >= sample_rate
         })
-        // A native f32 path avoids a per-sample quantisation step in the callback.
-        .max_by_key(|range| range.sample_format() == cpal::SampleFormat::F32)
+        // Smallest channel count first (a 4-channel cue should not open 8 channels just because the
+        // card offers them), then native f32, which avoids a per-sample quantisation step.
+        .min_by_key(|range| {
+            (
+                range.channels(),
+                u8::from(range.sample_format() != cpal::SampleFormat::F32),
+            )
+        })
         .map(|range| range.with_sample_rate(cpal::SampleRate(sample_rate)))
+}
+
+/// Clamps a requested device buffer to the range the backend advertises, so a value that is too
+/// small or too large becomes the nearest legal one instead of a stream-build failure.
+fn clamp_device_buffer(requested: usize, supported: &cpal::SupportedBufferSize) -> u32 {
+    let frames = match supported {
+        cpal::SupportedBufferSize::Range { min, max } => {
+            requested.clamp(*min as usize, *max as usize)
+        }
+        cpal::SupportedBufferSize::Unknown => requested,
+    };
+    frames.min(u32::MAX as usize) as u32
 }
 
 /// Builds and starts the stream. The consumer is moved into the callback, which is why the ring's two
@@ -475,8 +513,14 @@ fn build_stream(
     config: &cpal::SupportedStreamConfig,
     mut consumer: Consumer<f32>,
     name: &str,
+    device_buffer_frames: Option<usize>,
 ) -> Result<cpal::Stream, OutputError> {
-    let stream_config = config.config();
+    let mut stream_config = config.config();
+    if let Some(requested) = device_buffer_frames {
+        let frames = clamp_device_buffer(requested, config.buffer_size());
+        stream_config.buffer_size = cpal::BufferSize::Fixed(frames);
+        eprintln!("[audio] {name}: device buffer {frames} frames (fixed)");
+    }
     let name = name.to_owned();
     let on_error = move |err: cpal::StreamError| eprintln!("[audio] {name}: stream error: {err}");
     let built = match config.sample_format() {
@@ -715,8 +759,8 @@ mod tests {
         };
         let out = Output::open(&wrong_rate, SAMPLE_RATE, BLOCK_SIZE).expect("builds");
         assert_eq!(out.state(), OutputState::Disabled, "a rate mismatch disables the output");
-        assert!(wrong_rate.allows_rate(48_000));
-        assert!(!wrong_rate.allows_rate(SAMPLE_RATE));
+        assert!(wrong_rate.allows_engine_rate(48_000));
+        assert!(!wrong_rate.allows_engine_rate(SAMPLE_RATE));
     }
 
     /// The engine rate is allowed by default; anything else is not.
@@ -724,8 +768,21 @@ mod tests {
     fn the_default_rate_allow_list_is_the_engine_rate() {
         let cfg = OutputConfig::master(0, "x");
         assert!(cfg.sample_rates.is_empty(), "the default is empty, not a literal 44.1k");
-        assert!(cfg.allows_rate(SAMPLE_RATE));
-        assert!(!cfg.allows_rate(48_000));
+        assert!(cfg.allows_engine_rate(SAMPLE_RATE));
+        assert!(cfg.allows_engine_rate(48_000), "an empty list follows the engine's rate");
+    }
+
+    #[test]
+    fn a_requested_device_buffer_is_clamped_to_the_backend_range() {
+        let range = cpal::SupportedBufferSize::Range { min: 128, max: 2048 };
+        assert_eq!(clamp_device_buffer(512, &range), 512);
+        assert_eq!(clamp_device_buffer(64, &range), 128, "too small is raised to the minimum");
+        assert_eq!(clamp_device_buffer(9999, &range), 2048, "too large is lowered to the maximum");
+        assert_eq!(
+            clamp_device_buffer(512, &cpal::SupportedBufferSize::Unknown),
+            512,
+            "an unknown range accepts the request"
+        );
     }
 
     /// The device may be absent (CI) or present (a real card). Either way `open` must not panic, and

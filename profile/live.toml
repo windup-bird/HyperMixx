@@ -15,11 +15,19 @@
 # take it leaves its output `disabled` (see the `output` command) instead of playing at the wrong
 # speed.
 sample_rate = 44100
-# Output ring capacity in frames: more slack for a slow device, more latency (~93 ms at 44.1 kHz).
-# ring_frames = 4096
+# Output ring capacity in frames: more slack for a slow device, more latency.
+# 1024 frames is ~23 ms at 44.1 kHz. For a more conservative setup use 2048; for an aggressive
+# one, 512 works but leaves less room for scheduler jitter.
+ring_frames = 1024
 # Frames of silence pushed into each ring before its stream starts, so the device never waits on the
-# producer's first block. Capped at half the ring.
-# prefill_frames = 2048
+# producer's first block. Capped at half the ring. 512 is one device buffer below; set 0 only if you
+# prefer the shortest possible startup and accept a gap on `output refresh` during playback.
+prefill_frames = 512
+# Device buffer handed to cpal as BufferSize::Fixed. On ALSA the period is n/4, so 512 means a
+# 128-frame period (~2.9 ms) and a 512-frame buffer (~11.6 ms). Omit (or 0) for the backend default,
+# which on ALSA is a 25 ms period / 100 ms buffer. Aggressive: 256 (64-frame period, ~5.8 ms buffer),
+# but expect xruns on ordinary desktop scheduling.
+device_buffer_frames = 512
 
 [keylock]
 # The STFT window used by the keylock engine. Both values are in frames and are rounded to powers of
