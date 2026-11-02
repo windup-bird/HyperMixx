@@ -199,8 +199,8 @@ browser | command
 
 ```
 > controller   Numark Party Mix III · profile/controller.toml
-  mixer        profile/mixer.toml
   output       2 output(s)
+  mixer        profile/mixer.toml
   live         profile/live.toml
   preference   profile/preference.toml
 ```
@@ -216,6 +216,7 @@ browser | command
   `… › channels`（channel pair），选定即写该文件的 `device`/`channels` 并立即重载（不必重启）。
   `●` 当前绑定、`◆` 本 controller 的声卡、`✓/✗ rate` 采样率。立体声设备没有 channel 这一层；
   ALSA 的 `sysdefault`/`default`/`pipewire` 这类虚拟 PCM 会谎报 32 通道，列表只给前四对（0,1 / 2,3 / 4,5 / 6,7）。
+- `output` 排在 `mixer` 前面：设备绑定是演出前要动的，拓扑文件是设定。
 - `live`、`preference`：选新的 `.toml`；`live` 立即按 `live reload` 重新读取（引擎率/ring 需重启），
   `preference` 立即换主题。
 - 其余按键：`↑↓` 移动、`r` 重读当前拓扑文件（设备列表只在启动前探测一次，避免 ALSA 警告糊到界面上）。

@@ -1,11 +1,15 @@
 # Hypermixx mixer topology. `--print-config` prints this; edit and pass back via --config (or edit
 # this file in place — it is what a run without `--config` reads).
 #
-# Signal path, per channel:
+# Signal path, per channel. There is ONE channel fader and ONE channel chain; `fader` says on which
+# side of the chain the fader sits:
 #
 #   per stream:  source fader (stem mute/solo gate) → flow_fx → flow_fader ─┐
-#                                                                         Σ → deck_fx → deck_fader → gain
-#   the shared crossfader's gain sits at one of those three faders ([crossfader] place).
+#   fader = "pre_fx":   Σ → [cue tap] → fader → chain → gain                 │
+#   fader = "post_fx":  Σ → chain → [cue tap] → fader → gain                 │
+#
+# The cue send always taps the signal immediately before the fader, so pulling it down never
+# silences the headphones — that is what cueing a track in means.
 #
 # Every fader is attenuation only: the top of its travel is 0 dB. Headroom is `gain` (up to +6 dB),
 # which is a setting rather than a performance control.
@@ -13,21 +17,21 @@
 # One [[channel]] per deck. Omitted keys take the defaults shown in comments.
 [[channel]]
 side = "left"                 # left | right | center
-# flow_fader = 0.0            # per-stream level; top of travel = 0 dB
-# deck_fader = 0.0            # deck level; top of travel = 0 dB
+fader = "post_fx"             # pre_fx | post_fx — where the one channel fader acts, relative to `chain`
+chain = ["eq", "filter"]      # the channel's inserts (durable tone controls); names from `fx help`
+# deck_fader = 0.0            # the channel fader's starting level; top of travel = 0 dB
 # gain = 0.0                  # channel trim: 0 = 0 dB, +1 = +6 dB, -1 = silence
-cue_send = 1.0                # linear 0..1 into the cue bus
-cue_tap = "post_deck_fader"   # post_source_fader | post_flow_fader | post_deck_fader
-deck_fx = ["eq", "filter"]    # per-deck inserts; names from `fx help`
+cue_send = 1.0                # linear 0..1 into the cue bus (always pre-fader)
 # flow_fx = []                # per-stream inserts: ONE CHAIN PER STREAM (4 stems = 4 chains)
+# flow_fader = 0.0            # per-stream (stem) level; top of travel = 0 dB
 # [channel.stem_fx]           # per-stem overrides of flow_fx, for the stems that differ
 # vocals = ["filter"]         # (stem names: drums | bass | other | vocals)
 
 [[channel]]
 side = "right"
+fader = "post_fx"
+chain = ["eq", "filter"]
 cue_send = 1.0
-cue_tap = "post_deck_fader"
-deck_fx = ["eq", "filter"]
 
 # The shared crossfader: one physical control, applied on each channel by its `side`.
 [crossfader]

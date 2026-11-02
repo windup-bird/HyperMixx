@@ -2,8 +2,8 @@
 //!
 //! ```
 //! > controller   Numark Party Mix III · profile/controller.toml
-//!   mixer        profile/mixer.toml
 //!   output       2 output(s)
+//!   mixer        profile/mixer.toml
 //!   live         profile/live.toml
 //!   preference   profile/preference.toml
 //! ```
@@ -82,8 +82,8 @@ enum Item {
 
 const ITEMS: [Item; 5] = [
     Item::Controller,
-    Item::Mixer,
     Item::Output,
+    Item::Mixer,
     Item::Live,
     Item::Preference,
 ];
@@ -577,8 +577,8 @@ impl SettingsScreen {
                     _ => "<not connected>".to_owned(),
                 },
             ),
-            Row::new("mixer").note(self.mixer_path.clone()),
             Row::new("output").note(format!("{} output(s)", self.outputs.len())),
+            Row::new("mixer").note(self.mixer_path.clone()),
             Row::new("live").note(note(&self.context.live)),
             Row::new("preference").note(note(&self.context.preference)),
         ];
@@ -819,21 +819,24 @@ mod tests {
     }
 
     #[test]
-    fn the_root_list_is_controller_mixer_output_live_preference() {
+    fn the_root_list_is_controller_output_mixer_live_preference() {
         let screen = screen();
         let rows = screen.rows();
         let labels: Vec<String> = rows.iter().map(|(label, _)| label.clone()).collect();
         assert_eq!(
             labels,
-            vec!["controller", "mixer", "output", "live", "preference"]
+            vec!["controller", "output", "mixer", "live", "preference"]
         );
         assert_eq!(screen.title(), "settings");
-        assert!(
-            rows[1].1.ends_with("mixer.toml"),
-            "the mixer row names the topology file: {:?}",
-            rows[1]
+        assert_eq!(
+            rows[1].1, "2 output(s)",
+            "the output row counts bindings and comes first"
         );
-        assert_eq!(rows[2].1, "2 output(s)", "the output row counts bindings");
+        assert!(
+            rows[2].1.ends_with("mixer.toml"),
+            "the mixer row names the topology file: {:?}",
+            rows[2]
+        );
     }
 
     #[test]
@@ -932,8 +935,8 @@ mod tests {
         assert_eq!(screen.mixer_path, other);
         assert_eq!(screen.depth(), 0);
         let rows = screen.rows();
-        assert_eq!(rows[1].1, other, "the mixer row names the new file");
-        assert_eq!(rows[2].1, "1 output(s)", "the output rows are re-read");
+        assert_eq!(rows[1].1, "1 output(s)", "the output rows are re-read");
+        assert_eq!(rows[2].1, other, "the mixer row names the new file");
     }
 
     #[test]

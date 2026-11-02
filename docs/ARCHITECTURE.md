@@ -209,23 +209,28 @@ mixer 只负责把 deck 变成采样;谁跟谁、共享 BPM 是什么,是**关�
 (逐 stream 循环:一个 deck 有 1 条,装了 stems 就有 4 条)
     deck.render_stream(i)
     → source_fader[i] 逐流**门**:stem 的 mute/solo 决策,恰好 1.0 或 0.0(GATE_TAU 平滑)
-    → [cue tap]       PostSourceFader = 门之后、插入之前(听得到"裸声")
     → flow_fx[i]      逐流插入(换流即重置滤波记忆;**每 stream 一条,状态独立**)
-    → flow_fader[i]   逐流电平(只衰减,行程顶端 0 dB)
+    → flow_fader[i]   逐流电平(只衰减,行程顶端 0 dB;这是**每 stem 的**电平)
     → Σ 到 channel bus
-  → [cue tap]         PostFlowFader  = Σ 各路 flow_fader 之后
-  → deck_fx           逐 deck 音色(跨跳转持久,整 deck 共用)
-  → deck_fader        逐 deck 电平(只衰减)
-  → [cue tap]         PostDeckFader
+  → [cue tap]         恒在 channel fader **之前**
+  → fader             通道**唯一**的一颗 fader;`[channel] fader = "pre_fx"` 放在这里
+  → chain             通道插入(跨跳转持久,整 deck 共用;`[channel] chain = [...]`)
+  → [cue tap]         `fader = "post_fx"` 时在这里
+  → fader
   → gain              channel trim:0 dB .. +6 dB(唯一能 boost 的一级)
   → 求和
 ```
 
-共享 crossfader 的按侧增益坐在三颗 fader 之一的位置(`[crossfader] place = source|flow|deck`,
-缺省 `deck` = 历史位置),**恒在与其同名 cue tap 之后**,所以分叉点与它是同一点时 cue 不受
+**一通道一颗 fader,位置是配置**:`pre_fx` = 历史上的 flow fader 位置(先衰减再进音色),
+`post_fx` = 历史上的 deck fader 位置(缺省,音色随电平一起衰减)。**precue send 永远抽在
+fader 之前**,所以把推子拉到底只静音房间、不静音耳机——这就是 cue 的意义;也因此
+`cue_tap` 不再是配置项(它由 fader 位置唯一确定),TOML 只配一次 channel。
+
+共享 crossfader 的按侧增益坐在三个位置之一(`[crossfader] place = source|flow|deck`,
+缺省 `deck` = 历史位置),**恒在该位置的 cue tap 之后**,所以分叉点与它是同一点时 cue 不受
 crossfader 影响;分叉在它之后则跟着它(把 crossfader 放早的代价,文档写明)。
 
-单 stream、且 crossfader 在 `deck` 位置时,上面这段与历史路径**逐位相同**。
+单 stream、`post_fx`、crossfader 在 `deck` 位置时,上面这段与历史路径**逐位相同**。
 
 `MasterBus::render`:`sum → master_fx → master_fader → limiter(安全级)`。
 `CueBus`:`sum → cue_fader → blend_with(master.sum)` —— 耳机是 cue 与 master 的混合,
@@ -235,15 +240,16 @@ crossfader 影响;分叉在它之后则跟着它(把 crossfader 放早的代价,
 
 1. limiter 是 `MasterBus` 的字段而非槽位——配置忘写 `"limiter"` 也不可能把全尺度音频
    送到 DAC(且不走链跳过优化,engaged 即执行)
-2. cue tap 的三个位置是枚举,不是自由路由
+2. cue tap 是"fader 前"这一个点,由 fader 位置决定,不是自由路由
 3. **fader 只衰减**:`fader_amp` 的上半段恒为 1.0;headroom 只在 `gain`(`trim_amp`,+6 dB 封顶)
 4. 阶段顺序本身
 
-其余由 `MixerConfig` 纯数据描述(`config.rs`):每通道的 flow_fx/**stem_fx**/deck_fx 名单
-(`Vec<String>`,经 `FxKind` 注册表解析,未知名 → `MixerError::UnknownFx` 构造失败),
+其余由 `MixerConfig` 纯数据描述(`config.rs`):每通道的 flow_fx/**stem_fx**/`chain` 名单
+(`Vec<String>`,经 `FxKind` 注册表解析,未知名 → `MixerError::UnknownFx` 构造失败;
+`chain` 是通道共用那条链,旧名 `deck_fx` 仍接受),
 `[crossfader]`(place/curve/cut_width/start)、`[cue]`(fader/blend/curve/cut_width)、
-以及 fader 起始位、cue_send/cue_tap/side、master fx/limiter/fader、输出列表
-(name/role(`master`|`cue`)/channels/gain)。
+以及 fader 起始位与位置(`fader = pre_fx|post_fx`)、cue_send/side、master fx/limiter/fader、
+输出列表(name/role(`master`|`cue`)/channels/gain)。
 `flow_fx` 是**模板**:每条 stream 各建一条独立的链(4 stems = 4 条,各自状态),`[channel.stem_fx]`
 按 stem 覆写模板 —— 所以"只给人声加 filter"可以写在配置里,不必只靠运行时命令。
 
@@ -273,7 +279,7 @@ crossfader 影响;分叉在它之后则跟着它(把 crossfader 放早的代价,
   graph 里把两条流直接相加——main 有 limiter(≤−1 dBFS)但 cue 总线没有(cue_send 1.0
   时电平可达 2.0),DAC 实收 ~2.9 → 硬削波。Mixer 检测设备名重复,第二条降级 sink 不路由
   (设备选择 `[[output]] device` 字段是后续工作)
-- `simple_dj()` — 参考拓扑:2 通道(各 eq+filter,cue_send 1.0,tap PostDeckFader)+
+- `simple_dj()` — 参考拓扑:2 通道(各 `chain = [eq, filter]`,`fader = post_fx`,cue_send 1.0)+
   master limiter + master/cue 输出;`reference_toml()` 是它的 TOML 文本 —— 直接
   `include_str!("profile/mixer.toml")`,所以文件、`--print-config` 与内置构造只有一个真源
   (测试钉死解析回 `simple_dj()`)
@@ -503,7 +509,7 @@ AudioPipeline ──producer thread───────────────
   │ 查询: deck_source / channel_count(命令空队列时也 drain)             │
   │ 每 tick: SyncGroup::prepare → make_ctx → Mixer::process              │
   │   ├ channel × N: deck.render_streams[1..4] → flow_fx[i] → fader[i] → Σ │
-  │   │                     → deck_fx → deck_fader → gain                 │
+  │   │              → fader → chain → fader (post_fx) → gain             │
   │   │              → master.sum;cue tap → cue.sum → blend(master)       │
   │   ├ master: fx → fader → limiter(安全级)                            │
   │   └ cue: fader                                                       │

@@ -3,22 +3,27 @@
 //! The order is hard-coded — it *is* the design argument of this module:
 //!
 //! ```text
-//! deck.pull_into(bus)
-//!   → source fader   per-stream **gate**: the stem mute/solo decision, exactly 0.0 or 1.0
-//!   → [cue tap]      PostSourceFader
+//! deck.pull_into(bus)                                          (per stream)
+//!   → source gate    the stem mute/solo decision, exactly 0.0 or 1.0
 //!   → flow_fx        per-stream inserts (the sweep that rides one flow)
-//!   → flow_fader     per-stream level; equals the deck level while there is only one stream
-//!   → [cue tap]      PostFlowFader
-//!   → deck_fx        per-deck inserts (the tone controls a performance is built on)
-//!   → deck_fader     1.0 until a track exposes stems
-//!   → [cue tap]      PostDeckFader
+//!   → flow_fader     per-stream level: a stem's own level, not the channel fader
+//!   → Σ              the channel's sum
+//!   → [cue tap]      always immediately **before** the channel fader
+//!   → fader          the one channel fader; `[channel] fader = "pre_fx"` puts it here
+//!   → chain          the channel's inserts (`[channel] chain = ["eq", "filter"]`)
+//!   → [cue tap]      and here when `fader = "post_fx"`
+//!   → fader
 //!   → gain           channel trim, 0 dB .. +6 dB (the only stage that can boost)
 //!   → master
 //! ```
 //!
-//! The shared crossfader's per-side gain is applied at whichever of those three faders
-//! `[crossfader] place` names — always after the cue tap of the same name, so a cue stays a preview
-//! of the channel whatever the crossfader is doing.
+//! There is **one** channel fader, and `[channel] fader` decides where it sits relative to the
+//! channel's `chain`; the cue send always taps the signal just before it, so pulling a fader down
+//! never silences the monitor (which is the whole point of cueing a track in).
+//!
+//! The shared crossfader's per-side gain is applied at whichever of the three positions
+//! `[crossfader] place` names — always after the cue tap at that point, so a cue stays a preview of
+//! the channel whatever the crossfader is doing.
 //!
 //! Two chains rather than one: a flow is a bounded playback (a cue point, an acapella, a future
 //! stem) whose filter memory must reset when it is replaced, while a deck's tone controls persist
@@ -40,20 +45,20 @@ use crate::fx::sample::Fader;
 use crate::fx::{FxChain, FxSlot, Param};
 use crate::BLOCK_SIZE;
 
-/// Where a channel copies its signal into the cue bus: at one of the chain's three faders.
+/// Where the channel's one fader sits relative to the channel `chain`.
 ///
-/// [`CueTap::PostDeckFader`] is the usual DJ choice ("what I monitor is what would go out");
-/// earlier taps are what you want when cueing while the channel fader is down.
+/// The two positions are the historical pair: "flow fader" (the sum of the streams, before the
+/// channel's inserts) and "deck fader" (after them, before the trim). Configuring it instead of
+/// hard-coding it is what lets a channel fade *into* its tone controls or *with* them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CueTap {
-    /// The gated source, before any insert: the raw voice, ignoring level and tone.
-    PostSourceFader,
-    /// After the flow faders, before the deck chain: level applies, tone does not.
-    PostFlowFader,
-    /// After the deck fader, before the trim: exactly what the channel sends to master.
+pub enum FaderPlace {
+    /// Before the chain — the flow fader position: the sum is faded, then the tone controls act on
+    /// the faded signal.
+    PreFx,
+    /// After the chain — the historical deck fader: tone and level fade together.
     #[default]
-    PostDeckFader,
+    PostFx,
 }
 
 /// Which half of the crossfader a channel is on.
@@ -161,7 +166,7 @@ pub struct Channel {
     /// One scratch bus per stream, summed into [`Channel::bus`] through that stream's inserts and
     /// fader. This is what lets a stem have its own level and its own effects.
     stream_buses: Vec<Bus>,
-    /// The cue copy taken at [`Channel::cue_tap`], filled during [`Channel::process`].
+    /// The cue copy, taken just before the channel fader during [`Channel::process`].
     cue: Bus,
     /// One level fader per stream, *derived* from the per-stem intent below (see
     /// [`Channel::refresh_stem_faders`]). With one stream this is the channel's flow fader.
@@ -177,7 +182,8 @@ pub struct Channel {
     /// by the stem mute/solo intent. It sits *before* the stream's inserts so muting a stem also
     /// mutes its effects' tail, and a reverb on a muted stem cannot leak back in.
     source_gate: Vec<Param>,
-    deck_fader: Fader,
+    /// The channel fader — one fader, applied wherever [`FaderPlace`] says.
+    fader: Fader,
     crossfader: Fader,
     /// The channel trim: a static setting between the deck fader and the sum, `[`trim_amp`]`'s law.
     /// Kept apart from the faders because a fader is a performance control (attenuate only) while a
@@ -190,7 +196,8 @@ pub struct Channel {
     cue_send: Param,
     side: DeckSide,
     cross: CrossfaderConfig,
-    cue_tap: CueTap,
+    /// Where `fader` acts; the cue tap is derived from it (always just before the fader).
+    fader_place: FaderPlace,
 }
 
 impl Channel {
@@ -226,13 +233,13 @@ impl Channel {
             stem_level: std::array::from_fn(|_| AtomicU32::new(level.to_bits())),
             stem_mute: std::array::from_fn(|_| AtomicBool::new(false)),
             stem_solo: AtomicU8::new(0),
-            deck_fader: Fader::new(cfg.deck_fader, FADER_TAU),
+            fader: Fader::new(cfg.deck_fader, FADER_TAU),
             crossfader: Fader::new(cross.start, CROSSFADE_TAU),
             gain: Param::new(clamp_pos(cfg.gain), FADER_TAU),
             cue_send: Param::new(cfg.cue_send.clamp(0.0, 1.0), FADER_TAU),
             side: cfg.side,
             cross,
-            cue_tap: cfg.cue_tap,
+            fader_place: cfg.fader,
         };
         // A channel can carry up to `Stem::COUNT` streams, and an `fx` command may address any of
         // them before the deck has grown — a stem chain is *configured*, not created, by being
@@ -287,12 +294,9 @@ impl Channel {
         self.side
     }
 
-    pub fn cue_tap(&self) -> CueTap {
-        self.cue_tap
-    }
-
-    pub fn set_cue_tap(&mut self, tap: CueTap) {
-        self.cue_tap = tap;
+    /// Where the channel fader acts. The cue send always taps just before it.
+    pub fn fader_place(&self) -> FaderPlace {
+        self.fader_place
     }
 
     /// The first stream's insert chain — the only one a track without stems has.
@@ -336,7 +340,7 @@ impl Channel {
     pub fn levels(&self) -> (f32, f32, f32, f32, f32) {
         (
             self.flow_fader[0].target(),
-            self.deck_fader.target(),
+            self.fader.target(),
             self.crossfader.target(),
             self.cue_send.target(),
             self.gain.target(),
@@ -473,8 +477,10 @@ impl Channel {
         }
     }
 
-    pub fn set_deck_fader(&self, position: f32) {
-        self.deck_fader.set(clamp_pos(position));
+    /// The channel fader's position, `-1.0` (silence) ..= `1.0` (unity). Where it acts is
+    /// [`FaderPlace`].
+    pub fn set_fader(&self, position: f32) {
+        self.fader.set(clamp_pos(position));
     }
 
     /// The channel trim, `-1.0` (silence) .. `1.0` (`+6 dB`). 0.0 is unity.
@@ -511,14 +517,14 @@ impl Channel {
     /// Renders one block through the fixed chain, leaving the result in the channel's own bus.
     ///
     /// ```text
-    /// per stream: gate(source fader) → flow_fx → flow_fader ─┐
-    ///   [cue tap]                       [cue tap]           Σ → deck_fx → deck_fader → gain
-    ///                                                          [cue tap]
+    /// per stream: gate → flow_fx → flow_fader ─┐
+    ///                                          Σ → [cue tap] → fader → deck_fx → [cue tap] → fader → gain
     /// ```
     ///
-    /// with the shared crossfader's per-side gain applied at whichever of those three faders the
-    /// config puts it (`[crossfader] place`), always *after* the cue tap it shares a name with — a
-    /// cue is a preview of a channel regardless of where the crossfader has it.
+    /// with the fader at one of the two brackets ([`FaderPlace`]) and the cue always at the bracket's
+    /// left edge, and the shared crossfader's per-side gain applied at whichever position
+    /// `[crossfader] place` names — always after the cue tap at that point, so a cue is a preview of
+    /// a channel regardless of where the crossfader has it.
     ///
     /// Returns a borrow of that bus so the mixer can sum it; the data is the channel's, so a
     /// consumer must read it before driving this channel again.
@@ -544,9 +550,7 @@ impl Channel {
         let side_gain = self.side.gain_at(cross_position, self.cross.curve, self.cross.cut_width);
         let cross_at_source = self.cross.place == CrossfaderPlace::Source;
         let cross_at_flow = self.cross.place == CrossfaderPlace::Flow;
-        if self.cue_tap == CueTap::PostSourceFader {
-            self.cue.clear();
-        }
+        let fader_pre_chain = self.fader_place == FaderPlace::PreFx;
 
         let frames = ctx.block_frames;
         let live = streams.min(stream_buses.len());
@@ -563,9 +567,6 @@ impl Channel {
             if gate != 1.0 {
                 sb.scale(gate);
             }
-            if self.cue_tap == CueTap::PostSourceFader {
-                self.cue.add_scaled(sb, cue_gain);
-            }
             if cross_at_source {
                 sb.scale(side_gain);
             }
@@ -575,8 +576,12 @@ impl Channel {
             sb.scale(self.flow_fader[stream].next_amp(ctx));
             bus.add_from(sb);
         }
-        if self.cue_tap == CueTap::PostFlowFader {
+        // The cue is taken *before* the channel fader, whichever position that fader has: cueing a
+        // track in with its fader down is the whole reason a monitor exists. The tap itself is a
+        // fixed point relative to the fader, so there is nothing else to configure.
+        if fader_pre_chain {
             self.take_cue_into(&bus, cue_gain);
+            bus.scale(self.fader.next_amp(ctx));
         }
         // At the flow position the crossfader sits between the flow faders and the deck inserts. It
         // is one scalar, so scaling the sum is the same as scaling each stream before summing.
@@ -588,9 +593,9 @@ impl Channel {
             self.deck_fx.process(&mut bus, ctx);
         }
 
-        bus.scale(self.deck_fader.next_amp(ctx));
-        if self.cue_tap == CueTap::PostDeckFader {
+        if !fader_pre_chain {
             self.take_cue_into(&bus, cue_gain);
+            bus.scale(self.fader.next_amp(ctx));
         }
         // The historical position, and the default: last, so a crossfade is a routing decision taken
         // after the tone controls rather than a level change that recolours them.
@@ -962,53 +967,55 @@ mod tests {
     }
 
     #[test]
-    fn cue_taps_select_the_right_point_in_the_chain() {
-        // Three taps, three points: the source gate, the flow faders, the deck fader. A killed EQ in
-        // one chain must show up in exactly the taps *after* it — that difference is the whole reason
-        // there is more than one tap.
+    fn the_cue_is_taken_before_the_fader_wherever_the_fader_sits() {
+        // One rule, two placements: the cue taps the signal immediately before the channel fader.
+        // With the fader after the chain that means the tone controls are in the monitor; with the
+        // fader before it they are not. Either way a fader at the bottom is silence in the room and
+        // not in the headphones — which is what cueing a track in *is*.
         let killed = || FxChain::from_parts([("eq", Box::new(all_the_way_down()) as Box<dyn Fx>)]);
-        let measure = |tap: CueTap, flow_chain: FxChain, deck_chain: FxChain| -> f32 {
+        let measure = |place: FaderPlace, fader: f32, deck_chain: FxChain| -> (f32, f32) {
             let mut channel = Channel::new(
                 tone_deck(),
-                &ChannelConfig { cue_send: 1.0, cue_tap: tap, ..Default::default() },
+                &ChannelConfig {
+                    cue_send: 1.0,
+                    deck_fader: fader,
+                    fader: place,
+                    ..Default::default()
+                },
                 CrossfaderConfig::default(),
-                vec![flow_chain],
+                vec![FxChain::new()],
                 deck_chain,
             );
             channel.deck_mut().play();
             for _ in 0..40 {
                 channel.process(&ctx());
             }
-            channel.cue().peak()
+            (channel.peak(), channel.cue().peak())
         };
         let flat = || FxChain::new();
-        let reference = measure(CueTap::PostDeckFader, flat(), flat());
-        assert!(reference > 0.5, "the reference cue should carry the tone, got {reference}");
 
-        // A killed flow chain (per-stream inserts) is audible in the two later taps only.
-        for (tap, expects_cut) in [
-            (CueTap::PostSourceFader, false),
-            (CueTap::PostFlowFader, true),
-            (CueTap::PostDeckFader, true),
-        ] {
-            let peak = measure(tap, killed(), flat());
-            assert_eq!(
-                peak < reference * 0.1,
-                expects_cut,
-                "tap {tap:?} against a killed flow chain cued {peak} (flat reference {reference})"
-            );
-        }
-        // A killed deck chain is audible only in the last tap, so the first two are distinguished.
-        for (tap, expects_cut) in [
-            (CueTap::PostSourceFader, false),
-            (CueTap::PostFlowFader, false),
-            (CueTap::PostDeckFader, true),
-        ] {
-            let peak = measure(tap, flat(), killed());
-            assert_eq!(
-                peak < reference * 0.1,
-                expects_cut,
-                "tap {tap:?} against a killed deck chain cued {peak} (flat reference {reference})"
+        let (main, reference) = measure(FaderPlace::PostFx, 0.0, flat());
+        assert!(main > 0.5 && reference > 0.5, "reference: {main} / {reference}");
+
+        // A killed chain is inside the post-chain tap and outside the pre-chain one.
+        let (_, cue) = measure(FaderPlace::PostFx, 0.0, killed());
+        assert!(
+            cue < reference * 0.1,
+            "a post-chain cue carries the tone controls: {cue} vs {reference}"
+        );
+        let (_, cue) = measure(FaderPlace::PreFx, 0.0, killed());
+        assert!(
+            cue > reference * 0.9,
+            "a pre-chain cue is taken before the tone controls: {cue} vs {reference}"
+        );
+
+        // The fader never silences the monitor, at either placement.
+        for place in [FaderPlace::PreFx, FaderPlace::PostFx] {
+            let (main, cue) = measure(place, -1.0, flat());
+            assert!(main < 1e-6, "{place:?}: a fader at the bottom is silence");
+            assert!(
+                cue > reference * 0.9,
+                "{place:?}: the cue must not depend on the channel fader, got {cue} vs {reference}"
             );
         }
     }
@@ -1421,13 +1428,18 @@ mod tests {
         assert!(killed < 1e-6, "a closed trim leaked {killed}");
     }
 
-    /// The crossfader acts at the place the config names, the cue tap at the same point ignores it,
-    /// and a tap *downstream* of the crossfader hears it (that is what putting it early means).
+    /// The crossfader acts at the place the config names, and a cue tap taken *before* that point
+    /// ignores it: the monitor is a preview of the channel whatever the crossfader is doing.
     #[test]
-    fn the_crossfader_acts_at_its_place_and_the_matching_cue_tap_ignores_it() {
-        let run = |place: CrossfaderPlace, tap: CueTap| -> Channel {
+    fn the_crossfader_acts_at_its_place_and_an_earlier_cue_tap_ignores_it() {
+        let run = |fader: FaderPlace, place: CrossfaderPlace| -> Channel {
             let mut channel = channel_cross(
-                ChannelConfig { side: DeckSide::Right, cue_send: 1.0, cue_tap: tap, ..Default::default() },
+                ChannelConfig {
+                    side: DeckSide::Right,
+                    cue_send: 1.0,
+                    fader,
+                    ..Default::default()
+                },
                 cross(place, CrossfaderCurve::Classic, -1.0),
                 vec![FxChain::new()],
                 FxChain::new(),
@@ -1438,27 +1450,28 @@ mod tests {
             }
             channel
         };
-        // Each tap at the crossfader's own place ignores it: the cue is a preview of the channel
-        // whatever the crossfader is doing, which is the historical guarantee.
-        for (place, tap) in [
-            (CrossfaderPlace::Source, CueTap::PostSourceFader),
-            (CrossfaderPlace::Flow, CueTap::PostFlowFader),
-            (CrossfaderPlace::Deck, CueTap::PostDeckFader),
+        // The tap sits just before the fader, so a crossfader *downstream* of that point is not in
+        // the cue; one upstream is.
+        for (fader, place, cue_ignores) in [
+            (FaderPlace::PreFx, CrossfaderPlace::Source, false),
+            (FaderPlace::PreFx, CrossfaderPlace::Flow, true),
+            (FaderPlace::PreFx, CrossfaderPlace::Deck, true),
+            (FaderPlace::PostFx, CrossfaderPlace::Source, false),
+            (FaderPlace::PostFx, CrossfaderPlace::Flow, false),
+            (FaderPlace::PostFx, CrossfaderPlace::Deck, true),
         ] {
-            let channel = run(place, tap);
+            let channel = run(fader, place);
             assert!(
                 channel.peak() < 1e-4,
-                "{place:?}: a right channel at hard left still sounded"
+                "{fader:?}/{place:?}: a right channel at hard left still sounded"
             );
-            assert!(channel.cue().peak() > 0.0, "{place:?}: cue must ignore the crossfader");
+            assert_eq!(
+                channel.cue().peak() > 0.0,
+                cue_ignores,
+                "{fader:?}/{place:?}: cue level {} (ignores={cue_ignores})",
+                channel.cue().peak()
+            );
         }
-        // A tap downstream of the crossfader hears it: at the `source` place the whole channel is
-        // crossed before the deck fader, so a `PostDeckFader` cue is crossed with it.
-        let coupled = run(CrossfaderPlace::Source, CueTap::PostDeckFader);
-        assert!(
-            coupled.cue().peak() < 1e-4,
-            "a tap after an early crossfader must carry its level"
-        );
     }
 
     /// *Where* the crossfader acts is observable: a probe inside the deck chain sees the crossed
@@ -1542,7 +1555,7 @@ mod tests {
         let mut channel = channel_with(unity(), vec![FxChain::new()], FxChain::new());
         channel.set_flow_fader(f32::NAN);
         channel.set_crossfader(99.0);
-        channel.set_deck_fader(-99.0);
+        channel.set_fader(-99.0);
         assert_eq!(channel.levels(), (0.0, -1.0, 1.0, 1.0, 0.0));
         channel.deck_mut().play();
         channel.process(&ctx());

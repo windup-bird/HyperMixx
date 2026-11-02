@@ -329,7 +329,7 @@ CPU 与 CUDA 的结果 Σ 残差一致（实测都是 −32.9 dB 量级），但
 
 ```toml
 [[channel]]
-deck_fx = ["eq", "filter"]     # 共享：整 deck 一条链
+chain = ["eq", "filter"]       # 共享：整个通道一条链（旧名 deck_fx 仍接受）
 flow_fx = ["gain"]             # 模板：每条 stream 各建一条独立的链（4 stems = 4 条）
 [channel.stem_fx]              # 覆写：这里写了的 stem 用它，其余继承模板
 vocals = ["gain", "filter"]
@@ -347,7 +347,8 @@ vocals = ["gain", "filter"]
   尾巴的衰减信号。
 - **solo 优先于 mute**，而且 solo 是集合：`deck0 vocals solo on` 再 `deck0 drums solo on`
   会同时听到两条，而不是后者顶掉前者。
-- **`deck0 fader flow <x>`（不带 stem）一次写全部四条**，所以单个硬件推子仍然可用；
+- **`deck0 fader flow <x>`（不带 stem）一次写全部四条 stem 电平**；`fader deck <x>` 才是那颗
+  通道 fader（硬件推子映射到它，位置由 `[channel] fader` 决定）；
   `deck0 vocals fader <x>` 只写一条。
 
 ### 3.7.1 边分离边播（分段就是模型自己的分段）
@@ -386,18 +387,22 @@ vocals = ["gain", "filter"]
 
 ```
 每条流:  source fader(门) → flow_fx → flow_fader ─┐
-                                                  Σ → deck_fx → deck_fader → gain(trim) → 求和
-                        共享 crossfader 的增益坐在这三颗 fader 之一的位置（[crossfader] place）
+                                                   Σ → [cue tap] → fader → chain → [cue tap] → fader → gain
+                        共享 crossfader 的增益坐在三个位置之一（[crossfader] place）
 ```
+
+一个通道**只有一颗 fader**，位置由 `[channel] fader = "pre_fx" | "post_fx"` 决定：`pre_fx` 是
+历史上 flow fader 的位置（先衰减再进音色），`post_fx`（缺省）是 deck fader 的位置（音色随电平
+一起衰减）。`flow_fader` 是**每 stem 自己的电平**，不是这颗通道 fader。
 
 - **所有 fader 只衰减**：行程顶端是 0 dB。要 headroom 用 `gain`（trim，0 dB…+6 dB，`0.0` = 0 dB、
   `1.0` = +6 dB），它是设定而不是演出控制。
 - **crossfader 的位置可配**（`[crossfader] place = "source" | "flow" | "deck"`），三种曲线
   `classic`（缺省：中间两轨同时 0 dB，两头线性到单轨）/ `constant_power` / `cut`
   （两端陡降，`cut_width` 缺省 0.05 = 各占 5% 行程）。
-- **cue 从三颗 fader 之一分叉**（`[channel] cue_tap = post_source_fader | post_flow_fader |
-  post_deck_fader`）。分叉点与 crossfader 位置相同时，cue **不受** crossfader 影响（历史上的
-  保证）；分叉点在 crossfader 之后时，cue 会跟着它（把 crossfader 放早的代价，文档写明）。
+- **precue 恒在 fader 之前**（不是 post）：推子拉到底只静音房间、不静音耳机，这样才可以把
+  下一首 cue 好再推上去。分叉点由 fader 位置唯一确定，没有单独的 `cue_tap` 配置；crossfader
+  在分叉点之前时 cue 不受它影响，在之后则跟着它（文档写明）。
 - **cue 总线与 master 混合**（`[cue] blend`：`-1` = 只听 cue（缺省）/ `0` = 两者 / `+1` =
   只听 master，`curve`/`cut_width` 同上），这就是耳机上那颗 cue-mix 旋钮。
 

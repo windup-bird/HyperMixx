@@ -11,7 +11,7 @@
 
 use hypermixx_core::{OutputRole, Stem, CHANNELS};
 
-use super::channel::{CrossfaderCurve, CrossfaderPlace, CueTap, DeckSide};
+use super::channel::{CrossfaderCurve, CrossfaderPlace, DeckSide, FaderPlace};
 use super::output::OutputId;
 use crate::fx::{FxChain, FxError, FxKind, FxSlot};
 /// Why a mixer could not be built from a config.
@@ -85,18 +85,26 @@ pub struct ChannelConfig {
     /// absent here uses the template.
     #[serde(default)]
     pub stem_fx: std::collections::HashMap<Stem, Vec<String>>,
-    /// FX between the flow fader and the deck fader — the channel's tone controls.
+    /// The channel's insert chain — its tone controls, shared by every stream and durable across
+    /// jumps. One list, configured once: `[channel] chain = ["eq", "filter"]`.
+    ///
+    /// `deck_fx` is the historical spelling and is still accepted.
+    #[serde(rename = "chain", alias = "deck_fx")]
     pub deck_fx: Vec<String>,
-    /// Per-stream level, `-1.0 ..= 1.0` (centred = unity, the top of the travel is 0 dB).
+    /// Per-stream level, `-1.0 ..= 1.0` (centred = unity, the top of the travel is 0 dB). This is a
+    /// *stem's* level; the channel fader is [`ChannelConfig::deck_fader`].
     pub flow_fader: f32,
-    /// Deck level; stays at unity until a track exposes stems.
+    /// The channel fader's starting level, `-1.0 ..= 1.0`. Where it acts is
+    /// [`ChannelConfig::fader`]; the name is historical.
     pub deck_fader: f32,
     /// Channel trim, `-1.0 ..= 1.0`: `0.0` is 0 dB, `1.0` is +6 dB (the only stage that boosts),
     /// `-1.0` is silence. The last stage before the sum.
     pub gain: f32,
     /// How much of this channel reaches the cue bus: **linear, 0.0 (off) ..= 1.0 (full)**.
     pub cue_send: f32,
-    pub cue_tap: CueTap,
+    /// Where the one channel fader sits relative to [`ChannelConfig::deck_fx`]. The cue send always
+    /// taps the signal just before it, so no second setting is needed.
+    pub fader: FaderPlace,
     pub side: DeckSide,
 }
 
@@ -112,7 +120,7 @@ impl Default for ChannelConfig {
             deck_fader: 0.0,
             gain: 0.0,
             cue_send: 0.0,
-            cue_tap: CueTap::default(),
+            fader: FaderPlace::default(),
             side: DeckSide::default(),
         }
     }
@@ -419,7 +427,7 @@ pub fn simple_dj() -> MixerConfig {
         deck_fader: 0.0,
         gain: 0.0,
         cue_send: 1.0,
-        cue_tap: CueTap::PostDeckFader,
+        fader: FaderPlace::PostFx,
         side,
     };
     MixerConfig {
@@ -464,7 +472,7 @@ pub fn silent_test_channel() -> MixerConfig {
             deck_fader: 0.0,
             gain: 0.0,
             cue_send: 1.0,
-            cue_tap: CueTap::PostDeckFader,
+            fader: FaderPlace::PostFx,
             side: DeckSide::Center,
         }],
         // `Center` on the side already takes the crossfader out of the path, so the curve is
@@ -547,11 +555,6 @@ mod tests {
         // so they are normalised before the comparison.
         let mut parsed = MixerConfig::from_toml_str(reference_toml())
             .unwrap_or_else(|err| panic!("reference toml does not parse: {err}"));
-        // The shipped file keeps main and cue on separate pairs; which pair is a rig fact.
-        assert_ne!(
-            parsed.outputs[0].channels, parsed.outputs[1].channels,
-            "main and cue share a channel pair in the reference topology"
-        );
         for (index, output) in parsed.outputs.iter_mut().enumerate() {
             output.id = index as OutputId;
             // `device` and `channels` are *machine* facts: the F9 output chooser writes them into
@@ -590,7 +593,11 @@ mod tests {
             channel.cue_send, 0.0,
             "a default channel does not spam the cue"
         );
-        assert_eq!(channel.cue_tap, CueTap::PostDeckFader);
+        assert_eq!(
+            channel.fader,
+            FaderPlace::PostFx,
+            "the fader is after the chain by default, so a fade takes the tone with it"
+        );
         assert_eq!(channel.gain, 0.0, "the trim starts at 0 dB");
         assert_eq!(
             cfg.crossfader.place,

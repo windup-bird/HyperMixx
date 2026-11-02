@@ -416,13 +416,14 @@ impl KeylockMode {
 /// the value, so a mapping layer never has to duplicate that knowledge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaderTarget {
-    /// One channel's flow fader (the deck level while a track holds a single stream). Once stems
-    /// are installed this writes **every** stem's level at once, because one hardware fader still
-    /// has to work; a single stem is addressed through [`FaderTarget::Stem`].
+    /// One channel's **per-stream** level: the fader between a stream's inserts and the sum. With
+    /// stems installed this writes every stem's level at once, because one control still has to
+    /// work on a stem deck; a single stem is addressed through [`FaderTarget::Stem`].
     Flow(DeckId),
     /// One stem's level, as a bipolar fader position (`-1.0` = exact silence, `0.0` = unity).
     Stem { deck: DeckId, stem: Stem },
-    /// One channel's deck fader (unity until a track exposes stems).
+    /// One channel's **channel fader** — the one `[channel] fader` places before or after the
+    /// channel `chain`. This is what a mixer's fader is mapped to.
     Deck(DeckId),
     /// One channel's **trim**: `0.0` is 0 dB, `1.0` is +6 dB, `-1.0` is silence. The only level a
     /// channel has that can boost, and therefore the only one that is a setting rather than a

@@ -1,5 +1,9 @@
-# One channel strip. FX names address the per-deck chain; an unresolved name disables that one
+# One channel strip. FX names address the channel `chain`; an unresolved name disables that one
 # row rather than the whole unit.
+#
+# The fader is the channel fader (`fader deck`), *not* the per-stream level: where it sits relative
+# to the chain is a topology decision (`[channel] fader`), and a stem's own level is a separate
+# control, so one hardware fader always means "this channel's level".
 [[preset]]
 name = "mixer"
 scope = "deck"
@@ -52,7 +56,7 @@ min = -1.0
 max = 1.0
 [[preset.mode.bind]]
 slot = "fader"
-action = "fader flow"
+action = "fader deck"
 [[preset.mode.bind]]
 slot = "cue-toggle"
 action = "fader cuesend toggle"

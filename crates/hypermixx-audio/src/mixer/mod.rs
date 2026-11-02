@@ -25,7 +25,8 @@ pub(crate) mod output;
 
 pub use bus::Bus;
 pub use channel::{
-    Channel, CrossfaderCurve, CrossfaderPlace, CueTap, DeckSide, SlotChain, DEFAULT_CUT_WIDTH,
+    Channel, CrossfaderCurve, CrossfaderPlace, DeckSide, FaderPlace, SlotChain,
+    DEFAULT_CUT_WIDTH,
 };
 pub use config::{
     build_chain, build_slot, build_slots, reference_toml, simple_dj, silent_test_channel,
@@ -383,7 +384,7 @@ impl Mixer {
             FaderTarget::Stem { deck, stem } => {
                 self.fader_channel(deck)?.set_stem_level(stem, value)
             }
-            FaderTarget::Deck(deck_id) => self.fader_channel(deck_id)?.set_deck_fader(value),
+            FaderTarget::Deck(deck_id) => self.fader_channel(deck_id)?.set_fader(value),
             FaderTarget::Gain(deck_id) => self.fader_channel(deck_id)?.set_gain(value),
             FaderTarget::CueSend(deck_id) => self.fader_channel(deck_id)?.set_cue_send(value),
             FaderTarget::Crossfader => {

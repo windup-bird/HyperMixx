@@ -250,9 +250,9 @@ pub enum Hit {
         knob: Knob,
         value: f32,
     },
-    /// A channel fader set to an absolute position, `-1.0..=1.0` (top = 0 dB). The band draws the
-    /// deck fader; the flow fader (the per-stream level a separated track exposes) stays
-    /// command-only, because one cell cannot mean two things.
+    /// The channel fader set to an absolute position, `-1.0..=1.0` (top = 0 dB). The band draws the
+    /// channel fader (the one `[channel] fader` places); the per-stem levels a separated track
+    /// exposes stay command-only, because one cell cannot mean two things.
     Fader {
         deck: usize,
         value: f32,

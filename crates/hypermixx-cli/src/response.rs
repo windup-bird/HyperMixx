@@ -332,7 +332,8 @@ pub fn help_text(decks: usize) -> String {
   [deck] sync phaselock <mode> follower tracks the leader exactly (its own fader is ignored)
   [deck] sync set-leader       name *this* deck as the one the others follow
   [deck] sync unlock           drop the lock and the correction, keeping the tempo
-  [deck] fader <stage> <pos>   levels: flow|deck|gain|cuesend on a deck, cross|master|cue shared
+  [deck] fader <stage> <pos>   levels: flow (per-stem) |deck (the channel fader) |gain|cuesend,
+                               cross|master|cue shared
   [deck] nudge <delta> <sec>   temporary rate bend to hand-align phase (0.04 = 4% fast)
   [deck] nudge off             release the bend (it ramps back, no click)
   [deck] keylock on|off        keylock profile (default: on; window in live.toml)
