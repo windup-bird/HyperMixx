@@ -133,6 +133,8 @@ TUI 内尽量不用启动参数:`F9` 打开设置（控制器端口、映射文�
 `load` 不带路径则弹出文件浏览器；`--guide` 即使不跟路径也会在 TUI 里选端口与文件。波形左右声道上下镜像，三频段颜色、
 分频点（`low_hz`/`high_hz`，内置默认 200/4000Hz，随附文件用 250/4000Hz）、渲染 backend 与图像刷新率在 `profile/preference.toml` 配置：
 `auto` 按 kitty → braille 选择（tmux/screen 暂回 braille）；kitty 可用 60Hz。
+Windows 上经 ConPTY 时 kitty graphics 的 APC 序列会被丢掉（表现为选中 kitty 但波形区空白），
+原因与修法见 [`docs/WAVEFORM.md`](docs/WAVEFORM.md)。
 
 ### TUI 布局
 
