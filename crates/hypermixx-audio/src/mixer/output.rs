@@ -35,6 +35,10 @@ pub struct OutputTuning {
     /// Device buffer in frames, or `None` for whatever the backend chooses. On ALSA the backend
     /// default is a 25 ms period and a 100 ms buffer; `Some(512)` asks for a 128-frame period
     /// (~2.9 ms) and a 512-frame buffer (~11.6 ms).
+    ///
+    /// Best effort: a PCM path that refuses a fixed buffer (ALSA's `dmix`/`plug` behind
+    /// `sysdefault`, i.e. most USB interfaces) gets the backend default instead of a failed build.
+    /// Latency is a preference; silence is not.
     pub device_buffer_frames: Option<usize>,
 }
 
@@ -180,11 +184,18 @@ impl Output {
                     None,
                 ));
             }
-            DeviceLookup::Named(None) => {
+            DeviceLookup::Named { device: None, seen } => {
+                // The usual cause is not "unplugged": cpal's ALSA enumeration only lists PCMs it
+                // can open right now, so a card the sound server (PipeWire/PulseAudio) currently
+                // holds is absent from the list rather than reported as busy. Saying so is what
+                // turns "no sound and no reason" into an actionable line.
                 eprintln!(
-                    "[audio] {}: no device matches `{}` yet; `output refresh` retries",
+                    "[audio] {}: no output device matches `{}` ({} device(s) visible; it may be \
+                     unplugged or held by the sound server — a `default`/`pipewire` destination goes \
+                     through the server instead); `output refresh` retries",
                     cfg.name,
-                    cfg.device.as_deref().unwrap_or_default()
+                    cfg.device.as_deref().unwrap_or_default(),
+                    seen
                 );
                 return Ok(Self::placeholder(
                     cfg,
@@ -193,20 +204,25 @@ impl Output {
                     None,
                 ));
             }
-            DeviceLookup::Default(Some(device)) | DeviceLookup::Named(Some(device)) => device,
+            DeviceLookup::Default(Some(device))
+            | DeviceLookup::Named {
+                device: Some(device),
+                ..
+            } => device,
         };
         let device_name = found.name().unwrap_or_else(|_| "audio device".into());
 
-        // The device has to offer the engine's rate. Refused rather than papered over: a device
-        // pinned to 48k while the engine produces 44.1k plays every track 8.8% slow, which is worse
-        // than silence because it sounds intentional.
+        // The device has to offer the engine's rate, in a format we can actually write. Refused
+        // rather than papered over: a device pinned to 48k while the engine produces 44.1k plays
+        // every track 8.8% slow, which is worse than silence because it sounds intentional. A
+        // device that is 24-bit-only (many USB DJ controllers) is refused *here*, with the reason,
+        // instead of being handed a format `build_stream` cannot feed and turning into a sink later.
         let Some(config) = preferred_config(&found, sample_rate, cfg.wanted_device_channels())
         else {
-            let offered = describe_device_rates(&found);
             eprintln!(
-                "[audio] {}: {device_name} does not accept {sample_rate}Hz (offers {offered}); \
-                 disabling it",
-                cfg.name
+                "[audio] {}: {device_name} {}; disabling it",
+                cfg.name,
+                unsupported_message(&found, sample_rate)
             );
             return Ok(Self::placeholder(
                 cfg,
@@ -241,26 +257,40 @@ impl Output {
 
         let ring_frames = tuning.ring_frames.max(block_frames);
         let ring_channels = output.device_channels.max(1);
-        let (mut producer, consumer) =
-            AudioRingBuffer::with_channels(ring_frames, ring_channels).split();
-        // Prefill: the callback starts draining the instant the stream is built. Without a
-        // cushion the first seconds are a race between the producer's first blocks and the
-        // device, and every lost race is a silence gap the listener hears as a click. Half a
-        // ring of silence buys the producer a standing head start; the mix simply starts
-        // ~46 ms later, which nothing can hear.
-        let prefill = (tuning.prefill_frames * ring_channels).min(ring_frames * ring_channels / 2);
-        if prefill > 0 {
-            let silence = vec![0.0f32; prefill];
-            push_samples(&mut producer, &silence);
-        }
-        output.producer = Some(producer);
-        let stream = build_stream(
-            &found,
-            &config,
-            consumer,
-            &cfg.name,
-            tuning.device_buffer_frames,
-        )?;
+        // The latency hint is a *preference*. Some paths (ALSA's `dmix`/`plug` behind
+        // `sysdefault`/`default`, which is how a USB DJ controller is usually reached) reject a
+        // fixed buffer outright, and failing the build for that would turn a working device into a
+        // silent sink. So the fixed request is retried once with the backend's own default — which
+        // needs a fresh ring, because the failed attempt's callback took the consumer with it.
+        let mut device_buffer_frames = tuning.device_buffer_frames;
+        let stream = loop {
+            let (mut producer, consumer) =
+                AudioRingBuffer::with_channels(ring_frames, ring_channels).split();
+            // Prefill: the callback starts draining the instant the stream is built. Without a
+            // cushion the first seconds are a race between the producer's first blocks and the
+            // device, and every lost race is a silence gap the listener hears as a click. Half a
+            // ring of silence buys the producer a standing head start; the mix simply starts
+            // ~46 ms later, which nothing can hear.
+            let prefill =
+                (tuning.prefill_frames * ring_channels).min(ring_frames * ring_channels / 2);
+            if prefill > 0 {
+                let silence = vec![0.0f32; prefill];
+                push_samples(&mut producer, &silence);
+            }
+            output.producer = Some(producer);
+            match build_stream(&found, &config, consumer, &cfg.name, device_buffer_frames) {
+                Ok(stream) => break stream,
+                Err(err) if device_buffer_frames.is_some() => {
+                    eprintln!(
+                        "[audio] {}: fixed device buffer rejected ({err}); using the backend's \
+                         default instead",
+                        cfg.name
+                    );
+                    device_buffer_frames = None;
+                }
+                Err(err) => return Err(err),
+            }
+        };
         output._stream = Some(stream);
         Ok(output)
     }
@@ -419,26 +449,74 @@ impl Output {
 enum DeviceLookup {
     /// No pattern was configured: the host's default device, if it has one.
     Default(Option<cpal::Device>),
-    /// A pattern was configured: the matching device, or nothing.
-    Named(Option<cpal::Device>),
+    /// A pattern was configured: the matching device, or nothing plus how many were visible (the
+    /// reason a "missing" device deserves a better line than "not found").
+    Named {
+        device: Option<cpal::Device>,
+        seen: usize,
+    },
 }
+
+/// How many times a named device is looked for before it is called missing, and the pause between
+/// tries. Three attempts means two pauses — 10 ms in the worst case, well inside the output ring's
+/// slack — and covers the sound server releasing a card it has just suspended.
+const DEVICE_LOOKUP_ATTEMPTS: usize = 3;
+const DEVICE_LOOKUP_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Resolves a `device` pattern against the host's outputs: an all-digit pattern is an **index** into
 /// the enumeration, anything else is a **case-insensitive name substring** (first match wins).
 /// No pattern means the system default device.
 ///
 /// The enumeration is the only place a device name comes from, so `output list` and the resolution
-/// agree by construction.
+/// agree by construction. Two details matter more than they look:
+///
+/// * The **names are collected first, with every device dropped as it is read**. cpal's ALSA backend
+///   opens a PCM pair per device while iterating, and holding all of them alive truncates its own
+///   list: an alias early in the hint order (`samplerate`, `speex`, `upmix`, … all slave to the same
+///   card) keeps the card's `hw` PCM, so the real entries for that card (`sysdefault:CARD=…`,
+///   `front:CARD=…`) then fail to open and are silently skipped. Resolving a device by name used to
+///   fail precisely for the destinations the list had just shown.
+/// * The lookup is retried briefly because the same enumeration drops PCMs another client holds: a
+///   card the sound server has just suspended stays absent for a moment, and without the retry a
+///   correctly configured destination would boot into silence.
 fn resolve_device(host: &cpal::Host, pattern: Option<&str>) -> DeviceLookup {
     let Some(pattern) = pattern.map(str::trim).filter(|p| !p.is_empty()) else {
         return DeviceLookup::Default(host.default_output_device());
     };
-    let mut devices: Vec<(String, cpal::Device)> = host
-        .output_devices()
-        .map(|devices| devices.map(|d| (device_name(&d), d)).collect())
-        .unwrap_or_default();
-    let names: Vec<String> = devices.iter().map(|(name, _)| name.clone()).collect();
-    DeviceLookup::Named(match_device(&names, pattern).map(|index| devices.swap_remove(index).1))
+    let mut seen = 0;
+    for attempt in 0..DEVICE_LOOKUP_ATTEMPTS {
+        let names = output_device_names(host);
+        seen = names.len();
+        if let Some(index) = match_device(&names, pattern) {
+            return DeviceLookup::Named {
+                device: open_device_at(host, index),
+                seen,
+            };
+        }
+        if attempt + 1 < DEVICE_LOOKUP_ATTEMPTS {
+            std::thread::sleep(DEVICE_LOOKUP_PAUSE);
+        }
+    }
+    DeviceLookup::Named { device: None, seen }
+}
+
+/// The host's output device names, in enumeration order, **without keeping any device open**.
+fn output_device_names(host: &cpal::Host) -> Vec<String> {
+    let Ok(devices) = host.output_devices() else {
+        return Vec::new();
+    };
+    devices.filter_map(|device| device.name().ok()).collect()
+}
+
+/// Opens the `index`-th device of [`output_device_names`]' list, dropping every device before it
+/// before the target is opened (see [`resolve_device`] for why that is not optional).
+fn open_device_at(host: &cpal::Host, index: usize) -> Option<cpal::Device> {
+    let devices = host.output_devices().ok()?;
+    // The same `name()` filter as the snapshot, so the two enumerations cannot disagree on an index.
+    devices
+        .filter(|device| device.name().is_ok())
+        // `nth` drops each skipped device before asking for the next one.
+        .nth(index)
 }
 
 /// Which device a pattern names, given the names in enumeration order: all digits is an index,
@@ -500,8 +578,13 @@ pub fn output_devices(wanted_rate: Option<u32>) -> Vec<DeviceInfo> {
                 device
                     .supported_output_configs()
                     .map(|ranges| {
+                        // Same predicate the stream build uses: a rate is only "accepted" if it can
+                        // be fed in a format we can write. A 24-bit-only PCM must not show `✓` and
+                        // then disable itself.
                         ranges.into_iter().any(|range| {
-                            range.min_sample_rate().0 <= rate && range.max_sample_rate().0 >= rate
+                            playable_format(range.sample_format())
+                                && range.min_sample_rate().0 <= rate
+                                && range.max_sample_rate().0 >= rate
                         })
                     })
                     .unwrap_or(false)
@@ -599,6 +682,11 @@ fn describe_device_rates(device: &cpal::Device) -> String {
 /// Unlike the old version this does **not** fall back to the device's default config: a device that
 /// cannot run at the engine's rate is refused (and the output disabled), because a silent fallback
 /// to another rate plays everything at the wrong speed.
+///
+/// The format filter is not cosmetic. cpal enumerates I8/U8/I32/U32/F64 too, `build_stream` feeds
+/// only F32/I16/U16, and picking an unplayable format used to turn a working device into a silent
+/// sink with no message. A 24-bit-only interface (S24_3LE) is exactly this case when it is opened
+/// through a raw `hw:` PCM instead of ALSA's `plug`/`sysdefault` layer.
 fn preferred_config(
     device: &cpal::Device,
     sample_rate: u32,
@@ -609,6 +697,7 @@ fn preferred_config(
     ranges
         .filter(|range| {
             range.channels() >= wanted
+                && playable_format(range.sample_format())
                 && range.min_sample_rate().0 <= sample_rate
                 && range.max_sample_rate().0 >= sample_rate
         })
@@ -621,6 +710,45 @@ fn preferred_config(
             )
         })
         .map(|range| range.with_sample_rate(cpal::SampleRate(sample_rate)))
+}
+
+/// The sample formats [`build_stream`] can feed.
+fn playable_format(format: cpal::SampleFormat) -> bool {
+    matches!(
+        format,
+        cpal::SampleFormat::F32 | cpal::SampleFormat::I16 | cpal::SampleFormat::U16
+    )
+}
+
+/// Why [`preferred_config`] found nothing, in the device's own terms: the rate, the channels or the
+/// format. Silence with a reason beats a silent sink.
+fn unsupported_message(device: &cpal::Device, sample_rate: u32) -> String {
+    let Ok(ranges) = device.supported_output_configs() else {
+        return format!("will not say what it accepts (engine wants {sample_rate}Hz)");
+    };
+    let mut formats: Vec<String> = Vec::new();
+    let mut rate_ok = false;
+    for range in ranges {
+        if range.min_sample_rate().0 <= sample_rate && range.max_sample_rate().0 >= sample_rate {
+            rate_ok = true;
+            let format = format!("{:?}", range.sample_format());
+            if !formats.contains(&format) {
+                formats.push(format);
+            }
+        }
+    }
+    if rate_ok {
+        format!(
+            "offers {sample_rate}Hz only in formats we cannot play ({}); open it through a \
+             `sysdefault`/`plug` PCM or the sound server",
+            formats.join(", ")
+        )
+    } else {
+        format!(
+            "does not accept {sample_rate}Hz (offers {})",
+            describe_device_rates(device)
+        )
+    }
 }
 
 /// Clamps a requested device buffer to the range the backend advertises, so a value that is too
@@ -867,6 +995,52 @@ mod tests {
         assert_eq!(match_device(&names, "audio"), Some(0), "first match wins");
         assert_eq!(match_device(&names, "  usb  "), Some(1), "trimmed");
         assert_eq!(match_device(&names, "firewire"), None);
+    }
+
+    /// Every device the host lists must actually resolve. Resolving used to collect *all* devices
+    /// first, which kept one ALSA PCM per alias open: `samplerate`/`speex`/`upmix`/`default` slave to
+    /// the same card, so that card's real entries (`sysdefault:CARD=…`, `front:CARD=…`) failed to
+    /// open and were silently dropped from the list being searched. The destination a user had just
+    /// picked in `output` was then reported `missing` — and the engine played into a sink.
+    #[test]
+    fn every_listed_device_resolves_by_its_own_name() {
+        let host = cpal::default_host();
+        let names = output_device_names(&host);
+        if names.len() < 2 {
+            // A headless host (or one with a single PCM) has no ordering to disagree about.
+            return;
+        }
+        let mut unresolved = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            match resolve_device(&host, Some(name)) {
+                DeviceLookup::Named {
+                    device: Some(_), ..
+                } => {}
+                DeviceLookup::Named { device: None, seen } => {
+                    unresolved.push(format!("`{name}` (#{index}, {seen} visible)"))
+                }
+                DeviceLookup::Default(_) => unreachable!("a pattern never takes the default path"),
+            }
+        }
+        assert!(
+            unresolved.is_empty(),
+            "{} of {} listed device(s) do not resolve: {}",
+            unresolved.len(),
+            names.len(),
+            unresolved.join(", ")
+        );
+    }
+
+    /// The formats [`build_stream`] can feed; the enumeration offers more than that.
+    #[test]
+    fn only_formats_the_stream_can_feed_are_accepted() {
+        use cpal::SampleFormat as F;
+        for format in [F::F32, F::I16, F::U16] {
+            assert!(playable_format(format), "{format:?}");
+        }
+        for format in [F::I8, F::U8, F::I32, F::U32, F::F64] {
+            assert!(!playable_format(format), "{format:?} cannot be fed");
+        }
     }
 
     /// A destination that is configured but unavailable is a *state*, not a failed build: the mixer

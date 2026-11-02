@@ -383,13 +383,35 @@ fn apply_hit(app: &mut App, hit: Hit, dispatcher: &Dispatcher) {
 }
 
 /// Reloads the mixer topology after the settings screen rewrote an output.
+///
+/// The fallback is the point: a session started without `--config`/`--profile` boots from
+/// [`command::DEFAULT_TOPOLOGY`] (`main::default_config` reads exactly that file), but leaves
+/// `app.mixer_path` unset. Without the fallback the screen would write the file and the running
+/// engine would keep the old device bindings — silence that only a restart cures. The write path is
+/// the same file, so remembering it here also keeps the two views in step.
 fn reload_mixer(app: &mut App, dispatcher: &Dispatcher) {
-    let Some(path) = app.mixer_path.clone() else {
-        return;
-    };
+    let path = app
+        .mixer_path
+        .clone()
+        .unwrap_or_else(|| command::DEFAULT_TOPOLOGY.to_owned());
+    app.mixer_path = Some(path.clone());
     match std::fs::read_to_string(&path) {
         Ok(text) => {
             let _ = dispatcher.command_tx.send(Command::MixerReload { text });
+        }
+        Err(err) => app.push_log(LogLine::error(format!("{path}: {err}"))),
+    }
+}
+
+/// Points the session at a different topology file: remember it, then reload from its text (the
+/// settings screen's `mixer` row). The typed equivalent is `mixer reload <path>`.
+fn switch_mixer(app: &mut App, dispatcher: &Dispatcher, path: &str) {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            app.mixer_path = Some(path.to_owned());
+            dispatcher.with_topology(Some(path.to_owned()));
+            let _ = dispatcher.command_tx.send(Command::MixerReload { text });
+            app.push_log(LogLine::info(format!("mixer <- {path}")));
         }
         Err(err) => app.push_log(LogLine::error(format!("{path}: {err}"))),
     }
@@ -897,6 +919,11 @@ fn handle_overlay(app: &mut App, key: KeyEvent, dispatcher: &Dispatcher) {
         },
         Overlay::Settings(mut screen) => {
             let outcome = screen.handle_key(key.code);
+            // A newly chosen topology first, then any device binding the screen just wrote into it:
+            // the second step has to read the file the first one selected.
+            if let Some(path) = outcome.mixer.clone() {
+                switch_mixer(app, dispatcher, &path);
+            }
             if outcome.mixer_saved {
                 reload_mixer(app, dispatcher);
             }

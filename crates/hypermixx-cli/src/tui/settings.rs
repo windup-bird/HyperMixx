@@ -1,8 +1,9 @@
-//! The settings screen: four things, one flat list.
+//! The settings screen: five things, one flat list.
 //!
 //! ```
 //! > controller   Numark Party Mix III · profile/controller.toml
-//!   mixer        profile/mixer.toml · 2 outputs
+//!   mixer        profile/mixer.toml
+//!   output       2 output(s)
 //!   live         profile/live.toml
 //!   preference   profile/preference.toml
 //! ```
@@ -12,8 +13,11 @@
 //! deeper levels are the choosers themselves:
 //!
 //! * `controller › input` (MIDI ports) → `controller › map` (a `.toml` file) → reconnect.
-//! * `mixer › {output}` (one row per `[[output]]`) → `… › input` (hardware) → `… › channels` →
-//!   writes `device`/`channels` back into `mixer.toml` and reloads the topology.
+//! * `mixer` picks the **topology** file (a `.toml`), exactly like `live`/`preference`; the caller
+//!   reloads the engine from it.
+//! * `output › {destination}` (one row per `[[output]]` of that topology) → `… › input` (hardware) →
+//!   `… › channels` → writes `device`/`channels` back into the topology file and reloads it. This is
+//!   the device-binding half only: which topology file is `mixer`'s question.
 //! * `live` and `preference` are file pickers; the caller reloads what they point at.
 
 use std::fs;
@@ -52,8 +56,10 @@ pub struct Context {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Outcome {
     pub close: bool,
-    /// `mixer.toml` was written, so the caller reloads the topology.
+    /// The topology file was rewritten (`device`/`channels`), so the caller reloads it.
     pub mixer_saved: bool,
+    /// A different topology file was chosen; the caller reloads *that* file and remembers it.
+    pub mixer: Option<String>,
     /// The controller selection changed: `(port, map path)`. The caller reconnects.
     pub controller: Option<(String, String)>,
     /// A new `live.toml` was chosen.
@@ -66,17 +72,27 @@ pub struct Outcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Item {
     Controller,
+    /// Which topology file the engine runs from.
     Mixer,
+    /// Where each of that topology's destinations goes (device + channel pair).
+    Output,
     Live,
     Preference,
 }
 
-const ITEMS: [Item; 4] = [Item::Controller, Item::Mixer, Item::Live, Item::Preference];
+const ITEMS: [Item; 5] = [
+    Item::Controller,
+    Item::Mixer,
+    Item::Output,
+    Item::Live,
+    Item::Preference,
+];
 
 /// Which file a picker is choosing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FileTarget {
     ControllerMap,
+    Mixer,
     Live,
     Preference,
 }
@@ -187,7 +203,15 @@ impl SettingsScreen {
     fn open_item(&mut self, item: Item) {
         self.stack.push(match item {
             Item::Controller => Level::Ports(PortList::refresh()),
-            Item::Mixer => Level::Outputs { cursor: 0 },
+            Item::Mixer => Level::Files(
+                FilePicker::new(
+                    Some(std::path::Path::new(&self.mixer_path)),
+                    &["toml"],
+                    "mixer",
+                ),
+                FileTarget::Mixer,
+            ),
+            Item::Output => Level::Outputs { cursor: 0 },
             Item::Live => Level::Files(
                 FilePicker::new(
                     self.context.live.as_deref().map(std::path::Path::new),
@@ -303,7 +327,7 @@ impl SettingsScreen {
                     KeyCode::Enter | KeyCode::Right => match rows.get(cursor) {
                         Some(row) => {
                             let device = row.device();
-                            let pairs = devices::pairs(self.channels_of(device));
+                            let pairs = devices::channel_pairs(self.channels_of(device));
                             // A plain stereo interface has nothing to ask: bind it here.
                             if pairs.len() > 1 {
                                 self.stack.push(Level::Channels {
@@ -327,7 +351,7 @@ impl SettingsScreen {
                 device,
                 mut cursor,
             } => {
-                let pairs = devices::pairs(self.channels_of(device));
+                let pairs = devices::channel_pairs(self.channels_of(device));
                 match code {
                     KeyCode::Up => cursor = cursor.saturating_sub(1),
                     KeyCode::Down => cursor = (cursor + 1).min(pairs.len().saturating_sub(1)),
@@ -356,6 +380,16 @@ impl SettingsScreen {
                 if let Some(port) = self.context.controller_port.clone() {
                     outcome.controller = Some((port, path));
                 }
+                self.stack.clear();
+            }
+            // A topology is a pointer to the file the `output` rows read and write, so the list has
+            // to be re-read here: the new file names different destinations.
+            FileTarget::Mixer => {
+                self.context.mixer = Some(path.clone());
+                self.mixer_path = path.clone();
+                self.status = Some(format!("mixer: {path}"));
+                self.refresh();
+                outcome.mixer = Some(path);
                 self.stack.clear();
             }
             FileTarget::Live => {
@@ -445,6 +479,7 @@ impl SettingsScreen {
             Some(Level::Files(picker, target)) => {
                 let level = match target {
                     FileTarget::ControllerMap => "controller › map",
+                    FileTarget::Mixer => "mixer",
                     FileTarget::Live => "live",
                     FileTarget::Preference => "preference",
                 };
@@ -464,9 +499,9 @@ impl SettingsScreen {
                         Row::new(format!("{} ({role})", output.name)).note(device)
                     })
                     .collect();
-                View::new("settings › mixer", rows)
+                View::new("settings › output", rows)
                     .cursor(*cursor)
-                    .hint("↑↓ move · →/Enter choose hardware · Esc close")
+                    .hint("↑↓ move · →/Enter choose hardware · ← back · Esc close")
             }
             Some(Level::Hardware { output, cursor }) => {
                 let bound = self
@@ -505,7 +540,7 @@ impl SettingsScreen {
                 device,
                 cursor,
             }) => {
-                let rows = devices::pairs(self.channels_of(*device))
+                let rows = devices::channel_pairs(self.channels_of(*device))
                     .into_iter()
                     .enumerate()
                     .map(|(index, (left, right))| {
@@ -529,7 +564,7 @@ impl SettingsScreen {
             .outputs
             .get(output)
             .map_or_else(|| format!("output {output}"), |info| info.name.clone());
-        format!("settings › mixer › {name} › {level}")
+        format!("settings › output › {name} › {level}")
     }
 
     fn root_view(&self) -> View {
@@ -542,16 +577,13 @@ impl SettingsScreen {
                     _ => "<not connected>".to_owned(),
                 },
             ),
-            Row::new("mixer").note(format!(
-                "{} · {} output(s)",
-                self.mixer_path,
-                self.outputs.len()
-            )),
+            Row::new("mixer").note(self.mixer_path.clone()),
+            Row::new("output").note(format!("{} output(s)", self.outputs.len())),
             Row::new("live").note(note(&self.context.live)),
             Row::new("preference").note(note(&self.context.preference)),
         ];
-        // The profile is the pointer all four paths come from, so it belongs on screen — but it is
-        // not a fifth row: it is where the rows came from.
+        // The profile is the pointer all five paths come from, so it belongs on screen — but it is
+        // not a sixth row: it is where the rows came from.
         let hint = self
             .status
             .clone()
@@ -787,15 +819,21 @@ mod tests {
     }
 
     #[test]
-    fn the_root_list_is_controller_mixer_live_preference() {
+    fn the_root_list_is_controller_mixer_output_live_preference() {
         let screen = screen();
-        let labels: Vec<String> = screen.rows().into_iter().map(|(label, _)| label).collect();
-        assert_eq!(labels, vec!["controller", "mixer", "live", "preference"]);
+        let rows = screen.rows();
+        let labels: Vec<String> = rows.iter().map(|(label, _)| label.clone()).collect();
+        assert_eq!(
+            labels,
+            vec!["controller", "mixer", "output", "live", "preference"]
+        );
         assert_eq!(screen.title(), "settings");
         assert!(
-            screen.rows()[1].1.contains("2 output(s)"),
-            "the mixer row counts outputs"
+            rows[1].1.ends_with("mixer.toml"),
+            "the mixer row names the topology file: {:?}",
+            rows[1]
         );
+        assert_eq!(rows[2].1, "2 output(s)", "the output row counts bindings");
     }
 
     #[test]
@@ -804,7 +842,7 @@ mod tests {
         for _ in 0..6 {
             screen.handle_key(KeyCode::Down);
         }
-        assert_eq!(screen.cursor_row(), 3, "clamped to the last item");
+        assert_eq!(screen.cursor_row(), 4, "clamped to the last item");
         for _ in 0..6 {
             screen.handle_key(KeyCode::Up);
         }
@@ -830,20 +868,20 @@ mod tests {
     }
 
     #[test]
-    fn mixer_goes_output_then_hardware_then_channels_and_writes_the_file() {
+    fn output_goes_destination_then_hardware_then_channels_and_writes_the_file() {
         let mut screen = screen();
         screen.set_devices(vec![device("Quad Interface", 4), device("Stereo Box", 2)]);
-        assert!(screen.focus("mixer"));
+        assert!(screen.focus("output"));
         screen.handle_key(KeyCode::Enter);
-        assert_eq!(screen.title(), "settings › mixer");
+        assert_eq!(screen.title(), "settings › output");
         assert_eq!(
             screen.rows()[0],
             ("main (master)".to_owned(), "<host default>".to_owned())
         );
         screen.handle_key(KeyCode::Enter);
-        assert_eq!(screen.title(), "settings › mixer › main › input");
+        assert_eq!(screen.title(), "settings › output › main › input");
         screen.handle_key(KeyCode::Right);
-        assert_eq!(screen.title(), "settings › mixer › main › channels");
+        assert_eq!(screen.title(), "settings › output › main › channels");
         screen.handle_key(KeyCode::Down);
         let outcome = screen.handle_key(KeyCode::Enter);
         assert!(outcome.mixer_saved);
@@ -858,11 +896,11 @@ mod tests {
     fn a_stereo_device_is_bound_without_a_channel_level() {
         let mut screen = screen();
         screen.set_devices(vec![device("Stereo Box", 2)]);
-        assert!(screen.focus("mixer"));
+        assert!(screen.focus("output"));
         screen.handle_key(KeyCode::Enter);
         screen.handle_key(KeyCode::Down);
         screen.handle_key(KeyCode::Enter);
-        assert_eq!(screen.title(), "settings › mixer › phones › input");
+        assert_eq!(screen.title(), "settings › output › phones › input");
         let outcome = screen.handle_key(KeyCode::Enter);
         assert!(
             outcome.mixer_saved,
@@ -872,14 +910,41 @@ mod tests {
     }
 
     #[test]
+    fn a_new_topology_is_handed_back_and_the_output_rows_follow_it() {
+        let mut screen = screen();
+        let dir = std::path::Path::new(&screen.mixer_path)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        // Sorts before the other files in the directory, so the picker's first row is this one.
+        let other = write(
+            &dir,
+            "aaa.toml",
+            "[[output]]\nname = \"only\"\nrole = \"master\"\n",
+        );
+        assert!(screen.focus("mixer"));
+        screen.handle_key(KeyCode::Enter);
+        assert_eq!(screen.title(), "settings › mixer");
+        assert_eq!(screen.rows()[0].0, "aaa.toml");
+        let outcome = screen.handle_key(KeyCode::Enter);
+        assert_eq!(outcome.mixer.as_deref(), Some(other.as_str()));
+        assert!(!outcome.mixer_saved, "choosing a file writes nothing");
+        assert_eq!(screen.mixer_path, other);
+        assert_eq!(screen.depth(), 0);
+        let rows = screen.rows();
+        assert_eq!(rows[1].1, other, "the mixer row names the new file");
+        assert_eq!(rows[2].1, "1 output(s)", "the output rows are re-read");
+    }
+
+    #[test]
     fn choosing_a_file_hands_the_path_back_to_the_caller() {
         let mut screen = screen();
-        let picker_rows = screen.rows();
-        assert!(
-            picker_rows[2].1.ends_with("live.toml"),
-            "{:?}",
-            picker_rows[2]
-        );
+        let live = screen
+            .rows()
+            .into_iter()
+            .find(|(label, _)| label == "live")
+            .expect("live row");
+        assert!(live.1.ends_with("live.toml"), "{live:?}");
         // `live` opens a picker rooted at the current file's directory.
         assert!(screen.focus("live"));
         screen.handle_key(KeyCode::Enter);

@@ -908,7 +908,7 @@ fn handle_overlay(session: &mut Session, key: KeyEvent) {
                         session.overlay = Overlay::Devices { selected, target };
                         return;
                     };
-                    let pairs = crate::tui::devices::pairs(
+                    let pairs = crate::tui::devices::channel_pairs(
                         session
                             .outputs
                             .devices
@@ -938,7 +938,7 @@ fn handle_overlay(session: &mut Session, key: KeyEvent) {
                     };
                     // Level two: an interface with several stereo pairs asks which one this output
                     // is. A plain stereo device is already answered.
-                    let pairs = crate::tui::devices::pairs(
+                    let pairs = crate::tui::devices::channel_pairs(
                         session
                             .outputs
                             .devices
@@ -963,7 +963,7 @@ fn handle_overlay(session: &mut Session, key: KeyEvent) {
             mut selected,
             target,
         } => {
-            let pairs = crate::tui::devices::pairs(
+            let pairs = crate::tui::devices::channel_pairs(
                 session
                     .outputs
                     .devices
@@ -1333,7 +1333,7 @@ fn overlay_view(session: &Session) -> Option<crate::tui::popup::View> {
             selected,
             target,
         } => {
-            let rows = crate::tui::devices::pairs(
+            let rows = crate::tui::devices::channel_pairs(
                 session
                     .outputs
                     .devices

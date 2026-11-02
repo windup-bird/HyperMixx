@@ -137,7 +137,7 @@ cargo run -p hypermixx-cli -- --guide              # learn 模式编辑映射（
 #   旧的 --tui / --midi / --midi-map / --midi-guide 已移除
 ```
 
-TUI 内尽量不用启动参数:`F9` 打开设置（控制器端口、映射文件、mixer 输出设备都在这里选，取代了旧的 F2/F3）；
+TUI 内尽量不用启动参数:`F9` 打开设置（控制器端口、映射文件、拓扑文件、输出设备都在这里选，取代了旧的 F2/F3）；
 `load` 不带路径则弹出文件浏览器；`--guide` 即使不跟路径也会在 TUI 里选端口与文件。波形左右声道上下镜像，三频段颜色、
 分频点（`low_hz`/`high_hz`，内置默认 200/4000Hz，随附文件用 250/4000Hz）、渲染 backend 与图像刷新率在 `profile/preference.toml` 配置：
 `auto` 按 kitty → braille 选择（tmux/screen 暂回 braille）；kitty 可用 60Hz。
@@ -195,11 +195,12 @@ browser | command
 终端内 `controller ports` 列出可用输入端口（`midi ports` 仍可）；映射表格式与全部 action 见
 `profile/controller.toml` 注释与 [`docs/MIDI.md`](docs/MIDI.md)。
 
-`F9`（或 header 右侧的 settings 按钮）打开设置界面——**它不是 TOML 编辑器**，只有四项：
+`F9`（或 header 右侧的 settings 按钮）打开设置界面——**它不是 TOML 编辑器**，只有五项：
 
 ```
 > controller   Numark Party Mix III · profile/controller.toml
-  mixer        profile/mixer.toml · 2 output(s)
+  mixer        profile/mixer.toml
+  output       2 output(s)
   live         profile/live.toml
   preference   profile/preference.toml
 ```
@@ -209,12 +210,20 @@ browser | command
 
 - `controller`：先进 `controller › input`（MIDI 端口列表），选定后自动进入 `controller › map`（`.toml` 文件选择），
   选定即重连。文件选择里 `→`/`Enter` 进入目录、`⌦` 上一级目录、`←` 退回上一层。
-- `mixer`：`mixer`（每条 `[[output]]` 一行）→ `… › input`（hardware）→ `… › channels`（channel pair），
-  选定即写 `mixer.toml` 的 `device`/`channels` 并重载拓扑。`●` 当前绑定、`◆` 本 controller 的声卡、
-  `✓/✗ rate` 采样率。立体声设备没有 channel 这一层。
+- `mixer`：选**拓扑**文件（`.toml`），选定即把它交给引擎重载（等同 `mixer reload <file>`），
+  之后的 `mixer reload` 也以它为默认。
+- `output`：`output`（每条 `[[output]]` 一行，来自 `mixer` 选中的文件）→ `… › input`（hardware）→
+  `… › channels`（channel pair），选定即写该文件的 `device`/`channels` 并立即重载（不必重启）。
+  `●` 当前绑定、`◆` 本 controller 的声卡、`✓/✗ rate` 采样率。立体声设备没有 channel 这一层；
+  ALSA 的 `sysdefault`/`default`/`pipewire` 这类虚拟 PCM 会谎报 32 通道，列表只给前四对（0,1 / 2,3 / 4,5 / 6,7）。
 - `live`、`preference`：选新的 `.toml`；`live` 立即按 `live reload` 重新读取（引擎率/ring 需重启），
   `preference` 立即换主题。
-- 其余按键：`↑↓` 移动、`r` 重读 mixer 文件（设备列表只在启动前探测一次，避免 ALSA 警告糊到界面上）。
+- 其余按键：`↑↓` 移动、`r` 重读当前拓扑文件（设备列表只在启动前探测一次，避免 ALSA 警告糊到界面上）。
+
+`output` 绑定的设备若被别的客户端（通常是 PipeWire/PulseAudio）独占，引擎会把它报成 `missing` 而不是假装在放——
+此时选 `default`/`pipewire` 这类**走声音服务器**的目的地，或让出该声卡后 `output refresh`。该原因会打在 stderr 上。
+`live.toml` 的 `device_buffer_frames` 只是延迟偏好：ALSA 的 `dmix`/`plug`（`sysdefault`/`default`，USB 声卡常见路径）
+会拒绝固定 buffer，此时引擎自动退回后端默认值，不会因此变成静音输出。
 
 弹窗出现时 deck 上的 kitty 图片会被立即删除（kitty 图片在文字层之下，只是不再绘制的话会从弹窗里透出来），
 关闭后自动重传。

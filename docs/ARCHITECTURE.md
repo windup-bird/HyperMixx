@@ -411,7 +411,8 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   三频段颜色也在 `profile/preference.toml`)。command
   上半是响应日志,下半输入带的顶线嵌入 `deck0 / deck1 / browser` 目标(`Tab` 循环;browser
   目前没有 CLI 前缀),目标文字与面板标题 `command` 左对齐
-- TUI 设置界面(`src/tui/settings.rs`):`F9` 打开,选择控制器端口/映射文件、mixer 输出设备、
+- TUI 设置界面(`src/tui/settings.rs`):`F9` 打开,选择控制器端口/映射文件、拓扑文件(`mixer`)、
+  输出绑定(`output`,每条 `[[output]]` 的 device/channels,写入拓扑文件并立即重载)、
   live/preference 文件(取代旧的 `F2`/`F3`);`load` 不带路径弹文件浏览器;`Load` 完成后
   `App::connect_midi` 连上,`--controller/--controller-map` 仅是免选择的快捷方式
 - `--guide [<file>] [--controller <port>] [--decks <n>]` — learn 模式地图编辑器(`src/tui/guide.rs`),

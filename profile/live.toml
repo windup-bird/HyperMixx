@@ -30,6 +30,10 @@ prefill_frames = 512
 # 128-frame period (~2.9 ms) and a 512-frame buffer (~11.6 ms). Omit (or 0) for the backend default,
 # which on ALSA is a 25 ms period / 100 ms buffer. Aggressive: 256 (64-frame period, ~5.8 ms buffer),
 # but expect xruns on ordinary desktop scheduling.
+#
+# Best effort: a path that refuses a fixed buffer — ALSA's dmix/plug behind `sysdefault`/`default`,
+# which is how a USB controller's own interface is normally reached — falls back to the backend's
+# default instead of failing the stream (a failed stream is a silent output).
 device_buffer_frames = 512
 
 [keylock]

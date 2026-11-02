@@ -547,11 +547,17 @@ mod tests {
         // so they are normalised before the comparison.
         let mut parsed = MixerConfig::from_toml_str(reference_toml())
             .unwrap_or_else(|err| panic!("reference toml does not parse: {err}"));
+        // The shipped file keeps main and cue on separate pairs; which pair is a rig fact.
+        assert_ne!(
+            parsed.outputs[0].channels, parsed.outputs[1].channels,
+            "main and cue share a channel pair in the reference topology"
+        );
         for (index, output) in parsed.outputs.iter_mut().enumerate() {
             output.id = index as OutputId;
-            // The device is a *machine* fact: a user who edits `profile/mixer.toml` to name their
-            // interface must not break this contract, which is about the mixer's shape.
+            // `device` and `channels` are *machine* facts: the F9 output chooser writes them into
+            // this very file, so a rig with its cue on 2,3 must not break this shape contract.
             output.device = None;
+            output.channels = (0, 1);
         }
         let mut expected = simple_dj();
         for (index, output) in expected.outputs.iter_mut().enumerate() {

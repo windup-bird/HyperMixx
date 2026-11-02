@@ -92,7 +92,7 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     app.devices = hypermixx_audio::output_devices(Some(sample_rate));
     app.preference_path = preference_path.clone();
     app.live_path = live_path;
-    app.mixer_path = topology_path;
+    app.mixer_path = topology_path.or_else(|| Some(crate::command::DEFAULT_TOPOLOGY.to_owned()));
     match preference::load(&preference_path) {
         Ok((preference, notes)) => {
             app.waveform = preference.waveform;

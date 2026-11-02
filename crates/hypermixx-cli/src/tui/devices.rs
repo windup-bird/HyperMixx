@@ -38,8 +38,8 @@ pub fn rows(devices: &[DeviceInfo]) -> Vec<Row> {
     let mut out = Vec::new();
     for (index, device) in devices.iter().enumerate() {
         out.push(Row::Device { index });
-        if (4..=8).contains(&device.channels) {
-            for pair in pairs(device.channels) {
+        if channel_pairs(device.channels).len() > 1 {
+            for pair in channel_pairs(device.channels) {
                 out.push(Row::Pair {
                     index,
                     channels: pair,
@@ -56,6 +56,26 @@ pub fn pairs(channels: u16) -> Vec<(u16, u16)> {
         .map(|pair| (pair * 2, pair * 2 + 1))
         .collect()
 }
+
+/// The pairs worth **offering** for a device that advertises `channels` outputs.
+///
+/// A real interface reports 2, 4, 6 or 8 channels, and every pair is a real socket. ALSA's `plug`
+/// layer (which is what `sysdefault`/`default`/`pipewire` resolve to) accepts up to 32 channels for
+/// any card, so a 4-channel USB interface advertises 32 and would otherwise produce sixteen
+/// channel-pair rows of which only two exist. The first four pairs are the ones a DJ rig can use
+/// (stereo, two stereo pairs, 5.1, 7.1); past that the number is a plugin detail, not hardware.
+pub fn channel_pairs(channels: u16) -> Vec<(u16, u16)> {
+    let offered = pairs(channels.min(MAX_PAIR_CHANNELS));
+    if offered.is_empty() {
+        // A device that will not tell us its count still needs its usual stereo pair.
+        vec![(0, 1)]
+    } else {
+        offered
+    }
+}
+
+/// The widest advertised channel count that is treated as hardware rather than a plugin's ceiling.
+const MAX_PAIR_CHANNELS: u16 = 8;
 
 /// The row's text: the device name (plus its card description), or `channels 2,3` under it.
 pub fn label(devices: &[DeviceInfo], row: Row) -> String {
@@ -173,17 +193,61 @@ mod tests {
     }
 
     #[test]
+    fn a_plugins_32_channel_ceiling_does_not_become_sixteen_rows() {
+        // `sysdefault:CARD=III` is a 4-channel interface behind ALSA's `plug`, whose ceiling is 32.
+        // Only the pairs a real rig can have are offered, and the first two are the ones a DJ needs.
+        assert_eq!(
+            channel_pairs(32),
+            vec![(0, 1), (2, 3), (4, 5), (6, 7)],
+            "capped, but 2,3 stays reachable"
+        );
+        assert_eq!(channel_pairs(4), vec![(0, 1), (2, 3)]);
+        // A device that reports nothing usable still gets its stereo pair.
+        assert_eq!(channel_pairs(0), vec![(0, 1)]);
+        assert_eq!(channel_pairs(1), vec![(0, 1)]);
+    }
+
+    #[test]
     fn a_virtual_device_that_claims_32_channels_is_not_expanded() {
         // ALSA's `sysdefault`/`pulse` plugins advertise 32 channels whatever the card is; expanding
         // them would bury the real interfaces under sixteen "channels n,n+1" rows.
         let devices = vec![device("sysdefault", 32), device("Quad", 4)];
         let rows = rows(&devices);
         assert_eq!(rows[0], Row::Device { index: 0 });
-        assert_eq!(rows[1], Row::Device { index: 1 });
+        // The pair rows under it are the capped set, not sixteen.
+        assert_eq!(
+            rows[1],
+            Row::Pair {
+                index: 0,
+                channels: (0, 1)
+            }
+        );
+        assert_eq!(
+            rows[4],
+            Row::Pair {
+                index: 0,
+                channels: (6, 7)
+            }
+        );
+        assert_eq!(rows[5], Row::Device { index: 1 });
+        assert_eq!(
+            rows[6],
+            Row::Pair {
+                index: 1,
+                channels: (0, 1)
+            }
+        );
+        assert_eq!(
+            rows[7],
+            Row::Pair {
+                index: 1,
+                channels: (2, 3)
+            }
+        );
         assert_eq!(
             rows.len(),
-            4,
-            "only the quad device adds pair rows: {rows:?}"
+            8,
+            "four pairs under the virtual device, two under the quad: {rows:?}"
         );
     }
 }
