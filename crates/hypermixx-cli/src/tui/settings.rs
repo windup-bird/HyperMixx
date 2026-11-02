@@ -18,6 +18,10 @@
 //! * `output › {destination}` (one row per `[[output]]` of that topology) → `… › input` (hardware) →
 //!   `… › channels` → writes `device`/`channels` back into the topology file and reloads it. This is
 //!   the device-binding half only: which topology file is `mixer`'s question.
+//!   Opening `output` **re-probes the host's devices**, and `r` does it again from inside: a device
+//!   that was plugged in (or released by the sound server) after the TUI started has to show up
+//!   without restarting. Probing opens every PCM, so ALSA complains — those lines now land in the
+//!   response log instead of over the canvas (see `stderr.rs`).
 //! * `live` and `preference` are file pickers; the caller reloads what they point at.
 
 use std::fs;
@@ -127,6 +131,32 @@ enum Level {
     },
 }
 
+/// How the screen re-reads the host's output devices.
+///
+/// A field rather than a direct call: it is the one place that touches cpal, and a test can pin the
+/// list without a sound card (see [`DeviceProbe::fixed`]).
+#[derive(Clone)]
+struct DeviceProbe(
+    std::sync::Arc<dyn Fn(Option<u32>) -> Vec<hypermixx_audio::DeviceInfo> + Send + Sync>,
+);
+
+impl Default for DeviceProbe {
+    fn default() -> Self {
+        Self(std::sync::Arc::new(hypermixx_audio::output_devices))
+    }
+}
+
+impl DeviceProbe {
+    fn probe(&self, engine_rate: u32) -> Vec<hypermixx_audio::DeviceInfo> {
+        (self.0)(Some(engine_rate))
+    }
+
+    #[cfg(test)]
+    fn fixed(devices: Vec<hypermixx_audio::DeviceInfo>) -> Self {
+        Self(std::sync::Arc::new(move |_| devices.clone()))
+    }
+}
+
 pub struct SettingsScreen {
     context: Context,
     /// The root cursor and the open levels.
@@ -135,6 +165,7 @@ pub struct SettingsScreen {
     status: Option<String>,
     outputs: Vec<OutputInfo>,
     devices: Vec<hypermixx_audio::DeviceInfo>,
+    probe: DeviceProbe,
     mixer_path: String,
 }
 
@@ -152,6 +183,7 @@ impl SettingsScreen {
             status: None,
             outputs: Vec::new(),
             devices,
+            probe: DeviceProbe::default(),
             mixer_path,
         };
         screen.refresh();
@@ -164,6 +196,16 @@ impl SettingsScreen {
             .as_ref()
             .map(outputs_of)
             .unwrap_or_default();
+    }
+
+    /// Re-probes the host's output devices.
+    ///
+    /// The list is a snapshot of a moment: a controller plugged in after the TUI started, or a card
+    /// the sound server has just let go of, only appears after asking again. That is why opening
+    /// `output` and `r` both do it.
+    fn probe_devices(&mut self) -> usize {
+        self.devices = self.probe.probe(self.context.engine_rate);
+        self.devices.len()
     }
 
     /// Handles one key press. The screen owns the keyboard while it is open.
@@ -190,10 +232,11 @@ impl SettingsScreen {
             }
             KeyCode::Enter | KeyCode::Right => self.open_item(ITEMS[self.cursor]),
             KeyCode::Char('r') => {
-                // Only files are re-read: probing devices here would print ALSA warnings over the
-                // UI (the list is probed once, before the terminal is taken over).
+                // The file and the hardware list, because either can have changed since the screen
+                // opened. Probing prints ALSA warnings — into the response log, not over the UI.
                 self.refresh();
-                self.status = Some("reloaded".to_owned());
+                let devices = self.probe_devices();
+                self.status = Some(format!("reloaded · {devices} device(s)"));
             }
             _ => {}
         }
@@ -201,7 +244,12 @@ impl SettingsScreen {
 
     /// `Enter`/`→` on a root row: the first level of that item's chooser.
     fn open_item(&mut self, item: Item) {
-        self.stack.push(match item {
+        // Fresh hardware the moment the chooser opens: this is where a device that was plugged in
+        // (or released by the sound server) after startup used to be missing.
+        if item == Item::Output {
+            self.probe_devices();
+        }
+        let level = match item {
             Item::Controller => Level::Ports(PortList::refresh()),
             Item::Mixer => Level::Files(
                 FilePicker::new(
@@ -228,7 +276,8 @@ impl SettingsScreen {
                 ),
                 FileTarget::Preference,
             ),
-        });
+        };
+        self.stack.push(level);
     }
 
     fn handle_level(&mut self, code: KeyCode, outcome: &mut Outcome) {
@@ -317,6 +366,19 @@ impl SettingsScreen {
                         self.stack.push(Level::Outputs { cursor });
                     }
                 }
+                // The file is the thing that can change under a running TUI (`mixer reload`, an
+                // editor); `output` re-probes the hardware when it is (re)entered.
+                KeyCode::Char('r') => {
+                    self.refresh();
+                    let devices = self.probe_devices();
+                    cursor = cursor.min(self.outputs.len().saturating_sub(1));
+                    self.status = Some(format!(
+                        "reloaded · {} output(s) · {devices} device(s)",
+                        self.outputs.len()
+                    ));
+                    self.stack.push(Level::Outputs { cursor });
+                    return;
+                }
                 _ => self.stack.push(Level::Outputs { cursor }),
             },
             Level::Hardware { output, mut cursor } => {
@@ -324,6 +386,12 @@ impl SettingsScreen {
                 match code {
                     KeyCode::Up => cursor = cursor.saturating_sub(1),
                     KeyCode::Down => cursor = (cursor + 1).min(rows.len().saturating_sub(1)),
+                    // Plug a device in, press `r`, pick it: no trip back to the root for it.
+                    KeyCode::Char('r') => {
+                        let devices = self.probe_devices();
+                        cursor = cursor.min(devices.saturating_sub(1));
+                        self.status = Some(format!("{devices} device(s)"));
+                    }
                     KeyCode::Enter | KeyCode::Right => match rows.get(cursor) {
                         Some(row) => {
                             let device = row.device();
@@ -355,6 +423,22 @@ impl SettingsScreen {
                 match code {
                     KeyCode::Up => cursor = cursor.saturating_sub(1),
                     KeyCode::Down => cursor = (cursor + 1).min(pairs.len().saturating_sub(1)),
+                    // A re-probe can change the channel count behind this list; fail back to the
+                    // hardware level rather than keep a cursor into another device.
+                    KeyCode::Char('r') => {
+                        let devices = self.probe_devices();
+                        if device >= devices {
+                            self.status = Some(format!("{devices} device(s)"));
+                            self.stack.push(Level::Hardware {
+                                output,
+                                cursor: self.hardware_start(output),
+                            });
+                            return;
+                        }
+                        let pairs = devices::channel_pairs(self.channels_of(device));
+                        cursor = cursor.min(pairs.len().saturating_sub(1));
+                        self.status = Some(format!("{devices} device(s)"));
+                    }
                     KeyCode::Enter | KeyCode::Right => {
                         if let Some(pair) = pairs.get(cursor).copied() {
                             self.bind(output, device, Some(pair), outcome);
@@ -501,7 +585,7 @@ impl SettingsScreen {
                     .collect();
                 View::new("settings › output", rows)
                     .cursor(*cursor)
-                    .hint("↑↓ move · →/Enter choose hardware · ← back · Esc close")
+                    .hint("↑↓ move · →/Enter choose hardware · r refresh · ← back · Esc close")
             }
             Some(Level::Hardware { output, cursor }) => {
                 let bound = self
@@ -531,7 +615,7 @@ impl SettingsScreen {
                 View::new(self.output_title(*output, "input"), rows)
                     .cursor(*cursor)
                     .hint(format!(
-                        "engine {}Hz · ↑↓ move · →/Enter channels · ← back · Esc close",
+                        "engine {}Hz · ↑↓ move · →/Enter channels · r refresh · ← back · Esc close",
                         self.context.engine_rate
                     ))
             }
@@ -737,6 +821,9 @@ impl SettingsScreen {
     }
 
     fn set_devices(&mut self, devices: Vec<hypermixx_audio::DeviceInfo>) {
+        // Pin the re-probe too: the screen now asks the host again when `output` opens, and a test
+        // must not depend on the machine's sound cards.
+        self.probe = DeviceProbe::fixed(devices.clone());
         self.devices = devices;
     }
 
@@ -937,6 +1024,59 @@ mod tests {
         let rows = screen.rows();
         assert_eq!(rows[1].1, "1 output(s)", "the output rows are re-read");
         assert_eq!(rows[2].1, other, "the mixer row names the new file");
+    }
+
+    /// The device list is a snapshot, so the chooser has to be able to ask again: a controller
+    /// plugged in after the TUI started only appears after a re-probe. `output` does that when it
+    /// opens, and `r` does it from inside the hardware list.
+    #[test]
+    fn opening_output_and_pressing_r_re_probe_the_devices() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut screen = screen();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        screen.probe = DeviceProbe(Arc::new(move |_| {
+            let call = seen.fetch_add(1, Ordering::Relaxed);
+            // The first probe is what `output` opening does; the second is the `r` inside it.
+            let name = if call == 0 {
+                "Before Plug"
+            } else {
+                "After Plug"
+            };
+            vec![device(name, 2)]
+        }));
+        screen.devices = vec![device("Stale", 2)];
+
+        assert!(screen.focus("output"));
+        screen.handle_key(KeyCode::Enter); // probe #1
+        screen.handle_key(KeyCode::Enter); // `main` → hardware
+        assert_eq!(screen.title(), "settings › output › main › input");
+        assert!(
+            screen
+                .rows()
+                .iter()
+                .any(|(label, _)| label.contains("Before Plug")),
+            "opening `output` did not re-probe: {:?}",
+            screen.rows()
+        );
+
+        screen.handle_key(KeyCode::Char('r')); // probe #2
+        assert_eq!(
+            screen.title(),
+            "settings › output › main › input",
+            "`r` stays in the list it refreshes"
+        );
+        assert!(
+            screen
+                .rows()
+                .iter()
+                .any(|(label, _)| label.contains("After Plug")),
+            "`r` did not re-probe: {:?}",
+            screen.rows()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]
