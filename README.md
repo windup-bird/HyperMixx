@@ -29,7 +29,7 @@ cli ─┬─► audio ───┐
 
 ## 安装
 
-Linux 已完整构建并通过测试；Windows（MSVC）可构建运行（图形波形在 ConPTY 下自动回落 braille，见 `docs/WAVEFORM.md`）。
+Linux 已完整构建并通过测试；Windows（MSVC）可构建运行，依赖与踩坑见下面「Windows（MSVC）」（图形波形在 ConPTY 下自动回落 braille，见 `docs/WAVEFORM.md`）。
 
 前置：Rust（2021 edition，1.70+）、音频输出设备。
 
@@ -43,25 +43,78 @@ cargo build --release
 cargo build --release --features cuda  # use cuda to separate stems
 ```
 
-Windows 还需要两个原生依赖：
+### Windows（MSVC）
 
-- **OpenSSL**：`hypermixx-library` 的 `bundled-sqlcipher` 需要头文件和 `libcrypto.lib`。
-- **LLVM/libclang**：vendored `signalsmith-stretch` 的 `build.rs` 用 bindgen 生成绑定。
+Windows 上除了 Rust，还需要三样原生依赖；缺任何一样都是**构建期直接失败**，不是运行期警告：
+
+| 依赖 | 谁需要 | 装法 |
+|---|---|---|
+| MSVC C++ 工具链 | 所有 native 依赖 + `signalsmith-stretch` 的 C++ 源 | VS「使用 C++ 的桌面开发」；`rustup show` 应显示 `…-pc-windows-msvc` |
+| OpenSSL（头文件 + `libcrypto.lib`） | `hypermixx-library` 的 `rusqlite/bundled-sqlcipher` | `winget install ShiningLight.OpenSSL.Dev` |
+| LLVM/libclang | vendored `signalsmith-stretch` 的 `build.rs`（bindgen 生成绑定） | `winget install LLVM.LLVM` |
+
+两个 winget 包都装到默认位置（`C:\Program Files\OpenSSL-Win64`、`C:\Program Files\LLVM`）时，实测组合是
+OpenSSL 4.1.0 + LLVM 23.1.4 + Rust 1.98 msvc。
 
 ```powershell
 winget install ShiningLight.OpenSSL.Dev LLVM.LLVM
-
-$env:OPENSSL_LIB_DIR    = "C:\Program Files\OpenSSL-Win64\lib\VC\x64\MD"
-$env:OPENSSL_INCLUDE_DIR = "C:\Program Files\OpenSSL-Win64\include"
-$env:LIBCLANG_PATH       = "C:\Program Files\LLVM\bin"
-$env:PATH                = "C:\Program Files\OpenSSL-Win64\bin;$env:PATH"  # 运行期找 libcrypto-*-x64.dll
-
-git clone <repo>; cd HyperMixx
-cargo build --release
-cargo build --release --features cuda  # 需 CUDA 13 + cuDNN 9
+rustup show                      # 确认是 stable-x86_64-pc-windows-msvc
 ```
 
-把上面四个环境变量写进用户环境变量（或 `.cargo/config.toml` 的 `[env]`）就不必每次设置。
+**构建期环境变量**：`libsqlite3-sys` 的 build.rs 在 Windows 上只认两种写法——`OPENSSL_LIB_DIR` +
+`OPENSSL_INCLUDE_DIR` 成对，或单个 `OPENSSL_DIR`。这里必须用前者：winget 版 OpenSSL 的导入库在
+`lib\VC\x64\MD` 而不是 `lib`，而 `OPENSSL_DIR` 只会让 cargo 去 `lib`/`lib64` 下找，链接期就找不到
+`libcrypto.lib`。
+
+```powershell
+$env:OPENSSL_LIB_DIR     = "C:\Program Files\OpenSSL-Win64\lib\VC\x64\MD"
+$env:OPENSSL_INCLUDE_DIR = "C:\Program Files\OpenSSL-Win64\include"
+$env:LIBCLANG_PATH       = "C:\Program Files\LLVM\bin"   # 装在默认位置时可省（clang-sys 自己会搜 C:\Program Files*\LLVM\lib）
+```
+
+`$env:` 只在当前 PowerShell 会话有效。想只写一次就放进 `.cargo/config.toml`（与 `target/` 同级；该文件已在
+`.gitignore` 里，机器相关的绝对路径不会进仓库）：
+
+```toml
+[env]
+OPENSSL_LIB_DIR = "C:\\Program Files\\OpenSSL-Win64\\lib\\VC\\x64\\MD"
+OPENSSL_INCLUDE_DIR = "C:\\Program Files\\OpenSSL-Win64\\include"
+LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"
+```
+
+然后构建（首次要编译全部依赖，并下载 onnxruntime 预编译：CPU 约 101 MB、`cuda` 约 183 MB；之后只重建本仓库 ~40 秒）：
+
+```powershell
+git clone <repo>; cd HyperMixx
+cargo build --release
+cargo build --release --features cuda  # 可选：stem 分离走 GPU，需 CUDA 13 + cuDNN 9
+```
+
+产物是 `target\release\hypermixx-cli.exe`。它**运行期**还依赖两个动态库，构建成功不代表能直接双击：
+
+- `libcrypto-<major>-x64.dll`（OpenSSL 4 → `libcrypto-4-x64.dll`，3 → `libcrypto-3-x64.dll`）：
+  `bundled-sqlcipher` 是动态链接 `libcrypto` 的。把 `C:\Program Files\OpenSSL-Win64\bin` 留在 `PATH` 上，
+  或者把该 DLL 拷到 exe 旁边。
+- 只有 `--features cuda` 时才需要 `onnxruntime_providers_*.dll`：ORT 运行期按名字加载它，必须与 exe 同目录
+  （`cargo build` 会自动放进 `target\release\`，单独拷 exe 就要一起拷），并且 cuDNN 9 的 `bin` 要在 `PATH` 上。
+
+冒烟测试不需要声卡：
+
+```powershell
+.\target\release\hypermixx-cli.exe --print-config | Select-Object -First 3
+```
+
+**常见构建错误**
+
+| 报错（截断） | 原因 / 解法 |
+|---|---|
+| `failed to run custom build command for libsqlite3-sys` → `Missing environment variable OPENSSL_DIR or OPENSSL_DIR is not set` | 两个 OpenSSL 变量只设了一个（或都没设）。成对设，或设 `OPENSSL_DIR` |
+| `OpenSSL library directory does not exist: [...]` / `OpenSSL include directory does not exist` | 路径写错：导入库在 `lib\VC\x64\MD`，头是 `include\openssl\opensslv.h` |
+| `LINK : fatal error LNK1104: 无法打开文件“libcrypto.lib”` | `OPENSSL_LIB_DIR` 指到了 `…\OpenSSL-Win64\lib`（只有 `.def`/静态库），改成 `lib\VC\x64\MD` |
+| `Unable to generate bindings` / `couldn't find any valid shared libraries matching: ['libclang.dll']` | 没装 LLVM，或装在非默认目录又没设 `LIBCLANG_PATH`（指向**目录**，不是 `libclang.dll` 本身） |
+| `error: linker 'link.exe' not found` / `linking with link.exe failed` | 缺 MSVC：`rustup default stable-msvc` 并装 VS「使用 C++ 的桌面开发」 |
+| 启动即报缺 `libcrypto-4-x64.dll`（0xc0000135） | 见上：`PATH` 或把 DLL 拷到 exe 旁。版本号跟 OpenSSL 大版本走 |
+| `the CUDA execution provider could not run this model` | 见 `docs/STEM.md` §5：需要 `--features cuda`、CUDA 13 + cuDNN 9、provider DLL 在 exe 旁；或把 `[stems] provider` 改回 `cpu` |
 
 ## 示例操作
 
