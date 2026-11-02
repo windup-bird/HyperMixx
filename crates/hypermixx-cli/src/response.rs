@@ -361,23 +361,25 @@ pub fn help_text(decks: usize) -> String {
   browser tracks <list-id>     show one list's tracks
   browser show <location-id>   inspect one track
   state                        show every deck
-  midi ports                   list MIDI input ports (open one at launch with --midi)
-  midi mode [unit [mode|next]] list units, or switch one unit's active mode
+  controller ports             list controller input ports (`midi ports` is an alias)
+  controller mode [unit [mode|next]]
+                               list units, or switch one unit's active mode
   zoom in|out|fit              waveform zoom (UI only)
   quit                         exit
 
-In the TUI: `load` with no path opens a file picker; F2 picks a controller port and F3 the map
-file; F9 opens the settings screen. The browser is a soft focus: it takes the arrow keys (Miller
-columns; Enter opens a list or the deck chooser, Esc goes back) but a typed deck command still goes
-to the focused deck.
+In the TUI: `load` with no path opens a file picker; F9 opens the settings screen (controller port
+and map file, mixer outputs, live/preference files). The browser is a soft focus: it takes the arrow
+keys (Miller columns; Enter opens a list or the deck chooser, Esc goes back) but a typed deck
+command still goes to the focused deck.
 
 A leading `deck1` / `1` selects a deck (numbers are 1-based), `master` the summed output. Without
 one the command follows the focused deck (TUI: `Tab` cycles deck1 → deck2 → browser).
 startup flags: --config <file> (custom topology), --profile <name|file> (which files to use),
                --print-config (reference TOML), --live <file> (engine rate, ring, stem defaults),
-               --backend auto|stratum|timestretch, --tui (terminal UI),
-               --midi <port> [--midi-map <file>] (MIDI input; a map's [meta].device can supply the port),
-               --midi-guide [<file>] [--midi <port>] [--decks <n>] (unit map guide)",
+               --backend auto|stratum|timestretch, --cli (line REPL; the TUI is the default),
+               --controller <port> [--controller-map <file>] (controller input; a map's
+               [meta].device can supply the port),
+               --guide [<file>] [--controller <port>] [--decks <n>] (unit map guide)",
         decks - 1
     )
 }

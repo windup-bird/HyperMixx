@@ -793,6 +793,12 @@ impl Deck {
         self.push_rate();
     }
 
+    /// Tells the sync controller how long one block lasts at this engine's rate. The time constants
+    /// in `nudge` / `sync` are durations, so a 48k engine must not be told the 44.1k block length.
+    pub fn set_block_seconds(&mut self, seconds: f64) {
+        self.playhead.set_block_seconds(seconds);
+    }
+
     /// Sets the tempo rate on the engine — and remembers it for an armed looper/shadow.
     pub fn set_ratio(&mut self, rate: f32) {
         self.set_tempo(f64::from(rate));

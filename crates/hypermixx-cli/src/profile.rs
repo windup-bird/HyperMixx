@@ -33,7 +33,7 @@ pub const DEFAULT_MAP: &str = "midi-map.toml";
 /// The MIDI input a profile asks for.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MidiSettings {
-    /// A port name substring (case-insensitive, first match wins) or an index from `midi ports`.
+    /// A port name substring (case-insensitive, first match wins) or an index from `controller ports`.
     /// `None` means no input at startup — the TUI can still pick one at runtime.
     pub device: Option<String>,
     /// The mapping file. Already resolved against the folder of the file that named it.
@@ -47,6 +47,18 @@ pub fn default_midi_path() -> &'static str {
         DEFAULT_MIDI
     } else {
         LEGACY_MIDI
+    }
+}
+
+/// The **mapping file** to open when a front-end has a port but no file: the shipped one when it is
+/// there, and otherwise the historical working-directory default. One definition, used by
+/// `--guide`, the TUI's controller pickers and the session's fallback, so the four cannot drift.
+pub fn default_map_path() -> &'static str {
+    let shipped = default_midi_path();
+    if Path::new(shipped).is_file() {
+        shipped
+    } else {
+        DEFAULT_MAP
     }
 }
 
@@ -128,7 +140,7 @@ pub fn load(path: &str) -> Result<(Profile, Vec<String>), String> {
 /// Reads a `profile/midi.toml`-shaped map file.
 ///
 /// There is exactly one shape: a map file (`[[unit]]`, optional `[meta]`). The device is
-/// `[meta].device`; `--midi` still overrides it. The old two-part settings table (`device` +
+/// `[meta].device`; `--controller` still overrides it. The old two-part settings table (`device` +
 /// `map`) is refused with a migration message rather than silently ignored.
 pub fn load_midi(path: &str) -> Result<(MidiSettings, Vec<String>), String> {
     let text = std::fs::read_to_string(path).map_err(|err| format!("{path}: {err}"))?;
@@ -147,7 +159,8 @@ pub fn load_midi(path: &str) -> Result<(MidiSettings, Vec<String>), String> {
     let mut notes = Vec::new();
     if device.is_none() {
         notes.push(
-            "`[meta].device` is not set; no MIDI input is opened until `--midi` or F2".to_owned(),
+            "`[meta].device` is not set; no controller input opens until `--controller` or F9"
+                .to_owned(),
         );
     }
     Ok((
@@ -345,52 +358,56 @@ mod tests {
         assert_eq!(resolve("/tmp/p.toml"), "/tmp/p.toml");
     }
 
-    /// The shipped folder must be loadable: its profile points at files that exist, and its midi file
-    /// parses. The port is still optional; the map is wired so `--midi <port>` uses it.
+    /// The shipped folder must be loadable: the example profile points at files that exist, and the
+    /// resolution rule (every path relative to the file that names it) holds for all of them.
+    ///
+    /// Written against `profile/example.toml` rather than `profile/profile.toml` on purpose: the
+    /// ambient profile is optional, so a test that starts with it silently tested nothing on a
+    /// checkout that does not ship one. `example.toml` is tracked, so this always runs.
     #[test]
     fn the_shipped_profile_folder_loads() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let profile_path = root.join(AMBIENT);
-        if !profile_path.is_file() {
-            // A checkout without the shipped profile runs on the folder defaults; that is a valid
-            // configuration, not a broken one.
-            return;
+        // Canonical, because that is what the profile's own resolution produces: every relative path
+        // is joined onto the folder of the file that named it.
+        let folder = std::fs::canonicalize(root.join(PROFILES_DIR)).expect("the profile folder");
+        let root = &folder.parent().expect("the checkout root");
+        for name in ["mixer.toml", "live.toml", "controller.toml", "example.toml"] {
+            assert!(
+                folder.join(name).is_file(),
+                "profile/{name} is part of the shipped folder"
+            );
         }
+        let example = folder.join("example.toml");
         let (profile, notes) =
-            load(&profile_path.to_string_lossy()).expect("the shipped profile parses");
+            load(&example.to_string_lossy()).expect("the shipped profile parses");
         assert!(
             notes.iter().all(|note| note.contains("device")),
             "the only note is that the map names no port: {notes:?}"
         );
-        assert!(
-            profile.midi.device.is_some() || notes.iter().any(|note| note.contains("device")),
-            "either a device is named or the absence is reported"
-        );
-        assert!(
-            is_path(profile.midi.map.as_deref(), Path::new(DEFAULT_MIDI)),
-            "the shipped profile points at the map: {:?}",
-            profile.midi.map
-        );
-        // Each pointer resolved against the profile's own folder, so the files really are there.
-        for path in [profile.mixer, profile.live] {
-            let path = path.expect("the shipped profile names its files");
+        // Each pointer resolved against the profile's own folder — compared as a `Path`, so this is
+        // about the rule rather than about which separator the platform uses.
+        for (actual, expected) in [
+            (profile.mixer.as_deref(), "mixer.toml"),
+            (profile.live.as_deref(), "live.toml"),
+            (profile.midi.map.as_deref(), "controller.toml"),
+        ] {
             assert!(
-                path.ends_with("mixer.toml") || path.ends_with("live.toml"),
-                "{path}"
+                is_path(actual, &folder.join(expected)),
+                "{actual:?} should resolve to profile/{expected}"
             );
-            assert!(Path::new(&path).exists(), "{path}");
+            // ...and the file it names is really there.
+            assert!(
+                root.join(actual.expect("named")).is_file(),
+                "{actual:?} does not exist"
+            );
         }
-        assert!(root.join(DEFAULT_MIDI).exists());
-        assert!(root.join("profile/example.toml").exists());
-        // A named profile sitting next to the files it names resolves them the same way.
-        let (named, notes) =
-            load(&root.join("profile/example.toml").to_string_lossy()).expect("parses");
-        assert!(
-            notes.iter().all(|note| note.contains("device")),
-            "{notes:?}"
-        );
-        assert!(Path::new(&named.mixer.expect("names a mixer")).exists());
+        // The ambient profile is optional: a checkout without one runs on the folder defaults.
+        let root = folder.parent().expect("the checkout root");
+        if root.join(AMBIENT).is_file() {
+            load(&root.join(AMBIENT).to_string_lossy()).expect("the ambient profile parses");
+        }
     }
+
     #[test]
     fn a_map_file_carries_its_device_and_old_shapes_are_refused() {
         let dir =

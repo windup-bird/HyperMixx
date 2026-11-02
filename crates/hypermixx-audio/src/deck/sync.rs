@@ -48,7 +48,9 @@ pub const MAX_RATE: f64 = 4.0;
 pub const DEFAULT_TEMPO_RANGE: f64 = 0.1;
 /// Largest fader range the engine accepts (±100%).
 pub const MAX_TEMPO_RANGE: f64 = 1.0;
-/// Seconds one processing block covers: the controller's `dt`.
+/// Seconds one processing block covers at the default engine rate — the fallback `dt` for a deck
+/// nobody has told the real rate to (the raw-transport tests). A running mixer always sets the
+/// exact one, because every time constant below is a duration and the rate is a live setting.
 pub const BLOCK_SECONDS: f64 = crate::BLOCK_SIZE as f64 / crate::SAMPLE_RATE as f64;
 
 /// Wraps a phase difference (in beats) into `[-0.5, 0.5]`.
@@ -179,6 +181,8 @@ pub struct Nudge {
     applied: f64,
     /// Blocks left before the bend releases itself; `None` means "hold until `Stop`".
     remaining_blocks: Option<u32>,
+    /// Seconds per block: `0.0` means the default rate's block (see [`BLOCK_SECONDS`]).
+    block_seconds: f64,
 }
 
 impl Nudge {
@@ -206,9 +210,19 @@ impl Nudge {
     }
 
     fn arm_release(&mut self, seconds: Option<f64>) {
+        let dt = self.dt();
         self.remaining_blocks = seconds
             .filter(|s| s.is_finite() && *s > 0.0)
-            .map(|s| (s / BLOCK_SECONDS).ceil().max(1.0) as u32);
+            .map(|s| (s / dt).ceil().max(1.0) as u32);
+    }
+
+    /// Seconds this bend's block covers.
+    fn dt(&self) -> f64 {
+        if self.block_seconds > 0.0 {
+            self.block_seconds
+        } else {
+            BLOCK_SECONDS
+        }
     }
 
     /// Releases the bend; [`rate`](Self::rate) then ramps to zero rather than snapping.
@@ -226,7 +240,7 @@ impl Nudge {
                 self.target = 0.0;
             }
         }
-        let alpha = 1.0 - (-BLOCK_SECONDS / Self::TAU_SECONDS).exp();
+        let alpha = 1.0 - (-self.dt() / Self::TAU_SECONDS).exp();
         self.applied += (self.target - self.applied) * alpha;
         // Snap the last few micro-frames so an idle deck reports exactly zero instead of `1e-9`.
         if self.target == 0.0 && self.applied.abs() < 1e-6 {
@@ -290,6 +304,8 @@ pub struct Playhead {
     /// Whether this deck derives its `tempo` from the group's shared BPM.
     pub lock: bool,
     nudge: Nudge,
+    /// Seconds per block at this deck's engine rate; `0.0` until a mixer says otherwise.
+    block_seconds: f64,
 }
 
 impl Default for Playhead {
@@ -307,6 +323,27 @@ impl Playhead {
             align: None,
             lock: false,
             nudge: Nudge::default(),
+            block_seconds: 0.0,
+        }
+    }
+
+    /// Tells the controller how long a block lasts, so its time constants are durations rather than
+    /// "blocks at 44.1 kHz". The mixer calls this with its own engine rate.
+    pub fn set_block_seconds(&mut self, seconds: f64) {
+        self.block_seconds = if seconds.is_finite() && seconds > 0.0 {
+            seconds
+        } else {
+            0.0
+        };
+        self.nudge.block_seconds = self.block_seconds;
+    }
+
+    /// The block duration the controller is using.
+    pub fn block_seconds(&self) -> f64 {
+        if self.block_seconds > 0.0 {
+            self.block_seconds
+        } else {
+            BLOCK_SECONDS
         }
     }
 
@@ -364,6 +401,7 @@ impl Playhead {
     /// `own_bpm` is the BPM in force at this deck's position (`0.0` without a grid) and `own_phase`
     /// is where inside its beat it sits; both come from the deck so this stays a pure calculation.
     pub fn update(&mut self, sync: Option<&SyncCtx>, own_bpm: f64, own_phase: Option<f32>) {
+        let dt = self.block_seconds();
         // 1. Group tempo. A locked deck's rate is the group's BPM over its own track BPM, so two
         //    tracks of different tempo land on one audible speed. Free decks keep their own tempo.
         if self.lock && own_bpm > 0.0 {
@@ -388,10 +426,10 @@ impl Playhead {
                         // Instant never rests here: it is a jump performed at command time.
                         PhaseAlign::Instant => 0.0,
                         PhaseAlign::Linear { t_seconds } => {
-                            let t = (*t_seconds).max(BLOCK_SECONDS);
+                            let t = (*t_seconds).max(dt);
                             (err_sec / t).clamp(-PLL_LIMIT, PLL_LIMIT)
                         }
-                        PhaseAlign::Pid(pll) => pll.update(err_sec, BLOCK_SECONDS),
+                        PhaseAlign::Pid(pll) => pll.update(err_sec, dt),
                     };
                 }
             }
@@ -552,6 +590,32 @@ mod tests {
     }
 
     #[test]
+    fn the_block_length_follows_the_engine_rate() {
+        // Every time constant here is a duration, so a deck told it runs at 48k must not spend the
+        // 44.1k block length: a 0.1 s bend would otherwise last 8% too long.
+        let mut playhead = Playhead::new();
+        assert!(
+            (playhead.block_seconds() - BLOCK_SECONDS).abs() < 1e-12,
+            "an untold deck falls back to the default rate"
+        );
+        playhead.set_block_seconds(256.0 / 48_000.0);
+        assert!((playhead.block_seconds() - 0.005_333_3).abs() < 1e-6);
+        playhead.start_nudge(0.05, Some(0.1));
+        // One block to start moving: `applied` chases `target` from zero.
+        playhead.update(None, 0.0, None);
+        let mut blocks = 1u32;
+        while playhead.nudge_rate() != 0.0 && blocks < 10_000 {
+            playhead.update(None, 0.0, None);
+            blocks += 1;
+        }
+        let seconds = f64::from(blocks) * playhead.block_seconds();
+        assert!(
+            (0.1..0.16).contains(&seconds),
+            "a 0.1 s bend lasted {seconds:.3}s"
+        );
+    }
+
+    #[test]
     fn unlock_keeps_the_tempo_and_drops_everything_else() {
         let mut playhead = Playhead {
             tempo: 1.13,
@@ -559,6 +623,7 @@ mod tests {
             align: Some(PhaseAlign::Pid(Pll::new())),
             lock: true,
             nudge: Nudge::default(),
+            block_seconds: 0.0,
         };
         playhead.nudge.start(0.05, None);
         playhead.unlock();

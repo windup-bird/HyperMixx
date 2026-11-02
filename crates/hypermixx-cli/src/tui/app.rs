@@ -306,12 +306,15 @@ impl Knob {
 }
 
 /// A background library scan finishing on its worker connection. The scan itself runs there; the
-/// event only carries what the UI needs to log and reload.
+/// event only carries what the UI needs to log and reload. `remaining` counts the sources still
+/// queued behind this one, so the browser is reloaded once at the end instead of once per source
+/// (which would pull the user back to the first library mid-browse).
 enum LibraryScanEvent {
     Scanned {
         name: String,
         kind: SourceKind,
         outcome: Result<ScanStats, String>,
+        remaining: usize,
     },
     OpenFailed(String),
 }
@@ -358,6 +361,9 @@ pub struct App {
     /// library is hashed.
     library_scan_tx: Sender<LibraryScanEvent>,
     library_scan_rx: Receiver<LibraryScanEvent>,
+    /// Sources the running background scan has not reported yet. Non-zero means "keep the browser
+    /// where the user put it".
+    library_scan_pending: usize,
     /// `None` probes each file; a fixed value overrides the decoder start trim.
     pub decoder_start_ms: Option<f64>,
     /// Extra imported-grid/cue correction, positive = later.
@@ -479,6 +485,7 @@ impl App {
             usb_rx: None,
             library_scan_tx,
             library_scan_rx,
+            library_scan_pending: 0,
             decoder_start_ms: None,
             grid_offset_ms: 0.0,
             states: (0..decks)
@@ -579,7 +586,7 @@ impl App {
         let map_path = self
             .midi_map
             .clone()
-            .unwrap_or_else(|| "midi-map.toml".to_owned());
+            .unwrap_or_else(|| crate::profile::default_map_path().to_owned());
         let mut map = match crate::midi::read_map(&map_path) {
             Ok(map) => map,
             Err(err) => {
@@ -731,6 +738,10 @@ impl App {
             return;
         };
         let path = db.path().to_path_buf();
+        // The calibration is *state* on the handle, not something the database stores: a fresh
+        // connection starts from the defaults. Copying it over is what keeps an imported grid on the
+        // same clock as a foreground scan (Rekordbox/Serato/VirtualDJ all read it while scanning).
+        let calibration = db.import_calibration();
         let count = sources.len();
         let tx = self.library_scan_tx.clone();
         let spawned = std::thread::Builder::new()
@@ -743,7 +754,9 @@ impl App {
                         return;
                     }
                 };
-                for source in sources {
+                scan_db.set_import_calibration(calibration);
+                let total = sources.len();
+                for (done, source) in sources.into_iter().enumerate() {
                     let outcome = scan_db
                         .scan_source(source.id, &mut |_| {})
                         .map_err(|err| err.to_string());
@@ -751,6 +764,7 @@ impl App {
                         name: source.name,
                         kind: source.kind,
                         outcome,
+                        remaining: total.saturating_sub(done + 1),
                     };
                     if tx.send(event).is_err() {
                         return;
@@ -758,9 +772,12 @@ impl App {
                 }
             });
         match spawned {
-            Ok(_) => self.push_log(LogLine::info(format!(
-                "[library] scanning {count} source(s) in background"
-            ))),
+            Ok(_) => {
+                self.library_scan_pending = count;
+                self.push_log(LogLine::info(format!(
+                    "[library] scanning {count} source(s) in background"
+                )));
+            }
             Err(err) => self.push_log(LogLine::error(format!(
                 "[library] could not start scan: {err}"
             ))),
@@ -1051,24 +1068,37 @@ impl App {
                     name,
                     kind,
                     outcome: Ok(stats),
-                } => self.push_log(LogLine::info(format!(
-                    "[library] {name} [{}]: {}",
-                    kind.label(),
-                    stats.summary()
-                ))),
+                    remaining,
+                } => {
+                    self.library_scan_pending = remaining;
+                    self.push_log(LogLine::info(format!(
+                        "[library] {name} [{}]: {}",
+                        kind.label(),
+                        stats.summary()
+                    )));
+                }
                 LibraryScanEvent::Scanned {
                     name,
                     outcome: Err(err),
+                    remaining,
                     ..
-                } => self.push_log(LogLine::error(format!("[library] {name}: {err}"))),
-                LibraryScanEvent::OpenFailed(err) => self.push_log(LogLine::error(format!(
-                    "[library] could not open the scan connection: {err}"
-                ))),
+                } => {
+                    self.library_scan_pending = remaining;
+                    self.push_log(LogLine::error(format!("[library] {name}: {err}")));
+                }
+                LibraryScanEvent::OpenFailed(err) => {
+                    self.library_scan_pending = 0;
+                    self.push_log(LogLine::error(format!(
+                        "[library] could not open the scan connection: {err}"
+                    )));
+                }
             }
             rescan = true;
             changed = true;
         }
-        if rescan {
+        // One reload, at the end: reloading per source would re-open the browser on its first
+        // library and yank the selection away from wherever the user had browsed to.
+        if rescan && self.library_scan_pending == 0 {
             self.reload_browser();
         }
         let mut usb_events = Vec::new();
@@ -1283,10 +1313,22 @@ impl App {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
-        .map(PathBuf::from)
+    // Which variable wins is a platform question, not a matter of taste: on Windows `HOME` is
+    // whatever the *shell* thinks (MSYS/Git Bash write `/c/Users/me`, WSL `/mnt/c/...`), and a native
+    // process cannot open those spellings, while `USERPROFILE` is the real profile directory.
+    let names: &[&str] = if cfg!(windows) {
+        &["USERPROFILE", "HOME"]
+    } else {
+        &["HOME", "USERPROFILE"]
+    };
+    names
+        .iter()
+        .find_map(|name| {
+            std::env::var_os(name)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        // The last resort on a Windows session that has been stripped down to a login shell.
         .or_else(|| {
             let drive = std::env::var_os("HOMEDRIVE")?;
             let path = std::env::var_os("HOMEPATH")?;

@@ -10,8 +10,9 @@
 
 use serde::Deserialize;
 
-/// The defaults, in one place: the audio engine and the shipped `profile/live.toml` agree by
-/// construction.
+/// The default engine rate. A **default**, not a constraint: `[audio] sample_rate` accepts any rate
+/// a device offers (see [`AudioSettings::sample_rate`]), and 44.1 kHz is simply the rate the stem
+/// models were exported at, so the shipped configuration needs no conversion anywhere.
 pub const DEFAULT_SAMPLE_RATE: u32 = 44_100;
 /// Output ring capacity, in frames (~93 ms at 44.1 kHz).
 pub const DEFAULT_RING_FRAMES: usize = 4096;
@@ -41,8 +42,10 @@ pub const MIN_KEYLOCK_INTERVAL: usize = 32;
 /// the runtime.
 pub const MAX_THREADS: usize = 256;
 
-/// The bundled model's window, in seconds (its ONNX export pins 343 980 samples at 44.1 kHz). Used
-/// only to *describe* the streaming cadence in `live show` — the runtime owns the real number.
+/// The bundled model's window, in seconds (its ONNX export pins 343 980 samples at the model's own
+/// 44.1 kHz, which is the rate separation always runs at — see `media::ResampledSource` for the
+/// conversion an engine at another rate goes through). Used only to *describe* the streaming cadence
+/// in `live show`; the runtime owns the real number.
 const SEGMENT_SECONDS: f64 = 7.8;
 
 /// Device-facing settings.
@@ -50,7 +53,9 @@ const SEGMENT_SECONDS: f64 = 7.8;
 #[serde(deny_unknown_fields, default)]
 pub struct AudioSettings {
     /// The rate the engine renders at *and* asks every device for. Material is resampled to it at
-    /// load time, so this is the engine's clock, not a per-device setting.
+    /// load time, so this is the engine's clock, not a per-device setting. Anything a device offers
+    /// is legal (44.1k, 48k, 96k, ...); the only rule is that every time constant that used to be
+    /// "blocks at 44.1 kHz" now comes from this value.
     pub sample_rate: u32,
     /// Output ring capacity in frames. Bigger = more slack for a slow device, more latency.
     pub ring_frames: usize,
@@ -60,7 +65,7 @@ pub struct AudioSettings {
     /// default (on ALSA: 25 ms period / 100 ms buffer), which is the wrong default for a DJ tool
     /// but the only one guaranteed to open on every device. `Some(n)` asks for an n-frame buffer;
     /// ALSA uses `n / 4` as its period, so `Some(512)` is a ~2.9 ms period / ~11.6 ms buffer at
-    /// 44.1 kHz.
+    /// 44.1 kHz (~2.7 ms / ~10.7 ms at 48 kHz).
     pub device_buffer_frames: Option<usize>,
 }
 

@@ -36,6 +36,9 @@ pub struct Eq {
     /// these actually changes — see [`Eq::redesign_count`].
     cached_hertz: [f32; 3],
     cached_db: [f64; 3],
+    /// The rate the coefficients were designed at. A different engine rate invalidates them exactly
+    /// like a moved knob does — a 44.1k design on a 48k stream puts every crossover ~9% low.
+    cached_rate: u32,
     redesigns: u32,
 }
 
@@ -60,6 +63,8 @@ impl Eq {
             ),
             cached_hertz: initial,
             cached_db: [0.0; 3],
+            // 0 forces the first block to design at the rate it is actually running at.
+            cached_rate: 0,
             redesigns: 0,
         }
     }
@@ -94,7 +99,8 @@ impl Eq {
         if !value.is_finite() || value <= 0.0 {
             return Err(FxError::InvalidValue(value));
         }
-        // Below Nyquist, above the sub-audible.
+        // Below Nyquist at every rate the engine accepts (0.45 × 44.1k = 19.8 kHz, under the
+        // lowest usable Nyquist), above the sub-audible.
         param.set(value.clamp(20.0, crate::SAMPLE_RATE as f32 * 0.45));
         Ok(())
     }
@@ -156,13 +162,14 @@ impl Fx for Eq {
 
         // Coefficients are recomputed only when a control moved, and *in place*: the filter memory
         // survives a sweep, which is what lets a band settle while its knob travels.
-        if hertz != self.cached_hertz || db != self.cached_db {
+        if hertz != self.cached_hertz || db != self.cached_db || sr != self.cached_rate {
             let design = eq_sections(hertz[0], hertz[1], hertz[2], db[0], db[1], db[2]);
             if !self.chain.apply_design(&design, sr) {
                 self.chain = BiquadChain::from_design(&design, sr);
             }
             self.cached_hertz = hertz;
             self.cached_db = db;
+            self.cached_rate = sr;
             self.redesigns += 1;
         }
         // One diverged section would otherwise mute this deck for the rest of the session.
@@ -275,6 +282,54 @@ mod tests {
 
     fn settled(eq: &mut Eq, freq: f64) -> f64 {
         measure(eq, freq, 120)
+    }
+
+    /// The same measurement at an arbitrary engine rate: the tone is generated at that rate, so a
+    /// rate-correct EQ boosts it by the same number of decibels.
+    fn settled_at(eq: &mut Eq, freq: f64, rate: u32) -> f64 {
+        let ctx = FxContext::gridless(rate, BLOCK);
+        let mut tail = Vec::with_capacity(BLOCK);
+        for b in 0..120 {
+            let mut bus = Bus::new(BLOCK);
+            for (i, slot) in bus.l.iter_mut().enumerate() {
+                let s = (2.0 * std::f64::consts::PI * freq * (b * BLOCK + i) as f64
+                    / f64::from(rate))
+                    .sin() as f32;
+                *slot = s;
+                bus.r[i] = s;
+            }
+            eq.process(&mut bus, &ctx);
+            if b >= 60 {
+                tail.clear();
+                tail.extend_from_slice(&bus.l);
+            }
+        }
+        let peak = tail.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        20.0 * f64::from(peak.max(1e-12)).log10()
+    }
+
+    #[test]
+    fn the_bands_land_on_the_same_frequency_at_any_engine_rate() {
+        // A bell stays a bell: +MAX_BAND_DB at the chosen centre, whether the engine runs at 44.1k or
+        // 48k. The coefficients are designed from the block's own rate, so the centre cannot drift
+        // by the rate ratio (which is what a 44.1k design on a 48k stream would do).
+        let gain = |rate: u32| {
+            let mut eq = Eq::new();
+            eq.set_param("mid_hz", 1_000.0).unwrap();
+            eq.set_param("mid", 1.0).unwrap();
+            eq.reset();
+            settled_at(&mut eq, 1_000.0, rate)
+        };
+        let at_44 = gain(44_100);
+        let at_48 = gain(48_000);
+        assert!(
+            (at_44 - at_48).abs() < 0.1,
+            "the bell moved with the rate: {at_44:.2} dB at 44.1k vs {at_48:.2} dB at 48k"
+        );
+        assert!(
+            (at_48 - f64::from(MAX_BAND_DB)).abs() < 0.5,
+            "a centred bell at its own frequency is +{MAX_BAND_DB} dB, got {at_48:.2}"
+        );
     }
 
     #[test]
@@ -398,6 +453,27 @@ mod tests {
             during_ramp,
             "a settled EQ must not recompute coefficients"
         );
+    }
+
+    #[test]
+    fn a_new_engine_rate_is_a_new_design() {
+        // The rate is part of what the coefficients mean, so switching it invalidates them exactly
+        // like a moved knob does (a topology reload with another rate must not reuse the old set).
+        let mut eq = Eq::new();
+        eq.set_param("low", -0.5).unwrap();
+        eq.reset();
+        let mut bus = Bus::new(BLOCK);
+        eq.process(&mut bus, &FxContext::gridless(44_100, BLOCK));
+        let settled = eq.redesign_count();
+        eq.process(&mut bus, &FxContext::gridless(48_000, BLOCK));
+        assert_eq!(
+            eq.redesign_count(),
+            settled + 1,
+            "a different rate must redraw the coefficients"
+        );
+        // ...and the same rate again does not.
+        eq.process(&mut bus, &FxContext::gridless(48_000, BLOCK));
+        assert_eq!(eq.redesign_count(), settled + 1);
     }
 
     #[test]

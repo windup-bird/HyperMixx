@@ -260,6 +260,12 @@ impl Channel {
         self.deck = deck;
     }
 
+    /// Hands the deck the engine's block duration, so its sync controller works in seconds rather
+    /// than in "blocks at the default rate".
+    pub fn set_block_seconds(&mut self, seconds: f64) {
+        self.deck.set_block_seconds(seconds);
+    }
+
     /// Hands the transport out, leaving an empty one behind. Used by a topology reload, which
     /// builds fresh channels but must not stop the music: the deck is not a config value, so it
     /// survives the rebuild that every *config* value goes through.

@@ -32,7 +32,7 @@ pub struct Session {
     pub live: LiveConfig,
     /// Where the live settings came from, for `live reload`.
     pub live_source: Option<String>,
-    /// `--midi` / `--midi-map`, for the front-end that can pick them at runtime.
+    /// `--controller` / `--controller-map`, for the front-end that can pick them at runtime.
     pub midi_port: Option<String>,
     pub midi_map: String,
     /// The live router's channels, when `main` attached an input before the session started (the

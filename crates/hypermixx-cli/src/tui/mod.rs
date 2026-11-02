@@ -1,4 +1,4 @@
-//! The `--tui` front-end: terminal setup, the 30Hz render/poll loop, and shutdown.
+//! The TUI front-end (the default): terminal setup, the render/poll loop, and shutdown.
 //!
 //! The loop never blocks on the engine. Commands go out over the same unbounded channel the REPL
 //! uses; responses are drained with `try_recv`; the one blocking call in the loop is the meters
@@ -43,7 +43,8 @@ const METERS_EVERY: u64 = 6;
 /// Runs the TUI until the user quits. Restores the terminal and stops the engine on the way out.
 ///
 /// `midi_port` / `midi_map` come from the startup flags; when a port is given the TUI connects it
-/// itself (so the in-TUI pickers can replace it), otherwise it stays disconnected until F2.
+/// itself (so the F9 settings screen can replace it), otherwise it stays disconnected until one is
+/// chosen there.
 #[allow(clippy::too_many_arguments)]
 pub fn run(pipeline: &AudioPipeline, session: Session) {
     let Session {

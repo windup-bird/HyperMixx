@@ -10,11 +10,13 @@ mod chunked;
 mod cover;
 mod decoder;
 mod pool;
+mod resample;
 
 pub use chunked::{ChunkedStreams, DEFAULT_FADE_FRAMES};
 pub use cover::{read_cover, Cover};
 pub use decoder::{decode_file, decode_file_at, decoder_start_ms, DecodedAudio};
 pub use pool::PcmPool;
+pub use resample::{convert, Converter, ResampledSource, StreamConverter};
 
 // The `Source` trait is defined in `core` (the shared protocol) but re-exported here so media
 // consumers can `use hypermixx_media::Source` without naming core directly.

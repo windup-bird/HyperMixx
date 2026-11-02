@@ -5,7 +5,7 @@
 
 mixer = "mixer.toml"
 live = "live.toml"
-controller = "partymix3.toml"
+controller = "controller.toml"
 
 # Or point at something else entirely:
 # mixer = "../sets/club.toml"

@@ -130,13 +130,15 @@ impl Mixer {
         {
             // `build_chains` already produced one chain per stem, so the per-stem overrides in the
             // config are in effect from the first block — not only after a `SetStems`.
-            channels.push(Channel::new(
+            let mut channel = Channel::new(
                 Deck::empty(),
                 channel_cfg,
                 cfg.crossfader,
                 flow_chains,
                 FxChain::from_slots(deck_slots),
-            ));
+            );
+            channel.set_block_seconds(block_seconds_of(sample_rate));
+            channels.push(channel);
         }
 
         let routed = build_outputs(&cfg, sample_rate, block_frames, tuning);
@@ -227,6 +229,7 @@ impl Mixer {
                 flow_chains,
                 FxChain::from_slots(deck_slots),
             );
+            channel.set_block_seconds(block_seconds_of(self.sample_rate));
             // Whatever was playing on this index keeps playing: a deck is not a config value.
             if let Some(previous) = old.get_mut(channels.len()) {
                 channel.replace_deck(previous.take_deck());
@@ -357,6 +360,11 @@ impl Mixer {
     /// Block length this mixer renders.
     pub fn block_frames(&self) -> usize {
         self.block_frames
+    }
+
+    /// Seconds one rendered block covers at this engine's rate.
+    pub fn block_seconds(&self) -> f64 {
+        block_seconds_of(self.sample_rate)
     }
 
     /// The context for one block: the engine's own constants plus the musical position of whichever
@@ -708,6 +716,12 @@ struct RoutedOutputs {
 /// Split out of `Mixer::new` because `output refresh` needs exactly this again, without touching the
 /// channels: the destinations are the part of a topology that can change under the engine's feet
 /// (a device that is not plugged in yet, a rate a card refuses), while the signal path is not.
+/// Seconds one block covers at `sample_rate`. A free function because both the constructor and a
+/// topology reload need it before a `Mixer` exists / from `&self`.
+fn block_seconds_of(sample_rate: u32) -> f64 {
+    BLOCK_SIZE as f64 / f64::from(sample_rate.max(1))
+}
+
 fn build_outputs(
     cfg: &MixerConfig,
     sample_rate: u32,

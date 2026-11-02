@@ -80,7 +80,7 @@ ConPTY 的 VT 解析器对 SOS/PM/APC 的处理是写死的丢盘——`src/term
 
 ## 修复方案
 
-### 方案 A：加 ConPTY 守卫（最小改动）
+### 方案 A：加 ConPTY 守卫（**已实现**：`detect::decide()` / `Hints::conpty`）
 
 `resolve()` 里，`cfg!(windows)` 时把 `auto` 判为 braille，并给一条 note，例如
 `"Windows 控制台经 ConPTY，APC 被丢弃；using braille"`。显式 `backend = "kitty"` 可选择沿用用户选择，

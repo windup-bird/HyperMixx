@@ -148,8 +148,8 @@ crates/
 
 ## hypermixx-media
 
-- `decode_file(path)` — symphonia 解码 → 重采样到引擎率(44.1 kHz)→ 立体声交错 f32。
-  非 44.1k 素材在加载时一次性转换,引擎内不再有采样率概念。
+- `decode_file(path)` / `decode_file_at(path, rate)` — symphonia 解码 → 重采样到引擎率(缺省
+  44.1 kHz,可配)→ 立体声交错 f32。素材率≠引擎率时在加载时一次性转换,引擎内不再有采样率概念。
 - `PcmPool` — `Arc<Vec<f32>>` 的 `Source` 实现,克隆即 Arc bump;deck 与分析器共享同一条数据。
 
 ---
@@ -442,18 +442,29 @@ deck 装好后每个块 append 即可被 `feed()` 读到 —— 不重启 flow�
 
 ## 采样率与 live 设置
 
-引擎率是 **live 设置**（`profile/live.toml` 的 `[audio] sample_rate`，缺省 44.1 kHz）：
+引擎率是 **live 设置**（`profile/live.toml` 的 `[audio] sample_rate`，缺省 44.1 kHz，可填任何
+设备支持的率：44.1k / 48k / 88.2k / 96k …，`sanitised()` 只夹到 `8_000 ..= 384_000`）：
 `media::decode_file_at(path, rate)` 在装载时重采样到它，`AudioPipeline::start_with(cfg, rate, tuning)`
 把它和 ring/prefill 大小一起交给引擎，此后引擎内部没有采样率概念（`BeatGrid`/deck/FX 都只认帧）。
-**stem 分离仍要求 44.1 kHz**（内置模型是 44.1k 导出、缓存 key 也按它），非 44.1k 时 CLI 直接拒绝
-`stem separate`，不做双向重采样。`block_frames` 保持编译期常量：它是时间拉伸引擎的喂入契约，
-不是本机性能参数。
+需要知道"帧等于多少秒"的地方都从引擎率算：FX 的双二阶系数按**当块**的 `ctx.sample_rate` 设计
+（换率即重算，见 `Eq`/`Filter` 的 `cached_rate`），sync 的 `dt` 由 `Mixer::block_seconds()` 交给
+deck，而不是用 44.1k 的编译期常量。
 
-### 历史：固定 44.1 kHz 的理由
+**stem 分离在任意引擎率下都能跑**：模型是 44.1k 导出，所以 `separate_into_deck` 把 mix 用
+`media::ResampledSource` 转到模型率再喂给分隔器，回来的每块用 `media::StreamConverter` 转回引擎率
+（同一条 Hann 窗 sinc 内核，块边界相位连续）。缓存里存的永远是**模型率**的音频，key 由模型率的
+内容哈希算出，因此同一首歌在 44.1k 与 48k 引擎下命中同一条缓存。`block_frames` 保持编译期常量：
+它是时间拉伸引擎的喂入契约，不是本机性能参数。
 
-引擎域固定 44.1 kHz:目标设备(ALSA `default`)原生 44.1 kHz,`preferred_config` 按引擎率
-请求即直通。历史教训——引擎 48k 而设备 44.1k 时,ALSA 静默接受 48k 请求却按 44.1k 时钟
-消费 → 慢放 8.8% + 音调低 8.8%。多设备自适应(设备率≠引擎率时在回调内重采样)是后续工作。
+### 为什么缺省还是 44.1 kHz
+
+内置模型是 44.1k 导出，既有的 `beatgrid` 实测也都在这个率上，所以缺省值让"什么都不配"的路径
+既不需要重采样、也复现文档里的数字。这不是约束：引擎率是 live 设置，改成 48k 后播放、分析、
+keylock、sync、FX、波形与 stem 分离都按 48k 工作，代价只是分离时多两趟重采样。
+
+历史教训仍然成立——引擎 48k 而设备 44.1k 时，ALSA 会静默接受 48k 请求却按 44.1k 消费
+（慢放 8.8% + 音调低 8.8%）。`preferred_config` 因此只按引擎率请求；设备不接受时该输出
+`disabled` + 警告，而不是偷偷换率。
 
 ---
 
@@ -474,5 +485,5 @@ AudioPipeline ──producer thread───────────────
   │   │              → master.sum;cue tap → cue.sum → blend(master)       │
   │   ├ master: fx → fader → limiter(安全级)                            │
   │   └ cue: fader                                                       │
-  └─ Bus → Output.write(重映射+trim)→ ring → cpal 回调(44.1k 直通)→ 声卡
+  └─ Bus → Output.write(重映射+trim)→ ring → cpal 回调(引擎率直通)→ 声卡
 ```

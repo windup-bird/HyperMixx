@@ -31,7 +31,9 @@ pub use output::{OutputOp, OutputRole, OutputState, OutputStatus};
 pub use source::{Shared, Source};
 pub use stem::{Stem, StemOp, StemPreset, StemSet, StemStatus};
 
-/// Engine-wide sample rate. The decoder resamples everything to it at load time.
+/// The **default** engine sample rate, and the rate the stem models were exported at. The engine's
+/// real rate is a live setting (`[audio] sample_rate`); the decoder resamples everything to it at
+/// load time, so nothing downstream of the decoder assumes this constant.
 pub const SAMPLE_RATE: u32 = 44_100;
 /// Interleaved stereo.
 pub const CHANNELS: usize = 2;

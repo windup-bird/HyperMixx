@@ -26,9 +26,6 @@ use crate::tui::settings::SettingsScreen;
 const AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "mp1", "mp2", "wav", "aiff", "aif", "flac", "m4a", "mp4", "aac", "ogg", "oga",
 ];
-/// The conventional map the controller pickers start from.
-const DEFAULT_MAP: &str = "midi-map.toml";
-
 /// Handles one key press.
 pub fn handle(app: &mut App, key: KeyEvent, dispatcher: &Dispatcher, pipeline: &AudioPipeline) {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -848,7 +845,7 @@ fn handle_overlay(app: &mut App, key: KeyEvent, dispatcher: &Dispatcher) {
                     } else {
                         app.overlay = Some(Overlay::Files {
                             picker: FilePicker::new(
-                                Some(std::path::Path::new(DEFAULT_MAP)),
+                                Some(std::path::Path::new(crate::profile::default_map_path())),
                                 &["toml"],
                                 "controller map",
                             ),

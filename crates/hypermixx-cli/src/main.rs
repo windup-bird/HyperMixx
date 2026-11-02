@@ -3,7 +3,7 @@
 //! Owns file IO and analysis: `load` decodes on a worker thread and hands the pipeline a ready
 //! source; `analyse` runs the library analyser and publishes a compiled grid. The pipeline only ever
 //! receives executable commands. Two front-ends share the parsing and rendering: the default line
-//! REPL and the `--tui` terminal UI.
+//! REPL and the default TUI.
 
 mod command;
 mod midi;
@@ -37,7 +37,7 @@ fn main() {
     if let Some(path) = args.midi_guide.as_deref() {
         let decks = args.decks.unwrap_or(1);
         // The file is the source of truth for the guide: its `[meta].device` wins, and only an
-        // explicit `--midi` overrides it. A profile device belongs to the engine session, not to a
+        // explicit `--controller` overrides it. A profile device belongs to the engine session, not to a
         // map file the user picked here.
         let guide_port = args.midi.clone();
         // The guide never starts an engine, so it cannot ask the mixer what the outputs are. Probing
@@ -108,7 +108,7 @@ fn main() {
         .midi_map
         .clone()
         .or_else(|| midi_from_profile.map.clone())
-        .unwrap_or_else(|| profile::DEFAULT_MAP.to_owned());
+        .unwrap_or_else(|| profile::default_map_path().to_owned());
     // An explicit map is validated even when no port opens: otherwise a typo would be swallowed by
     // the "no device" warning and the user would wonder why the session ignored the file.
     if args.midi_map.is_some() {
@@ -117,7 +117,7 @@ fn main() {
             std::process::exit(1);
         }
     }
-    // A map file can name its own device. An explicit `--midi-map` is the source of truth for
+    // A map file can name its own device. An explicit `--controller-map` is the source of truth for
     // that choice; without one the profile already carried the device out of the same map.
     let midi_port = args.midi.clone().or_else(|| {
         if args.midi_map.is_some() {
@@ -132,7 +132,7 @@ fn main() {
     if args.midi_map.is_some() && midi_port.is_none() {
         eprintln!(
             "warning: `{midi_map}` has no `[meta].device`; no MIDI input will open \
-             (use --controller or F2)"
+             (use --controller, or pick one in the F9 settings screen)"
         );
     }
 
@@ -214,8 +214,8 @@ fn main() {
     // The TUI attaches MIDI itself (and can pick a port/map at runtime), so its session lives in
     // the app rather than here. The REPL has no picker, so its session is attached up front — a bad
     // port or map still fails the launch cleanly.
-    // The terminal UI is the default front-end; `--cli` asks for the line REPL instead (`--tui` is
-    // still accepted so an old command line keeps working).
+    // The terminal UI is the default front-end; `--cli` asks for the line REPL instead. The old
+    // `--tui` / `--midi` / `--midi-map` / `--midi-guide` spellings are refused, not aliased.
     if !args.cli {
         tui::run(
             &pipeline,
@@ -241,7 +241,7 @@ fn main() {
 
     // A port the *user* named on the command line must open, or the run is a mistake; a port that
     // came from the profile is "what this rig usually is", and a controller that is not plugged in
-    // yet should not stop the session — say so and carry on (the TUI's `F2` can still pick one).
+    // yet should not stop the session — say so and carry on (F9 can still pick one).
     let explicit_midi = args.midi.is_some();
     let midi_session = match midi_port.as_deref() {
         Some(port) => match midi::attach_file(
@@ -302,7 +302,7 @@ fn main() {
 }
 
 /// Reads `--config <path>` (topology file), `--print-config` (emit the reference TOML and exit),
-/// `--backend auto|stratum|timestretch` (default `auto`), `--tui` (terminal UI),
+/// `--backend auto|stratum|timestretch` (default `auto`), `--cli` (line REPL instead of the TUI),
 /// `--controller <port>` (open a controller input onto the engine), `--controller-map <file>` (the
 /// mapping file, default `midi-map.toml`; the map's `[meta].device` can supply the port) and
 /// `--guide <file>` (the unit map guide, no engine). The terminal UI is the default front-end;
@@ -322,8 +322,7 @@ struct CliArgs {
     midi: Option<String>,
     /// `--controller-map <file>` (alias `--midi-map`): only meaningful with a port.
     midi_map: Option<String>,
-    /// `--controller-guide <file>` (alias `--midi-guide`): run the unit map guide instead of the
-    /// engine.
+    /// `--guide [<file>]`: run the unit map guide instead of the engine.
     midi_guide: Option<String>,
     /// `--decks <n>`: how many deck groups the guide shows; `new` allocates beyond them.
     decks: Option<usize>,
@@ -395,7 +394,7 @@ impl CliArgs {
                     // file picker can choose another.
                     args.midi_guide = Some(match raw.peek() {
                         Some(next) if !next.starts_with("--") => raw.next().unwrap(),
-                        _ => "midi-map.toml".to_owned(),
+                        _ => profile::default_map_path().to_owned(),
                     });
                 }
                 "--decks" => {

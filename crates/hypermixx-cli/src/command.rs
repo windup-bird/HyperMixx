@@ -15,11 +15,11 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::fx::FxKind;
-use hypermixx_audio::{AudioPipeline, Command, SAMPLE_RATE};
+use hypermixx_audio::{AudioPipeline, Command};
 use hypermixx_core::{
     Backend, BeatLen, CommandResponse, CueOp, FxChainId, FxSlotRef, HotCueOp, KeylockMode,
-    LiveConfig, LoopEditOp, LoopOp, LoopQuantum, NudgeOp, OutputOp, PhaseMode, Shared, Stem,
-    StemOp, StemPreset, SyncOp, TrackAnalysis, VinylOp,
+    LiveConfig, LoopEditOp, LoopOp, LoopQuantum, NudgeOp, OutputOp, PhaseMode, Shared, Source,
+    Stem, StemOp, StemPreset, SyncOp, TrackAnalysis, VinylOp,
 };
 use hypermixx_library::LibraryDb;
 use hypermixx_media::ChunkedStreams;
@@ -193,7 +193,7 @@ impl Dispatcher {
     }
 
     /// Installs the live MIDI router's channels. Called after `attach` succeeds; a later attach
-    /// replaces them, which is what an F2/F3 reconnect does.
+    /// replaces them, which is what choosing another port in the F9 settings screen does.
     pub fn set_midi(&self, control: Sender<RouterCommand>, state: Arc<Mutex<RouterState>>) {
         if let Ok(mut slot) = self.midi_control.lock() {
             *slot = Some(control);
@@ -920,7 +920,8 @@ fn output_command<'a>(
 }
 
 /// The `midi` family: port listing and the live unit-mode controls. Opening an input still happens
-/// at launch (or F2), because a mapping is wired to the running engine once.
+/// at launch (or from the F9 settings screen), because a mapping is wired to the running engine
+/// once.
 /// `controller ...` — the port and mode questions. `midi ...` still parses: the protocol is MIDI,
 /// the thing the user plugs in is a controller.
 fn midi_command<'a>(words: &mut impl Iterator<Item = &'a str>, dispatcher: &Dispatcher) -> Action {
@@ -1514,21 +1515,9 @@ fn stem_family<'a>(
     };
     match sub {
         "separate" | "split" => {
-            // One read of the live config for the whole arm: the rate guard, the model choice and
+            // One read of the live config for the whole arm: the engine rate, the model choice and
             // every separator parameter come from it (`live reload` applies an edit immediately).
             let live = dispatcher.live();
-            // The bundled model is a 44.1 kHz export and the cache is keyed on that rate, so a
-            // 48k engine would feed it material it was not trained on. Refuse rather than resample
-            // silently in both directions — that is a job for a model whose spec says 48k.
-            if live.audio.sample_rate != SAMPLE_RATE {
-                return Action::Failed(format!(
-                    "separation needs the engine at {}Hz (the model is a {}Hz export); this run is \
-                     at {}Hz — set `[audio] sample_rate` in profile/live.toml and launch it",
-                    SAMPLE_RATE,
-                    SAMPLE_RATE,
-                    live.audio.sample_rate
-                ));
-            }
             // Everything the separator is asked for comes from `[stems]` in live.toml: the model, the
             // provider, the window overlap, the shift ensemble, the thread budget and the memory
             // trade. A hand-typed flag would be a second place to keep them in step — and these are
@@ -1583,7 +1572,14 @@ fn stem_family<'a>(
                 return Action::Failed(format!("deck {deck_id} holds no track to separate"));
             };
             spawn_separate(
-                deck_id, source, options, runtime, spec, local_file, dispatcher,
+                deck_id,
+                source,
+                options,
+                runtime,
+                spec,
+                local_file,
+                live.audio.sample_rate,
+                dispatcher,
             );
             Action::Continue
         }
@@ -1772,6 +1768,9 @@ fn command_tx_of(dispatcher: &Dispatcher) -> Sender<Command> {
 /// which it keeps even after stems replace stream 0). The four streams come back through
 /// `Command::SetStems`, which is a seamless source swap
 /// — so the user can keep playing, looping and beatmatching while this runs.
+// The worker's inputs are all "what to do and where to report it"; the job struct one level down is
+// the shape they take, so an argument list here is clearer than a second builder at the call site.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_separate(
     deck_id: u8,
     mix: Shared,
@@ -1779,6 +1778,7 @@ pub(crate) fn spawn_separate(
     runtime: hypermixx_stems::RuntimeOptions,
     spec: &'static hypermixx_stems::ModelSpec,
     local_file: Option<std::path::PathBuf>,
+    engine_rate: u32,
     dispatcher: &Dispatcher,
 ) {
     let command_tx = dispatcher.command_tx.clone();
@@ -1798,6 +1798,7 @@ pub(crate) fn spawn_separate(
                 runtime,
                 table_spec: spec,
                 local_file,
+                engine_rate,
                 command_tx: &command_tx,
                 notices_tx: &notices_tx,
                 cancelled: &cancelled,
@@ -1845,6 +1846,9 @@ struct SeparateJob<'a> {
     table_spec: &'static hypermixx_stems::ModelSpec,
     /// A model file to run instead of the table entry: the user's own export.
     local_file: Option<std::path::PathBuf>,
+    /// The rate the deck and the device run at. A model pinned to another rate is fed and drained
+    /// through the resampler, so `[audio] sample_rate` is never a reason to refuse a separation.
+    engine_rate: u32,
     command_tx: &'a Sender<Command>,
     notices_tx: &'a NoticeTx,
     cancelled: &'a hypermixx_stems::Cancelled,
@@ -1858,16 +1862,27 @@ fn separate_into_deck(job: SeparateJob<'_>) -> Result<(), hypermixx_stems::StemE
         runtime,
         table_spec,
         local_file,
+        engine_rate,
         command_tx,
         notices_tx,
         cancelled,
     } = job;
+    // Two clocks are in play and only one of them is negotiable. The deck and the device run at the
+    // engine's rate; the model is pinned to the rate its export was trained at. Converting between
+    // them here is what lets `[audio] sample_rate` say 48k (or 96k) without either feeding the model
+    // material it was not trained on or installing stems on the wrong frame grid.
     let total = mix.total_frames();
+    let model_rate = table_spec.sample_rate;
+    let converted = engine_rate != model_rate;
+    let feed_view = hypermixx_media::ResampledSource::new(mix.as_ref(), model_rate, engine_rate);
+    let feed: &dyn Source = if converted { &feed_view } else { mix.as_ref() };
+    let model_total = feed.total_frames();
     let growing = ChunkedStreams::new(
         Stem::COUNT,
         total,
         Some(Arc::clone(mix)),
-        hypermixx_media::DEFAULT_FADE_FRAMES,
+        // ~50 ms at the engine's rate rather than the compile-time default, which is a frame count.
+        u64::from(engine_rate) / 20,
     );
     let streams: [Shared; Stem::COUNT] = match growing.streams().try_into() {
         Ok(streams) => streams,
@@ -1901,10 +1916,20 @@ fn separate_into_deck(job: SeparateJob<'_>) -> Result<(), hypermixx_stems::StemE
             "[stem] {}: {} blocks of {:.1}s as the model finishes them — the deck plays the mix \
              until the first one lands",
             hypermixx_core::deck_label(deck_id),
-            total.div_ceil(block_frames.max(1)),
-            block_frames as f32 / SAMPLE_RATE as f32,
+            model_total.div_ceil(block_frames.max(1)),
+            block_frames as f32 / model_rate as f32,
         ),
     );
+    if converted {
+        notices::info(
+            notices_tx,
+            format!(
+                "[stem] {}: the engine runs at {engine_rate}Hz and the model at {model_rate}Hz — \
+                 the mix is converted down and the stems back up",
+                hypermixx_core::deck_label(deck_id),
+            ),
+        );
+    }
     notices::info(
         notices_tx,
         if hypermixx_stems::model_path(model).exists() {
@@ -1968,14 +1993,13 @@ fn separate_into_deck(job: SeparateJob<'_>) -> Result<(), hypermixx_stems::StemE
         notices_tx,
         started,
         blocks: &mut blocks,
+        model_total,
+        rate: converted.then_some((model_rate, engine_rate)),
+        written: 0,
+        converters: Vec::new(),
     };
-    let out = hypermixx_stems::stream_cached(
-        separator.as_ref(),
-        mix.as_ref(),
-        &mut sink,
-        &progress,
-        cancelled,
-    );
+    let out =
+        hypermixx_stems::stream_cached(separator.as_ref(), feed, &mut sink, &progress, cancelled);
     let separated = growing.available_frames();
     match &out {
         Ok(()) => notices::info(
@@ -2014,6 +2038,52 @@ struct DeckSink<'a> {
     notices_tx: &'a NoticeTx,
     started: std::time::Instant,
     blocks: &'a mut u64,
+    /// Frames the model was given, in its own clock: the point where the tail has to be flushed.
+    model_total: u64,
+    /// `Some((model, engine))` when the two rates differ, so blocks are converted on the way in.
+    rate: Option<(u32, u32)>,
+    /// Next engine frame the converted stream writes (only meaningful while converting).
+    written: u64,
+    /// One converter per stem, created on the first block so a cached replay and a resumed run both
+    /// start where the model's clock says they do. Empty when no conversion is needed.
+    converters: Vec<hypermixx_media::StreamConverter>,
+}
+
+impl DeckSink<'_> {
+    /// Converts one block from the model's clock to the engine's, returning the frame the converted
+    /// audio belongs at. Blocks arrive contiguously (the streaming layer guarantees it), so a single
+    /// running position is enough — and it is what keeps the seam between two blocks sample-exact.
+    fn convert(&mut self, start_frame: u64, blocks: &[Vec<f32>]) -> (u64, Vec<Vec<f32>>) {
+        let Some((from, to)) = self.rate else {
+            return (start_frame, blocks.to_vec());
+        };
+        if self.converters.is_empty() {
+            // Where a fresh run would have put this frame: the resume path can hand over a stream
+            // that does not start at zero, and the converted audio has to land where the cache's
+            // model-rate frames say it does.
+            let first_out = (start_frame as f64 * f64::from(to) / f64::from(from)).round() as u64;
+            self.converters = (0..blocks.len())
+                .map(|_| hypermixx_media::StreamConverter::new(from, to, start_frame, first_out))
+                .collect();
+            self.written = first_out;
+        }
+        let mut out: Vec<Vec<f32>> = vec![Vec::new(); blocks.len()];
+        for (index, block) in blocks.iter().enumerate() {
+            self.converters[index].push(block, &mut out[index]);
+        }
+        let end = start_frame + blocks.first().map(|b| b.len() / 2).unwrap_or(0) as u64;
+        if end >= self.model_total {
+            // The tail of the last block is completed against silence, so the deck gets every frame
+            // the model's audio implies rather than stopping a few samples short.
+            for (index, converter) in self.converters.iter_mut().enumerate() {
+                converter.finish(&mut out[index]);
+            }
+        }
+        let start = self.written;
+        let frames = out.first().map(|block| block.len() / 2).unwrap_or(0) as u64;
+        self.written += frames;
+        (start, out)
+    }
 }
 
 impl hypermixx_stems::StemBlockSink for DeckSink<'_> {
@@ -2029,6 +2099,10 @@ impl hypermixx_stems::StemBlockSink for DeckSink<'_> {
                 ),
             );
             return false;
+        }
+        let (start_frame, blocks) = self.convert(start_frame, blocks);
+        if blocks.first().is_some_and(|block| block.is_empty()) {
+            return true;
         }
         let buffers: Vec<Arc<Vec<f32>>> =
             blocks.iter().map(|block| Arc::new(block.clone())).collect();
@@ -2403,6 +2477,62 @@ mod tests {
     use crossbeam_channel::unbounded;
     use hypermixx_core::FaderTarget;
 
+    /// The rate bridge a separation goes through when the engine is not at the model's rate: the
+    /// blocks it hands the growing streams must tile the engine's frame timeline exactly, or the deck
+    /// plays a gap (a short append) or a doubled sample (an overlap).
+    #[test]
+    fn a_converted_separation_tiles_the_engine_timeline() {
+        let (notice_tx, _notice_rx) = unbounded();
+        let model_rate = 44_100u32;
+        let engine_rate = 48_000u32;
+        let model_total = model_rate as u64 * 2; // two seconds of "separated" audio
+        let growing = ChunkedStreams::new(Stem::COUNT, model_total, None, 0);
+        let mut blocks = 0u64;
+        let mut sink = DeckSink {
+            growing: &growing,
+            deck_id: 0,
+            notices_tx: &notice_tx,
+            started: std::time::Instant::now(),
+            blocks: &mut blocks,
+            model_total,
+            rate: Some((model_rate, engine_rate)),
+            written: 0,
+            converters: Vec::new(),
+        };
+
+        // Model-shaped blocks of a constant value per stem, so a seam is visible as a discontinuity.
+        let block_frames = 22u64 * 1000;
+        let mut start = 0u64;
+        let mut written = 0u64;
+        while start < model_total {
+            let frames = block_frames.min(model_total - start) as usize;
+            let blocks: Vec<Vec<f32>> = (0..Stem::COUNT)
+                .map(|stem| {
+                    std::iter::repeat_n(stem as f32 + 1.0, frames * 2).collect::<Vec<f32>>()
+                })
+                .collect();
+            let (at, pcm) = sink.convert(start, &blocks);
+            assert_eq!(at, written, "a converted block must abut the previous one");
+            assert_eq!(pcm.len(), Stem::COUNT);
+            let frames_out = pcm[0].len() / 2;
+            assert!(frames_out > 0, "a block must convert to audio");
+            for stem in &pcm {
+                assert_eq!(
+                    stem.len() / 2,
+                    frames_out,
+                    "every stem keeps the same length"
+                );
+            }
+            written += frames_out as u64;
+            start += frames as u64;
+        }
+        let expected = (model_total as f64 * f64::from(engine_rate) / f64::from(model_rate)).ceil();
+        assert_eq!(
+            written, expected as u64,
+            "two seconds at the model's rate is {expected} frames at the engine's"
+        );
+    }
+
     /// The `fader` verb is a pure parse into `Command::SetFader`, so it can be tested without an
     /// engine: every stage must resolve, and a bad line must fail before it reaches the engine.
     #[test]
@@ -2561,7 +2691,21 @@ mod tests {
             notes.is_empty(),
             "the shipped file needs no clamping: {notes:?}"
         );
-        assert_eq!(live.audio.sample_rate, hypermixx_core::SAMPLE_RATE);
+        // The engine rate is a device fact, not a compile-time constant: any rate a sound card
+        // takes is legal, and the shipped file only has to name one of them.
+        assert!(
+            (8_000..=384_000).contains(&live.audio.sample_rate),
+            "the shipped rate is usable: {}",
+            live.audio.sample_rate
+        );
+        assert!(
+            matches!(
+                live.audio.sample_rate,
+                44_100 | 48_000 | 88_200 | 96_000 | 176_400 | 192_000
+            ),
+            "the shipped file names a rate devices actually offer: {}",
+            live.audio.sample_rate
+        );
         assert!(
             matches!(live.stems.provider.as_str(), "cpu" | "cuda" | "gpu"),
             "the shipped provider is a known EP: {}",

@@ -57,7 +57,8 @@ cargo run -p hypermixx-cli -- [flags]
 
 ### 2.3 时间单位
 
-- 帧 = 1/44100 秒（引擎域固定 44.1 kHz 立体声）；`jump` 用帧，`beatjump`/`loop`/`sync` 用拍。
+- 帧 = 1/引擎采样率 秒（缺省 44.1 kHz 立体声；`profile/live.toml` 的 `[audio] sample_rate` 可改）；
+  `jump` 用帧，`beatjump`/`loop`/`sync` 用拍。
 
 ---
 
@@ -129,7 +130,7 @@ folders = ["~/Music"]
                              唱盘：`touch` = 手放上去（暂停并记住走带），`turn` = 转轮（手持时
                              按 tick 移动播放头，空手时是 pitch bend），`release` = 松手（恢复
                              被 touch 打断的走带）。bare = touch
-[deck] jump <frame>         按帧 seek（1 秒 = 44100 帧）
+[deck] jump <frame>         按帧 seek（1 秒 = 引擎采样率帧）
 [deck] beatjump <beats|forward|backward>
                             按整拍 seek；显式数字同时更新 jump_beats（缺省 8）
 [deck] jumpbeats double|halve  改 jump_beats（1..64）
@@ -455,7 +456,7 @@ live reload [<file>]  重读 live 文件（缺省 --live 的路径，否则 ./pr
 
 | 键 | 缺省 | 说明 |
 |---|---|---|
-| `[audio] sample_rate` | 44100 | 引擎渲染率，同时也是向每个设备请求的率；素材在装载时重采样到它 |
+| `[audio] sample_rate` | 44100 | 引擎渲染率，同时也是向每个设备请求的率；素材在装载时重采样到它。填 48000 等任何设备支持的率都可以（8 kHz–384 kHz） |
 | `[audio] ring_frames` | 4096 | 输出 ring 容量（帧）：更多余量 = 更多延迟；随附的 `profile/live.toml` 用 1024（~23 ms） |
 | `[audio] prefill_frames` | 2048 | 开流前预填的静音，避免设备等第一个块；上限为 ring 的一半；随附 profile 用 512 |
 | `[audio] device_buffer_frames` | 后端默认 | 以 `BufferSize::Fixed(n)` 交给 cpal；ALSA 的 period 为 `n/4`。随附 profile 用 512（~2.9 ms period / ~11.6 ms buffer）；`0` 表示后端默认 |
@@ -468,8 +469,9 @@ live reload [<file>]  重读 live 文件（缺省 --live 的路径，否则 ./pr
 - **采样率、ring 与设备 buffer 需要重启**：引擎的时钟与缓冲在启动时定下（`live reload` 会明说这一点），
   但 `[stems]` 的默认值下一次分离就生效。未知键报错（拼错的 `sample_rat` 静默按 44.1k 跑才是灾难），
   越界的值被夹到有效范围并打印一行警告。
-- **分开分离仍要求引擎率为 44.1 kHz**：内置模型是 44.1k 导出、缓存也按这个率做 key，
-  非 44.1k 时 `stem separate` 直接报错而不是悄悄双向重采样。
+- **分离跟着引擎率走**：模型固定 44.1 kHz，引擎不是 44.1k 时 `stem separate` 会把 mix 转到模型率、
+  把每块 stem 转回引擎率（日志里明说），缓存仍按模型率存，所以同一首歌在两个率下共用一条缓存。
+  多花两趟重采样，除此之外行为不变。
 - `[audio] block_frames` **不在这里**，因为它是引擎内部契约（时间拉伸引擎按块喂入），不是本机性能参数。
 - **分离的块长也不在这里**：它就是模型自己的窗口步长（见 §3.7.1），设不了的才是对的。
 

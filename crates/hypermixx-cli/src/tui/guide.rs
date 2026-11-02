@@ -1,4 +1,4 @@
-//! The `--midi-guide` front-end.
+//! The `--guide` front-end.
 //!
 //! Three columns (`deck | unit | slot`), an `info` card, a `watch dog` that carries the latest
 //! prompt plus the raw MIDI stream, and five command buttons. The map editor stays deliberately
@@ -699,7 +699,7 @@ fn save(session: &mut Session) {
         let default_name = start
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("midi-map.toml");
+            .unwrap_or_else(|| crate::profile::default_map_path());
         session.overlay = Overlay::Files(FilePicker::new_save(
             Some(start),
             &["toml"],

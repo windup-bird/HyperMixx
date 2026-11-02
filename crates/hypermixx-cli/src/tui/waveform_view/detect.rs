@@ -5,6 +5,12 @@
 //! fallback. Every image backend still has braille underneath it, so a wrong guess costs quality,
 //! not correctness. A future round can add a DA1/Kitty query for terminals whose environment is
 //! silent.
+//!
+//! One hint is a *transport* fact rather than an identity fact: on Windows every console program is
+//! hosted through ConPTY, whose VT parser discards SOS/PM/APC strings outright — and kitty graphics
+//! travels in an APC string. The terminal may well be WezTerm (so `kitty_hint()` is true) and still
+//! never see a byte of it, which shows up as a blank waveform rather than a slow one. `docs/WAVEFORM.md`
+//! has the measurement; the guard below is the cheap half of the fix (the probe is the other).
 
 use crate::preference::WaveformBackend;
 
@@ -38,15 +44,37 @@ impl Default for CellPx {
     }
 }
 
-/// Resolves the requested preference against the terminal's environment.
-pub fn resolve(requested: WaveformBackend) -> (Backend, Option<String>) {
-    let tmux = env("TMUX").is_some() || env("STY").is_some();
-    let dumb = env("TERM").is_some_and(|term| term == "dumb");
+/// What the process can learn about the terminal from its environment. Split out from
+/// [`resolve`] so the decision table is testable without a real terminal (or a real Windows).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Hints {
+    pub tmux: bool,
+    pub dumb: bool,
+    pub kitty: bool,
+    /// The output crosses ConPTY: true for a native Windows console session.
+    pub conpty: bool,
+}
+
+impl Hints {
+    /// The hints this process actually has.
+    pub fn from_env() -> Self {
+        Self {
+            tmux: env("TMUX").is_some() || env("STY").is_some(),
+            dumb: env("TERM").is_some_and(|term| term == "dumb"),
+            kitty: kitty_hint(),
+            conpty: cfg!(windows),
+        }
+    }
+}
+
+/// Resolves `requested` against `hints`: the image backend to use and, when the choice had to be
+/// overruled, the one-line reason to put in the log.
+pub fn decide(requested: WaveformBackend, hints: Hints) -> (Backend, Option<String>) {
     let backend = match requested {
         WaveformBackend::Braille => Backend::Braille,
         WaveformBackend::Kitty => Backend::Kitty,
         WaveformBackend::Auto => {
-            if kitty_hint() {
+            if hints.kitty {
                 Backend::Kitty
             } else {
                 Backend::Braille
@@ -56,19 +84,36 @@ pub fn resolve(requested: WaveformBackend) -> (Backend, Option<String>) {
     if backend == Backend::Braille {
         return (backend, None);
     }
-    if tmux {
+    if hints.tmux {
         return (
             Backend::Braille,
             Some("tmux/screen passthrough is not enabled; using braille".to_owned()),
         );
     }
-    if dumb {
+    if hints.dumb {
         return (
             Backend::Braille,
             Some("TERM=dumb; using braille".to_owned()),
         );
     }
+    if hints.conpty {
+        // Not the terminal's fault and not our escape sequences' fault: the bytes are consumed
+        // before they reach it. `wezterm ssh` to a Linux/macOS host is the way to get images back.
+        return (
+            Backend::Braille,
+            Some(
+                "Windows consoles are hosted through ConPTY, which drops the APC strings kitty \
+                 graphics travels in; using braille (see docs/WAVEFORM.md)"
+                    .to_owned(),
+            ),
+        );
+    }
     (backend, None)
+}
+
+/// Resolves the requested preference against this process's environment.
+pub fn resolve(requested: WaveformBackend) -> (Backend, Option<String>) {
+    decide(requested, Hints::from_env())
 }
 
 /// The terminal's cell size in pixels, as reported by crossterm's window-size query. Falls back to
@@ -117,6 +162,58 @@ mod tests {
         if env("TMUX").is_none() && env("STY").is_none() && env("TERM").as_deref() != Some("dumb") {
             assert_eq!(resolve(WaveformBackend::Kitty).0, Backend::Kitty);
         }
+    }
+
+    #[test]
+    fn a_conpty_session_falls_back_to_braille() {
+        let conpty = Hints {
+            kitty: true,
+            conpty: true,
+            ..Hints::default()
+        };
+        // `auto` would otherwise pick kitty because the terminal *is* WezTerm.
+        let (backend, note) = decide(WaveformBackend::Auto, conpty);
+        assert_eq!(backend, Backend::Braille);
+        assert!(
+            note.as_deref().is_some_and(|note| note.contains("ConPTY")),
+            "{note:?}"
+        );
+        // An explicit request is overruled too, because the bytes cannot arrive either way —
+        // but it says why instead of silently ignoring the file.
+        let (backend, note) = decide(WaveformBackend::Kitty, conpty);
+        assert_eq!(backend, Backend::Braille);
+        assert!(note.is_some());
+
+        // A terminal that is not behind ConPTY keeps its images.
+        let native = Hints {
+            kitty: true,
+            ..Hints::default()
+        };
+        assert_eq!(
+            decide(WaveformBackend::Auto, native),
+            (Backend::Kitty, None)
+        );
+        // And brailles stays braille, with nothing to report.
+        assert_eq!(
+            decide(WaveformBackend::Braille, conpty),
+            (Backend::Braille, None)
+        );
+    }
+
+    #[test]
+    fn a_mux_or_a_dumb_terminal_wins_over_the_hint() {
+        let muxed = Hints {
+            kitty: true,
+            tmux: true,
+            ..Hints::default()
+        };
+        assert_eq!(decide(WaveformBackend::Auto, muxed).0, Backend::Braille);
+        let dumb = Hints {
+            kitty: true,
+            dumb: true,
+            ..Hints::default()
+        };
+        assert_eq!(decide(WaveformBackend::Auto, dumb).0, Backend::Braille);
     }
 
     #[test]

@@ -23,6 +23,8 @@ pub struct Filter {
     chain: BiquadChain,
     /// (value, resonance) as of the last coefficient redraw.
     cached: (f32, f32),
+    /// The rate `cached` was designed at; a rate change invalidates the design like a knob move.
+    cached_rate: u32,
 }
 
 /// Cutoff travel. Below 20 Hz a sweep is a DC servo, not a filter; past ~18 kHz there is nothing
@@ -41,7 +43,10 @@ impl Filter {
             value: Param::new(0.0, FILTER_TAU),
             resonance: Param::new(0.2, FILTER_TAU),
             chain: BiquadChain::from_design(&[section(0.0, 0.707)], crate::SAMPLE_RATE),
-            cached: (0.0, 0.2),
+            // NaN forces a redesign on the first block, at the rate the engine is really running —
+            // a coefficient set built at 44.1k on a 48k stream is a 9% pitch error on the cutoff.
+            cached: (f32::NAN, f32::NAN),
+            cached_rate: 0,
         }
     }
 
@@ -115,12 +120,13 @@ impl Fx for Filter {
         let q = resonance_to_q(resonance);
         let normalised = f64::from(value);
 
-        if (value, resonance) != self.cached {
+        if (value, resonance) != self.cached || sr != self.cached_rate {
             let design = [section(normalised, q)];
             if !self.chain.apply_design(&design, sr) {
                 self.chain = BiquadChain::from_design(&design, sr);
             }
             self.cached = (value, resonance);
+            self.cached_rate = sr;
         }
         self.chain.recover_if_blowing(|| {
             [section(normalised, q)]

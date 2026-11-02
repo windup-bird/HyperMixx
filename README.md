@@ -18,7 +18,7 @@ cli ─┬─► audio ───┐
 | crate | 职责 | 依赖 |
 |---|---|---|
 | `hypermixx-core` | 协议与类型：`Command`/`CommandResponse`、`DeckState`、`BeatGrid`、`Key`、`Source`、action 语法表、live 设置、输出状态 | serde |
-| `hypermixx-media` | 解码与内存池：`decode_file`（symphonia → 44.1k 立体声）、`PcmPool` | core |
+| `hypermixx-media` | 解码与内存池：`decode_file`（symphonia → 引擎率立体声）、`PcmPool`、`StreamConverter` 重采样 | core |
 | `hypermixx-audio` | 实时引擎：producer 线程 + cpal 输出、mixer/通道/FX 链、时间拉伸 | core, media |
 | `hypermixx-library` | 离线分析：beat 网格编译、stratum-dsp 适配、波形峰值 | core, media |
 | `hypermixx-stems` | 离线 stem 分离：HTDemucs 模型获取/校验、内容寻址缓存、ONNX 后端（CPU 默认；`cuda` 可选） | core, media, ort |
@@ -29,7 +29,7 @@ cli ─┬─► audio ───┐
 
 ## 安装
 
-Linux 与 Windows（MSVC）均已完整构建并通过测试。
+Linux 已完整构建并通过测试；Windows（MSVC）可构建运行（图形波形在 ConPTY 下自动回落 braille，见 `docs/WAVEFORM.md`）。
 
 前置：Rust（2021 edition，1.70+）、音频输出设备。
 

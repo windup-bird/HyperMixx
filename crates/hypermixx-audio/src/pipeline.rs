@@ -440,6 +440,7 @@ fn route(mixer: &mut Mixer, sync: &mut SyncGroup, command: Command) -> Option<Co
                 .deck(deck_id as usize)
                 .map(crate::deck::Deck::tempo_range);
             let keylock = mixer.keylock_window();
+            let block_seconds = mixer.block_seconds();
             let Some(channel) = mixer.channel_mut(deck_id as usize) else {
                 return Some(error(unknown_deck(deck_id, mixer.channel_count())));
             };
@@ -449,6 +450,9 @@ fn route(mixer: &mut Mixer, sync: &mut SyncGroup, command: Command) -> Option<Co
             // `set_analysis` takes `&self` (the grid swaps in lock-free), so no `mut` needed.
             let mut deck = Deck::new(source);
             deck.set_keylock_window(keylock);
+            // A fresh transport still runs at the mixer's rate: the sync controller's time constants
+            // are seconds, not blocks.
+            deck.set_block_seconds(block_seconds);
             if let Some(range) = range {
                 deck.set_tempo_range(range);
             }
