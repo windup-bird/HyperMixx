@@ -13,6 +13,8 @@
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use hypermixx_core::{OutputRole, OutputState, OutputStatus};
 
@@ -83,6 +85,34 @@ impl std::fmt::Display for OutputError {
 
 impl std::error::Error for OutputError {}
 
+/// What a device's callbacks look like, shared between the audio callback and the producer thread.
+///
+/// The size matters beyond diagnostics: cpal's ALSA backend hands the callback *all* the PCM
+/// buffer's free space, so a ring smaller than one callback underruns on every callback and the
+/// padded silence makes the mix crawl.
+#[derive(Debug, Default)]
+struct CallbackStats {
+    /// Biggest chunk the device has asked for, in frames.
+    frames: AtomicUsize,
+    /// Callbacks that were short of ring.
+    starved: AtomicU64,
+    /// Samples that had to be padded with silence.
+    padded: AtomicU64,
+}
+
+impl CallbackStats {
+    fn record(&self, frames: usize) {
+        self.frames.fetch_max(frames, Ordering::Relaxed);
+    }
+
+    fn padded(&self, samples: usize) {
+        if samples > 0 {
+            self.starved.fetch_add(1, Ordering::Relaxed);
+            self.padded.fetch_add(samples as u64, Ordering::Relaxed);
+        }
+    }
+}
+
 /// One hardware destination: a cpal stream, its ring, and the channel mapping into it.
 ///
 /// `_stream` is a field and never read: dropping it stops the sound card, which is exactly the
@@ -120,6 +150,10 @@ pub struct Output {
     /// device drained slower than the mixer produced.
     overruns: u64,
     writes: u64,
+    /// What the device's callbacks look like, written from the audio thread (see [`CallbackStats`]).
+    callback: Arc<CallbackStats>,
+    /// This output's ring capacity in frames, so a callback can be compared with it.
+    ring_frames: usize,
 }
 
 impl Output {
@@ -253,9 +287,12 @@ impl Output {
             gain: cfg.gain_or_unity(),
             overruns: 0,
             writes: 0,
+            callback: Arc::new(CallbackStats::default()),
+            ring_frames: 0,
         };
 
         let ring_frames = tuning.ring_frames.max(block_frames);
+        output.ring_frames = ring_frames;
         let ring_channels = output.device_channels.max(1);
         // The latency hint is a *preference*. Some paths (ALSA's `dmix`/`plug` behind
         // `sysdefault`/`default`, which is how a USB DJ controller is usually reached) reject a
@@ -278,7 +315,15 @@ impl Output {
                 push_samples(&mut producer, &silence);
             }
             output.producer = Some(producer);
-            match build_stream(&found, &config, consumer, &cfg.name, device_buffer_frames) {
+            match build_stream(
+                &found,
+                &config,
+                consumer,
+                &cfg.name,
+                device_buffer_frames,
+                Arc::clone(&output.callback),
+                output.device_channels,
+            ) {
                 Ok(stream) => break stream,
                 Err(err) if device_buffer_frames.is_some() => {
                     eprintln!(
@@ -324,6 +369,8 @@ impl Output {
             gain: cfg.gain_or_unity(),
             overruns: 0,
             writes: 0,
+            callback: Arc::new(CallbackStats::default()),
+            ring_frames: 0,
         }
     }
 
@@ -353,6 +400,8 @@ impl Output {
             gain: self.gain,
             writes: self.writes,
             overruns: self.overruns,
+            starved: self.starved_callbacks(),
+            padded: self.padded_samples(),
         }
     }
 
@@ -394,6 +443,36 @@ impl Output {
     /// story.
     pub fn overruns(&self) -> u64 {
         self.overruns
+    }
+
+    /// `Some(frames)` when the device's callback asks for more frames than the ring can hold.
+    ///
+    /// That is not a tuning preference: the callback gets `avail_frames` from ALSA, so a ring
+    /// smaller than one callback underruns *every* callback, and the padded silence makes the mix
+    /// play slow and broken. The mixer reopens the destination with a ring that fits (see
+    /// [`Mixer::widen_output_rings`](super::Mixer::widen_output_rings)).
+    pub fn ring_shortfall(&self) -> Option<usize> {
+        if !self.is_live() {
+            return None;
+        }
+        let wanted = self.callback.frames.load(Ordering::Relaxed);
+        shortfall(self.ring_frames, self.block_frames, wanted)
+    }
+
+    /// Callbacks that ran out of ring and were padded with silence. A non-zero, growing count means
+    /// the mix is gapped: the ring is too small for the device's chunk, or the producer is late.
+    pub fn starved_callbacks(&self) -> u64 {
+        self.callback.starved.load(Ordering::Relaxed)
+    }
+
+    /// Samples of padding the device has been given, across every starved callback.
+    pub fn padded_samples(&self) -> u64 {
+        self.callback.padded.load(Ordering::Relaxed)
+    }
+
+    /// The ring this output was built with, in frames.
+    pub fn ring_frames(&self) -> usize {
+        self.ring_frames
     }
 
     /// Hands one block to the device.
@@ -763,14 +842,42 @@ fn clamp_device_buffer(requested: usize, supported: &cpal::SupportedBufferSize) 
     frames.min(u32::MAX as usize) as u32
 }
 
+/// Whether a ring of `ring_frames` can serve a callback that asked for `wanted` frames.
+///
+/// One block of slack on top of the callback: the producer writes whole blocks, so a ring that fits
+/// exactly one callback has no room for the next block between callbacks. `wanted == 0` means no
+/// callback has fired yet (nothing to decide).
+fn shortfall(ring_frames: usize, block_frames: usize, wanted: usize) -> Option<usize> {
+    (wanted > 0 && wanted + block_frames > ring_frames).then_some(wanted)
+}
+
+/// The ring to reopen with when a device's callback wanted `wanted` frames: that callback plus four
+/// blocks of slack, never smaller than the configured ring.
+///
+/// The cap is a runaway guard, not a tuning value: a device that wants more than two seconds of
+/// buffer is not a device this engine can play through, and growing forever would eat the session.
+pub(crate) fn grown_ring(wanted: usize, block_frames: usize, configured: usize) -> usize {
+    const MAX_RING_FRAMES: usize = 131_072;
+    (wanted + 4 * block_frames)
+        .max(configured)
+        .min(MAX_RING_FRAMES)
+}
+
 /// Builds and starts the stream. The consumer is moved into the callback, which is why the ring's two
 /// ends are owned rather than shared.
+///
+/// `callback_frames` is written by the audio callback with the size of the chunk the device asked
+/// for. cpal's ALSA backend passes ALSA's `avail_frames` — everything the PCM buffer has room for —
+/// so this is the device's own period/buffer, and a ring smaller than it starves on every callback.
+#[allow(clippy::too_many_arguments)]
 fn build_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
     mut consumer: Consumer<f32>,
     name: &str,
     device_buffer_frames: Option<usize>,
+    callback: Arc<CallbackStats>,
+    channels: usize,
 ) -> Result<cpal::Stream, OutputError> {
     let mut stream_config = config.config();
     if let Some(requested) = device_buffer_frames {
@@ -780,24 +887,35 @@ fn build_stream(
     }
     let name = name.to_owned();
     let on_error = move |err: cpal::StreamError| eprintln!("[audio] {name}: stream error: {err}");
+    // Each callback records its own size: the ring-growth check reads the maximum, so a device that
+    // asks for its whole PCM buffer once (the first callback after `play`) is sized for.
+    let channels = channels.max(1);
     let built = match config.sample_format() {
-        cpal::SampleFormat::F32 => device.build_output_stream(
-            &stream_config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                fill_with_silence_on_underrun(&mut consumer, data);
-            },
-            on_error,
-            None,
-        ),
+        cpal::SampleFormat::F32 => {
+            let stats = Arc::clone(&callback);
+            device.build_output_stream(
+                &stream_config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    stats.record(data.len() / channels);
+                    let padded = fill_with_silence_on_underrun(&mut consumer, data);
+                    stats.padded(padded);
+                },
+                on_error,
+                None,
+            )
+        }
         cpal::SampleFormat::I16 => {
             // Sized here, outside the real-time callback.
             let mut scratch: Vec<f32> = vec![0.0; data_capacity(config)];
+            let stats = Arc::clone(&callback);
             device.build_output_stream(
                 &stream_config,
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                    stats.record(data.len() / channels);
                     grow(&mut scratch, data.len());
                     let (buffer, _) = scratch.split_at_mut(data.len());
-                    fill_with_silence_on_underrun(&mut consumer, buffer);
+                    let padded = fill_with_silence_on_underrun(&mut consumer, buffer);
+                    stats.padded(padded);
                     for (out, sample) in data.iter_mut().zip(&*buffer) {
                         *out = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
                     }
@@ -808,12 +926,15 @@ fn build_stream(
         }
         cpal::SampleFormat::U16 => {
             let mut scratch: Vec<f32> = vec![0.0; data_capacity(config)];
+            let stats = Arc::clone(&callback);
             device.build_output_stream(
                 &stream_config,
                 move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
+                    stats.record(data.len() / channels);
                     grow(&mut scratch, data.len());
                     let (buffer, _) = scratch.split_at_mut(data.len());
-                    fill_with_silence_on_underrun(&mut consumer, buffer);
+                    let padded = fill_with_silence_on_underrun(&mut consumer, buffer);
+                    stats.padded(padded);
                     for (out, sample) in data.iter_mut().zip(&*buffer) {
                         *out = ((sample.clamp(-1.0, 1.0) + 1.0) * 0.5 * f32::from(u16::MAX)) as u16;
                     }
@@ -1011,7 +1132,19 @@ mod tests {
             return;
         }
         let mut unresolved = Vec::new();
+        let mut checked = 0;
         for (index, name) in names.iter().enumerate() {
+            // Skip anything that has vanished from a fresh *names-only* snapshot: another client (the
+            // sound server, a test holding a stream open) grabbing a device in the meantime is not
+            // what this pins. The bug this test exists for truncated the list *while opening* the
+            // devices, which does not affect this snapshot.
+            if !output_device_names(&host)
+                .iter()
+                .any(|current| current == name)
+            {
+                continue;
+            }
+            checked += 1;
             match resolve_device(&host, Some(name)) {
                 DeviceLookup::Named {
                     device: Some(_), ..
@@ -1026,7 +1159,7 @@ mod tests {
             unresolved.is_empty(),
             "{} of {} listed device(s) do not resolve: {}",
             unresolved.len(),
-            names.len(),
+            checked,
             unresolved.join(", ")
         );
     }
@@ -1041,6 +1174,29 @@ mod tests {
         for format in [F::I8, F::U8, F::I32, F::U32, F::F64] {
             assert!(!playable_format(format), "{format:?} cannot be fed");
         }
+    }
+
+    /// A device whose callback is bigger than the ring starves on every callback: the mix plays
+    /// slow and broken. The check has to fire on the callback size, not on the configured ring.
+    #[test]
+    fn a_callback_bigger_than_the_ring_asks_for_a_bigger_ring() {
+        // The PCH measurement that started this: 1024-frame ring, ~2032-frame callbacks.
+        assert_eq!(shortfall(1024, 256, 2032), Some(2032));
+        assert_eq!(shortfall(1024, 256, 768), None, "fits with slack");
+        assert_eq!(shortfall(1024, 256, 0), None, "no callback yet");
+        assert_eq!(
+            shortfall(1024, 256, 769),
+            Some(769),
+            "exactly a callback but no room for the next block"
+        );
+    }
+
+    #[test]
+    fn the_grown_ring_holds_the_callback_and_never_shrinks_below_the_config() {
+        assert_eq!(grown_ring(2032, 256, 1024), 2032 + 1024);
+        assert_eq!(grown_ring(512, 256, 4096), 4096, "never shrinks");
+        // A pathological device cannot make the engine allocate unlimited frames.
+        assert_eq!(grown_ring(usize::MAX / 2, 256, 1024), 131_072);
     }
 
     /// A destination that is configured but unavailable is a *state*, not a failed build: the mixer

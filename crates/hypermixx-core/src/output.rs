@@ -75,6 +75,11 @@ pub struct OutputStatus {
     /// Blocks handed to this output, and blocks whose tail the ring could not take.
     pub writes: u64,
     pub overruns: u64,
+    /// Callbacks that ran out of ring, and the samples of silence that had to be padded. A growing
+    /// pair is the honest answer to "why does it sound slow and broken": the device asked for more
+    /// frames than the ring held, so part of every callback is silence.
+    pub starved: u64,
+    pub padded: u64,
 }
 
 /// A command addressed to the mixer's output set rather than to a signal path.

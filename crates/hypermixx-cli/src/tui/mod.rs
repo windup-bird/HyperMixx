@@ -16,6 +16,7 @@ pub mod overview;
 pub mod picker;
 pub mod popup;
 pub mod settings;
+mod stderr;
 pub mod text;
 pub mod view;
 pub mod waveform_view;
@@ -138,9 +139,20 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     if let Some(note) = note {
         app.push_log(LogLine::info(format!("[waveform] {note}")));
     }
-    let outcome = event_loop(&mut terminal, &mut app, pipeline, &dispatcher);
+    // From here on, whatever the engine and libasound print goes into the response log instead of
+    // under the UI (a single `F9 › output` binding prints a dozen lines). Dropped after `restore`,
+    // so a fatal message still reaches the real terminal.
+    let stderr = stderr::start();
+    let outcome = event_loop(
+        &mut terminal,
+        &mut app,
+        pipeline,
+        &dispatcher,
+        stderr.as_ref().map(|(_, rx)| rx),
+    );
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
+    drop(stderr);
 
     // However the loop ended, stop the engine so the producer joins. Report a terminal failure on
     // the normal screen, after `restore`.
@@ -178,6 +190,7 @@ fn event_loop(
     app: &mut App,
     pipeline: &AudioPipeline,
     dispatcher: &Dispatcher,
+    stderr: Option<&crossbeam_channel::Receiver<String>>,
 ) -> io::Result<()> {
     let mut next_tick = Instant::now() + TICK;
     let mut ticks: u64 = 0;
@@ -200,6 +213,12 @@ fn event_loop(
             app.on_response(&response, pipeline);
         }
         app.drain();
+        if let Some(lines) = stderr {
+            // Engine/ALSA diagnostics, kept out of the canvas by `stderr::start`.
+            for line in lines.try_iter() {
+                app.push_log(LogLine::info(line));
+            }
+        }
         for action in app.drain_browser_actions() {
             input::apply_browser_action(app, action, dispatcher);
         }

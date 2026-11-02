@@ -63,10 +63,15 @@ pub fn pop_samples(consumer: &mut Consumer<f32>, output: &mut [f32]) -> usize {
     read.len()
 }
 
-/// Fills `output` from the ring, padding an underrun with silence. Audio-callback safe.
-pub fn fill_with_silence_on_underrun(consumer: &mut Consumer<f32>, output: &mut [f32]) {
+/// Fills `output` from the ring, padding an underrun with silence and reporting how many **samples**
+/// had to be padded. Audio-callback safe.
+///
+/// The return value is the only way to tell an underrun from a genuinely silent block: the padded
+/// silence is indistinguishable from the mix being quiet.
+pub fn fill_with_silence_on_underrun(consumer: &mut Consumer<f32>, output: &mut [f32]) -> usize {
     let read = pop_samples(consumer, output);
     output[read..].fill(0.0);
+    output.len() - read
 }
 
 #[cfg(test)]
@@ -107,7 +112,11 @@ mod tests {
         ring.push(&[1.0, 2.0]);
         let (mut producer, mut consumer) = ring.split();
         let mut out = [7.0f32; 8];
-        fill_with_silence_on_underrun(&mut consumer, &mut out);
+        assert_eq!(
+            fill_with_silence_on_underrun(&mut consumer, &mut out),
+            6,
+            "six samples had to be padded"
+        );
         assert_eq!(&out[..2], &[1.0, 2.0]);
         assert!(out[2..].iter().all(|s| *s == 0.0));
         assert_eq!(push_samples(&mut producer, &[3.0, 4.0]), 2);

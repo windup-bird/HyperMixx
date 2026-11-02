@@ -21,6 +21,11 @@ sample_rate = 48000
 # Output ring capacity in frames: more slack for a slow device, more latency.
 # 1024 frames is ~23 ms at 44.1 kHz (~21 ms at 48 kHz). For a more conservative setup use 2048; for an aggressive
 # one, 512 works but leaves less room for scheduler jitter.
+#
+# This is a *floor*. A device whose callback asks for more than this (ALSA's `avail_frames` can be a
+# whole PCM buffer, and paths that refuse `device_buffer_frames` — `dmix`/`plug` behind `sysdefault`
+# — decide their own) makes the engine grow the ring to fit and log the size; put that number here to
+# make the log quiet and to stop the one-time reopen.
 ring_frames = 1024
 # Frames of silence pushed into each ring before its stream starts, so the device never waits on the
 # producer's first block. Capped at half the ring. 512 is one device buffer below; set 0 only if you

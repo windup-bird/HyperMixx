@@ -219,11 +219,15 @@ browser | command
 - `live`、`preference`：选新的 `.toml`；`live` 立即按 `live reload` 重新读取（引擎率/ring 需重启），
   `preference` 立即换主题。
 - 其余按键：`↑↓` 移动、`r` 重读当前拓扑文件（设备列表只在启动前探测一次，避免 ALSA 警告糊到界面上）。
+- TUI 运行期间 **stderr 被接管**：引擎的 `[audio] …` 和 libasound 的 `ALSA lib …` 不再画到界面上，
+  而是进响应日志（可滚动）。所以换一次 `output` 只看得到日志里几行，不会把画面冲掉。
 
 `output` 绑定的设备若被别的客户端（通常是 PipeWire/PulseAudio）独占，引擎会把它报成 `missing` 而不是假装在放——
 此时选 `default`/`pipewire` 这类**走声音服务器**的目的地，或让出该声卡后 `output refresh`。该原因会打在 stderr 上。
 `live.toml` 的 `device_buffer_frames` 只是延迟偏好：ALSA 的 `dmix`/`plug`（`sysdefault`/`default`，USB 声卡常见路径）
-会拒绝固定 buffer，此时引擎自动退回后端默认值，不会因此变成静音输出。
+会拒绝固定 buffer，此时引擎自动退回后端默认值，不会因此变成静音输出。这种情况下设备一次回调可能要一整个 PCM buffer，
+而 `ring_frames` 只是下限：引擎会把该输出的 ring 自动长到装得下一次回调（日志里给出建议值），否则每次回调都会补静音——
+听起来就是“变慢 + 破碎”。
 
 弹窗出现时 deck 上的 kitty 图片会被立即删除（kitty 图片在文字层之下，只是不再绘制的话会从弹窗里透出来），
 关闭后自动重传。

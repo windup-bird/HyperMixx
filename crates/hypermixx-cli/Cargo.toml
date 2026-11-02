@@ -26,6 +26,11 @@ crossterm = { workspace = true }
 sysinfo = { workspace = true }
 unicode-width = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Only for the TUI's stderr capture: rebinding fd 2 so engine/ALSA diagnostics land in the response
+# log instead of scribbling the alternate screen.
+libc = "0.2"
+
 [features]
 # GPU stem separation. Off by default: the CPU path is complete without it, and this pulls the
 # CUDA-enabled ONNX Runtime prebuilt (~183 MB) and needs CUDA 13 + cuDNN 9 on the host.

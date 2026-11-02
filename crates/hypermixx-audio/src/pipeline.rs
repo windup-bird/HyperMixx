@@ -352,6 +352,10 @@ impl AudioPipeline {
             sync.prepare(&mut mixer);
             let ctx = mixer.make_ctx(sample_rate);
             mixer.process(&ctx);
+            // A device that asked for a bigger chunk than our ring holds underruns on every
+            // callback (the mix crawls, padded with silence). The callback records its size; growing
+            // the ring is a one-off reopen, and a no-op once it fits.
+            mixer.widen_output_rings();
             sleep_until_next(started, pace);
         }
     }

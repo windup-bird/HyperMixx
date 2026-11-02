@@ -256,11 +256,19 @@ crossfader 影响;分叉在它之后则跟着它(把 crossfader 放早的代价,
   取消静音能恢复原电平(而不是回到 unity),而被静音的 stem 交给自己的插入链的是真静音
 - `Output`(`output.rs`,crate 里唯一出现 cpal 类型的地方)— 每输出独立 ring + stream;
   回调外预分配 scratch、partial push 永不阻塞、声道重映射安全钳制(单声道取和);
-  `gain` 逐目的地 trim;**预填半 ring 静音**(~46ms)避免启动竞速;producer 侧 overrun
-  有计数(callback 侧 underrun 与真实静音不可区分,故不数)。设备按 `device` 模式解析
-  (**名字子串**或序号,缺省 = 系统默认),状态四态 `live | sink | missing | disabled` ——
-  "设备没插"和"设备不接受引擎率"都是**状态而不是失败**:引擎照跑、`output refresh` 重试
-  (`Mixer::refresh_outputs` 重新跑一遍 `build_outputs`,先 drop 旧流再开新流,免得两条流抢同一设备)
+  `gain` 逐目的地 trim;**预填半 ring 静音**(~46ms)避免启动竞速;producer 侧 overrun 与
+  callback 侧 underrun(被补静音的样本数)都计数。设备按 `device` 模式解析(**名字子串**或
+  序号,缺省 = 系统默认),状态四态 `live | sink | missing | disabled` —— "设备没插"和
+  "设备不接受引擎率"都是**状态而不是失败**:引擎照跑、`output refresh` 重试
+  (`Mixer::refresh_outputs` 重新跑一遍 `build_outputs`,先 drop 旧流再开新流,免得两条流抢同一设备)。
+  解析先做**只取名字**的快照(每读一个设备就 drop),否则枚举时持有的 PCM 会把同一张卡后面的
+  条目挤掉——列表里有、引擎却报 `missing`
+- **ring 按设备回调大小自适应**:cpal 的 ALSA 回调拿的是 `avail_frames`(整块 PCM buffer 的剩余
+  空间),ring 小于一次回调就会**每次**回调都补静音(听感=变慢+破碎)。固定 buffer 被拒的路径
+  (`dmix`/`plug`,`sysdefault` 常见)只能拿后端默认值,所以 callback 把自己的帧数记进
+  `CallbackStats`;`Mixer::widen_output_rings` 在 block 之间发现不够就把该输出**单独**重开成
+  `wanted + 4×block` 的 ring 并写进日志(`live.toml` 的 `ring_frames` 因此是下限而非定值)。
+  固定 buffer 只是延迟偏好:被拒就退回后端默认,而不是失败成 sink
 - **同一物理设备只保留一条流**:master+cue 都落在 default device 时,PipeWire 会在
   graph 里把两条流直接相加——main 有 limiter(≤−1 dBFS)但 cue 总线没有(cue_send 1.0
   时电平可达 2.0),DAC 实收 ~2.9 → 硬削波。Mixer 检测设备名重复,第二条降级 sink 不路由

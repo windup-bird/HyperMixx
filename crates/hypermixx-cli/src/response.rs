@@ -102,8 +102,16 @@ fn output_line(status: &OutputStatus) -> String {
     } else {
         format!("  ch {}-{}", status.channels.0, status.channels.1)
     };
+    let padding = if status.starved > 0 {
+        format!(
+            "  underruns {} ({} samples padded)",
+            status.starved, status.padded
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "output {:<12} {:<6} {:<8} {device}{route}",
+        "output {:<12} {:<6} {:<8} {device}{route}{padding}",
         status.name,
         status.role.name(),
         status.state.label()
@@ -467,6 +475,8 @@ mod tests {
             gain: 1.0,
             writes: 0,
             overruns: 0,
+            starved: 0,
+            padded: 0,
         };
         let live = output_line(&status(OutputState::Live, Some("USB Headset"), (0, 1)));
         assert!(live.contains("cans") && live.contains("cue") && live.contains("live"));
@@ -478,6 +488,14 @@ mod tests {
         // A non-default channel pair is worth showing; (0,1) is not.
         assert!(output_line(&status(OutputState::Live, Some("x"), (2, 3))).contains("ch 2-3"));
         assert!(!live.contains("ch 0-1"));
+        // Underruns are the difference between "live" and "audible": a starved callback is silence
+        // in the middle of the mix, so it belongs on the line.
+        let mut starving = status(OutputState::Live, Some("x"), (0, 1));
+        starving.starved = 3;
+        starving.padded = 1536;
+        let line = output_line(&starving);
+        assert!(line.contains("underruns 3"), "{line}");
+        assert!(line.contains("1536 samples"), "{line}");
     }
 
     use super::*;

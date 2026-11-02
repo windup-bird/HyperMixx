@@ -91,6 +91,9 @@ pub struct Mixer {
     sample_rate: u32,
     /// Buffer sizes, kept so a reload/refresh opens the same kind of ring.
     tuning: OutputTuning,
+    /// Set once a device asked for more than the ring cap: the engine stops trying to grow and the
+    /// log says so instead of reopening a stream on every block.
+    ring_capped: bool,
     /// Keylock STFT window from the live config; re-applied to every freshly loaded deck.
     keylock: KeylockSettings,
 }
@@ -176,6 +179,7 @@ impl Mixer {
             config: cfg,
             sample_rate,
             tuning,
+            ring_capped: false,
             keylock: KeylockSettings::default(),
         })
     }
@@ -198,6 +202,74 @@ impl Mixer {
     /// Every destination's binding, for `output list`.
     pub fn output_statuses(&self) -> Vec<OutputStatus> {
         self.outputs.statuses()
+    }
+
+    /// Grows a destination's ring when the device's callback is bigger than it, and returns the new
+    /// size. Called between blocks by the producer loop.
+    ///
+    /// A ring smaller than one device callback underruns on *every* callback: the callback takes
+    /// what is there and ALSA fills the rest with silence, so the mix plays slow and broken rather
+    /// than merely muffled. The size is learned from the callback itself (cpal passes ALSA's
+    /// `avail_frames`), which is the only way to know it: cpal exposes no period, and the paths that
+    /// need this most (dmix/plug behind `sysdefault`) refuse a requested buffer.
+    ///
+    /// The reopen is a cold path — one dropped stream, once per destination — and only the output
+    /// that needs it is touched, so a working cue is not interrupted.
+    pub fn widen_output_rings(&mut self) -> Option<usize> {
+        let wanted = self
+            .outputs
+            .iter()
+            .filter_map(Output::ring_shortfall)
+            .max()?;
+        let ring = output::grown_ring(wanted, self.block_frames, self.tuning.ring_frames);
+        if ring <= self.tuning.ring_frames {
+            if !self.ring_capped {
+                self.ring_capped = true;
+                eprintln!(
+                    "[audio] a device asks for {wanted}-frame callbacks, above the {}-frame ring \
+                     cap; leaving it there (choose another destination)",
+                    self.tuning.ring_frames
+                );
+            }
+            return None;
+        }
+        eprintln!(
+            "[audio] a device asks for {wanted}-frame callbacks; growing the output ring from {} \
+             to {ring} frames ({:.0} ms). Set `ring_frames` in live.toml to make it quiet",
+            self.tuning.ring_frames,
+            ring as f64 * 1000.0 / f64::from(self.sample_rate.max(1)),
+        );
+        self.tuning.ring_frames = ring;
+        // Reopen only the destinations whose ring is too small. The old output is swapped for a sink
+        // first: its stream has to be dropped before the same device can be opened again.
+        for index in 0..self.outputs.len() {
+            if self
+                .outputs
+                .get(index)
+                .and_then(Output::ring_shortfall)
+                .is_none()
+            {
+                continue;
+            }
+            let Some(cfg) = self.config.outputs.get(index).cloned() else {
+                continue;
+            };
+            let placeholder = Output::sink(&cfg, self.block_frames);
+            let old = self
+                .outputs
+                .get_mut(index)
+                .map(|slot| std::mem::replace(slot, placeholder));
+            drop(old); // frees the device channel pair before we ask for it again
+            match Output::open_with(&cfg, self.sample_rate, self.block_frames, self.tuning) {
+                Ok(output) => {
+                    if let Some(slot) = self.outputs.get_mut(index) {
+                        *slot = output;
+                    }
+                }
+                Err(err) => eprintln!("[audio] {}: reopen for a bigger ring failed: {err}", cfg.name),
+            }
+        }
+        Some(ring)
     }
 
     /// The topology this mixer was built from.

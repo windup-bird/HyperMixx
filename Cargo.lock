@@ -1059,6 +1059,7 @@ dependencies = [
  "hypermixx-media",
  "hypermixx-midi",
  "hypermixx-stems",
+ "libc",
  "ratatui",
  "sysinfo",
  "toml",
