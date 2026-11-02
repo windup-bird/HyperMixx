@@ -14,7 +14,7 @@
 # loaded, so this is the engine's clock rather than a per-destination setting. A device that cannot
 # take it leaves its output `disabled` (see the `output` command) instead of playing at the wrong
 # speed.
-sample_rate = 44100
+sample_rate = 48000
 # Output ring capacity in frames: more slack for a slow device, more latency.
 # 1024 frames is ~23 ms at 44.1 kHz. For a more conservative setup use 2048; for an aggressive
 # one, 512 works but leaves less room for scheduler jitter.
