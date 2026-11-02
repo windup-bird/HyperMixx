@@ -215,6 +215,14 @@ mod tests {
         Profile::from_toml_str(text, Path::new("profile"))
     }
 
+    fn toml_path(path: &Path) -> String {
+        format!("\"{}\"", path.display().to_string().replace('\\', "\\\\"))
+    }
+
+    fn is_path(actual: Option<&str>, expected: &Path) -> bool {
+        actual.is_some_and(|path| Path::new(path) == expected)
+    }
+
     #[test]
     fn a_profile_names_the_files_it_needs() {
         let (profile, notes) = parse(
@@ -225,47 +233,57 @@ mod tests {
         )
         .unwrap();
         // Relative to the profile's own folder, so a name alone is enough.
-        assert_eq!(profile.mixer.as_deref(), Some("profile/mixer.toml"));
-        assert_eq!(profile.live.as_deref(), Some("profile/live.toml"));
+        assert!(is_path(
+            profile.mixer.as_deref(),
+            &Path::new("profile").join("mixer.toml")
+        ));
+        assert!(is_path(
+            profile.live.as_deref(),
+            &Path::new("profile").join("live.toml")
+        ));
         assert!(notes.is_empty());
         assert_eq!(profile.midi, MidiSettings::default());
     }
 
     #[test]
     fn paths_resolve_against_the_profile_that_names_them() {
-        let (profile, _) = Profile::from_toml_str(
-            "mixer = \"../sets/club.toml\"\nlive = \"/etc/hypermixx/live.toml\"\n",
-            Path::new("profile"),
-        )
-        .unwrap();
-        assert_eq!(profile.mixer.as_deref(), Some("profile/../sets/club.toml"));
-        assert_eq!(
-            profile.live.as_deref(),
-            Some("/etc/hypermixx/live.toml"),
-            "absolute stays"
+        let absolute = std::env::temp_dir().join("hypermixx-live.toml");
+        let text = format!(
+            "mixer = \"../sets/club.toml\"\nlive = {}\n",
+            toml_path(&absolute)
+        );
+        let (profile, _) = Profile::from_toml_str(&text, Path::new("profile")).unwrap();
+        assert!(is_path(
+            profile.mixer.as_deref(),
+            &Path::new("profile").join("../sets/club.toml")
+        ));
+        assert!(
+            is_path(profile.live.as_deref(), &absolute),
+            "absolute stays: {:?}",
+            profile.live
         );
         // A profile at the root of the tree resolves against the root.
         let (profile, _) =
             Profile::from_toml_str("mixer = \"profile/mixer.toml\"\n", Path::new(".")).unwrap();
-        assert_eq!(profile.mixer.as_deref(), Some("./profile/mixer.toml"));
+        assert!(is_path(
+            profile.mixer.as_deref(),
+            &Path::new(".").join("profile/mixer.toml")
+        ));
     }
 
     #[test]
     fn the_controller_file_is_a_map_file_only() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let map = root.join(DEFAULT_MIDI);
-        let text = format!("controller = \"{}\"\n", map.display());
+        let text = format!("controller = {}\n", toml_path(&map));
         let (profile, notes) = parse(&text).unwrap();
         assert!(
-            profile
-                .midi
-                .map
-                .as_deref()
-                .is_some_and(|path| path.ends_with("profile/controller.toml")),
-            "the map path is what the profile carries"
+            is_path(profile.midi.map.as_deref(), &map),
+            "the map path is what the profile carries: {:?}",
+            profile.midi.map
         );
         // The pre-rename key still parses, so an old profile keeps working.
-        let legacy = parse(&format!("midi = \"{}\"\n", map.display())).unwrap().0;
+        let legacy = parse(&format!("midi = {}\n", toml_path(&map))).unwrap().0;
         assert_eq!(legacy.midi.map, profile.midi.map);
         // The shipped map names the development controller, so there is nothing to warn about.
         let device = profile.midi.device.clone();
@@ -349,11 +367,7 @@ mod tests {
             "either a device is named or the absence is reported"
         );
         assert!(
-            profile
-                .midi
-                .map
-                .as_deref()
-                .is_some_and(|path| path.ends_with("profile/controller.toml")),
+            is_path(profile.midi.map.as_deref(), Path::new(DEFAULT_MIDI)),
             "the shipped profile points at the map: {:?}",
             profile.midi.map
         );

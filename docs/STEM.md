@@ -2,8 +2,9 @@
 
 这份文档记的是**已经建成什么、依据是什么**。相关的其它文档：
 
-- 旋钮的完整语义与命令族：[`commands.md`](commands.md) §3.7、README「stem 分离」一节；
-- 模型来源、许可、下载与校验：[`stem-info.md`](stem-info.md)；
+- 旋钮的完整语义与命令族：[`COMMANDS.md`](COMMANDS.md) §3.7、README「Stem Separate」一节；
+- 模型来源、许可、下载与校验：`crates/hypermixx-stems/src/model.rs` 的模型表与
+  [`../README.md`](../README.md)（`stem model list` / `--model <name|path>`）；
 - CUDA 补丁的全文说明与可重放 diff：[fork 的 `FORK.md`](https://github.com/windup-bird/charon-audio-cuda/blob/feat/cuda-ep/FORK.md)。
 
 ## 1. 现在能做什么
@@ -29,7 +30,7 @@ out stems :: Float32 [1, 4, 2, 343980]
 ```
 
 - 整轨**切成 7.8 s 窗口逐窗过模型**，再用三角权重叠加粘回去（**按权重和归一化**，所以零重叠不会在
-  边界塌陷）。重叠相加的窗口布局见 README 的统计表。
+  边界塌陷）。重叠相加的窗口布局与耗时实测见 [`COMMANDS.md`](COMMANDS.md) §3.7。
 - **帧长精确**：Σ四条 stem 的帧数 == 输入帧数（测试钉住），所以换源不需要任何重采样或对齐。
 - **源顺序按名字映射**：`ModelConfig::default()` 的顺序（drums,bass,vocals,other）与
   `htdemucs()`（drums,bass,other,vocals）**不同**——这是个地雷，`build_set` 已按名字映射，加新模型
@@ -39,11 +40,11 @@ out stems :: Float32 [1, 4, 2, 343980]
 
 ## 3. 两个旋钮（都改变产出的音频 → 都进缓存 key）
 
-| 旋钮 | 默认 | 实测（`stem-test.mp3` 3:39） | 轴 |
+| 旋钮（`live.toml` 的 `[stems]`） | 默认 | 实测（`stem-test.mp3` 3:39） | 轴 |
 |---|---|---|---|
-| `--overlap <0..=0.5>` | 0.25 | `0.0` = **−24% 时间**（82→61 s）；代价：窗口边缘估计主导的采样从 0.0% 升到 12.8% | 空间：相邻窗口的估计互相融合 |
-| `--shifts <0..=2>` | 1 | `2` = **+98% 时间**（82→164 s）、+360 MB；`0` 与 `1` 完全等价 | 相位：同一段音乐在不同窗口对位下重跑取平均 |
-| `--gpu` / `--provider` | cpu | 见 §4 | 执行后端 |
+| `overlap`（0..=0.5） | 0.25 | `0.0` = **−24% 时间**（82→61 s）；代价：窗口边缘估计主导的采样从 0.0% 升到 12.8% | 空间：相邻窗口的估计互相融合 |
+| `shifts`（0..=2） | 1 | `2` = **+98% 时间**（82→164 s）、+360 MB；`0` 与 `1` 完全等价 | 相位：同一段音乐在不同窗口对位下重跑取平均 |
+| `provider`（`cpu`/`cuda`） | cpu | 见 §4 | 执行后端 |
 
 **诚实说明**：我试过的两个客观代理都测不出这两个旋钮的**质量**差异——Σ 残差基本不动
 （−30.1/−30.4/−30.7 dB，它量的是"四条加起来还等于原曲吗"），二阶差分（找边界突变）也只在
@@ -95,7 +96,7 @@ CUDA 不能接管整张图时，ORT 只是**悄悄**回到 CPU：慢 9 倍，看
 - 会话设 `disable_cpu_ep_fallback = 1`，任何节点落不到 CUDA 就**报错**；
 - 建完会话再核对 `separator.provider()` 是否等于请求的后端，不一致也报错（双保险）；
 - 失败信息翻译成可操作的话（需要 CUDA 13 / cuDNN 9 / `--features cuda` / provider 库在二进制旁，
-  或去掉 `--gpu` 走 CPU）；
+  或把 `[stems] provider` 改回 `cpu`）；
 - 需要判断"是这个构建没有"还是"这个宿主没有"：`provider_available(cuda)` 看编译期，实际能否建
   会话看运行期。
 
@@ -106,7 +107,7 @@ CUDA 路径生效，CPU 行为与加 GPU 之前逐位一致。
 
 - `separator.id()` = `charon-htdemucs-s{shifts}-o{overlap}-{provider}`，其中 shifts `0` 归一化成
   `1`（同一份 300 MB 不会存两份）。key 里带 provider，所以 CPU 与 CUDA 是两条独立缓存条目。
-- 单测 24 个（`cargo test -p hypermixx-stems`），覆盖模型校验、缓存往返、选项策略与
+- 单测 40 个（`cargo test -p hypermixx-stems`），覆盖模型校验、缓存往返、选项策略与
   "**id 携带每一个会改变音频的选项**"。
 - `crates/hypermixx-stems/tests/real_model.rs`（`#[ignore]`，要 302 MB 模型，opt-in 跑）把
   P0 的测量固化成回归：

@@ -5,7 +5,7 @@
 //! input mapping testable without a terminal.
 
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,7 +16,7 @@ use hypermixx_core::{
     KeyFormat, KeylockMode, StemStatus,
 };
 use hypermixx_library::{
-    detect_source_kinds, ImportCalibration, LibraryDb, Source, SourceKind, SourceOrigin,
+    detect_source_kinds, ImportCalibration, LibraryDb, ScanStats, Source, SourceKind, SourceOrigin,
 };
 
 use crate::command::{Slots, UiEvent};
@@ -305,6 +305,17 @@ impl Knob {
     }
 }
 
+/// A background library scan finishing on its worker connection. The scan itself runs there; the
+/// event only carries what the UI needs to log and reload.
+enum LibraryScanEvent {
+    Scanned {
+        name: String,
+        kind: SourceKind,
+        outcome: Result<ScanStats, String>,
+    },
+    OpenFailed(String),
+}
+
 /// A deck's transport, as the TUI sees it. Mirrors [`DeckState`] plus front-end-only data.
 pub struct App {
     pub version: &'static str,
@@ -343,6 +354,10 @@ pub struct App {
     /// Formats enabled for USB auto-discovery.
     usb_formats: Vec<SourceKind>,
     usb_rx: Option<Receiver<UsbEvent>>,
+    /// Startup scans run on their own connection so the browser stays usable while a large
+    /// library is hashed.
+    library_scan_tx: Sender<LibraryScanEvent>,
+    library_scan_rx: Receiver<LibraryScanEvent>,
     /// `None` probes each file; a fixed value overrides the decoder start trim.
     pub decoder_start_ms: Option<f64>,
     /// Extra imported-grid/cue correction, positive = later.
@@ -437,6 +452,7 @@ impl App {
         let (waveform_tx, waveform_rx) = crossbeam_channel::unbounded();
         let (cover_tx, cover_rx) = crossbeam_channel::unbounded();
         let (browser_tx, browser_rx) = crossbeam_channel::unbounded();
+        let (library_scan_tx, library_scan_rx) = crossbeam_channel::unbounded();
         let browser = Browser::new();
         Self {
             version: crate::VERSION,
@@ -461,6 +477,8 @@ impl App {
             allowed_sources: HashSet::new(),
             usb_formats: Vec::new(),
             usb_rx: None,
+            library_scan_tx,
+            library_scan_rx,
             decoder_start_ms: None,
             grid_offset_ms: 0.0,
             states: (0..decks)
@@ -629,6 +647,9 @@ impl App {
                         self.allowed_sources.contains(&source.id) && source.root.is_dir()
                     })
                     .collect();
+                // The browser opens its first source, so put ~/Music there when it is configured.
+                let preferred = music_dir().and_then(|path| std::fs::canonicalize(path).ok());
+                let visible = prefer_source(visible, preferred.as_deref());
                 match Browser::load_sources(&db, visible) {
                     Ok(mut browser) => {
                         browser.key_format = self.key_format;
@@ -665,9 +686,14 @@ impl App {
             vdj_offset_ms: settings.vdj_offset_ms,
         });
 
+        let mut pending = Vec::new();
         for folder in &settings.folders {
-            match db.add_folder_source(folder, None) {
-                Ok(source) => self.adopt_source(&db, source),
+            let root = expand_home(folder);
+            match db.add_folder_source(&root, None) {
+                Ok(source) => {
+                    self.allowed_sources.insert(source.id);
+                    pending.push(source);
+                }
                 Err(err) => self.push_log(LogLine::error(format!("[library] {folder}: {err}"))),
             }
         }
@@ -677,7 +703,10 @@ impl App {
                     continue;
                 }
                 match db.add_source(kind, &root, None) {
-                    Ok(source) => self.adopt_source(&db, source),
+                    Ok(source) => {
+                        self.allowed_sources.insert(source.id);
+                        pending.push(source);
+                    }
                     Err(err) => self.push_log(LogLine::error(format!(
                         "[library] {}: {err}",
                         root.display()
@@ -686,7 +715,56 @@ impl App {
             }
         }
         self.start_usb_watcher(settings.usb_kinds());
+        // Show the cached tree before touching the disk: the first scan of a large folder can take
+        // minutes, and blocking here would keep the terminal on the normal screen.
         self.reload_browser();
+        self.start_library_scan(pending);
+    }
+
+    /// Scans the configured sources off the UI thread. A second connection keeps the browser's
+    /// reads independent from the scan's write transaction.
+    fn start_library_scan(&mut self, sources: Vec<Source>) {
+        if sources.is_empty() {
+            return;
+        }
+        let Some(db) = self.library.as_ref() else {
+            return;
+        };
+        let path = db.path().to_path_buf();
+        let count = sources.len();
+        let tx = self.library_scan_tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("hypermixx-library".to_owned())
+            .spawn(move || {
+                let scan_db = match LibraryDb::open(&path) {
+                    Ok(db) => db,
+                    Err(err) => {
+                        let _ = tx.send(LibraryScanEvent::OpenFailed(err.to_string()));
+                        return;
+                    }
+                };
+                for source in sources {
+                    let outcome = scan_db
+                        .scan_source(source.id, &mut |_| {})
+                        .map_err(|err| err.to_string());
+                    let event = LibraryScanEvent::Scanned {
+                        name: source.name,
+                        kind: source.kind,
+                        outcome,
+                    };
+                    if tx.send(event).is_err() {
+                        return;
+                    }
+                }
+            });
+        match spawned {
+            Ok(_) => self.push_log(LogLine::info(format!(
+                "[library] scanning {count} source(s) in background"
+            ))),
+            Err(err) => self.push_log(LogLine::error(format!(
+                "[library] could not start scan: {err}"
+            ))),
+        }
     }
 
     fn adopt_source(&mut self, db: &Arc<LibraryDb>, source: Source) {
@@ -966,6 +1044,33 @@ impl App {
             }
             changed = true;
         }
+        let mut rescan = false;
+        while let Ok(event) = self.library_scan_rx.try_recv() {
+            match event {
+                LibraryScanEvent::Scanned {
+                    name,
+                    kind,
+                    outcome: Ok(stats),
+                } => self.push_log(LogLine::info(format!(
+                    "[library] {name} [{}]: {}",
+                    kind.label(),
+                    stats.summary()
+                ))),
+                LibraryScanEvent::Scanned {
+                    name,
+                    outcome: Err(err),
+                    ..
+                } => self.push_log(LogLine::error(format!("[library] {name}: {err}"))),
+                LibraryScanEvent::OpenFailed(err) => self.push_log(LogLine::error(format!(
+                    "[library] could not open the scan connection: {err}"
+                ))),
+            }
+            rescan = true;
+            changed = true;
+        }
+        if rescan {
+            self.reload_browser();
+        }
         let mut usb_events = Vec::new();
         if let Some(rx) = &self.usb_rx {
             while let Ok(event) = rx.try_recv() {
@@ -1177,8 +1282,52 @@ impl App {
     }
 }
 
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE")?;
+            let path = std::env::var_os("HOMEPATH")?;
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            Some(home)
+        })
+}
+
+fn music_dir() -> Option<PathBuf> {
+    home_dir().map(|home| home.join("Music"))
+}
+
+fn expand_tilde(path: &str, home: Option<&Path>) -> PathBuf {
+    if let Some(home) = home {
+        if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+            return home.join(rest);
+        }
+        if path == "~" {
+            return home.to_path_buf();
+        }
+    }
+    PathBuf::from(path)
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    expand_tilde(path, home_dir().as_deref())
+}
+
+/// Moves the preferred root to the front, so `Browser::load_sources` opens it first.
+fn prefer_source(mut sources: Vec<Source>, preferred: Option<&Path>) -> Vec<Source> {
+    if let Some(index) =
+        preferred.and_then(|root| sources.iter().position(|source| source.root == root))
+    {
+        sources.rotate_left(index);
+    }
+    sources
+}
+
 fn local_roots(kind: SourceKind) -> Vec<PathBuf> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = home_dir() else {
         return Vec::new();
     };
     let mut roots = match kind {
@@ -1221,6 +1370,59 @@ mod tests {
         bytes.extend_from_slice(&400u32.to_le_bytes());
         bytes.resize(44 + 400, 0);
         bytes
+    }
+
+    fn source(name: &str, root: impl Into<PathBuf>) -> Source {
+        Source {
+            id: 0,
+            kind: SourceKind::Folder,
+            origin: SourceOrigin::Folder,
+            name: name.to_owned(),
+            root: root.into(),
+            last_scan_at: None,
+        }
+    }
+
+    #[test]
+    fn the_browser_starts_on_the_music_folder() {
+        let music = Path::new("home").join("me").join("Music");
+        let sources = vec![
+            source("mp3", "mp3"),
+            source("Music", &music),
+            source("USB", "run/media/stick"),
+        ];
+        let ordered = prefer_source(sources, Some(&music));
+        assert_eq!(ordered[0].name, "Music");
+
+        // Without a Music source the configured order is left alone.
+        let ordered = prefer_source(
+            vec![source("mp3", "mp3"), source("USB", "run/media/stick")],
+            Some(&music),
+        );
+        assert_eq!(ordered[0].name, "mp3");
+    }
+
+    #[test]
+    fn a_tilde_folder_resolves_against_the_home_directory() {
+        let home = Path::new("home").join("me");
+        assert_eq!(
+            expand_tilde("~/Music", Some(home.as_path())),
+            home.join("Music")
+        );
+        assert_eq!(
+            expand_tilde("~\\Music", Some(home.as_path())),
+            home.join("Music")
+        );
+        assert_eq!(expand_tilde("~", Some(home.as_path())), home);
+        assert_eq!(
+            expand_tilde("./mp3", Some(home.as_path())),
+            PathBuf::from("./mp3")
+        );
+        assert_eq!(
+            expand_tilde("~/Music", None),
+            PathBuf::from("~/Music"),
+            "no home directory means the literal path is tried"
+        );
     }
 
     #[test]

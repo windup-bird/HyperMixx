@@ -1,8 +1,8 @@
 # Hypermixx 命令参考
 
-REPL 与 `--tui` 共用同一套语法（`crates/hypermixx-cli/src/command.rs`）与同一套响应渲染
+TUI（默认）与 `--cli` 的 REPL 共用同一套语法（`crates/hypermixx-cli/src/command.rs`）与同一套响应渲染
 （`response.rs`），本文档覆盖：启动参数、会话语法、全部会话命令、TUI 键位与输出格式。
-MIDI 映射文件的 action 表见 [`MIDI.md`](MIDI.md)。
+控制器映射文件的 action 表见 [`MIDI.md`](MIDI.md)。
 
 ---
 
@@ -14,19 +14,19 @@ cargo run -p hypermixx-cli -- [flags]
 
 | 参数 | 说明 |
 |---|---|
-| `--tui` | 终端界面（默认是行式 REPL） |
+| `--cli` | 行式 REPL；不给则启动 TUI（默认） |
 | `--config <file>` | 自定义混音拓扑 TOML（通道/效果链/输出）；不给则读 `./profile/mixer.toml`（缺文件/坏文件回落内置参考拓扑）。这个路径也是 `mixer reload` 不带参数时的默认 |
 | `--print-config` | 打印参考拓扑 TOML 后退出（不启动引擎） |
-| `--profile <name\|file>` | 一个**指路文件**：写 `mixer` / `live` / `midi`（各自是路径，`midi` 也可内联成表）。裸名字解析成 `profile/<name>.toml`；不给则读 `profile/profile.toml`（没有就用文件夹默认）。显式 flag 优先于它 |
+| `--profile <name\|file>` | 一个**指路文件**：写 `mixer` / `live` / `controller`（`controller` 是映射文件路径，端口名在该文件的 `[meta].device`；旧的 `midi` 键仍解析）。裸名字解析成 `profile/<name>.toml`；不给则读 `profile/profile.toml`（没有就用文件夹默认）。显式 flag 优先于它 |
 | `--live <file>` | 本机设置 TOML（引擎采样率、ring 大小、stem 默认值）；缺省 `./profile/live.toml`，两边都没有则用内置默认 |
 | `--backend auto\|stratum\|timestretch` | 离线分析后端，缺省 `auto`（stratum 优先，失败回落） |
-| `--midi <port>` | 启动时打开 MIDI 输入端口（端口号或名字，`midi ports` 可列） |
-| `--midi-map <file>` | 映射文件，缺省 `midi-map.toml`；显式给时必须与 `--midi` 同给，否则报错（profile 里的 `[midi]` 不受此限） |
-| `--midi-guide [<file>]` | learn 模式地图编辑器（**不启动音频引擎**）；文件缺省 `midi-map.toml` |
-| `--decks <n>` | 仅作用于 `--midi-guide` 的 deck 栏宽度，缺省 1 |
+| `--controller <port>` | 启动时打开控制器输入（端口号或名字，`controller ports` 可列；`midi ports` 别名仍可） |
+| `--controller-map <file>` | 映射文件；不给则用 profile 指的文件，再缺省 `profile/controller.toml`（旧的 `midi.toml` 会回退读取）。映射文件自己的 `[meta].device` 也能给出端口 |
+| `--guide [<file>]` | learn 模式地图编辑器（**不启动音频引擎**）；文件缺省 `midi-map.toml` |
+| `--decks <n>` | 仅作用于 `--guide` 的 deck 栏宽度，缺省 1 |
 
-- 未知参数是硬错误（`error: unknown argument …`），不会静默忽略。
-- `--midi-guide` 即使不跟 `--midi` 也能在 TUI 里选端口/文件；给了路径/端口时启动即尝试打开，
+- 未知参数是硬错误（`error: unknown argument …`），不会静默忽略；`--tui` / `--midi` / `--midi-map` / `--midi-guide` 已移除。
+- `--guide` 即使不跟端口也能在 TUI 里选端口/文件；给了路径/端口时启动即尝试打开，
   失败会留在 watch dog 里等待 `File` / `Connect`。
 - deck 数量启动时从引擎查询（自定义拓扑可配任意通道数），不是固定常量。
 
@@ -98,10 +98,11 @@ browser analyse                       分析当前选中的 track
 [library]
 local = ["rkb", "serato", "vdj"]
 usb = ["rkb", "serato", "vdj"]
-folders = ["./mp3"]
+folders = ["~/Music"]
 ```
 
-未配置的类别不扫描、不显示；USB 自动发现并挂载，同一个 U 盘的多种导出是多个 library。
+`~` 在 `folders` 里展开为用户主目录。启动时 browser 优先打开 `~/Music`；没有这个来源时
+停在第一个已配置来源。扫描在后台进行，界面先显示缓存，完成后自动刷新。未配置的类别不扫描、不显示；USB 自动发现并挂载，同一个 U 盘的多种导出是多个 library。
 
 - 数据库在 `$HYPERMIXX_CACHE/library/library.sqlite3`（默认 `.cache/library/`），是**可重建缓存**。
 - U 盘只读：rekordbox 的 `exportLibrary.db` 会先复制 `.db/-wal/-shm` 再打开；没有它时回退
@@ -283,7 +284,7 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 
 | 命令 | 说明 |
 |---|---|
-| `[deck] stem separate [--shifts <n>] [--overlap <x>] [--gpu]` | 分离并安装；见下表 |
+| `[deck] stem separate [--model <name\|path>]` | 分离并安装；provider/overlap/shifts 等来自 `live.toml` |
 | `[deck] stem status` | 逐 stem 报告：电平、是否被静音/独奏、实际增益 |
 | `[deck] stem full \| acapella \| instrumental \| drums \| bass` | 命名编排（改的是静音位，**你的电平保留**） |
 | `[deck] stem clear` | 四条全开、unity、取消 solo |
@@ -298,16 +299,16 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 `<stem>` = `drums` \| `bass` \| `other` \| `vocals`。行首目标因此可以带一层 stem：
 `deck0 vocals level -0.5`、`deck0 vocals fx add filter`。
 
-分离参数（三个都会改变产出的音频，所以**都进缓存 key**）：
+分离参数来自 `profile/live.toml` 的 `[stems]`（三个都会改变产出的音频，所以**都进缓存 key**）：
 
-| 参数 | 缺省 | 效果（`stem-test.mp3`, 3:39, 实测） |
+| 键 | 缺省 | 效果（`stem-test.mp3`, 3:39, 实测） |
 |---|---|---|
-| `--shifts <0..=2>` | 1 | `0` 与 `1` 等价（单趟）；`2` 多跑一次带偏移的平均，**+98% 时间**（81→161 s）、+360 MB |
-| `--overlap <0..=0.5>` | 0.25 | `0.0` **−24% 时间**（81→62 s，窗口数 38→29）；代价是窗口边缘的模型估计权重更大，需要耳朵判断 |
-| `--gpu` | 关 | CUDA：**13 s**（vs CPU 87 s，RTX 4050），显存 ~3.2 GB。需要 `--features cuda` 构建 + 宿主 CUDA 13 / cuDNN 9 |
+| `shifts` | 1 | `0` 与 `1` 等价（单趟）；`2` 多跑一次带偏移的平均，**+98% 时间**（81→161 s）、+360 MB |
+| `overlap` | 0.25 | `0.0` **−24% 时间**（81→62 s，窗口数 38→29）；代价是窗口边缘的模型估计权重更大，需要耳朵判断 |
+| `provider` | `cpu` | `cuda`：**13 s**（vs CPU 87 s，RTX 4050），显存 ~3.2 GB。需要 `--features cuda` 构建 + 宿主 CUDA 13 / cuDNN 9 |
 
-`--gpu` 是**要求而不是建议**：CUDA 不能接管整张图时会直接报错，而不是悄悄在 CPU 上跑（那样只是慢 9 倍，
-看起来却像成功了）。窗口长度不可调 —— 导出把它钉在 343,980 采样（7.8 s）。
+`provider = "cuda"` 是**要求而不是建议**：CUDA 不能接管整张图时会直接报错，而不是悄悄在 CPU 上跑
+（那样只是慢 9 倍，看起来却像成功了）。窗口长度不可调 —— 导出把它钉在 343,980 采样（7.8 s）。
 
 分离是**离线异步**的：换源在后台线程预热完才落地，期间 deck 一直在放原始混音；重复跑同一条曲目
 命中内容寻址缓存，成本是 0 s。缓存每曲约 300 MB，所以 `stem cache prune` 是需要的，不是装饰。
@@ -435,11 +436,12 @@ output refresh   （别名 reload/reopen）重试所有不可用的目的地，�
 CLI 侧有一个测试逐一断言每个 action 都有对应的会话动词。
 
 ```
-midi ports    列出可用 MIDI 输入端口（别名 list；无端口则提示 midi: no input ports）
+controller ports    列出可用控制器输入端口（`midi ports` / `list` 仍是别名）
+controller mode     查看/切换已接入映射的 unit 模式
 ```
 
-只有列端口走会话命令：打开端口在启动时（`--midi`）或 TUI 的 `F2` 完成——映射是
-对运行中引擎接线一次，不支持会话中途开关。映射表格式与全部 action 见
+只有查询与模式切换走会话命令：打开端口在启动时（`--controller`）或 TUI 的 `F9` 设置界面完成——
+映射是对运行中引擎接线一次，会话中途不重新打开输入。映射表格式与全部 action 见
 [`MIDI.md`](MIDI.md)。
 
 ### 3.11 本机设置 `live`
@@ -475,48 +477,44 @@ live reload [<file>]  重读 live 文件（缺省 --live 的路径，否则 ./pr
 
 ```
 profile/                 # 全部配置文件都在这里
-├── profile.toml         # profile（--profile 不给时的默认）：只写"用哪几个文件"
+├── profile.toml         # 可选：--profile 不给时的默认 profile，只写"用哪几个文件"
 ├── mixer.toml           # 拓扑（= --config 的默认路径，也是 --print-config 打印的文本）
 ├── live.toml            # 本机设置（= --live 的默认路径）
-├── midi.toml            # MIDI：设备名 + 映射文件
-├── preference.toml      # 前端设置 —— 预留，目前不读
+├── controller.toml      # 控制器映射（设备名在该文件的 [meta].device；旧的 midi.toml 仍会读）
+├── preference.toml      # 前端设置：主题、波形后端/分频点、曲库来源（TUI 启动时读）
 └── example.toml         # 命名 profile 的样例：复制成 <name>.toml 后 --profile <name>
 ```
 
-profile 是**指路而不是又一套 schema**：拓扑、本机设置、MIDI 各自保有文件与校验，于是
+profile 是**指路而不是又一套 schema**：拓扑、本机设置、控制器映射各自保有文件与校验，于是
 `mixer reload` / `live reload` 仍然作用在它们被告知的那个文件上。
 **文件里任何相对路径都相对"写它的那个文件所在的文件夹"** —— 所以 `profile/profile.toml` 里
 `mixer = "mixer.toml"` 就是 `profile/mixer.toml`，命名 profile 和它指的文件放一起时不用写 `../`。
 
 ```toml
-# profile/profile.toml
-mixer = "mixer.toml"     # -> profile/mixer.toml
-live  = "live.toml"      # -> profile/live.toml
-midi  = "midi.toml"      # -> profile/midi.toml（也可以内联成 [midi] 表，见下）
+# profile/profile.toml 或自建的 profile/dj.toml
+mixer      = "mixer.toml"        # -> profile/mixer.toml
+live       = "live.toml"         # -> profile/live.toml
+controller = "controller.toml"   # 映射文件；端口名在它的 [meta].device（旧的 midi = 仍解析）
 
-[preference]             # 预留段：现在写进去的键会被**报告**，而不是被静默忽略
-
-# 内联写法（与 midi.toml 的键相同）：
-# [midi]
-# device = "DDJ-400"     # 端口名字子串，或 `midi ports` 的序号；不给 = 启动时不打开输入
-# map = "../midi-map.toml"   # 映射文件，相对本文件；不给则缺省 midi-map.toml（工作目录）
+[preference]                     # 预留段：写进去的键会被**报告**，而不是被静默忽略
 ```
 
 - 没有 profile（或 profile 里没写某项）时用文件夹默认：`profile/mixer.toml`、`profile/live.toml`、
-  `profile/midi.toml`，各自缺失则回落内置默认（MIDI 缺失 = 不打开输入，即出厂状态）。
-- **显式 flag 永远优先**：`--config` / `--live` / `--midi` / `--midi-map` > profile > 文件夹默认 > 内置默认。
+  `profile/controller.toml`，各自缺失则回落内置默认（控制器缺失 = 不打开输入，即出厂状态）。
+- **显式 flag 永远优先**：`--config` / `--live` / `--controller` / `--controller-map` > profile > 文件夹默认 > 内置默认。
 - **切换 profile**：
   - 启动时 `--profile <name>`（裸名字 → `profile/<name>.toml`；`--profile path/x.toml` 直接给路径）；
     不给则读 `profile/profile.toml`（存在就用，不存在就是文件夹默认）。仓库里自带 `profile/example.toml`
     可复制成 `profile/dj.toml` 等处。
   - 会话内 `profile show` 看当前用的 profile 与它解析出的 topology/live/stems 参数；
     **`profile reload [<name|path>]` 切一个** —— profile 指到的 topology 走 `MixerReload`（立即生效）、
-    live 立即生效（下一次分离就用新值），**只有 MIDI 是启动时接线的**，reload 会明说"下次启动生效"。
-- 端口打不开时：**显式 `--midi` 直接报错退出**（你点名要的），**profile 里的设备只警告并继续**
-  （"这套设备通常长这样"，控制器没插不该让整场起不来；TUI 里 `F2` 仍可临时选）。
+    live 立即生效（下一次分离就用新值），**只有控制器是启动时接线的**，reload 会明说"下次启动生效"。
+- 端口打不开时：**显式 `--controller` 直接报错退出**（你点名要的），**profile 里的设备只警告并继续**
+  （"这套设备通常长这样"，控制器没插不该让整场起不来；TUI 里 `F9` 仍可临时选）。
 - `--profile dj` 读 `profile/dj.toml`；`--profile path/to/p.toml` 直接读该路径。
-- 段名拼错（`[mixr]`、`[midi] portt`）是错误，不是静默回落 —— 否则看起来用了某套配置其实没有。
-- `[preference]` 是空段也合法（= 什么都没设）；`preference.toml` 目前不读，文件里写明了原因。
+- 段名拼错（`[mixr]`、`controller` 写成了别的键）是错误，不是静默回落 —— 否则看起来用了某套配置其实没有。
+- profile 里的 `[preference]` 是空段也合法（= 什么都没设）；真正的前端设置在独立的
+  `profile/preference.toml`，TUI 启动时读取（见 README 的 TUI 布局与 `[theme]` / `[waveform]` / `[library]`）。
 
 ### 3.13 帮助与退出
 
@@ -547,9 +545,11 @@ load                    （不带路径）弹文件浏览器，见 §3.1
 | `Backspace` `Delete` | 编辑 |
 | `Esc` | 关补全弹窗；再按清空命令行 |
 | `PgUp` `PgDn` | 日志区滚动 5 行 |
-| `F2` | 选 MIDI 端口（Enter 连接，Esc 取消） |
-| `F3` | 选 MIDI 映射文件并连接 |
+| `F9` | 打开设置界面（控制器端口/映射文件、mixer 输出设备、live/preference 文件） |
 | `Ctrl+C` | 退出 |
+
+浏览器（启动时焦点所在）用 `↑` `↓` 选择、`→`/`Enter` 打开、`←`/`Esc` 返回；track 上
+`Enter` 加载，双击弹出 deck 选择框。控件也可鼠标点击（pads、fader、knob、crossfader）。
 
 - 命令行有上下文补全：动词、目标词、`sync`/`loop`/`fx` 子命令、槽位名（带 `slot N` 提示）、
   参数名、`load` 的文件路径。

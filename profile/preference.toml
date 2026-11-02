@@ -41,11 +41,11 @@ high_hz = 4000
 # Library sources. A category that is absent or empty is neither scanned nor displayed.
 # local: formats found in local user locations (`~/Music`, `~/.VirtualDJ`, ...)
 # usb: formats found on automatically discovered/mounted removable media
-# folders: plain folders to index
+# folders: plain folders to index; `~` expands to the home directory
 [library]
 local = []
 usb = ["rkb", "serato", "vdj"]
-folders = ["./mp3"]
+folders = ["~/Music"]
 
 # Imported-grid calibration. `decoder_start_ms` is the gapless trim at the start of a decoded file:
 # "auto" probes each file (MP3 sample: 25.0567 ms); a number overrides it, 0 disables the fix.

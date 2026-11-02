@@ -23,15 +23,17 @@ cli ─┬─► audio ───┐
 | `hypermixx-library` | 离线分析：beat 网格编译、stratum-dsp 适配、波形峰值 | core, media |
 | `hypermixx-stems` | 离线 stem 分离：HTDemucs 模型获取/校验、内容寻址缓存、ONNX 后端（CPU 默认；`cuda` 可选） | core, media, ort |
 | `hypermixx-midi` | MIDI 输入：字节解析、TOML 映射表、`Event → Command` 翻译（纯逻辑，可无硬件单测） | core, midir |
-| `hypermixx-cli` | 前端：行 REPL、`--tui` 终端界面、命令解析与补全 | 全部 |
+| `hypermixx-cli` | 前端：默认 TUI（`--cli` 切行 REPL）、命令解析与补全 | 全部 |
 
 外部依赖：`stratum-dsp`、`signalsmith-stretch`(vendored)、`midir`、`charon-audio-cuda`(forked from `charon-audio`)
 
 ## 安装
 
-仅在Linux完成测试。
+Linux 与 Windows（MSVC）均已完整构建并通过测试。
 
-前置：Rust（2021 edition，1.70+）、音频输出设备；Linux 还需 ALSA 开发库。
+前置：Rust（2021 edition，1.70+）、音频输出设备。
+
+Linux 还需 ALSA 开发库：
 
 ```bash
 sudo apt install libasound2-dev   # Debian/Ubuntu
@@ -41,10 +43,30 @@ cargo build --release
 cargo build --release --features cuda  # use cuda to separate stems
 ```
 
+Windows 还需要两个原生依赖：
+
+- **OpenSSL**：`hypermixx-library` 的 `bundled-sqlcipher` 需要头文件和 `libcrypto.lib`。
+- **LLVM/libclang**：vendored `signalsmith-stretch` 的 `build.rs` 用 bindgen 生成绑定。
+
+```powershell
+winget install ShiningLight.OpenSSL.Dev LLVM.LLVM
+
+$env:OPENSSL_LIB_DIR    = "C:\Program Files\OpenSSL-Win64\lib\VC\x64\MD"
+$env:OPENSSL_INCLUDE_DIR = "C:\Program Files\OpenSSL-Win64\include"
+$env:LIBCLANG_PATH       = "C:\Program Files\LLVM\bin"
+$env:PATH                = "C:\Program Files\OpenSSL-Win64\bin;$env:PATH"  # 运行期找 libcrypto-*-x64.dll
+
+git clone <repo>; cd HyperMixx
+cargo build --release
+cargo build --release --features cuda  # 需 CUDA 13 + cuDNN 9
+```
+
+把上面四个环境变量写进用户环境变量（或 `.cargo/config.toml` 的 `[env]`）就不必每次设置。
+
 ## 示例操作
 
 ```bash
-cargo run -p hypermixx-cli --features cuda      # 默认就是 TUI
+cargo run -p hypermixx-cli                      # 默认就是 TUI
 cargo run -p hypermixx-cli -- --cli             # 纯命令行（REPL）
 ```
 
@@ -70,10 +92,11 @@ deck1> fx set filter value  0.5
 deck1> master fx list
 
 # stems：离线分离 4 条轨，然后逐条控制（分离在后台跑，期间照常 play/loop/jump/sync）
-deck1> stem separate         # 分段分离：先装四路流（此刻仍听原曲），每 60s 一块落地即可用
+deck1> stem separate         # 分段分离：先装四路流（此刻仍听原曲），每 5.85s 一块落地即可用
 deck1> stem status           # 水位：`25% separated`（未装入部分是原曲回落）
-deck1> stem separate --gpu   # CUDA：13s（同曲目，RTX 4050）；需 --features cuda 构建
-deck1> stem separate --overlap 0.0   # 0.25→0.0：少 24% 时间，窗口边缘权重更大
+deck1> stem separate --model htdemucs-fp16   # 临时换模型（provider/overlap/shifts 在 live.toml）
+# CUDA：在 live.toml 设 `[stems] provider = "cuda"`，需 --features cuda 构建（13s，RTX 4050）
+# 更快：设 `[stems] overlap = 0.0` 后 `live reload`，分离时间少约 24%，窗口边缘权重更大
 deck1> stem acapella         # 只要人声（instrumental | drums | bass | full）
 deck1> vocals level -0.5     # 单条 stem 电平（-1 = 精确静音）
 deck1> vocals mute           # solo 仍然优先
@@ -93,22 +116,22 @@ deck1> quit
 
 ```bash
 cargo run -p hypermixx-cli -- --cli                  # 纯 REPL（默认是 TUI）
-cargo run -p hypermixx-cli -- --guide                # controller-guide（= --controller-guide）
+cargo run -p hypermixx-cli -- --guide                # controller-guide（不启动引擎）
 cargo run -p hypermixx-cli -- --backend auto        # 分析后端 auto | stratum | timestretch
 cargo run -p hypermixx-cli -- --config topo.toml    # 自定义拓扑
 cargo run -p hypermixx-cli -- --print-config        # 打印参考 TOML（= profile/mixer.toml）
 cargo run -p hypermixx-cli -- --profile dj          # 用 profile/dj.toml 指路（拓扑 + 本机设置 + MIDI 设备）
-#   会话内切换：`profile show` 看当前 profile，`profile reload dj` 换一套（MIDI 下次启动生效）
+#   会话内切换：`profile show` 看当前 profile，`profile reload dj` 换一套（控制器下次启动生效）
 cargo run -p hypermixx-cli -- --live live.toml      # 引擎采样率 / ring 大小 / keylock 窗口 / stem 默认值
-cargo run -p hypermixx-cli -- --controller 0       # 打开 0 号控制器输入，用默认 midi-map.toml
+cargo run -p hypermixx-cli -- --controller 0       # 打开 0 号控制器输入，用 profile/controller.toml
 cargo run -p hypermixx-cli -- --controller 0 --controller-map my.toml   # 指定映射文件
-cargo run -p hypermixx-cli -- --controller-guide   # learn 模式编辑映射（不启动引擎，端口/文件在 TUI 里选）
-#   旧的 --midi / --midi-map / --midi-guide 仍可用（协议是 MIDI，用户接的是 controller）
+cargo run -p hypermixx-cli -- --guide              # learn 模式编辑映射（不启动引擎，端口/文件在 TUI 里选）
+#   旧的 --tui / --midi / --midi-map / --midi-guide 已移除
 ```
 
 TUI 内尽量不用启动参数:`F9` 打开设置（控制器端口、映射文件、mixer 输出设备都在这里选，取代了旧的 F2/F3）；
-`load` 不带路径则弹出文件浏览器；`--controller-guide` 即使不跟路径也会在 TUI 里选端口与文件。波形左右声道上下镜像，三频段颜色、
-分频点（`low_hz`/`high_hz`，默认 200/4000Hz）、渲染 backend 与图像刷新率在 `profile/preference.toml` 配置：
+`load` 不带路径则弹出文件浏览器；`--guide` 即使不跟路径也会在 TUI 里选端口与文件。波形左右声道上下镜像，三频段颜色、
+分频点（`low_hz`/`high_hz`，内置默认 200/4000Hz，随附文件用 250/4000Hz）、渲染 backend 与图像刷新率在 `profile/preference.toml` 配置：
 `auto` 按 kitty → braille 选择（tmux/screen 暂回 braille）；kitty 可用 60Hz。
 
 ### TUI 布局
@@ -152,15 +175,15 @@ browser | command
 - 封面与 overview 和波形共用渲染后端：kitty 下都走 graphics 协议（同一个 image/placement 生命周期，
   弹层打开时不发送也不放置，关闭后重传重放，避免残留），其它终端下封面用半格真彩、overview 用 braille。
 
-`profile/` 放全部默认文件：`profile.toml`（用哪几个文件）、`mixer.toml`（拓扑，含 `[[output]]` 输出设备）、
+`profile/` 放全部默认文件：`mixer.toml`（拓扑，含 `[[output]]` 输出设备）、
 `live.toml`（本机设置）、`controller.toml`（映射文件，设备名在 `[meta].device`；旧的 `midi.toml` 仍会被读）、
-`preference.toml`（主题/波形/曲库），命名 profile 也放这里
-（`--profile dj` → `profile/dj.toml`）。文件里的相对路径都相对它所在的文件夹。
+`preference.toml`（主题/波形/曲库）。命名 profile 也放这里（`example.toml` 是样例；`--profile dj` →
+`profile/dj.toml`，不给则找 `profile/profile.toml`，没有就用文件夹默认）。文件里的相对路径都相对它所在的文件夹。
 运行时改配置不必重启：`mixer reload` 重建拓扑（保留走带），`live reload` 重读本机设置
 （引擎率/ring 需重启，`[stems]` 立即生效）。
 
-终端内 `controller ports` 列出可用输入端口（`midi ports` 仍可）；映射表格式与全部 action 见 `midi-map.toml`
-注释与 [`docs/MIDI.md`](docs/MIDI.md)。
+终端内 `controller ports` 列出可用输入端口（`midi ports` 仍可）；映射表格式与全部 action 见
+`profile/controller.toml` 注释与 [`docs/MIDI.md`](docs/MIDI.md)。
 
 `F9`（或 header 右侧的 settings 按钮）打开设置界面——**它不是 TOML 编辑器**，只有四项：
 
@@ -201,7 +224,7 @@ browser | command
 [library]
 local = ["rkb", "serato", "vdj"]   # 本机用户目录里的库
 usb   = ["rkb", "serato", "vdj"]   # 插拔 U 盘时自动挂载并发现的库
-folders = ["./mp3"]                # 普通文件夹源
+folders = ["~/Music"]              # 普通文件夹；`~` 展开为用户主目录源
 ```
 
 ```text
@@ -211,7 +234,9 @@ browser tracks <list-id>              # list 内容
 browser show <location-id>            # 单曲详情
 ```
 
-未出现在 `local` / `usb` / `folders` 里的来源不会扫描，也不会显示。同一个 U 盘的
+启动时 browser 优先打开 `~/Music` 来源；没有这个来源时停在第一个已配置来源。
+扫描在后台进行，界面先显示缓存，完成后自动刷新。未出现在 `local` / `usb` / `folders`
+里的来源不会扫描，也不会显示。同一个 U 盘的
 rekordbox / VirtualDJ / Serato 会作为三个不同 library 出现。USB 插拔由后台 watcher
 轮询 `/sys/block`，未挂载时调用 `udisksctl mount --no-user-interaction`。
 

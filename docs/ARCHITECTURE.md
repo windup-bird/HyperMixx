@@ -363,10 +363,13 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 
 ## hypermixx-cli
 
-启动参数:`--config <file>`(TOML 拓扑,自定义通道/链/输出)/ `--print-config`
-(输出参考拓扑)/ `--backend auto|stratum|timestretch` / `--midi <port> [--midi-map <file>]`
-(打开 MIDI 输入,缺省映射 `midi-map.toml`;端口名或序号,`midi ports` 可列);deck 数量启动时
-从引擎查询(`channel_count`,自定义拓扑可配任意通道)。
+启动参数:默认启动 TUI(`--cli` 切行式 REPL)/ `--config <file>`(TOML 拓扑,自定义通道/链/输出)/
+`--print-config`(输出参考拓扑)/ `--profile <name|file>`(指路拓扑、live 与控制器映射)/
+`--live <file>` / `--backend auto|stratum|timestretch` /
+`--controller <port> [--controller-map <file>]`(打开控制器输入,缺省映射来自 profile 或
+`profile/controller.toml`;端口名或序号,`controller ports` 可列,`midi ports` 是别名);
+`--guide [<file>]` 是 learn 模式编辑器(不启动引擎)。deck 数量启动时从引擎查询
+(`channel_count`,自定义拓扑可配任意通道)。
 
 会话命令(target-first:行首 `deck0`/`0`/`master` 选目标,缺省用焦点 deck):
 - `load <path> [bpm]` — 后台解码;给 bpm 则建常网格跳过分析
@@ -384,20 +387,21 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   解析错误(`linear 0`、非数字秒数)前端直接 `Failed`;引擎拒绝(无网格、反向同步)后到为 `Error`
 - TUI deck 信息行多一枚黄色徽标:`sync phaselock 122.0 BPM ← deck0 phase pid locked`,
   与 CLI 的 `deck_line` 共用 `response::sync_badge`(所以测它就同时覆盖两边)
-- `midi ports` — 列出 MIDI 输入端口(`--midi` 在启动时打开并把映射翻译成 `Command`,
-  接线在 `src/midi.rs`:translator 线程 + 1ms 合并 flush + `ListFx` 名字解析)
+- `controller ports` — 列出控制器输入端口(`midi ports` 仍可；`--controller` 在启动时打开并把映射
+  翻译成 `Command`,接线在 `src/midi.rs`:translator 线程 + 1ms 合并 flush + `ListFx` 名字解析)
 - TUI 布局(`src/tui/view.rs`):顶部一行全局 header;deck 区合计不超过屏幕一半,每个 deck
   只保留一行状态(文件名在边框标题,右侧是 `已播放 / -剩余`)+ 波形(左声道在上、右声道在下的
-  三频段镜像;缩放单位是 frames/cell;分频点默认 200/4000Hz，可在 preference 调);底部
+  三频段镜像;缩放单位是 frames/cell;分频点默认 200/4000Hz（随附 `preference.toml` 用 250/4000），
+  可在 preference 调);底部
   `browser : command = 2 : 1`,browser 内部再按 1 : 3 分栏(目录/歌单 | 曲目列表)。波形 backend
   按 preference 的 `auto`/`kitty`/`braille` 选择(auto 为 kitty → braille;
   三频段颜色也在 `profile/preference.toml`)。command
   上半是响应日志,下半输入带的顶线嵌入 `deck0 / deck1 / browser` 目标(`Tab` 循环;browser
   目前没有 CLI 前缀),目标文字与面板标题 `command` 左对齐
-- TUI 内选择器(`src/tui/picker.rs`,两个前端共用):`--tui` 下 `F2` 选 MIDI 端口、`F3` 选映射
-  文件、`load` 不带路径弹文件浏览器;`Load` 完成后 `App::connect_midi` 连上,`--midi/--midi-map`
-  仅是免选择的快捷方式
-- `--midi-guide [<file>] [--midi <port>] [--decks <n>]` — learn 模式地图编辑器(`src/tui/guide.rs`),
+- TUI 设置界面(`src/tui/settings.rs`):`F9` 打开,选择控制器端口/映射文件、mixer 输出设备、
+  live/preference 文件(取代旧的 `F2`/`F3`);`load` 不带路径弹文件浏览器;`Load` 完成后
+  `App::connect_midi` 连上,`--controller/--controller-map` 仅是免选择的快捷方式
+- `--guide [<file>] [--controller <port>] [--decks <n>]` — learn 模式地图编辑器(`src/tui/guide.rs`),
   **不启动引擎**;`deck | unit | slot` 三栏、`info | watch dog`、灰色键位提示、居中 command
   (`Enter/Learn/Confirm` + `Delete/Connect/File/Save/Exit`)。方向键换栏/换行,Tab 切 command,
   Enter 下钻/学习,new 菜单负责 clone/new deck,add unit 只列内置 preset;逻辑在

@@ -96,7 +96,7 @@ endpoint = [
 | `two_point` | `1` = 一步 +，`127` = 一步 −，其余忽略 | 小控制器的 `{0,1,127}` 旋钮 |
 
 `two_point` 是给「只发 1 和 127」的编码器用的，不要再靠 `twos_complement` 兼职。
-判不准就用 `--midi-guide` 的 raw 监视器看一遍，guide 的 learn 也会自动识别。
+判不准就用 `--guide` 的 raw 监视器看一遍，guide 的 learn 也会自动识别。
 
 ## 4. slot 类型
 
@@ -255,9 +255,10 @@ FX 链要用 `chain = "vocals"` / `chain = "deck1/vocals"`，这次不提供 ste
 
 ## 9. 打开与编辑
 
-- `--midi <port> [--midi-map <file>]`：启动时打开端口并按映射翻译。
-- `--tui` 下 `F2` 选端口、`F3` 选映射文件。
-- `--midi-guide <file> [--midi <port>] [--decks <n>]`：learn 模式编辑器，不启动音频引擎。
+- `--controller <port> [--controller-map <file>]`：启动时打开端口并按映射翻译。
+  （旧的 `--midi` / `--midi-map` 拼写已移除；会话里 `controller ports` 仍接受 `midi ports` 别名。）
+- TUI 下 `F9` 打开设置界面选端口与映射文件（取代旧的 `F2`/`F3`）。
+- `--guide [<file>] [--controller <port>] [--decks <n>]`：learn 模式编辑器，不启动音频引擎。
   顶栏显示 file/controller；下面是带边框的 `deck | unit | slot`、`info | watch dog`、
   灰色键位提示和居中 command 按钮。
 

@@ -538,8 +538,9 @@ fn sync_refuses_a_deck_that_cannot_be_compared() {
         },
     );
     let message = expect_error(&rx, "sync_refuses_a_deck_that_cannot_be_compared");
+    // Deck ids are zero-based in the command channel, but labels are one-based.
     assert!(
-        message.contains("leader deck0") && message.contains("grid"),
+        message.contains("leader deck1") && message.contains("grid"),
         "unhelpful refusal: {message}"
     );
 
