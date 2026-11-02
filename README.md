@@ -89,6 +89,14 @@ deck1> beatjump 16
 deck1> fx list                    # 列出fx
 deck1> fx set eq low -0.5         # -1~1
 deck1> fx set filter value  0.5
+deck1> fx add echo                # 拍同步 echo：time 是拍数（无网格回落 120 BPM）
+deck1> fx set echo time 0.5       # 每半拍重复一次；feedback 0..0.95
+deck1> fx add reverb              # Freeverb：mix/size/damping/width
+deck1> fx set reverb size 0.6
+deck1> fx add flanger             # rate 是每拍周期数；rate/depth/feedback/mix
+deck1> fx add phaser              # 6 级全通级联，同样按拍扫
+deck1> fx add cut                 # 拍锁门限：div 拍、width 占空比、depth、edge(ms)
+deck1> fx set cut div 0.25
 deck1> master fx list
 
 # stems：离线分离 4 条轨，然后逐条控制（分离在后台跑，期间照常 play/loop/jump/sync）

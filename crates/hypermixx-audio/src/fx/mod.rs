@@ -5,9 +5,9 @@
 //! * **An effect only sees a [`Bus`] and a [`FxContext`].** It never opens a device, reads a file,
 //!   or looks at a deck. That is what lets the same `Limiter` sit in a channel chain, the master
 //!   chain and the master's safety stage without knowing the difference.
-//! * **The trait has six methods and every one has a default body.** A new effect implements
-//!   [`Fx::process`] plus [`Fx::set_param`]/[`Fx::param_names`] if it takes parameters at all;
-//!   `reset`, `on_trigger` and `get_param` stay optional.
+//! * **The trait has seven methods and only [`Fx::process`] is required.** A new effect also
+//!   implements [`Fx::set_param`]/[`Fx::param_names`] if it takes parameters at all;
+//!   `prepare`, `reset`, `on_trigger` and `get_param` stay optional.
 //! * **Parameters cross the thread boundary through [`Param`], not through a lock.** A command
 //!   thread calls [`Param::set`] (an atomic store); the audio thread pulls the moving target down
 //!   per block or per sample, so a cutoff sweep can never click and never blocks.
@@ -15,6 +15,7 @@
 //!   boundary, by moving a `Box<dyn Fx>` — which is why a chain is `Vec<FxSlot>` and not an
 //!   `ArcSwap`.
 
+pub(crate) mod delay;
 pub(crate) mod dsp;
 
 // The fader/trim laws, re-exported: a front-end that shows a level in dB has to agree with what
@@ -91,6 +92,26 @@ impl FxContext {
     pub fn beat(&self) -> Option<f64> {
         (self.has_grid() && self.beat_position.is_finite()).then_some(self.beat_position)
     }
+
+    /// Frames per beat, with the documented fallback when the context has no grid.
+    ///
+    /// A tempo-synced effect still has to sound on a deck that has not been analysed yet. Falling
+    /// back to a free-running 120 BPM is a musical default (the tempo most DJ tools assume), and it
+    /// keeps every effect from having to write its own "no grid" branch.
+    #[inline]
+    pub fn beat_frames(&self) -> f64 {
+        if self.has_grid() {
+            self.frames_per_beat
+        } else {
+            f64::from(self.sample_rate.max(1)) * 0.5
+        }
+    }
+
+    /// Beats per second, derived from [`FxContext::beat_frames`] and the engine rate.
+    #[inline]
+    pub fn beats_per_second(&self) -> f64 {
+        f64::from(self.sample_rate.max(1)) / self.beat_frames()
+    }
 }
 
 /// Why an effect refused a parameter.
@@ -129,6 +150,15 @@ impl std::error::Error for FxError {}
 pub trait Fx: Send {
     /// Processes `bus` in place. This is the only method a trivial effect has to write.
     fn process(&mut self, bus: &mut Bus, ctx: &FxContext);
+
+    /// Sizes buffers for the engine's rate, off the audio thread.
+    ///
+    /// A frequency-domain effect designs its coefficients per block and can ignore this; a
+    /// time-based one (delay, reverb) owns buffers whose length *is* the rate, so it allocates here
+    /// once rather than in [`Fx::process`]. The mixer calls this when it builds a chain, after a
+    /// topology reload, and when an effect is appended at run time. A hand-built chain that skips it
+    /// still works: `process` notices the first block's rate and prepares itself once.
+    fn prepare(&mut self, _sample_rate: u32) {}
 
     /// Clears filter memory / restarts envelopes. Called when a slot is bypassed then re-enabled,
     /// so an effect never resumes with state from audio the listener has since moved past.
@@ -177,6 +207,16 @@ mod tests {
         ctx.beat_position = f64::NAN;
         assert_eq!(ctx.beat(), None);
         assert_eq!(ctx.block_seconds(), BLOCK_SIZE as f64 / 44_100.0);
+        // Without a grid, tempo-synced effects run at a free 120 BPM.
+        assert!((ctx.beat_frames() - 22_050.0).abs() < 1e-9);
+        assert!((ctx.beats_per_second() - 2.0).abs() < 1e-9);
+        ctx.frames_per_beat = 24_000.0;
+        assert_eq!(
+            ctx.beat_frames(),
+            24_000.0,
+            "a real grid wins over the fallback"
+        );
+        assert!((ctx.beats_per_second() - 44_100.0 / 24_000.0).abs() < 1e-9);
     }
 
     /// An effect that only implements `process` must be writable in two lines.
@@ -186,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn five_of_six_methods_are_optional() {
+    fn six_of_seven_methods_are_optional() {
         // The whole point of default bodies: this compiles, runs, and reports no parameters.
         let mut chain = FxChain::new();
         chain.push(Box::new(PassThrough));

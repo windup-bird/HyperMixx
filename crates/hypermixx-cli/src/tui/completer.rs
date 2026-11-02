@@ -649,6 +649,13 @@ mod tests {
         let fixture = Fixture::new();
         assert!(fixture.complete("fx a", 4).contains(&"add".to_owned()));
         assert!(fixture.complete("fx add ", 7).contains(&"eq".to_owned()));
+        // The time-based kinds come from the same registry list, so they are offered automatically.
+        for kind in ["echo", "reverb", "flanger", "phaser", "cut"] {
+            assert!(
+                fixture.complete("fx add ", 7).contains(&kind.to_owned()),
+                "{kind} missing from fx add completion"
+            );
+        }
     }
 
     #[test]

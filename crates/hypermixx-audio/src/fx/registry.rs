@@ -5,7 +5,7 @@
 //! registry would add a plugin surface with nothing to plug into it. Adding an effect means one
 //! variant, one `build` arm and one line in `ALL`.
 
-use super::sample::{Eq, Filter, Gain, Limiter};
+use super::sample::{Cut, Echo, Eq, Filter, Flanger, Gain, Limiter, Phaser, Reverb};
 use super::{Fx, FxError};
 
 /// Every built-in effect class.
@@ -19,11 +19,31 @@ pub enum FxKind {
     Gain,
     /// Safety limiter with a soft knee and a releasing threshold.
     Limiter,
+    /// Tempo-synced feedback delay with a damped feedback path.
+    Echo,
+    /// Freeverb-style stereo room.
+    Reverb,
+    /// Modulated short delay (the jet sweep).
+    Flanger,
+    /// Swept all-pass cascade (the moving notches).
+    Phaser,
+    /// Beat-locked gate: the DJM's Trans, in one insert.
+    Cut,
 }
 
 impl FxKind {
     /// Every kind, in the order `help` should list them.
-    pub const ALL: [FxKind; 4] = [FxKind::Eq, FxKind::Filter, FxKind::Gain, FxKind::Limiter];
+    pub const ALL: [FxKind; 9] = [
+        FxKind::Eq,
+        FxKind::Filter,
+        FxKind::Gain,
+        FxKind::Limiter,
+        FxKind::Echo,
+        FxKind::Reverb,
+        FxKind::Flanger,
+        FxKind::Phaser,
+        FxKind::Cut,
+    ];
 
     /// The canonical name, and the only spelling [`FxKind::parse`] accepts.
     pub fn name(&self) -> &'static str {
@@ -32,6 +52,11 @@ impl FxKind {
             FxKind::Filter => "filter",
             FxKind::Gain => "gain",
             FxKind::Limiter => "limiter",
+            FxKind::Echo => "echo",
+            FxKind::Reverb => "reverb",
+            FxKind::Flanger => "flanger",
+            FxKind::Phaser => "phaser",
+            FxKind::Cut => "cut",
         }
     }
 
@@ -42,6 +67,13 @@ impl FxKind {
             FxKind::Filter => &["filter", "lp", "hp", "sweep"],
             FxKind::Gain => &["gain", "volume", "amp"],
             FxKind::Limiter => &["limiter", "lim", "clip"],
+            // "delay" is the plain-language name for what this kind actually is; a future
+            // no-feedback delay would be a separate kind, not a second meaning for this alias.
+            FxKind::Echo => &["echo", "delay", "dub"],
+            FxKind::Reverb => &["reverb", "verb"],
+            FxKind::Flanger => &["flanger", "flange"],
+            FxKind::Phaser => &["phaser", "phase"],
+            FxKind::Cut => &["cut", "gate", "trans"],
         }
     }
 
@@ -61,6 +93,11 @@ impl FxKind {
             FxKind::Filter => Box::new(Filter::new()),
             FxKind::Gain => Box::new(Gain::new(1.0)),
             FxKind::Limiter => Box::new(Limiter::new()),
+            FxKind::Echo => Box::new(Echo::new()),
+            FxKind::Reverb => Box::new(Reverb::new()),
+            FxKind::Flanger => Box::new(Flanger::new()),
+            FxKind::Phaser => Box::new(Phaser::new()),
+            FxKind::Cut => Box::new(Cut::new()),
         }
     }
 
@@ -74,6 +111,11 @@ impl FxKind {
             FxKind::Filter => Filter::PARAMS,
             FxKind::Gain => Gain::PARAMS,
             FxKind::Limiter => Limiter::PARAMS,
+            FxKind::Echo => Echo::PARAMS,
+            FxKind::Reverb => Reverb::PARAMS,
+            FxKind::Flanger => Flanger::PARAMS,
+            FxKind::Phaser => Phaser::PARAMS,
+            FxKind::Cut => Cut::PARAMS,
         }
     }
 
@@ -123,9 +165,17 @@ mod tests {
         assert_eq!(FxKind::parse("  limiter "), Ok(FxKind::Limiter));
         assert_eq!(FxKind::parse("lp"), Ok(FxKind::Filter));
         assert_eq!(FxKind::parse("tone"), Ok(FxKind::Eq));
-        let err = FxKind::parse("reverb").unwrap_err();
-        assert_eq!(err, FxError::UnknownKind("reverb".into()));
-        assert!(err.message().contains("reverb"));
+        // The time-based effects answer to both their name and the spelling a controller map uses.
+        assert_eq!(FxKind::parse("delay"), Ok(FxKind::Echo));
+        assert_eq!(FxKind::parse("verb"), Ok(FxKind::Reverb));
+        assert_eq!(FxKind::parse("flange"), Ok(FxKind::Flanger));
+        assert_eq!(FxKind::parse("phase"), Ok(FxKind::Phaser));
+        assert_eq!(FxKind::parse("gate"), Ok(FxKind::Cut));
+        assert_eq!(FxKind::parse("trans"), Ok(FxKind::Cut));
+        // A name that is still not an effect is refused, and the message names it.
+        let err = FxKind::parse("shimmer").unwrap_err();
+        assert_eq!(err, FxError::UnknownKind("shimmer".into()));
+        assert!(err.message().contains("shimmer"));
         assert!(!FxKind::is_known("scratcher"));
     }
 

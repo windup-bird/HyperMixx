@@ -249,7 +249,7 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 `deck1 fx …` 作用于 deck1。
 
 ```
-[deck|master] fx add <kind>                追加到链尾（eq|filter|gain|limiter，含别名）
+[deck|master] fx add <kind>                追加到链尾（eq|filter|gain|limiter|echo|reverb|flanger|phaser|cut，含别名）
 [deck|master] fx remove|rm <slot>          删除该槽，后续槽位前移
 [deck|master] fx toggle <slot>             翻转槽位（引擎持有状态，前端不留镜像）
 [deck|master] fx list|ls                   列出槽位：索引、kind、开关、参数
@@ -272,8 +272,18 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 | `filter` | lp, hp, sweep | `value`（−1 = LP 20Hz .. 0 = 全开 .. +1 = HP 18kHz）、`resonance`（0..1 → Q 0.3..18） |
 | `gain` | volume, amp | `gain` |
 | `limiter` | lim, clip | `ceiling` `release` `recovery` `backoff` `reduction`（`reduction` 是只读表针） |
+| `echo` | delay, dub | `mix` `feedback` `time`（拍数，1/32..4）`tone` `pingpong`；反馈路径带阻尼，`pingpong=1` 时左右交叉 |
+| `reverb` | verb | `mix` `size` `damping` `width`；Freeverb 拓扑（8 comb + 4 allpass / 声道），comb 长度按引擎率缩放 |
+| `flanger` | flange | `mix` `depth` `rate`（每拍周期数，1/16..4）`feedback`（−0.95..0.95） |
+| `phaser` | phase | `mix` `depth` `rate` `feedback`（6 级全通级联，系数查表） |
+| `cut` | gate, trans | `depth` `div`（拍，1/16..4）`width`（占空比 0.05..0.95）`edge`（ms，0..20）；按拍锁相的梯形门 |
 
-- `fx set` 的 value 非数字 → 前端直接报错。
+- 时间类效果（`echo` / `reverb` / `flanger` / `phaser` / `cut`）的节拍参数走
+  `FxContext` 的拍网格；曲目还没分析时回落到 120 BPM，不会静音。
+- 时间类效果的主参数排第一，所以 MIDI 的 `fx param 1` 就是"效果量"（`echo` 的 `mix`、
+  `cut` 的 `depth`）。
+- 时间类效果在 `prepare` 里按引擎率一次性分配缓冲区，之后 `process` 不再分配；
+  `Mixer` 构造、`mixer reload` 和运行中的 `fx add` 都会调用它。
 
 ### 3.7 Stems（分离与逐 stem 控制）
 

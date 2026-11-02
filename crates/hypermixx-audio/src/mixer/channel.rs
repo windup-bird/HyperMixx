@@ -317,6 +317,17 @@ impl Channel {
         &mut self.deck_fx
     }
 
+    /// Sizes every chain's time-based buffers at the engine's rate.
+    ///
+    /// Called once by the mixer at construction, and again after a topology reload — the two moments
+    /// a chain can appear at a rate it was not built for.
+    pub fn prepare_fx(&mut self, sample_rate: u32) {
+        for chain in &mut self.flow_fx {
+            chain.prepare(sample_rate);
+        }
+        self.deck_fx.prepare(sample_rate);
+    }
+
     /// Fader positions (`-1.0 ..= 1.0`), for a UI mirror.
     /// `(flow, deck, crossfader, cue send, gain)`: the first three bipolar positions, then the send
     /// level and the trim.

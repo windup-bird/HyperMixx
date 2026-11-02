@@ -138,19 +138,24 @@ impl Mixer {
                 FxChain::from_slots(deck_slots),
             );
             channel.set_block_seconds(block_seconds_of(sample_rate));
+            // Time-based effects size their buffers from the engine's rate, before the first block.
+            channel.prepare_fx(sample_rate);
             channels.push(channel);
         }
 
         let routed = build_outputs(&cfg, sample_rate, block_frames, tuning);
 
-        let limiter = build_slot("limiter")?;
+        let mut master_fx = build_chain(&cfg.master_fx)?;
+        master_fx.prepare(sample_rate);
+        let mut limiter = build_slot("limiter")?;
         limiter.set_enabled(cfg.master_limiter);
+        limiter.prepare(sample_rate);
 
         Ok(Self {
             channels,
             master: MasterBus {
                 sum: Bus::stereo(block_frames),
-                fx: build_chain(&cfg.master_fx)?,
+                fx: master_fx,
                 fader: Fader::new(cfg.master_fader, MASTER_TAU),
                 limiter,
                 outputs: routed.master_outputs,
@@ -217,7 +222,8 @@ impl Mixer {
         }
         // Validate everything that can be validated before touching live state.
         let chains = cfg.build_chains()?;
-        let master_fx = build_chain(&cfg.master_fx)?;
+        let mut master_fx = build_chain(&cfg.master_fx)?;
+        master_fx.prepare(self.sample_rate);
 
         let mut old = std::mem::take(&mut self.channels);
         let mut channels = Vec::with_capacity(cfg.channels.len());
@@ -230,6 +236,7 @@ impl Mixer {
                 FxChain::from_slots(deck_slots),
             );
             channel.set_block_seconds(block_seconds_of(self.sample_rate));
+            channel.prepare_fx(self.sample_rate);
             // Whatever was playing on this index keeps playing: a deck is not a config value.
             if let Some(previous) = old.get_mut(channels.len()) {
                 channel.replace_deck(previous.take_deck());
@@ -597,8 +604,10 @@ impl Mixer {
         use hypermixx_core::Command;
         match command {
             Command::AddFx { chain, kind } => match config::build_slot(&kind) {
-                Ok(slot) => {
+                Ok(mut slot) => {
                     let reported_kind = slot.kind().to_owned();
+                    // An effect appended at run time needs the engine's rate before its first block.
+                    slot.prepare(self.sample_rate);
                     match self.add_fx(chain, slot) {
                         Ok(index) => CommandResponse::FxAdded {
                             chain,
@@ -1217,6 +1226,52 @@ mod tests {
         );
     }
 
+    /// The run-time insert path has one extra obligation the config path does not: an effect that
+    /// owns buffers must be sized for the engine's rate before its first block.
+    #[test]
+    fn a_time_based_effect_is_prepared_when_added_at_run_time() {
+        use hypermixx_core::Command;
+        let mut mixer = loaded(simple_dj(), 1);
+        let base = mixer
+            .channel(0)
+            .unwrap()
+            .slot_statuses(SlotChain::Deck)
+            .unwrap()
+            .len();
+        let index = match mixer.handle_fx_command(Command::AddFx {
+            chain: FxChainId::Deck(0),
+            kind: "echo".into(),
+        }) {
+            CommandResponse::FxAdded { index, kind, .. } => {
+                assert_eq!(kind, "echo");
+                index
+            }
+            other => panic!("expected FxAdded, got {other:?}"),
+        };
+        assert_eq!(index, base);
+        let slot = FxTarget { chain: FxChainId::Deck(0), index };
+        assert!(matches!(
+            mixer.handle_fx_command(Command::SetFxParam {
+                slot,
+                name: "mix".into(),
+                value: 1.0,
+            }),
+            CommandResponse::Ok
+        ));
+        // Parameter index 2 is `feedback` in the effect's declared order.
+        assert!(matches!(
+            mixer.handle_fx_command(Command::SetFxParamIndex { slot, index: 1, value: 0.6 }),
+            CommandResponse::Ok
+        ));
+        assert_eq!(
+            mixer.resolve_fx(&slot).unwrap().get_param("feedback"),
+            Some(0.6)
+        );
+        // Four blocks through the freshly inserted delay lines, at the mixer's own rate.
+        tick(&mut mixer, 4);
+        assert!(mixer.master_peak().is_finite());
+    }
+
     #[test]
     fn fx_errors_are_answers_not_panics() {
         use hypermixx_core::Command;
@@ -1224,7 +1279,7 @@ mod tests {
         for command in [
             Command::AddFx {
                 chain: FxChainId::Deck(0),
-                kind: "flanger".into(),
+                kind: "shimmer".into(),
             },
             Command::SetFxParam {
                 slot: FxTarget { chain: FxChainId::Deck(0), index: 99 },
@@ -1472,7 +1527,7 @@ mod tests {
         );
 
         // A bad file changes nothing: an unknown effect is refused before any live state is touched.
-        let err = mixer.reload("[[channel]]\ndeck_fx = [\"reverb\"]\n").unwrap_err();
+        let err = mixer.reload("[[channel]]\ndeck_fx = [\"shimmer\"]\n").unwrap_err();
         assert!(matches!(err, MixerError::UnknownFx(_)), "{err:?}");
         assert_eq!(mixer.channel_count(), 1);
         assert_eq!(

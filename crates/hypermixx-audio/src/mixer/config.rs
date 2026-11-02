@@ -658,10 +658,10 @@ side = \"spinward\"",
     #[test]
     fn an_unknown_fx_is_a_construction_error_not_a_silent_skip() {
         let mut cfg = simple_dj();
-        cfg.channels[0].deck_fx.push("reverb".into());
+        cfg.channels[0].deck_fx.push("shimmer".into());
         let err = cfg.build_chains().unwrap_err();
         assert!(matches!(err, MixerError::UnknownFx(_)));
-        assert!(err.message().contains("reverb"));
+        assert!(err.message().contains("shimmer"));
         // The message names what *is* available, because that is the next thing a user asks.
         assert!(err.message().contains(FxKind::Eq.name()));
     }
@@ -713,10 +713,10 @@ side = \"spinward\"",
         let mut cfg = simple_dj();
         cfg.channels[0]
             .stem_fx
-            .insert(Stem::Vocals, vec!["reverb".into()]);
+            .insert(Stem::Vocals, vec!["shimmer".into()]);
         let err = cfg.build_chains().unwrap_err();
         assert!(matches!(err, MixerError::UnknownFx(_)), "{err:?}");
-        assert!(err.message().contains("reverb"));
+        assert!(err.message().contains("shimmer"));
     }
 
     /// The TOML spelling of a per-stem override, which is the point of the field.

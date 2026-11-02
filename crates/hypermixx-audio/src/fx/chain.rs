@@ -94,6 +94,12 @@ impl FxSlot {
         now
     }
 
+    /// Sizes the effect's own buffers for the engine's rate. Off the audio thread; see
+    /// [`Fx::prepare`].
+    pub fn prepare(&mut self, sample_rate: u32) {
+        self.fx.prepare(sample_rate);
+    }
+
     pub fn set_param(&self, name: &str, value: f32) -> Result<(), FxError> {
         self.fx.set_param(name, value)
     }
@@ -263,6 +269,17 @@ impl FxChain {
     pub fn process(&mut self, bus: &mut Bus, ctx: &FxContext) {
         for slot in &mut self.slots {
             slot.process(bus, ctx);
+        }
+    }
+
+    /// Sizes every slot's buffers at the engine's rate, before the first block.
+    ///
+    /// Called by the mixer when the chain is built, after a topology reload, and when an effect is
+    /// appended at run time. A chain built by hand may skip it: an effect that needs buffers
+    /// prepares itself on its first block instead.
+    pub fn prepare(&mut self, sample_rate: u32) {
+        for slot in &mut self.slots {
+            slot.prepare(sample_rate);
         }
     }
 

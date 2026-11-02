@@ -283,8 +283,9 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 
 ### `fx/` — 效果子系统
 
-- `Fx` trait — 只见 `Bus` + `FxContext`(采样率/块长/拍网格),六个方法五个有默认体;
-  实现须 `Send`、`process` 内不分配不阻塞不加锁
+- `Fx` trait — 只见 `Bus` + `FxContext`(采样率/块长/拍网格),七个方法六个有默认体;
+  实现须 `Send`、`process` 内不分配不阻塞不加锁;`prepare(rate)` 在非音频线程按引擎率
+  一次性分配缓冲区(Mixer 构造、`mixer reload`、运行时 `AddFx` 都会调用)
 - `Param` — 参数跨线程的唯一通道:双原子(u32 位转换)+ 指数逼近,块级(`next_block`)
   或逐样本(`next_sample`)步进;`alpha≥1` snap、NaN 消毒、settled 收尾——扫频不
   zipper、fader 移动不咔哒
@@ -295,7 +296,10 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   `10^(dB/40)`(各自正确的 A 幂次);原地重设计保留状态(连续扫频收敛)、退化输入
   钳制、发散自愈 + 计数;`fader_amp`(只衰减,−1 恰好静音、0 dB 封顶)与 `trim_amp`
   (下半个行程同律,上半段到 +6 dB)
-- `sample/` 四个内置效果:
+- `delay.rs` — 时间类效果的原语:`DelayLine`(线性插值分数延迟,先读后写)、
+  `OnePole`(反馈阻尼)、`SineLfo`(flanger/phaser 调制);容量在 `prepare` 里按引擎率定,
+  之后 `process` 不再分配
+- `sample/` 九个内置效果:
   - `Eq` — 三段 ISO:low shelf 320Hz / bell 1.2kHz / high shelf 3.6kHz,±26 dB 线性 dB
     律;系数仅在控制移动时重算,平坦时整段跳过
   - `Filter` — 共振扫频:LP/HP(Q 律)/ BP(恒峰值增益,构造性安全);cutoff 指数映射
@@ -305,8 +309,17 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
     增益包络**(attack 三时间常数跨前瞻窗,块边界无增益阶跃=无瞬态咔哒;立体声联动);
     软拐点值/斜率双连续、拐点下 bit-exact;ceiling 派生不存储(backoff 机制),纳米输入
     兜底;任何输入不超 ceiling
-- `registry.rs` — `FxKind` 封闭枚举(eq/filter/gain/limiter)+ 别名解析;加效果 =
-  一个 variant + 一个 `build` arm + 一行 `ALL`,无插件面
+  - `Echo` — 拍同步反馈延迟:`time` 是拍数(1/32..4),无网格回落 120 BPM;反馈路径
+    one-pole 阻尼,`pingpong` 交叉反馈,干湿同相(不引入额外延迟)
+  - `Reverb` — Freeverb 拓扑:每声道 8 个 damped comb + 4 个 allpass,右声道 +23 样本
+    spread;comb 长度按 `sr/44100` 缩放,`size`→反馈 0.7..0.98、`damping`→0..0.4
+  - `Flanger` — 0.2..4.8ms 调制延迟、双极反馈、双声道 LFO 相差 90°;`rate` 是每拍周期数
+  - `Phaser` — 6 级一阶全通级联;系数在 `prepare` 里按 `sr` 建 512 点表,逐样本插值
+    (避免每样本 `tan`),LFO 扫 150Hz..3kHz
+  - `Cut` — 拍锁梯形门:`div` 拍、`width` 占空比、`depth` 关断深度、`edge` ms 过渡;
+    相位由 `beat_position` 推导,loop/jump 后仍落在拍上
+- `registry.rs` — `FxKind` 封闭枚举(eq/filter/gain/limiter/echo/reverb/flanger/
+  phaser/cut)+ 别名解析;加效果 = 一个 variant + 一个 `build` arm + 一行 `ALL`,无插件面
 
 ### `deck/`
 - `Deck` — `sources: Vec<Shared>`(1 条 = 普通曲目,4 条 = stems)、单活跃 flow;
