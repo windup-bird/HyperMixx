@@ -309,10 +309,11 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 | `[deck] <stem> level <-1..1>` | 该 stem 电平（0 = unity，-1 = 精确静音） |
 | `[deck] <stem> mute [on\|off]` | 静音该 stem（solo 仍然优先） |
 | `[deck] <stem> solo [on\|off] \| unsolo` | 加入/移出独奏集合（**集合语义**，可多个同时 solo） |
-| `[deck] <stem> fx <子命令>` | **只作用于该 stem 的**效果链，如 `deck0 vocals fx add filter` |
+| `[deck] <stem> fx <子命令>` | 效果链是**流组共享**的：写操作广播到每条 flow（一个控件、N 份实例），如 `deck0 vocals fx set filter value 0.3` |
 
 `<stem>` = `drums` \| `bass` \| `other` \| `vocals`。行首目标因此可以带一层 stem：
-`deck0 vocals level -0.5`、`deck0 vocals fx add filter`。
+`deck0 vocals level -0.5`（电平/静音/独奏是逐 stem 的事实）；`deck0 vocals fx …` 只是选
+*哪条 flow 的视图*，写操作落到流组（whitelist 见下一片）。
 
 分离参数来自 `profile/live.toml` 的 `[stems]`（三个都会改变产出的音频，所以**都进缓存 key**）：
 

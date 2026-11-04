@@ -612,14 +612,22 @@ impl Mixer {
                     f(slot)
                 }
             }
-            FxChainId::Stem { deck, stem } => {
+            FxChainId::Stem { deck, .. } => {
+                // A flow slot is one control over N instances: naming a stem selects the *view*,
+                // never a private parameter set. The whitelist (`flows`) is what picks flows.
                 let count = self.channels.len();
-                let slot = self
+                let channel = self
                     .channels
                     .get_mut(deck as usize)
-                    .and_then(|channel| channel.slot_mut(SlotChain::Flow(stem), target.index))
                     .ok_or_else(|| unknown_deck(deck, count))?;
-                f(slot)
+                for stem in Stem::ALL {
+                    let slot = channel
+                        .chain_mut(SlotChain::Flow(stem))
+                        .and_then(|chain| chain.slot_mut(target.index))
+                        .ok_or_else(|| slot_error(target))?;
+                    f(slot)?;
+                }
+                Ok(())
             }
         }
     }
@@ -748,14 +756,19 @@ impl Mixer {
                     first.expect("one instance removed")
                 }
             }
-            FxChainId::Stem { deck, stem } => {
+            FxChainId::Stem { deck, .. } => {
                 let channel = self
                     .channels
                     .get_mut(deck as usize)
                     .ok_or_else(|| unknown_deck(deck, count))?;
-                channel
-                    .remove_slot(SlotChain::Flow(stem), target.index)
-                    .ok_or_else(|| slot_error(target))?
+                let mut first = None;
+                for stem in Stem::ALL {
+                    let removed = channel
+                        .remove_slot(SlotChain::Flow(stem), target.index)
+                        .ok_or_else(|| slot_error(target))?;
+                    first.get_or_insert(removed);
+                }
+                first.expect("one instance removed")
             }
         };
         Ok(removed)
