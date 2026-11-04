@@ -13,8 +13,10 @@ use super::{Fx, FxError};
 pub enum FxKind {
     /// 3-band DJ EQ (bass / mid / treble).
     Eq,
-    /// Resonant low-pass / high-pass / band-pass sweep.
+    /// Resonant low-pass / high-pass sweep, two poles (the clean "linear" sweep).
     Filter,
+    /// The same sweep with four poles and a ladder character.
+    Moog,
     /// Straight gain, ±∞ dB law.
     Gain,
     /// Safety limiter with a soft knee and a releasing threshold.
@@ -33,9 +35,10 @@ pub enum FxKind {
 
 impl FxKind {
     /// Every kind, in the order `help` should list them.
-    pub const ALL: [FxKind; 9] = [
+    pub const ALL: [FxKind; 10] = [
         FxKind::Eq,
         FxKind::Filter,
+        FxKind::Moog,
         FxKind::Gain,
         FxKind::Limiter,
         FxKind::Echo,
@@ -50,6 +53,7 @@ impl FxKind {
         match self {
             FxKind::Eq => "eq",
             FxKind::Filter => "filter",
+            FxKind::Moog => "moog",
             FxKind::Gain => "gain",
             FxKind::Limiter => "limiter",
             FxKind::Echo => "echo",
@@ -64,7 +68,8 @@ impl FxKind {
     pub fn aliases(&self) -> &'static [&'static str] {
         match self {
             FxKind::Eq => &["eq", "equalizer", "tone"],
-            FxKind::Filter => &["filter", "lp", "hp", "sweep"],
+            FxKind::Filter => &["filter", "lp", "hp", "sweep", "linear"],
+            FxKind::Moog => &["moog", "ladder"],
             FxKind::Gain => &["gain", "volume", "amp"],
             FxKind::Limiter => &["limiter", "lim", "clip"],
             // "delay" is the plain-language name for what this kind actually is; a future
@@ -91,6 +96,7 @@ impl FxKind {
         match self {
             FxKind::Eq => Box::new(Eq::new()),
             FxKind::Filter => Box::new(Filter::new()),
+            FxKind::Moog => Box::new(Filter::moog()),
             FxKind::Gain => Box::new(Gain::new(1.0)),
             FxKind::Limiter => Box::new(Limiter::new()),
             FxKind::Echo => Box::new(Echo::new()),
@@ -109,6 +115,7 @@ impl FxKind {
         match self {
             FxKind::Eq => Eq::PARAMS,
             FxKind::Filter => Filter::PARAMS,
+            FxKind::Moog => Filter::PARAMS,
             FxKind::Gain => Gain::PARAMS,
             FxKind::Limiter => Limiter::PARAMS,
             FxKind::Echo => Echo::PARAMS,

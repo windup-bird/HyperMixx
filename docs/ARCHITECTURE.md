@@ -313,10 +313,13 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 - `delay.rs` — 时间类效果的原语:`DelayLine`(线性插值分数延迟,先读后写)、
   `OnePole`(反馈阻尼)、`SineLfo`(flanger/phaser 调制);容量在 `prepare` 里按引擎率定,
   之后 `process` 不再分配
-- `sample/` 九个内置效果:
+- `sample/` 十个内置效果:
   - `Eq` — 三段 ISO:low shelf 320Hz / bell 1.2kHz / high shelf 3.6kHz,±26 dB 线性 dB
     律;系数仅在控制移动时重算,平坦时整段跳过
-  - `Filter` — 共振扫频:LP/HP(Q 律)/ BP(恒峰值增益,构造性安全);cutoff 指数映射
+  - `Filter`/`Moog` — 同一套 TPT 状态变量核(`filter` 两极点 12dB/oct,`moog` 四极点级联 24dB/oct):
+    LP/HP 两条支路**始终并行**、各自 cutoff 连续,中间用逐样本平滑的权重交叉淡化 —— 换的是权重不是拓扑,
+    所以 `value` 过零不会把旧滤波器的状态交给新拓扑(旧实现正是这样掉的声)。两者参数面完全相同
+    (`value`/`resonance`),是同一个固定位置槽位可以互换的两种 kind。cutoff 指数映射
     20Hz..18kHz,模式热切换
   - `Gain` / `Fader` — 线性增益(mixer 自己的 fader 也建在这上)
   - `Limiter` — 安全级:**64 帧前瞻**(1.45ms,位于混音后不影响 deck 相位)+ **逐样本

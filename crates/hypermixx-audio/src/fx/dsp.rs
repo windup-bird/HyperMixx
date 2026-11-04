@@ -96,7 +96,12 @@ impl Biquad {
 /// One low-pass / high-pass / bell / shelf section.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Section {
+    /// Kept as a primitive: the sweep builds its own state-variable sections (they can morph a
+    /// cutoff without a topology change), but a plain biquad low-pass is still the right tool for
+    /// any future effect that just needs its band removed.
+    #[allow(dead_code)]
     LowPass { freq: f64, q: f64 },
+    #[allow(dead_code)]
     HighPass { freq: f64, q: f64 },
     Bell { freq: f64, gain_db: f64, q: f64 },
     /// Shelf with `slope` (RBJ's `S`): 1.0 is maximally flat. Clamped to (0, 1] because the
@@ -289,6 +294,10 @@ impl BiquadChain {
     }
 
     /// How many times the chain has caught itself diverging and been rebuilt.
+    ///
+    /// The sweep grew its own state-variable core, so this is now only read by the EQ's tests; it
+    /// stays because a divergence counter is exactly what a test of a shared primitive wants.
+    #[allow(dead_code)]
     pub fn blowup_count(&self) -> u32 {
         self.blowup_count
     }

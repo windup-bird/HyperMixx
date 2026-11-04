@@ -269,7 +269,8 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 | kind | 别名 | 参数 |
 |---|---|---|
 | `eq` | equalizer, tone | `low` `mid` `high` `low_hz` `mid_hz` `high_hz`（增益 −26..+26 dB；分频 320Hz / 1.2kHz / 3.6kHz） |
-| `filter` | lp, hp, sweep | `value`（−1 = LP 20Hz .. 0 = 全开 .. +1 = HP 18kHz）、`resonance`（0..1 → Q 0.3..18） |
+| `filter` | lp, hp, sweep, linear | `value`（−1 = LP 20Hz .. 0 = 全开 .. +1 = HP 18kHz）、`resonance`（0..1 → Q 0.3..18）；2 极点 |
+| `moog` | ladder | 同上（同一个 `value`/`resonance` 语义）；4 极点级联，24 dB/oct |
 | `gain` | volume, amp | `gain` |
 | `limiter` | lim, clip | `ceiling` `release` `recovery` `backoff` `reduction`（`reduction` 是只读表针） |
 | `echo` | delay, dub | `mix` `feedback` `time`（拍数，1/32..4）`tone` `pingpong`；反馈路径带阻尼，`pingpong=1` 时左右交叉 |
