@@ -177,6 +177,7 @@ deck1> quit
 
 ```bash
 cargo run -p hypermixx-cli -- --cli                  # 纯 REPL（默认是 TUI）
+cargo run -p hypermixx-cli -- --headless             # 无音频/MIDI 硬件：输出走 sink，引擎照常跑
 cargo run -p hypermixx-cli -- --guide                # controller-guide（不启动引擎）
 cargo run -p hypermixx-cli -- --backend auto        # 分析后端 auto | stratum | timestretch
 cargo run -p hypermixx-cli -- --config topo.toml    # 自定义拓扑
@@ -189,6 +190,11 @@ cargo run -p hypermixx-cli -- --controller 0 --controller-map my.toml   # 指定
 cargo run -p hypermixx-cli -- --guide              # learn 模式编辑映射（不启动引擎，端口/文件在 TUI 里选）
 #   旧的 --tui / --midi / --midi-map / --midi-guide 已移除
 ```
+
+无音频设备、无 MIDI sequencer 的环境（Docker / CI / Termux / chroot）加 `--headless`：所有 `[[output]]`
+强制走 sink、跳过控制器连接，启动时不会向 stderr 喷 ALSA 错误，REPL/TUI、命令层、离线分析、
+stem 分离与全部测试仍可用。拓扑里也可以单独写 `device = "sink"` 只关掉某一路输出。
+`--headless` 是纯 opt-in，不带它时本机绑定（如 Numark 控制器）与其它平台的行为都不变。
 
 TUI 内尽量不用启动参数:`F9` 打开设置（控制器端口、映射文件、拓扑文件、输出设备都在这里选，取代了旧的 F2/F3）；
 `load` 不带路径则弹出文件浏览器；`--guide` 即使不跟路径也会在 TUI 里选端口与文件。波形左右声道上下镜像，三频段颜色、

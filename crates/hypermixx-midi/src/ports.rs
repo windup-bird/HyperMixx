@@ -27,8 +27,34 @@ pub struct PortInfo {
     pub name: String,
 }
 
+/// Whether this machine can open a MIDI input at all.
+///
+/// On Linux midir goes through the ALSA sequencer, which needs /dev/snd/seq. Containers,
+/// Termux/chroot and kernels built without snd-seq do not have it, and MidiInput::new() would
+/// let libasound print its own errors to stderr before we can explain anything. Checking first
+/// turns "no MIDI on this machine" into a normal empty result instead of an error. Other
+/// platforms have no such gate, so their backend is left to report for itself.
+fn backend_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        backend_available_at(std::path::Path::new("/dev/snd/seq"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn backend_available_at(sequencer: &std::path::Path) -> bool {
+    sequencer.exists()
+}
+
 /// Every available MIDI input port, in the order the backend reports them.
 pub fn list_ports() -> Result<Vec<PortInfo>, String> {
+    if !backend_available() {
+        return Ok(Vec::new());
+    }
     let input = MidiInput::new("hypermixx").map_err(|err| err.to_string())?;
     let ports = input.ports();
     Ok(ports
@@ -58,6 +84,9 @@ pub struct Input {
 /// is a clean error listing the alternatives, matching the CLI's habit of failing a bad `--config`
 /// instead of starting half-configured.
 pub fn open(query: &str, tx: Sender<Received>) -> Result<Input, String> {
+    if !backend_available() {
+        return Err("MIDI input is unavailable on this system (no ALSA sequencer)".to_owned());
+    }
     let mut input = MidiInput::new("hypermixx").map_err(|err| err.to_string())?;
     // The decoder already drops clock/active-sensing/sysex; keep the backend transparent so there
     // is one place that decides what an event is.
@@ -122,6 +151,13 @@ mod tests {
 
     fn names() -> Vec<String> {
         vec!["Launch Control".to_owned(), "Virtual Raw MIDI 1-0".to_owned()]
+    }
+
+    #[test]
+    fn a_missing_sequencer_device_means_no_midi_backend() {
+        assert!(!backend_available_at(std::path::Path::new(
+            "/definitely/not/a/sequencer"
+        )));
     }
 
     #[test]

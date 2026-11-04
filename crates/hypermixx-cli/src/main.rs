@@ -39,7 +39,7 @@ fn main() {
         // The file is the source of truth for the guide: its `[meta].device` wins, and only an
         // explicit `--controller` overrides it. A profile device belongs to the engine session, not to a
         // map file the user picked here.
-        let guide_port = args.midi.clone();
+        let guide_port = if args.headless { None } else { args.midi.clone() };
         // The guide never starts an engine, so it cannot ask the mixer what the outputs are. Probing
         // cpal here is enough to show the devices and whether each takes the configured rate — the
         // question a controller mapping session actually has ("will my interface work?").
@@ -60,7 +60,11 @@ fn main() {
             // colours: the profile's own `preference.toml`, not always the shipped path.
             preference: tui::preference_path(args.profile.as_deref()),
             mixer_path,
-            devices: hypermixx_audio::output_devices(Some(rate)),
+            devices: if args.headless {
+                Vec::new()
+            } else {
+                hypermixx_audio::output_devices(Some(rate))
+            },
             engine_rate: rate,
             // Filled from the map (or the port) once the guide has opened it.
             controller: guide_port.clone(),
@@ -139,7 +143,7 @@ fn main() {
     // `--config` overrides the built-in reference topology; a bad file is a clean exit, not a
     // half-alive engine (and the mixer's own validation — unknown FX, empty channels — runs
     // inside `start`, on the thread that will own the result).
-    let cfg = match &config_path {
+    let mut cfg = match &config_path {
         Some(path) => match read_config(path) {
             Ok(cfg) => cfg,
             Err(err) => {
@@ -149,6 +153,10 @@ fn main() {
         },
         None => default_config(),
     };
+    if args.headless {
+        cfg.headless();
+        eprintln!("[headless] audio outputs are sinks; MIDI input is disabled");
+    }
     // The live settings are this machine's, not the music's: the engine rate, the ring sizes and
     // the stem defaults. A missing file is not an error (the shipped defaults are the built-ins);
     // a broken one is, because silently running at another rate is the surprise this file exists
@@ -234,6 +242,7 @@ fn main() {
                 midi_control: None,
                 midi_state: None,
                 library: library.clone(),
+                headless: args.headless,
             },
         );
         return;
@@ -241,28 +250,33 @@ fn main() {
 
     // A port the *user* named on the command line must open, or the run is a mistake; a port that
     // came from the profile is "what this rig usually is", and a controller that is not plugged in
-    // yet should not stop the session — say so and carry on (F9 can still pick one).
+    // yet should not stop the session — say so and carry on (F9 can still pick one). A headless
+    // session skips the backend entirely, so a machine with no MIDI sequencer starts quietly.
     let explicit_midi = args.midi.is_some();
-    let midi_session = match midi_port.as_deref() {
-        Some(port) => match midi::attach_file(
-            port,
-            &midi_map,
-            decks,
-            command_tx.clone(),
-            pipeline.response_rx(),
-            &notice_tx,
-        ) {
-            Ok(session) => Some(session),
-            Err(err) if explicit_midi => {
-                eprintln!("error: controller: {err}");
-                std::process::exit(1);
-            }
-            Err(err) => {
-                eprintln!("warning: controller: {err}; continuing without it");
-                None
-            }
-        },
-        None => None,
+    let midi_session = if args.headless {
+        None
+    } else {
+        match midi_port.as_deref() {
+            Some(port) => match midi::attach_file(
+                port,
+                &midi_map,
+                decks,
+                command_tx.clone(),
+                pipeline.response_rx(),
+                &notice_tx,
+            ) {
+                Ok(session) => Some(session),
+                Err(err) if explicit_midi => {
+                    eprintln!("error: controller: {err}");
+                    std::process::exit(1);
+                }
+                Err(err) => {
+                    eprintln!("warning: controller: {err}; continuing without it");
+                    None
+                }
+            },
+            None => None,
+        }
     };
 
     // Name the files this run picked up, so "which profile am I on?" is answerable without asking.
@@ -296,6 +310,7 @@ fn main() {
             midi_control,
             midi_state,
             library,
+            headless: args.headless,
         },
     );
     drop(midi_session);
@@ -317,6 +332,8 @@ struct CliArgs {
     backend: Backend,
     /// `--cli`: the line REPL instead of the terminal UI.
     cli: bool,
+    /// `--headless`: run without opening any audio device or MIDI input.
+    headless: bool,
     /// `--controller <port>` (alias `--midi`): a port name or index, opened and mapped onto the
     /// engine.
     midi: Option<String>,
@@ -340,6 +357,7 @@ impl CliArgs {
             match arg.as_str() {
                 "--print-config" => args.print_config = true,
                 "--cli" => args.cli = true,
+                "--headless" => args.headless = true,
                 "--backend" => {
                     args.backend = match raw.next().as_deref() {
                         Some("stratum") => Backend::Stratum,
@@ -410,7 +428,7 @@ impl CliArgs {
                 other => {
                     eprintln!(
                         "error: unknown argument `{other}`\n  flags: --config, --print-config, \
-                         --profile, --live, --backend, --cli,\n         --guide, --controller, \
+                         --profile, --live, --backend, --cli, --headless,\n         --guide, --controller, \
                          --controller-map, --decks"
                     );
                     std::process::exit(1);

@@ -41,4 +41,7 @@ pub struct Session {
     pub midi_state: Option<Arc<Mutex<RouterState>>>,
     /// The library cache, opened once by `main` and shared by both front-ends.
     pub library: Option<Arc<LibraryDb>>,
+    /// `--headless`: no audio device or MIDI input is opened. Front-ends skip device probes
+    /// and controller auto-connect, so a machine with neither stays quiet.
+    pub headless: bool,
 }

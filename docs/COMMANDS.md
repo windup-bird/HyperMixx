@@ -15,6 +15,7 @@ cargo run -p hypermixx-cli -- [flags]
 | 参数 | 说明 |
 |---|---|
 | `--cli` | 行式 REPL；不给则启动 TUI（默认） |
+| `--headless` | 不打开任何音频设备或 MIDI 输入：所有 `[[output]]` 强制走 sink，控制器不连接。用于 CI、容器、Termux/chroot 等无硬件环境；引擎其余部分（deck、FX、分析、meter、曲库、stem）照常运行，pacing 改用墙钟。`--guide` 下同时跳过设备探测与端口打开 |
 | `--config <file>` | 自定义混音拓扑 TOML（通道/效果链/输出）；不给则读 `./profile/mixer.toml`（缺文件/坏文件回落内置参考拓扑）。这个路径也是 `mixer reload` 不带参数时的默认 |
 | `--print-config` | 打印参考拓扑 TOML 后退出（不启动引擎） |
 | `--profile <name\|file>` | 一个**指路文件**：写 `mixer` / `live` / `controller`（`controller` 是映射文件路径，端口名在该文件的 `[meta].device`；旧的 `midi` 键仍解析）。裸名字解析成 `profile/<name>.toml`；不给则读 `profile/profile.toml`（没有就用文件夹默认）。显式 flag 优先于它 |
@@ -26,6 +27,9 @@ cargo run -p hypermixx-cli -- [flags]
 | `--decks <n>` | 仅作用于 `--guide` 的 deck 栏宽度，缺省 1 |
 
 - 未知参数是硬错误（`error: unknown argument …`），不会静默忽略；`--tui` / `--midi` / `--midi-map` / `--midi-guide` 已移除。
+- `--headless` 不改变命令层：`load` / `analyse` / `stem separate` / `fx` / 全部单测都可照常使用；
+  输出只在 sink 里被丢弃，`output list` 会把每个目的地报成 `sink`。拓扑里也可以单独写
+  `device = "sink"` 只关掉某一路输出。不带该 flag 时本机绑定（如控制器声卡）与其它平台行为都不变。
 - `--guide` 即使不跟端口也能在 TUI 里选端口/文件；给了路径/端口时启动即尝试打开，
   失败会留在 watch dog 里等待 `File` / `Connect`。
 - deck 数量启动时从引擎查询（自定义拓扑可配任意通道数），不是固定常量。

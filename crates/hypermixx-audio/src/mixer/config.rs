@@ -161,6 +161,8 @@ pub struct OutputConfig {
     pub name: String,
     /// Which physical device to bind to: a **name substring** (case-insensitive, first match wins)
     /// or an **index** into the host's output devices. Omitted = the system default device.
+    /// The value `sink` (case-insensitive) opens no device at all: the destination produces into
+    /// a sink that discards audio, for CI, containers and machines without a sound card.
     ///
     /// A substring rather than an id because the names are the only thing every platform agrees on
     /// (ALSA, PipeWire, WASAPI and future Android backends all have human names, and hardware ids
@@ -262,6 +264,9 @@ impl Default for OutputConfig {
 }
 
 impl OutputConfig {
+    /// The `device` value that means "no device": produce into a sink instead.
+    pub const SINK_DEVICE: &'static str = "sink";
+
     /// A stereo master destination on the system default device.
     pub fn master(id: OutputId, name: impl Into<String>) -> Self {
         Self {
@@ -286,6 +291,13 @@ impl OutputConfig {
         } else {
             1.0
         }
+    }
+
+    /// True when this destination is explicitly headless and must not touch the audio host.
+    pub fn wants_sink(&self) -> bool {
+        self.device
+            .as_deref()
+            .is_some_and(|device| device.trim().eq_ignore_ascii_case(Self::SINK_DEVICE))
     }
 
     /// Whether this destination may run at the engine's rate. An empty `sample_rates` means
@@ -334,6 +346,15 @@ pub struct MixerConfig {
 }
 
 impl MixerConfig {
+    /// Forces every output to a sink, so the engine can run on a machine with no audio device
+    /// (CI, containers, Termux/chroot). Only the device bindings change: decks, FX, analysis,
+    /// meters and every command keep working, paced by the wall clock instead of a callback.
+    pub fn headless(&mut self) {
+        for output in &mut self.outputs {
+            output.device = Some(OutputConfig::SINK_DEVICE.to_owned());
+        }
+    }
+
     /// Builds the chains this config names: **one per stream** (`Stem::COUNT` of them, from the
     /// template and any per-stem overrides) plus the shared deck chain.
     ///
@@ -804,5 +825,27 @@ side = \"spinward\"",
             ..OutputConfig::master(0, "high")
         };
         assert_eq!(high.wanted_device_channels(), 6);
+    }
+
+    #[test]
+    fn the_sink_device_is_recognised_without_opening_a_host() {
+        let mut sink = OutputConfig::master(0, "main");
+        sink.device = Some("  SiNk  ".to_owned());
+        assert!(sink.wants_sink());
+        assert!(!OutputConfig::master(0, "main").wants_sink());
+        let mut named = OutputConfig::master(0, "main");
+        named.device = Some("USB Headset".to_owned());
+        assert!(!named.wants_sink());
+    }
+
+    #[test]
+    fn headless_rebinds_every_output_to_a_sink() {
+        let mut cfg = simple_dj();
+        cfg.outputs[0].device = Some("Numark Party Mix III".to_owned());
+        cfg.headless();
+        assert!(cfg.outputs.iter().all(|output| output.wants_sink()));
+        // Nothing else in the topology is touched.
+        assert_eq!(cfg.channels.len(), 2);
+        assert_eq!(cfg.outputs.len(), 2);
     }
 }

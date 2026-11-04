@@ -61,6 +61,7 @@ role = "master"               # master | cue
 device = "扬声器 (Numark Party Mix III Audio)"
 channels = [0, 1]
 # device = "USB Headset"      # name substring (case-insensitive) or a device index; omit = default
+# device = "sink"             # open no device at all (headless / no sound card); audio is discarded
 # sample_rates = [44100]      # rates this destination may run at (default: the engine's own)
 # channels = [0, 1]           # device channel pair
 # gain = 1.0                  # per-destination trim

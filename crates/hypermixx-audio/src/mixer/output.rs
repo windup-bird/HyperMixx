@@ -184,6 +184,12 @@ impl Output {
         block_frames: usize,
         tuning: OutputTuning,
     ) -> Result<Self, OutputError> {
+        // A declared sink never touches the host: on a machine with no sound card even asking
+        // cpal for its default device makes libasound complain on stderr. Check before anything
+        // device-shaped, and before the rate allow-list (a sink has no rate to refuse).
+        if cfg.wants_sink() {
+            return Ok(Self::sink(cfg, block_frames));
+        }
         let host = cpal::default_host();
         // The config's own rate allow-list is checked first: it is a mistake in the file, and it is
         // worth reporting as such whether or not a device happens to be plugged in.
@@ -1064,6 +1070,17 @@ mod tests {
         let mut b = Bus::new(BLOCK_SIZE);
         b.fill_from(left, right);
         b
+    }
+
+    #[test]
+    fn a_declared_sink_opens_without_touching_the_host() {
+        let cfg = crate::mixer::config::OutputConfig {
+            device: Some(crate::mixer::config::OutputConfig::SINK_DEVICE.to_owned()),
+            ..crate::mixer::config::OutputConfig::master(0, "main")
+        };
+        // Would enumerate the host and log a missing device on a headless machine otherwise.
+        let out = Output::open(&cfg, SAMPLE_RATE, BLOCK_SIZE).expect("sink always opens");
+        assert!(!out.is_live());
     }
 
     #[test]

@@ -63,6 +63,7 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         midi_control,
         midi_state,
         library,
+        headless,
     } = session;
     let preference_path = preference_path(profile.as_deref());
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
@@ -90,7 +91,13 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     app.profile_path = profile.clone();
     // Probe here, not in the settings screen: cpal's ALSA/JACK backends print warnings to stderr, and
     // anything printed after `ratatui::try_init` lands on top of the alternate screen.
-    app.devices = hypermixx_audio::output_devices(Some(sample_rate));
+    // A headless session has no device to probe; asking cpal anyway only makes its backend
+    // complain on stderr on machines without a sound card.
+    app.devices = if headless {
+        Vec::new()
+    } else {
+        hypermixx_audio::output_devices(Some(sample_rate))
+    };
     app.preference_path = preference_path.clone();
     app.live_path = live_path;
     app.mixer_path = topology_path.or_else(|| Some(crate::command::DEFAULT_TOPOLOGY.to_owned()));
@@ -110,6 +117,7 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         }
     }
     app.midi_map = (!midi_map.is_empty()).then_some(midi_map);
+    let midi_port = if headless { None } else { midi_port };
     if let Some(port) = midi_port {
         app.midi_port = Some(port);
         app.connect_midi(
