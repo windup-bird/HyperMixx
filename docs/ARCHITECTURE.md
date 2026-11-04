@@ -206,34 +206,37 @@ mixer 只负责把 deck 变成采样;谁跟谁、共享 BPM 是什么,是**关�
 固定信号路径(`Channel::process`):
 
 ```
-(逐 stream 循环:一个 deck 有 1 条,装了 stems 就有 4 条)
+(逐 flow 循环:一个 deck 有 1 条,装了 stems 就有 4 条)
     deck.render_stream(i)
     → source_fader[i] 逐流**门**:stem 的 mute/solo 决策,恰好 1.0 或 0.0(GATE_TAU 平滑)
-    → flow_fx[i]      逐流插入(换流即重置滤波记忆;**每 stream 一条,状态独立**)
+    → [crossfader at "source"]
     → flow_fader[i]   逐流电平(只衰减,行程顶端 0 dB;这是**每 stem 的**电平)
+    → eq → filter → flowfx…   逐流链:固定前缀 + `flowfx` 槽;**每 flow 一套实例**(状态独立)
     → Σ 到 channel bus
+  → [crossfader at "flow"]
+  → gain              channel trim:0 dB .. +6 dB(唯一能 boost 的一级;在 flow 求和之后)
+  → knobfx… → padfx…  合并后链:knob 组然后 pad 组(各一个实例)
   → [cue tap]         `[channel] cue = "pre"`(缺省)时在这里
-  → fader             通道**唯一**的一颗 fader;`[channel] fader = "pre_fx"` 放在这里
+  → fader             通道**唯一**的一颗 fader(位置固定,在两条 bank 之后)
   → [cue tap]         `cue = "post"` 时在这里(推子的另一侧)
-  → chain             通道插入(跨跳转持久,整 deck 共用;`[channel] chain = [...]`)
-  → [cue tap]         `fader = "post_fx"` 时在这里(cue = "pre")
-  → fader
-  → [cue tap]         `fader = "post_fx"` + `cue = "post"` 时在这里
-  → gain              channel trim:0 dB .. +6 dB(唯一能 boost 的一级)
+  → [crossfader at "deck"]
   → 求和
 ```
 
-**一通道一颗 fader,位置是配置**:`pre_fx` = 历史上的 flow fader 位置(先衰减再进音色),
-`post_fx` = 历史上的 deck fader 位置(缺省,音色随电平一起衰减)。cue send 抽在 fader 的
-**某一侧**,`[channel] cue = "pre"`(缺省)是推子之前——把推子拉到底只静音房间、不静音耳机,
-这就是 cue 的意义;`cue = "post"` 抽在推子之后(仍是 crossfader 之前),所以推子会连耳机
-一起关,这是给 scratch/throw 用法的一个显式选项,不是缺省。
+**顺序是设计参数,槽位由配置给**:`eq` 和 `filter` 是路径的一部分(唯一的配置是 filter 的
+kind:`linear`/`moog`),`flowfx` 在合并前逐流跑,`knobfx`/`padfx` 在合并后跑,channel fader 固定
+在最后一条 bank 之后。`[channel] cue = "pre"`(缺省)把 cue send 抽在推子之前——把推子拉到底只
+静音房间、不静音耳机,这就是 cue 的意义;`cue = "post"` 抽在推子之后(仍是 crossfader 之前),
+所以推子会连耳机一起关,这是给 scratch/throw 用法的显式选项,不是缺省。
+
+**一个 deck 的平坦槽位序号**:`[eq, filter, flowfx…, knobfx…, padfx…]`。map 绑的就是这个序号
+(或 role),所以 bank 只在队尾增长时,前面的序号永不移动。逐流槽位是**一个控件、N 份实例**:
+写 `fx` 时 mixer 把同一条命令广播到每条 flow 链的同号实例,参数目标一致、平滑轨迹一致,而滤波
+器/延迟状态各自独立。
 
 共享 crossfader 的按侧增益坐在三个位置之一(`[crossfader] place = source|flow|deck`,
-缺省 `deck` = 历史位置),**恒在该位置的 cue tap 之后**,所以分叉点与它是同一点时 cue 不受
-crossfader 影响;分叉在它之后则跟着它(把 crossfader 放早的代价,文档写明)。
-
-单 stream、`post_fx`、crossfader 在 `deck` 位置时,上面这段与历史路径**逐位相同**。
+缺省 `deck`),**恒在该位置的 cue tap 之后**,所以分叉点与它是同一点时 cue 不受 crossfader
+影响;分叉在它之后则跟着它(把 crossfader 放早的代价,文档写明)。
 
 `MasterBus::render`:`sum → master_fx → master_fader → limiter(安全级)`。
 `CueBus`:`sum → cue_fader → blend_with(master.sum)` —— 耳机是 cue 与 master 的混合,
@@ -247,14 +250,14 @@ crossfader 影响;分叉在它之后则跟着它(把 crossfader 放早的代价,
 3. **fader 只衰减**:`fader_amp` 的上半段恒为 1.0;headroom 只在 `gain`(`trim_amp`,+6 dB 封顶)
 4. 阶段顺序本身
 
-其余由 `MixerConfig` 纯数据描述(`config.rs`):每通道的 flow_fx/**stem_fx**/`chain` 名单
-(`Vec<String>`,经 `FxKind` 注册表解析,未知名 → `MixerError::UnknownFx` 构造失败;
-`chain` 是通道共用那条链,旧名 `deck_fx` 仍接受),
+其余由 `MixerConfig` 纯数据描述(`config.rs`):每通道的 `filter`(linear|moog)、
+`flow_fx`/`knobfx`/`padfx` 名单(`Vec<String>`,经 `FxKind` 注册表解析,未知名 →
+`MixerError::UnknownFx` 构造失败),
 `[crossfader]`(place/curve/cut_width/start)、`[cue]`(fader/blend/curve/cut_width)、
 以及 fader 起始位与位置(`fader = pre_fx|post_fx`)、cue_send/side、master fx/limiter/fader、
 输出列表(name/role(`master`|`cue`)/channels/gain)。
-`flow_fx` 是**模板**:每条 stream 各建一条独立的链(4 stems = 4 条,各自状态),`[channel.stem_fx]`
-按 stem 覆写模板 —— 所以"只给人声加 filter"可以写在配置里,不必只靠运行时命令。
+`flow_fx` 是**模板**:每条 flow 各建一条独立的链(4 stems = 4 条,各自状态);要做"只给人声加
+filter"这类逐流差异,用 flowfx 的白名单(见计划中的 `flows` 字段,下一片实现)。
 
 - `Bus` — 面内(L/R 分离)块单位,构造时分配,热路径零分配;效果器逐面迭代省去步长乘法
 - `Channel` — 拥有自己的 deck、**每 stream 一条 flow 链**(`Vec<FxChain>`,从 config 的

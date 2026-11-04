@@ -333,16 +333,16 @@ CPU 与 CUDA 的结果 Σ 残差一致（实测都是 −32.9 dB 量级），但
 
 ```toml
 [[channel]]
-chain = ["eq", "filter"]       # 共享：整个通道一条链（旧名 deck_fx 仍接受）
+filter = "linear"              # linear | moog：固定 filter 级的 kind（`fx kind filter moog` 可运行时换）
 cue = "pre"                    # pre | post：cue send 抽在 fader 的哪一侧（post 时推子连耳机一起关）
-flow_fx = ["gain"]             # 模板：每条 stream 各建一条独立的链（4 stems = 4 条）
-[channel.stem_fx]              # 覆写：这里写了的 stem 用它，其余继承模板
-vocals = ["gain", "filter"]
+flow_fx = ["gain"]             # 合并前、逐 flow 的插入：模板，每条 flow 各建一条独立链（4 stems = 4 条）
+knob_fx = ["echo"]             # 合并后 knob bank
+pad_fx = ["reverb"]            # 合并后 pad bank（在 knob 之后）
 ```
 
 `flow_fx` 是**模板而不是一条链**：`flow_fx = ["filter"]` 意味着四个独立的滤波器（各自状态，
-互不串味），不是一个滤波器加在求和之后。`[channel.stem_fx]` 里的名字和 `flow_fx` 一样在构造时
-校验，写错会在启动时失败而不是等到用的时候。
+互不串味），不是一个滤波器加在求和之后。三个 bank 里的名字在构造时校验，写错会在启动时失败
+而不是等到用的时候。一个 deck 的平坦槽位序号是 `[eq, filter, flowfx…, knobfx…, padfx…]`。
 
 三条容易混淆的语义，都是刻意的：
 

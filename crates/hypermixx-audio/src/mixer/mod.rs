@@ -25,19 +25,21 @@ pub(crate) mod output;
 
 pub use bus::Bus;
 pub use channel::{
-    Channel, CrossfaderCurve, CrossfaderPlace, CueTap, DeckSide, FaderPlace, SlotChain,
-    DEFAULT_CUT_WIDTH,
+    Channel, CrossfaderCurve, CrossfaderPlace, CueTap, DeckSide, SlotChain, DEFAULT_CUT_WIDTH,
 };
 pub use config::{
-    build_chain, build_slot, build_slots, reference_toml, simple_dj, silent_test_channel,
-    ChannelConfig, CrossfaderConfig, CueMixConfig, MixerConfig, MixerError, OutputConfig,
+    build_chain, build_chain_with_roles, build_slot, build_slots, reference_toml, simple_dj,
+    silent_test_channel, ChannelConfig, CrossfaderConfig, CueMixConfig, MixerConfig, MixerError,
+    OutputConfig,
 };
 pub use hypermixx_core::{OutputRole, OutputState, OutputStatus};
 pub use output::{
     output_devices, DeviceInfo, Output, OutputError, OutputId, OutputTuning, Outputs,
 };
 
-use hypermixx_core::{CommandResponse, FxChainId, FxSlotStatus, KeylockSettings, StemOp, StemSet};
+use hypermixx_core::{
+    CommandResponse, FxChainId, FxSlotStatus, KeylockSettings, Stem, StemOp, StemSet,
+};
 
 use channel::Channel as ChannelInner;
 use crate::deck::Deck;
@@ -129,17 +131,15 @@ impl Mixer {
         let block_frames = BLOCK_SIZE;
         let chains = cfg.build_chains()?;
         let mut channels = Vec::with_capacity(cfg.channels.len());
-        for (channel_cfg, (flow_chains, deck_slots)) in
-            cfg.channels.iter().zip(chains)
-        {
-            // `build_chains` already produced one chain per stem, so the per-stem overrides in the
-            // config are in effect from the first block — not only after a `SetStems`.
+        for (channel_cfg, (flow_chains, post_fx)) in cfg.channels.iter().zip(chains) {
+            // `build_chains` already produced one chain per flow (with the fixed tone prefix), so
+            // the configured order is in effect from the first block — not only after a `SetStems`.
             let mut channel = Channel::new(
                 Deck::empty(),
                 channel_cfg,
                 cfg.crossfader,
                 flow_chains,
-                FxChain::from_slots(deck_slots),
+                post_fx,
             );
             channel.set_block_seconds(block_seconds_of(sample_rate));
             // Time-based effects size their buffers from the engine's rate, before the first block.
@@ -149,7 +149,7 @@ impl Mixer {
 
         let routed = build_outputs(&cfg, sample_rate, block_frames, tuning);
 
-        let mut master_fx = build_chain(&cfg.master_fx)?;
+        let mut master_fx = build_chain_with_roles(&cfg.master_fx, "masterfx")?;
         master_fx.prepare(sample_rate);
         let mut limiter = build_slot("limiter")?;
         limiter.set_enabled(cfg.master_limiter);
@@ -295,18 +295,18 @@ impl Mixer {
         }
         // Validate everything that can be validated before touching live state.
         let chains = cfg.build_chains()?;
-        let mut master_fx = build_chain(&cfg.master_fx)?;
+        let mut master_fx = build_chain_with_roles(&cfg.master_fx, "masterfx")?;
         master_fx.prepare(self.sample_rate);
 
         let mut old = std::mem::take(&mut self.channels);
         let mut channels = Vec::with_capacity(cfg.channels.len());
-        for (channel_cfg, (flow_chains, deck_slots)) in cfg.channels.iter().zip(chains) {
+        for (channel_cfg, (flow_chains, post_fx)) in cfg.channels.iter().zip(chains) {
             let mut channel = Channel::new(
                 Deck::empty(),
                 channel_cfg,
                 cfg.crossfader,
                 flow_chains,
-                FxChain::from_slots(deck_slots),
+                post_fx,
             );
             channel.set_block_seconds(block_seconds_of(self.sample_rate));
             channel.prepare_fx(self.sample_rate);
@@ -547,14 +547,21 @@ impl Mixer {
 
     // ---- FX command surface ---------------------------------------------------------------
 
-    /// Reads one slot, addressing the deck's merged chain (flow slots first, then deck slots).
+    /// Reads one slot. A deck's index space is **flat**: one flow's chain (the fixed `eq`/`filter`
+    /// prefix then the `flowfx` bank) followed by the post-merge chain (knob bank, then pad bank),
+    /// so a controller map's slot number never moves when a bank grows at its end.
     pub fn resolve_fx(&self, target: &FxTarget) -> Option<&FxSlot> {
         match target.chain {
             FxChainId::Master => self.master.fx.slot(target.index),
-            FxChainId::Deck(deck_id) => self
-                .channels
-                .get(deck_id as usize)?
-                .slot(SlotChain::Deck, target.index),
+            FxChainId::Deck(deck_id) => {
+                let channel = self.channels.get(deck_id as usize)?;
+                let flow_len = channel.flow_len();
+                if target.index < flow_len {
+                    channel.slot(SlotChain::Flow(Stem::Drums), target.index)
+                } else {
+                    channel.slot(SlotChain::Deck, target.index - flow_len)
+                }
+            }
             FxChainId::Stem { deck, stem } => self
                 .channels
                 .get(deck as usize)?
@@ -562,28 +569,94 @@ impl Mixer {
         }
     }
 
-    pub fn resolve_fx_mut(&mut self, target: &FxTarget) -> Option<&mut FxSlot> {
+    /// Applies `f` to **every instance** a target addresses.
+    ///
+    /// A flow slot exists once per flow (its own filter state), while the control is shared: the
+    /// group has one knob, one on/off and one parameter trajectory, which only stays true if a write
+    /// reaches all instances. `Stem` deliberately addresses one instance for inspection.
+    fn for_each_fx_mut(
+        &mut self,
+        target: &FxTarget,
+        mut f: impl FnMut(&mut FxSlot) -> Result<(), String>,
+    ) -> Result<(), String> {
         match target.chain {
-            FxChainId::Master => self.master.fx.slot_mut(target.index),
-            FxChainId::Deck(deck_id) => self
-                .channels
-                .get_mut(deck_id as usize)?
-                .slot_mut(SlotChain::Deck, target.index),
-            FxChainId::Stem { deck, stem } => self
-                .channels
-                .get_mut(deck as usize)?
-                .slot_mut(SlotChain::Flow(stem), target.index),
+            FxChainId::Master => {
+                let slot = self
+                    .master
+                    .fx
+                    .slot_mut(target.index)
+                    .ok_or_else(|| slot_error(target))?;
+                f(slot)
+            }
+            FxChainId::Deck(deck_id) => {
+                let count = self.channels.len();
+                let channel = self
+                    .channels
+                    .get_mut(deck_id as usize)
+                    .ok_or_else(|| unknown_deck(deck_id, count))?;
+                let flow_len = channel.flow_len();
+                if target.index < flow_len {
+                    for stem in Stem::ALL {
+                        let slot = channel
+                            .chain_mut(SlotChain::Flow(stem))
+                            .and_then(|chain| chain.slot_mut(target.index))
+                            .ok_or_else(|| slot_error(target))?;
+                        f(slot)?;
+                    }
+                    Ok(())
+                } else {
+                    let slot = channel
+                        .post_fx_mut()
+                        .slot_mut(target.index - flow_len)
+                        .ok_or_else(|| slot_error(target))?;
+                    f(slot)
+                }
+            }
+            FxChainId::Stem { deck, stem } => {
+                let count = self.channels.len();
+                let slot = self
+                    .channels
+                    .get_mut(deck as usize)
+                    .and_then(|channel| channel.slot_mut(SlotChain::Flow(stem), target.index))
+                    .ok_or_else(|| unknown_deck(deck, count))?;
+                f(slot)
+            }
         }
     }
 
-    /// Every slot in one chain.
+    /// Runs one mutation through [`Mixer::for_each_fx_mut`] and turns the outcome into a response.
+    fn answer(
+        &mut self,
+        slot: FxTarget,
+        f: impl FnMut(&mut FxSlot) -> Result<(), String>,
+    ) -> CommandResponse {
+        match self.for_each_fx_mut(&slot, f) {
+            Ok(()) => CommandResponse::Ok,
+            Err(err) => CommandResponse::Error(err),
+        }
+    }
+
+    /// Every slot in one address space, with flat indices.
     pub fn list_fx(&self, chain: FxChainId) -> Option<Vec<FxSlotStatus>> {
         match chain {
             FxChainId::Master => Some(self.master.fx.statuses()),
-            FxChainId::Deck(deck_id) => self
-                .channels
-                .get(deck_id as usize)?
-                .slot_statuses(SlotChain::Deck),
+            FxChainId::Deck(deck_id) => {
+                let channel = self.channels.get(deck_id as usize)?;
+                // The group's *view* is one flow's chain: every instance carries the same role and
+                // the same control values, so one listing is the truth.
+                let mut slots = channel.slot_statuses(SlotChain::Flow(Stem::Drums))?;
+                let flow_len = slots.len();
+                slots.extend(
+                    channel
+                        .slot_statuses(SlotChain::Deck)?
+                        .into_iter()
+                        .map(|mut slot| {
+                            slot.index += flow_len;
+                            slot
+                        }),
+                );
+                Some(slots)
+            }
             FxChainId::Stem { deck, stem } => self
                 .channels
                 .get(deck as usize)?
@@ -591,29 +664,50 @@ impl Mixer {
         }
     }
 
-    /// Appends an effect, returning its index in the addressed chain's own index space.
+    /// Appends an effect at the end of a bank, returning its flat index.
     ///
-    /// `Deck` is the channel's shared chain; `Stem` is one stream's chain. There is no merged index
-    /// space any more — with a chain per stream, one index space could not mean anything.
+    /// `Deck` appends to the post-merge bank (after `padfx`); `Stem` appends a `flowfx` slot to
+    /// *every* flow so the group stays aligned. Existing indices never move.
     pub fn add_fx(&mut self, chain: FxChainId, slot: FxSlot) -> Result<usize, String> {
         match chain {
             FxChainId::Master => Ok(self.master.fx.push_slot(slot)),
-            FxChainId::Deck(deck_id) => self
-                .channels
-                .get_mut(deck_id as usize)
-                .and_then(|channel| channel.add_slot(SlotChain::Deck, slot))
-                .ok_or_else(|| unknown_deck(deck_id, self.channels.len())),
-            FxChainId::Stem { deck, stem } => self
-                .channels
-                .get_mut(deck as usize)
-                .and_then(|channel| channel.add_slot(SlotChain::Flow(stem), slot))
-                .ok_or_else(|| unknown_deck(deck, self.channels.len())),
+            FxChainId::Deck(deck_id) => {
+                let count = self.channels.len();
+                let channel = self
+                    .channels
+                    .get_mut(deck_id as usize)
+                    .ok_or_else(|| unknown_deck(deck_id, count))?;
+                let flow_len = channel.flow_len();
+                let appended = channel
+                    .add_slot(SlotChain::Deck, slot)
+                    .ok_or_else(|| unknown_deck(deck_id, count))?;
+                Ok(flow_len + appended)
+            }
+            FxChainId::Stem { deck, .. } => {
+                let count = self.channels.len();
+                let channel = self
+                    .channels
+                    .get_mut(deck as usize)
+                    .ok_or_else(|| unknown_deck(deck, count))?;
+                // A `flowfx` slot is one control over N flows, so every flow gets its own instance
+                // (its own filter/delay state) built from the same kind and role.
+                let kind = crate::fx::FxKind::parse(slot.kind()).map_err(|err| err.message())?;
+                let role = slot.role().to_owned();
+                let mut index = 0;
+                for stem in Stem::ALL {
+                    let fresh = FxSlot::with_role(kind.build(), kind.name(), role.clone());
+                    index = channel
+                        .add_slot(SlotChain::Flow(stem), fresh)
+                        .ok_or_else(|| unknown_deck(deck, count))?;
+                }
+                Ok(index)
+            }
         }
     }
 
     pub fn remove_fx(&mut self, target: &FxTarget) -> Result<FxSlot, String> {
         let count = self.channels.len();
-        let (channel, place) = match target.chain {
+        let removed = match target.chain {
             FxChainId::Master => {
                 return self
                     .master
@@ -621,26 +715,50 @@ impl Mixer {
                     .remove(target.index)
                     .ok_or_else(|| "no effect at that index on master".to_owned())
             }
-            FxChainId::Deck(deck_id) => (
-                self.channels
+            FxChainId::Deck(deck_id) => {
+                let channel = self
+                    .channels
                     .get_mut(deck_id as usize)
-                    .ok_or_else(|| unknown_deck(deck_id, count))?,
-                SlotChain::Deck,
-            ),
-            FxChainId::Stem { deck, stem } => (
-                self.channels
+                    .ok_or_else(|| unknown_deck(deck_id, count))?;
+                let flow_len = channel.flow_len();
+                if target.index >= flow_len {
+                    channel
+                        .remove_slot(SlotChain::Deck, target.index - flow_len)
+                        .ok_or_else(|| slot_error(target))?
+                } else {
+                    // The tone prefix is part of the topology, not a bank: only the `flowfx` slots
+                    // after it can be removed.
+                    let protected = channel
+                        .slot(SlotChain::Flow(Stem::Drums), target.index)
+                        .map(FxSlot::role)
+                        .map(str::to_owned)
+                        .unwrap_or_default();
+                    if matches!(protected.as_str(), "eq" | "filter") {
+                        return Err(format!(
+                            "`{protected}` is a fixed stage, not a slot — use `fx kind` to change it"
+                        ));
+                    }
+                    let mut first = None;
+                    for stem in Stem::ALL {
+                        let removed = channel
+                            .remove_slot(SlotChain::Flow(stem), target.index)
+                            .ok_or_else(|| slot_error(target))?;
+                        first.get_or_insert(removed);
+                    }
+                    first.expect("one instance removed")
+                }
+            }
+            FxChainId::Stem { deck, stem } => {
+                let channel = self
+                    .channels
                     .get_mut(deck as usize)
-                    .ok_or_else(|| unknown_deck(deck, count))?,
-                SlotChain::Flow(stem),
-            ),
+                    .ok_or_else(|| unknown_deck(deck, count))?;
+                channel
+                    .remove_slot(SlotChain::Flow(stem), target.index)
+                    .ok_or_else(|| slot_error(target))?
+            }
         };
-        channel.remove_slot(place, target.index).ok_or_else(|| {
-            format!(
-                "{} has no effect at index {}",
-                target.chain.label(),
-                target.index
-            )
-        })
+        Ok(removed)
     }
 
     /// Installs a separated track into one channel. The swap is seamless (a source change at the
@@ -699,89 +817,71 @@ impl Mixer {
                     Err(err) => CommandResponse::Error(err),
                 }
             }
-            Command::ToggleFx { slot } => match self.resolve_fx(&slot) {
-                Some(found) => {
+            Command::ToggleFx { slot } => {
+                self.answer(slot, |found| {
                     found.toggle();
-                    CommandResponse::Ok
-                }
-                None => CommandResponse::Error(slot_error(&slot)),
-            },
-            Command::SetFxEnabled { slot, enabled } => match self.resolve_fx(&slot) {
-                Some(found) => {
-                    found.set_enabled(enabled);
-                    CommandResponse::Ok
-                }
-                None => CommandResponse::Error(slot_error(&slot)),
-            },
+                    Ok(())
+                })
+            }
+            Command::SetFxEnabled { slot, enabled } => self.answer(slot, |found| {
+                found.set_enabled(enabled);
+                Ok(())
+            }),
             Command::SetFxKind { slot, kind } => match FxKind::parse(&kind) {
                 Ok(parsed) => {
                     let rate = self.sample_rate;
-                    match self.resolve_fx_mut(&slot) {
-                        Some(found) => {
-                            // Same position, same role, same engagement; only the effect changes.
-                            // Parameters with a shared name (a filter's `value`/`resonance`) carry
-                            // over, so a swap under a mapped knob is seamless.
-                            found.replace(parsed.build(), parsed.name());
-                            found.prepare(rate);
-                            CommandResponse::Ok
-                        }
-                        None => CommandResponse::Error(slot_error(&slot)),
-                    }
+                    self.answer(slot, |found| {
+                        // Same position, same role, same engagement; only the effect changes.
+                        // Parameters with a shared name (a filter's `value`/`resonance`) carry over,
+                        // so a swap under a mapped knob is seamless.
+                        found.replace(parsed.build(), parsed.name());
+                        found.prepare(rate);
+                        Ok(())
+                    })
                 }
                 Err(err) => CommandResponse::Error(err.message()),
             },
-            Command::SetFxParam { slot, name, value } => match self.resolve_fx(&slot) {
-                Some(found) => match found.set_param(&name, value) {
-                    Ok(()) => CommandResponse::Ok,
-                    Err(err) => CommandResponse::Error(format!(
-                        "{} {name}: {}",
+            Command::SetFxParam { slot, name, value } => {
+                let label = slot.chain.label();
+                self.answer(slot, |found| {
+                    found
+                        .set_param(&name, value)
+                        .map_err(|err| format!("{label} {name}: {}", err.message()))
+                })
+            }
+            Command::SetFxParamIndex { slot, index, value } => {
+                // The name is resolved once, from the slot's own declaration, and then applied to
+                // every instance of the group: a knob sweep must move all flows together.
+                let name = self
+                    .resolve_fx(&slot)
+                    .and_then(|found| found.fx().param_names().get(index).copied())
+                    .map(str::to_owned);
+                let Some(name) = name else {
+                    return CommandResponse::Error(format!(
+                        "{}: parameter index {} is out of range",
                         slot.chain.label(),
-                        err.message()
-                    )),
-                },
-                None => CommandResponse::Error(slot_error(&slot)),
-            },
-            Command::SetFxParamIndex { slot, index, value } => match self.resolve_fx(&slot) {
-                Some(found) => {
-                    let Some(name) = found.fx().param_names().get(index).copied() else {
-                        return CommandResponse::Error(format!(
-                            "{}: parameter index {} is out of range",
-                            slot.chain.label(),
-                            index + 1
-                        ));
-                    };
-                    match found.set_param(name, value) {
-                        Ok(()) => CommandResponse::Ok,
-                        Err(err) => CommandResponse::Error(format!(
-                            "{} {name}: {}",
-                            slot.chain.label(),
-                            err.message()
-                        )),
-                    }
-                }
-                None => CommandResponse::Error(slot_error(&slot)),
-            },
-            Command::FxTrigger { slot } => match self.resolve_fx_mut(&slot) {
-                Some(found) => {
-                    found.trigger();
-                    CommandResponse::Ok
-                }
-                None => CommandResponse::Error(slot_error(&slot)),
-            },
-            Command::PadPress { slot } => match self.resolve_fx(&slot) {
-                Some(found) => {
-                    found.press_pad();
-                    CommandResponse::Ok
-                }
-                None => CommandResponse::Error(slot_error(&slot)),
-            },
-            Command::PadRelease { slot } => match self.resolve_fx(&slot) {
-                Some(found) => {
-                    found.release_pad();
-                    CommandResponse::Ok
-                }
-                None => CommandResponse::Error(slot_error(&slot)),
-            },
+                        index + 1
+                    ));
+                };
+                let label = slot.chain.label();
+                self.answer(slot, |found| {
+                    found
+                        .set_param(&name, value)
+                        .map_err(|err| format!("{label} {name}: {}", err.message()))
+                })
+            }
+            Command::FxTrigger { slot } => self.answer(slot, |found| {
+                found.trigger();
+                Ok(())
+            }),
+            Command::PadPress { slot } => self.answer(slot, |found| {
+                found.press_pad();
+                Ok(())
+            }),
+            Command::PadRelease { slot } => self.answer(slot, |found| {
+                found.release_pad();
+                Ok(())
+            }),
             Command::ListFx { chain } => match self.list_fx(chain) {
                 Some(slots) => CommandResponse::FxListed { chain, slots },
                 None => CommandResponse::Error(unknown_chain(&chain)),
@@ -1259,19 +1359,23 @@ mod tests {
     fn fx_commands_round_trip_through_the_mixer() {
         use hypermixx_core::Command;
         let mut mixer = loaded(simple_dj(), 2);
-        let base = mixer
+        // The deck's flat space is one flow's chain (eq, filter) followed by the post-merge bank;
+        // `AddFx(Deck)` appends to the post-merge bank, so its index is `flow_len + post_len`.
+        let flow_len = mixer.channel(0).unwrap().flow_len();
+        let post_len = mixer
             .channel(0)
             .unwrap()
             .slot_statuses(SlotChain::Deck)
             .unwrap()
             .len();
+        let base = flow_len + post_len;
         match mixer.handle_fx_command(Command::AddFx {
             chain: FxChainId::Deck(0),
             kind: "gain".into(),
         }) {
             CommandResponse::FxAdded { index, kind, .. } => {
                 assert_eq!(kind, "gain");
-                assert_eq!(index, base, "appended after the configured chain");
+                assert_eq!(index, base, "appended after the post-merge bank");
             }
             other => panic!("expected FxAdded, got {other:?}"),
         }
@@ -1312,13 +1416,71 @@ mod tests {
         ));
         assert_eq!(
             mixer.channel(0).unwrap().slot_statuses(SlotChain::Deck).unwrap().len(),
-            base
+            post_len
         );
     }
 
     /// A fixed slot changes its effect without moving: same index, same role, same engagement, and
     /// the parameters both effects declare survive — that is what lets a mapped knob ride a
     /// `filter` → `moog` swap without jumping.
+    /// The deck's flat listing is one flow's chain followed by the post-merge banks, and the
+    /// prefixes are the ones the map resolves.
+    #[test]
+    fn the_deck_listing_is_the_flow_chain_then_the_post_banks() {
+        use hypermixx_core::Command;
+        let mut cfg = simple_dj();
+        cfg.channels[0].flow_fx = vec!["echo".into()];
+        cfg.channels[0].knob_fx = vec!["filter".into()];
+        cfg.channels[0].pad_fx = vec!["reverb".into()];
+        let mut mixer = loaded(cfg, 1);
+        let slots = match mixer.handle_fx_command(Command::ListFx {
+            chain: FxChainId::Deck(0),
+        }) {
+            CommandResponse::FxListed { slots, .. } => slots,
+            other => panic!("expected FxListed, got {other:?}"),
+        };
+        let got: Vec<(String, String)> = slots
+            .iter()
+            .map(|slot| (slot.role.clone(), slot.kind.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("eq".to_owned(), "eq".to_owned()),
+                ("filter".to_owned(), "filter".to_owned()),
+                ("flowfx1".to_owned(), "echo".to_owned()),
+                ("knobfx1".to_owned(), "filter".to_owned()),
+                ("padfx1".to_owned(), "reverb".to_owned()),
+            ]
+        );
+        // The flat indices are 0..n, so a map's slot number means the same thing every session.
+        assert_eq!(
+            slots.iter().map(|slot| slot.index).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        // A flow slot is one control over four instances: writing it must reach all of them.
+        mixer.handle_fx_command(Command::SetFxParam {
+            slot: FxTarget {
+                chain: FxChainId::Deck(0),
+                index: 2,
+            },
+            name: "mix".into(),
+            value: 0.25,
+        });
+        for stem in Stem::ALL {
+            assert_eq!(
+                mixer
+                    .channel(0)
+                    .unwrap()
+                    .slot(SlotChain::Flow(stem), 2)
+                    .unwrap()
+                    .get_param("mix"),
+                Some(0.25),
+                "{stem}: a group write must reach every flow"
+            );
+        }
+    }
+
     #[test]
     fn swapping_a_slots_effect_keeps_its_role_index_and_engagement() {
         use hypermixx_core::Command;
@@ -1392,12 +1554,13 @@ mod tests {
     fn a_time_based_effect_is_prepared_when_added_at_run_time() {
         use hypermixx_core::Command;
         let mut mixer = loaded(simple_dj(), 1);
-        let base = mixer
-            .channel(0)
-            .unwrap()
-            .slot_statuses(SlotChain::Deck)
-            .unwrap()
-            .len();
+        let base = mixer.channel(0).unwrap().flow_len()
+            + mixer
+                .channel(0)
+                .unwrap()
+                .slot_statuses(SlotChain::Deck)
+                .unwrap()
+                .len();
         let index = match mixer.handle_fx_command(Command::AddFx {
             chain: FxChainId::Deck(0),
             kind: "echo".into(),
@@ -1475,14 +1638,12 @@ mod tests {
     fn a_pad_holds_a_slot_and_lets_go() {
         use hypermixx_core::Command;
         let mut mixer = loaded(simple_dj(), 1);
-        let index = mixer
-            .channel(0)
-            .unwrap()
-            .slot_statuses(SlotChain::Deck)
-            .unwrap()
-            .len()
-            - 1;
-        let slot = FxTarget { chain: FxChainId::Deck(0), index };
+        // The last slot of one flow's chain: the sweep (`eq` is 0, `filter` is 1).
+        let index = mixer.channel(0).unwrap().flow_len() - 1;
+        let slot = FxTarget {
+            chain: FxChainId::Deck(0),
+            index,
+        };
         mixer.handle_fx_command(Command::SetFxEnabled { slot, enabled: false });
         mixer.handle_fx_command(Command::PadPress { slot });
         assert!(mixer.resolve_fx(&slot).unwrap().is_enabled());
@@ -1494,7 +1655,7 @@ mod tests {
     fn a_bad_config_is_refused_before_any_device_is_touched() {
         let cfg = MixerConfig {
             channels: vec![ChannelConfig {
-                deck_fx: vec!["chorus".into()],
+                knob_fx: vec!["chorus".into()],
                 ..Default::default()
             }],
             outputs: vec![],
@@ -1660,7 +1821,7 @@ mod tests {
                 r#"
                 [[channel]]
                 side = "center"
-                deck_fx = ["gain"]
+                knob_fx = ["gain"]
                 gain = 1.0
                 [[output]]
                 name = "only"
@@ -1687,7 +1848,7 @@ mod tests {
         );
 
         // A bad file changes nothing: an unknown effect is refused before any live state is touched.
-        let err = mixer.reload("[[channel]]\ndeck_fx = [\"shimmer\"]\n").unwrap_err();
+        let err = mixer.reload("[[channel]]\nknob_fx = [\"shimmer\"]\n").unwrap_err();
         assert!(matches!(err, MixerError::UnknownFx(_)), "{err:?}");
         assert_eq!(mixer.channel_count(), 1);
         assert_eq!(

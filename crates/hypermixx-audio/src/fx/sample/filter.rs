@@ -38,7 +38,8 @@ use super::super::{Fx, FxContext, FxError, Param};
 use crate::mixer::Bus;
 
 /// Which character the sweep is built from. Both expose the same parameters and the same travel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Mode {
     /// Two poles, 12 dB/oct: the clean "linear" sweep.
     Linear,
@@ -47,6 +48,14 @@ pub enum Mode {
 }
 
 impl Mode {
+    /// The effect-kind name this mode is built as; the fixed `filter` slot's `kind`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Mode::Linear => "filter",
+            Mode::Moog => "moog",
+        }
+    }
+
     /// Stages in each branch: one 2-pole stage for `Linear`, two cascaded for `Moog`.
     const fn stages(self) -> usize {
         match self {

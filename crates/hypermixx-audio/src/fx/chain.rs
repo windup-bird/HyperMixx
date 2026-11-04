@@ -23,7 +23,7 @@ pub struct FxSlot {
     kind: &'static str,
     /// Stable identity of the position, independent of what is in it. A front-end finds its knob
     /// by role, so [`FxSlot::replace`] can change the effect without moving the control.
-    role: &'static str,
+    role: String,
     enabled: AtomicBool,
     /// Audio-thread memory of the previous block's engagement, to catch a bypass→engage edge and
     /// call [`Fx::reset`] exactly once.
@@ -42,13 +42,13 @@ impl FxSlot {
     }
 
     /// A slot whose role is not its current kind: a fixed stage (`filter`) that may hold one of
-    /// several variants (`linear`, `moog`).
-    pub fn with_role(fx: Box<dyn Fx>, kind: &'static str, role: &'static str) -> Self {
+    /// several variants (`filter`, `moog`), or a numbered bank slot (`flowfx1`, `padfx2`).
+    pub fn with_role(fx: Box<dyn Fx>, kind: &'static str, role: impl Into<String>) -> Self {
         let enabled = true;
         Self {
             fx,
             kind,
-            role,
+            role: role.into(),
             enabled: AtomicBool::new(enabled),
             was_enabled: enabled,
             pad_held: Cell::new(None),
@@ -76,8 +76,8 @@ impl FxSlot {
     }
 
     /// The slot's stable position identity; see [`FxSlot::replace`].
-    pub fn role(&self) -> &'static str {
-        self.role
+    pub fn role(&self) -> &str {
+        &self.role
     }
 
     /// Replaces the effect, keeping the slot's role, engagement and pad latch.
@@ -188,7 +188,7 @@ impl FxSlot {
     pub fn status(&self, index: usize) -> FxSlotStatus {
         FxSlotStatus {
             index,
-            role: self.role.to_owned(),
+            role: self.role.clone(),
             kind: self.kind.to_owned(),
             enabled: self.is_enabled(),
             params: super::param_snapshot(&*self.fx),

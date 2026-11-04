@@ -11,8 +11,9 @@
 
 use hypermixx_core::{OutputRole, Stem, CHANNELS};
 
-use super::channel::{CrossfaderCurve, CrossfaderPlace, CueTap, DeckSide, FaderPlace};
+use super::channel::{CrossfaderCurve, CrossfaderPlace, CueTap, DeckSide};
 use super::output::OutputId;
+use crate::fx::sample::FilterMode;
 use crate::fx::{FxChain, FxError, FxKind, FxSlot};
 /// Why a mixer could not be built from a config.
 #[derive(Clone, Debug, PartialEq)]
@@ -67,45 +68,44 @@ impl From<FxError> for MixerError {
     }
 }
 
-/// One channel's built chains: one flow chain per stream ([`Stem::ALL`] order), then the shared
-/// deck chain's slots. A named type because the tuple is otherwise unreadable at every use site.
-pub type BuiltChains = (Vec<FxChain>, Vec<FxSlot>);
+/// One channel's built chains: one chain per flow (the same fixed prefix plus the `flowfx` slots),
+/// then the post-merge chain (knob bank, then pad bank).
+pub type BuiltChains = (Vec<FxChain>, FxChain);
 
 /// One mixer input.
+///
+/// The stage order inside a channel is fixed (it *is* the design): each flow gets the same tone
+/// prefix — `eq`, then the sweep — followed by the `flowfx` slots, and the flows are summed; the
+/// post-merge chain holds the knob bank and then the pad bank; the channel fader sits after both.
+/// Configuration decides *what* is in each stage, never the order.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ChannelConfig {
-    /// Per-stream inserts, as a **template**: every stream gets its own chain built from this list,
-    /// so four stems get four independent instances (separate filter state, not one filter shared).
+    /// Which sweep the fixed `filter` stage builds. Both kinds expose the same `value`/`resonance`
+    /// parameters, so the stage can also be swapped at run time with `fx kind filter moog`.
+    pub filter: FilterMode,
+    /// Per-flow inserts, as a **template**: every flow gets its own chain built from this list, so
+    /// four streams get four independent instances (separate filter state, not one shared filter).
     ///
-    /// A stem that should differ is named in [`ChannelConfig::stem_fx`]; an empty list means "no
-    /// per-stream inserts", which is the default and costs nothing (the chains are never entered).
+    /// These run *after* the tone prefix (`eq`, `filter`) and *before* the flows are summed.
     pub flow_fx: Vec<String>,
-    /// Per-stem overrides of [`ChannelConfig::flow_fx`], for the stems that should differ. A stem
-    /// absent here uses the template.
-    #[serde(default)]
-    pub stem_fx: std::collections::HashMap<Stem, Vec<String>>,
-    /// The channel's insert chain — its tone controls, shared by every stream and durable across
-    /// jumps. One list, configured once: `[channel] chain = ["eq", "filter"]`.
-    ///
-    /// `deck_fx` is the historical spelling and is still accepted.
-    #[serde(rename = "chain", alias = "deck_fx")]
-    pub deck_fx: Vec<String>,
+    /// Post-merge knob bank: continuous effects (a sweep, an echo) addressed by the first knob.
+    pub knob_fx: Vec<String>,
+    /// Post-merge pad bank: momentary effects (a gate, a roll), after the knob bank.
+    pub pad_fx: Vec<String>,
     /// Per-stream level, `-1.0 ..= 1.0` (centred = unity, the top of the travel is 0 dB). This is a
     /// *stem's* level; the channel fader is [`ChannelConfig::deck_fader`].
     pub flow_fader: f32,
-    /// The channel fader's starting level, `-1.0 ..= 1.0`. Where it acts is
-    /// [`ChannelConfig::fader`]; the name is historical.
+    /// The channel fader's starting level, `-1.0 ..= 1.0`. The name is historical; the fader sits
+    /// after the post-merge chain.
     pub deck_fader: f32,
     /// Channel trim, `-1.0 ..= 1.0`: `0.0` is 0 dB, `1.0` is +6 dB (the only stage that boosts),
-    /// `-1.0` is silence. The last stage before the sum.
+    /// `-1.0` is silence. It sits after the flow sum and before the post-merge chain.
     pub gain: f32,
     /// How much of this channel reaches the cue bus: **linear, 0.0 (off) ..= 1.0 (full)**.
     pub cue_send: f32,
-    /// Where the one channel fader sits relative to [`ChannelConfig::deck_fx`].
-    pub fader: FaderPlace,
-    /// Which side of that fader the cue send taps: `pre` (default) keeps a channel cueable with its
-    /// fader down; `post` makes the fader silence the monitor too.
+    /// Which side of the channel fader the cue send taps: `pre` (default) keeps a channel cueable
+    /// with its fader down; `post` makes the fader silence the monitor too.
     pub cue: CueTap,
     pub side: DeckSide,
 }
@@ -115,14 +115,14 @@ impl Default for ChannelConfig {
     /// cannot silently change an existing config's behaviour.
     fn default() -> Self {
         Self {
+            filter: FilterMode::Linear,
             flow_fx: Vec::new(),
-            stem_fx: std::collections::HashMap::new(),
-            deck_fx: Vec::new(),
+            knob_fx: Vec::new(),
+            pad_fx: Vec::new(),
             flow_fader: 0.0,
             deck_fader: 0.0,
             gain: 0.0,
             cue_send: 0.0,
-            fader: FaderPlace::default(),
             cue: CueTap::default(),
             side: DeckSide::default(),
         }
@@ -130,24 +130,18 @@ impl Default for ChannelConfig {
 }
 
 impl ChannelConfig {
-    /// Every FX name this channel names — the template, every override, then the deck chain. Used
-    /// for validation and `fx list`, so an unknown name in an override cannot hide.
+    /// Every FX name this channel names — every bank — for validation and `fx help`.
     pub fn all_fx(&self) -> impl Iterator<Item = &String> {
         self.flow_fx
             .iter()
-            .chain(self.stem_fx.values().flatten())
-            .chain(self.deck_fx.iter())
+            .chain(self.knob_fx.iter())
+            .chain(self.pad_fx.iter())
     }
 
-    /// The names one stream's chain is built from: its own override, else the template.
-    pub fn chain_names(&self, stem: Stem) -> &[String] {
-        self.stem_fx.get(&stem).unwrap_or(&self.flow_fx)
-    }
-
-    /// A channel with `deck_fx` tone controls and no per-stream inserts.
-    pub fn dj(deck_fx: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    /// A channel with a post-merge knob bank and no per-flow inserts.
+    pub fn dj(knob_fx: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
-            deck_fx: deck_fx.into_iter().map(Into::into).collect(),
+            knob_fx: knob_fx.into_iter().map(Into::into).collect(),
             ..Default::default()
         }
     }
@@ -344,16 +338,7 @@ impl MixerConfig {
     /// bad name inside a `stem_fx` override, which would otherwise only surface when that stem's
     /// chain was first built.
     pub fn build_chains(&self) -> Result<Vec<BuiltChains>, MixerError> {
-        self.channels
-            .iter()
-            .map(|channel| {
-                let flow = Stem::ALL
-                    .iter()
-                    .map(|stem| build_chain(channel.chain_names(*stem)))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok((flow, build_slots(&channel.deck_fx)?))
-            })
-            .collect()
+        self.channels.iter().map(build_channel_chains).collect()
     }
 
     /// Parses a mixer topology from TOML text.
@@ -421,16 +406,16 @@ impl From<MixerFile> for MixerConfig {
 /// ("does a cue still work, does the crossfader still isolate a deck?") has a new answer.
 pub fn simple_dj() -> MixerConfig {
     let deck_channels = |side: DeckSide| ChannelConfig {
+        // The tone prefix is part of the topology: `eq` is always there and `filter` is a fixed
+        // stage whose kind is the only choice. The reference leaves the two banks empty.
+        filter: FilterMode::Linear,
         flow_fx: vec![],
-        // The reference topology has no per-stem inserts: stems get the same (empty) template, and
-        // `[channel.stem_fx]` is how a user asks for one stem to differ.
-        stem_fx: std::collections::HashMap::new(),
-        deck_fx: vec!["eq".into(), "filter".into()],
+        knob_fx: vec![],
+        pad_fx: vec![],
         flow_fader: 0.0,
         deck_fader: 0.0,
         gain: 0.0,
         cue_send: 1.0,
-        fader: FaderPlace::PostFx,
         cue: CueTap::default(),
         side,
     };
@@ -470,15 +455,15 @@ pub fn silent_test_channel() -> MixerConfig {
     MixerConfig {
         channels: vec![ChannelConfig {
             flow_fx: vec![],
-            stem_fx: std::collections::HashMap::new(),
-            deck_fx: vec![],
+            knob_fx: vec![],
+            pad_fx: vec![],
             flow_fader: 0.0,
             deck_fader: 0.0,
             gain: 0.0,
             cue_send: 1.0,
-            fader: FaderPlace::PostFx,
             cue: CueTap::default(),
             side: DeckSide::Center,
+            ..Default::default()
         }],
         // `Center` on the side already takes the crossfader out of the path, so the curve is
         // irrelevant here — the default keeps the test config minimal.
@@ -497,10 +482,56 @@ pub fn build_slots(names: &[String]) -> Result<Vec<FxSlot>, MixerError> {
     names.iter().map(|name| build_slot(name)).collect()
 }
 
-/// One FX by name, at its defaults.
+/// One FX by name, at its defaults. Its role is the kind's name — a bank slot gets a numbered role
+/// from [`build_channel_chains`] instead.
 pub fn build_slot(name: &str) -> Result<FxSlot, MixerError> {
+    Ok(slot_with_role(name, None)?)
+}
+
+/// One FX by name with an explicit role (the slot's stable identity; see [`FxSlot`]).
+pub fn slot_with_role(name: &str, role: Option<&str>) -> Result<FxSlot, MixerError> {
     let kind = FxKind::parse(name).map_err(|_| MixerError::UnknownFx(name.to_owned()))?;
-    Ok(FxSlot::new(kind.build(), kind.name()))
+    Ok(match role {
+        Some(role) => FxSlot::with_role(kind.build(), kind.name(), role),
+        None => FxSlot::new(kind.build(), kind.name()),
+    })
+}
+
+/// Every chain one channel owns: the per-flow chains (the same tone prefix and `flowfx` slots for
+/// each flow) and the post-merge chain (knob bank, then pad bank).
+fn build_channel_chains(cfg: &ChannelConfig) -> Result<BuiltChains, MixerError> {
+    let flow = (0..Stem::COUNT)
+        .map(|_| {
+            // `eq` first, then the sweep — part of the path, not of any bank.
+            let mut slots = vec![
+                slot_with_role("eq", Some("eq"))?,
+                slot_with_role(cfg.filter.name(), Some("filter"))?,
+            ];
+            for (index, name) in cfg.flow_fx.iter().enumerate() {
+                slots.push(slot_with_role(name, Some(&format!("flowfx{}", index + 1)))?);
+            }
+            Ok(FxChain::from_slots(slots))
+        })
+        .collect::<Result<Vec<_>, MixerError>>()?;
+
+    let mut post = Vec::with_capacity(cfg.knob_fx.len() + cfg.pad_fx.len());
+    for (index, name) in cfg.knob_fx.iter().enumerate() {
+        post.push(slot_with_role(name, Some(&format!("knobfx{}", index + 1)))?);
+    }
+    for (index, name) in cfg.pad_fx.iter().enumerate() {
+        post.push(slot_with_role(name, Some(&format!("padfx{}", index + 1)))?);
+    }
+    Ok((flow, FxChain::from_slots(post)))
+}
+
+/// A chain whose slots carry numbered roles (`masterfx1`, `masterfx2`, …), for the master bus.
+pub fn build_chain_with_roles(names: &[String], prefix: &str) -> Result<FxChain, MixerError> {
+    let slots = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| slot_with_role(name, Some(&format!("{prefix}{}", index + 1))))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(FxChain::from_slots(slots))
 }
 
 /// Builds a chain from names.
@@ -511,7 +542,6 @@ pub fn build_chain(names: &[String]) -> Result<FxChain, MixerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fx::FxKind;
 
     #[test]
     fn simple_dj_is_the_documented_topology() {
@@ -521,14 +551,16 @@ mod tests {
         assert_eq!(cfg.outputs[0].role, OutputRole::Master);
         assert_eq!(cfg.outputs[1].role, OutputRole::Cue);
         for channel in &cfg.channels {
-            assert_eq!(channel.deck_fx, vec!["eq".to_owned(), "filter".to_owned()]);
-            // A cue that only sounds when you send to it is not a cue.
+            // The tone prefix is part of the path; the banks are the configurable part.
+            assert_eq!(channel.filter, FilterMode::Linear);
+            assert!(channel.flow_fx.is_empty() && channel.knob_fx.is_empty() && channel.pad_fx.is_empty());
             assert!(
                 channel.cue_send > -1.0,
                 "channels must reach the headphones"
             );
             assert_eq!(channel.flow_fader, 0.0, "both decks start at unity");
             assert_eq!(channel.gain, 0.0, "no channel starts with a trim");
+            assert_eq!(channel.cue, CueTap::Pre, "the reference cue is pre-fader");
         }
         assert_ne!(
             cfg.channels[0].side, cfg.channels[1].side,
@@ -546,7 +578,7 @@ mod tests {
         for name in cfg
             .channels
             .iter()
-            .flat_map(|c| c.deck_fx.iter().chain(c.flow_fx.iter()))
+            .flat_map(|c| c.all_fx())
             .chain(cfg.master_fx.iter())
         {
             build_slot(name).unwrap_or_else(|err| panic!("{name}: {err}"));
@@ -592,6 +624,8 @@ mod tests {
         )
         .unwrap();
         let channel = &cfg.channels[0];
+        assert_eq!(channel.filter, FilterMode::Linear, "the clean sweep by default");
+        assert!(channel.flow_fx.is_empty() && channel.knob_fx.is_empty() && channel.pad_fx.is_empty());
         assert_eq!(channel.flow_fader, 0.0, "unity by default");
         assert_eq!(channel.deck_fader, 0.0);
         assert_eq!(
@@ -599,9 +633,9 @@ mod tests {
             "a default channel does not spam the cue"
         );
         assert_eq!(
-            channel.fader,
-            FaderPlace::PostFx,
-            "the fader is after the chain by default, so a fade takes the tone with it"
+            channel.cue,
+            CueTap::Pre,
+            "the cue taps before the fader by default, so the fader never silences the monitor"
         );
         assert_eq!(channel.gain, 0.0, "the trim starts at 0 dB");
         assert_eq!(
@@ -616,7 +650,6 @@ mod tests {
             cfg.cue.blend, -1.0,
             "a default cue carries the cue and nothing else"
         );
-        assert!(channel.flow_fx.is_empty() && channel.deck_fx.is_empty());
         assert_eq!(cfg.outputs[0].channels, (0, 1));
         assert_eq!(cfg.outputs[0].gain, 1.0);
         assert_eq!(cfg.cue_fader, 0.0);
@@ -627,14 +660,14 @@ mod tests {
         assert_eq!(cfg.master_fader, 0.0);
         // The struct default and the `dj` helper agree with the parsed channel above.
         let default = ChannelConfig::default();
-        assert!(default.flow_fx.is_empty() && default.deck_fx.is_empty());
+        assert!(default.flow_fx.is_empty() && default.knob_fx.is_empty() && default.pad_fx.is_empty());
         assert_eq!(
             default.cue_send, 0.0,
             "a default channel must not spam the cue"
         );
         assert_eq!(default.side, DeckSide::default());
         let dj = ChannelConfig::dj(["eq"]);
-        assert_eq!(dj.deck_fx, vec!["eq".to_owned()]);
+        assert_eq!(dj.knob_fx, vec!["eq".to_owned()]);
         assert!(dj.flow_fx.is_empty());
     }
 
@@ -657,6 +690,18 @@ side = \"spinward\"",
             err.message()
         );
 
+        // The pre-bank spelling is gone: `stem_fx` and `chain` are refused by name rather than
+        // silently ignored, so an old topology file cannot half-load.
+        for gone in ["stem_fx", "chain"] {
+            let text = format!("[[channel]]\n{gone} = [\"eq\"]\n");
+            let err = MixerConfig::from_toml_str(&text).unwrap_err();
+            assert!(
+                err.message().contains(gone),
+                "`{gone}` should be named in the error, got: {}",
+                err.message()
+            );
+        }
+
         // An output without a name has nothing to log against.
         assert!(MixerConfig::from_toml_str("[[output]]\nrole = \"main\"").is_err());
         // Every error variant is displayable.
@@ -676,7 +721,7 @@ side = \"spinward\"",
     #[test]
     fn an_unknown_fx_is_a_construction_error_not_a_silent_skip() {
         let mut cfg = simple_dj();
-        cfg.channels[0].deck_fx.push("shimmer".into());
+        cfg.channels[0].knob_fx.push("shimmer".into());
         let err = cfg.build_chains().unwrap_err();
         assert!(matches!(err, MixerError::UnknownFx(_)));
         assert!(err.message().contains("shimmer"));
@@ -684,85 +729,90 @@ side = \"spinward\"",
         assert!(err.message().contains(FxKind::Eq.name()));
     }
 
+    /// The stage order and the banks: `eq`, `filter`, then the flow slots per flow; the post-merge
+    /// chain is the knob bank followed by the pad bank. Roles are numbered per bank.
     #[test]
-    fn chains_build_in_the_configured_order() {
-        let mut cfg = simple_dj();
-        cfg.channels[0].deck_fx = vec!["gain".into(), "eq".into()];
-        let chains = cfg.build_chains().unwrap();
-        let kinds: Vec<_> = chains[0].1.iter().map(|slot| slot.kind()).collect();
-        assert_eq!(kinds, vec!["gain", "eq"]);
-        assert_eq!(chains[0].0.len(), Stem::COUNT, "one stream chain per stem");
-        assert!(chains[0].0.iter().all(|chain| chain.is_empty()));
-    }
-
-    /// The template reaches every stem, and an override replaces it for exactly one.
-    #[test]
-    fn a_stem_override_replaces_the_template_for_that_stem_only() {
+    fn the_banks_build_in_the_documented_order_with_numbered_roles() {
         let mut cfg = simple_dj();
         cfg.channels[0].flow_fx = vec!["gain".into()];
-        cfg.channels[0]
-            .stem_fx
-            .insert(Stem::Vocals, vec!["filter".into(), "gain".into()]);
+        cfg.channels[0].knob_fx = vec!["echo".into(), "filter".into()];
+        cfg.channels[0].pad_fx = vec!["reverb".into()];
         let chains = cfg.build_chains().unwrap();
-        for stem in Stem::ALL {
-            let kinds: Vec<_> = chains[0].0[stem.index()]
+        let (flow, post) = &chains[0];
+        assert_eq!(flow.len(), Stem::COUNT, "one tone prefix per flow");
+
+        let kinds = |chain: &FxChain| -> Vec<(&'static str, String)> {
+            chain
                 .slots()
                 .iter()
-                .map(|slot| slot.kind())
-                .collect();
-            if stem == Stem::Vocals {
-                assert_eq!(kinds, vec!["filter", "gain"], "the override wins");
-            } else {
-                assert_eq!(kinds, vec!["gain"], "{stem} follows the template");
-            }
+                .map(|slot| (slot.kind(), slot.role().to_owned()))
+                .collect()
+        };
+        // Every flow carries the same prefix and the same `flowfx` slots, each its own instance.
+        for chain in flow {
+            let got = kinds(chain);
+            assert_eq!(
+                got,
+                vec![
+                    ("eq", "eq".to_owned()),
+                    ("filter", "filter".to_owned()),
+                    ("gain", "flowfx1".to_owned()),
+                ]
+            );
         }
+        assert!(!std::ptr::eq(&flow[0], &flow[1]), "flows must not share a chain");
         assert_eq!(
-            cfg.channels[0].chain_names(Stem::Drums),
-            ["gain".to_owned()]
-        );
-        assert_eq!(
-            cfg.channels[0].chain_names(Stem::Vocals),
-            ["filter".to_owned(), "gain".to_owned()]
+            kinds(post),
+            vec![
+                ("echo", "knobfx1".to_owned()),
+                ("filter", "knobfx2".to_owned()),
+                ("reverb", "padfx1".to_owned()),
+            ]
         );
     }
 
+    /// `filter` chooses the kind of the fixed stage; the slot's role stays `filter`, which is what a
+    /// mapped knob and `fx kind` rely on.
     #[test]
-    fn an_unknown_fx_in_a_stem_override_is_a_construction_error() {
-        let mut cfg = simple_dj();
-        cfg.channels[0]
-            .stem_fx
-            .insert(Stem::Vocals, vec!["shimmer".into()]);
-        let err = cfg.build_chains().unwrap_err();
-        assert!(matches!(err, MixerError::UnknownFx(_)), "{err:?}");
-        assert!(err.message().contains("shimmer"));
+    fn the_filter_kind_configures_the_fixed_stage() {
+        let cfg = MixerConfig::from_toml_str(
+            r#"
+            [[channel]]
+            filter = "moog"
+            "#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.channels[0].filter, FilterMode::Moog);
+        let chains = cfg.build_chains().unwrap();
+        let slot = &chains[0].0[0].slots()[1];
+        assert_eq!(slot.kind(), "moog");
+        assert_eq!(slot.role(), "filter");
     }
 
-    /// The TOML spelling of a per-stem override, which is the point of the field.
+    /// The `flowfx` bank is a template: every flow gets its own instance of every slot.
     #[test]
-    fn a_stem_override_parses_from_toml() {
+    fn a_flowfx_slot_exists_once_per_flow_but_is_one_control() {
         let text = r#"
             [[channel]]
-            side = "center"
-            deck_fx = ["eq"]
-            flow_fx = ["gain"]
-            [channel.stem_fx]
-            vocals = ["filter"]
+            flow_fx = ["filter", "echo"]
+            knob_fx = ["filter"]
+            pad_fx = []
         "#;
         let cfg = MixerConfig::from_toml_str(text).expect("parses");
-        assert_eq!(
-            cfg.channels[0].chain_names(Stem::Vocals),
-            ["filter".to_owned()]
-        );
-        assert_eq!(
-            cfg.channels[0].chain_names(Stem::Other),
-            ["gain".to_owned()]
-        );
-        assert!(cfg.build_chains().is_ok());
-        // An unknown stem name is a parse error, not a silently ignored key.
-        assert!(
-            MixerConfig::from_toml_str("[[channel]]\n[channel.stem_fx]\nguitar = [\"eq\"]\n")
-                .is_err()
-        );
+        let chains = cfg.build_chains().unwrap();
+        assert_eq!(chains[0].0.len(), 4);
+        for chain in &chains[0].0 {
+            assert_eq!(chain.len(), 2 + 2, "eq, filter, then two flow slots");
+            assert_eq!(chain.slots()[2].role(), "flowfx1");
+            assert_eq!(chain.slots()[3].role(), "flowfx2");
+        }
+        // And an unknown name in any bank is a construction error.
+        let mut cfg = cfg;
+        cfg.channels[0].flow_fx.push("shimmer".into());
+        assert!(matches!(
+            cfg.build_chains(),
+            Err(MixerError::UnknownFx(_))
+        ));
     }
 
     #[test]
