@@ -11,7 +11,7 @@
 
 use hypermixx_core::{OutputRole, Stem, CHANNELS};
 
-use super::channel::{CrossfaderCurve, CrossfaderPlace, DeckSide, FaderPlace};
+use super::channel::{CrossfaderCurve, CrossfaderPlace, CueTap, DeckSide, FaderPlace};
 use super::output::OutputId;
 use crate::fx::{FxChain, FxError, FxKind, FxSlot};
 /// Why a mixer could not be built from a config.
@@ -102,9 +102,11 @@ pub struct ChannelConfig {
     pub gain: f32,
     /// How much of this channel reaches the cue bus: **linear, 0.0 (off) ..= 1.0 (full)**.
     pub cue_send: f32,
-    /// Where the one channel fader sits relative to [`ChannelConfig::deck_fx`]. The cue send always
-    /// taps the signal just before it, so no second setting is needed.
+    /// Where the one channel fader sits relative to [`ChannelConfig::deck_fx`].
     pub fader: FaderPlace,
+    /// Which side of that fader the cue send taps: `pre` (default) keeps a channel cueable with its
+    /// fader down; `post` makes the fader silence the monitor too.
+    pub cue: CueTap,
     pub side: DeckSide,
 }
 
@@ -121,6 +123,7 @@ impl Default for ChannelConfig {
             gain: 0.0,
             cue_send: 0.0,
             fader: FaderPlace::default(),
+            cue: CueTap::default(),
             side: DeckSide::default(),
         }
     }
@@ -428,6 +431,7 @@ pub fn simple_dj() -> MixerConfig {
         gain: 0.0,
         cue_send: 1.0,
         fader: FaderPlace::PostFx,
+        cue: CueTap::default(),
         side,
     };
     MixerConfig {
@@ -473,6 +477,7 @@ pub fn silent_test_channel() -> MixerConfig {
             gain: 0.0,
             cue_send: 1.0,
             fader: FaderPlace::PostFx,
+            cue: CueTap::default(),
             side: DeckSide::Center,
         }],
         // `Center` on the side already takes the crossfader out of the path, so the curve is

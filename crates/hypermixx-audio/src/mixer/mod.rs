@@ -25,7 +25,7 @@ pub(crate) mod output;
 
 pub use bus::Bus;
 pub use channel::{
-    Channel, CrossfaderCurve, CrossfaderPlace, DeckSide, FaderPlace, SlotChain,
+    Channel, CrossfaderCurve, CrossfaderPlace, CueTap, DeckSide, FaderPlace, SlotChain,
     DEFAULT_CUT_WIDTH,
 };
 pub use config::{

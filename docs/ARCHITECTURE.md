@@ -212,19 +212,22 @@ mixer 只负责把 deck 变成采样;谁跟谁、共享 BPM 是什么,是**关�
     → flow_fx[i]      逐流插入(换流即重置滤波记忆;**每 stream 一条,状态独立**)
     → flow_fader[i]   逐流电平(只衰减,行程顶端 0 dB;这是**每 stem 的**电平)
     → Σ 到 channel bus
-  → [cue tap]         恒在 channel fader **之前**
+  → [cue tap]         `[channel] cue = "pre"`(缺省)时在这里
   → fader             通道**唯一**的一颗 fader;`[channel] fader = "pre_fx"` 放在这里
+  → [cue tap]         `cue = "post"` 时在这里(推子的另一侧)
   → chain             通道插入(跨跳转持久,整 deck 共用;`[channel] chain = [...]`)
-  → [cue tap]         `fader = "post_fx"` 时在这里
+  → [cue tap]         `fader = "post_fx"` 时在这里(cue = "pre")
   → fader
+  → [cue tap]         `fader = "post_fx"` + `cue = "post"` 时在这里
   → gain              channel trim:0 dB .. +6 dB(唯一能 boost 的一级)
   → 求和
 ```
 
 **一通道一颗 fader,位置是配置**:`pre_fx` = 历史上的 flow fader 位置(先衰减再进音色),
-`post_fx` = 历史上的 deck fader 位置(缺省,音色随电平一起衰减)。**precue send 永远抽在
-fader 之前**,所以把推子拉到底只静音房间、不静音耳机——这就是 cue 的意义;也因此
-`cue_tap` 不再是配置项(它由 fader 位置唯一确定),TOML 只配一次 channel。
+`post_fx` = 历史上的 deck fader 位置(缺省,音色随电平一起衰减)。cue send 抽在 fader 的
+**某一侧**,`[channel] cue = "pre"`(缺省)是推子之前——把推子拉到底只静音房间、不静音耳机,
+这就是 cue 的意义;`cue = "post"` 抽在推子之后(仍是 crossfader 之前),所以推子会连耳机
+一起关,这是给 scratch/throw 用法的一个显式选项,不是缺省。
 
 共享 crossfader 的按侧增益坐在三个位置之一(`[crossfader] place = source|flow|deck`,
 缺省 `deck` = 历史位置),**恒在该位置的 cue tap 之后**,所以分叉点与它是同一点时 cue 不受
@@ -240,7 +243,7 @@ crossfader 影响;分叉在它之后则跟着它(把 crossfader 放早的代价,
 
 1. limiter 是 `MasterBus` 的字段而非槽位——配置忘写 `"limiter"` 也不可能把全尺度音频
    送到 DAC(且不走链跳过优化,engaged 即执行)
-2. cue tap 是"fader 前"这一个点,由 fader 位置决定,不是自由路由
+2. cue tap 只有 fader 两侧两个点(`pre`/`post`),没有第三种路由
 3. **fader 只衰减**:`fader_amp` 的上半段恒为 1.0;headroom 只在 `gain`(`trim_amp`,+6 dB 封顶)
 4. 阶段顺序本身
 

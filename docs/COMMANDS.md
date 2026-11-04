@@ -334,6 +334,7 @@ CPU 与 CUDA 的结果 Σ 残差一致（实测都是 −32.9 dB 量级），但
 ```toml
 [[channel]]
 chain = ["eq", "filter"]       # 共享：整个通道一条链（旧名 deck_fx 仍接受）
+cue = "pre"                    # pre | post：cue send 抽在 fader 的哪一侧（post 时推子连耳机一起关）
 flow_fx = ["gain"]             # 模板：每条 stream 各建一条独立的链（4 stems = 4 条）
 [channel.stem_fx]              # 覆写：这里写了的 stem 用它，其余继承模板
 vocals = ["gain", "filter"]

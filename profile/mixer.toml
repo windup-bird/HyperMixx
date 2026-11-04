@@ -8,8 +8,9 @@
 #   fader = "pre_fx":   Σ → [cue tap] → fader → chain → gain                 │
 #   fader = "post_fx":  Σ → chain → [cue tap] → fader → gain                 │
 #
-# The cue send always taps the signal immediately before the fader, so pulling it down never
-# silences the headphones — that is what cueing a track in means.
+# `cue` picks which side of that fader the cue send taps. `pre` (default) is what cueing a track
+# in means: the headphones hear the channel with the fader down. `post` feeds the monitor the
+# faded signal, so the fader silences the headphones too (still before the crossfader).
 #
 # Every fader is attenuation only: the top of its travel is 0 dB. Headroom is `gain` (up to +6 dB),
 # which is a setting rather than a performance control.
@@ -18,6 +19,7 @@
 [[channel]]
 side = "left"                 # left | right | center
 fader = "post_fx"             # pre_fx | post_fx — where the one channel fader acts, relative to `chain`
+cue = "pre"                   # pre | post — which side of that fader the cue send taps
 chain = ["eq", "filter"]      # the channel's inserts (durable tone controls); names from `fx help`
 # deck_fader = 0.0            # the channel fader's starting level; top of travel = 0 dB
 # gain = 0.0                  # channel trim: 0 = 0 dB, +1 = +6 dB, -1 = silence
@@ -30,6 +32,7 @@ cue_send = 1.0                # linear 0..1 into the cue bus (always pre-fader)
 [[channel]]
 side = "right"
 fader = "post_fx"
+cue = "pre"
 chain = ["eq", "filter"]
 cue_send = 1.0
 
