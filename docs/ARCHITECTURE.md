@@ -211,10 +211,11 @@ mixer 只负责把 deck 变成采样;谁跟谁、共享 BPM 是什么,是**关�
     → source_fader[i] 逐流**门**:stem 的 mute/solo 决策,恰好 1.0 或 0.0(GATE_TAU 平滑)
     → [crossfader at "source"]
     → flow_fader[i]   逐流电平(只衰减,行程顶端 0 dB;这是**每 stem 的**电平)
+    → gain             channel trim:0 dB .. +6 dB(唯一能 boost 的一级;在 flow fader 之后、
+                       eq 之前,所以音色前缀看到的是 trim 过的信号;autogain 将来插在两者之间)
     → eq → filter → flowfx…   逐流链:固定前缀 + `flowfx` 槽;**每 flow 一套实例**(状态独立)
     → Σ 到 channel bus
   → [crossfader at "flow"]
-  → gain              channel trim:0 dB .. +6 dB(唯一能 boost 的一级;在 flow 求和之后)
   → knobfx… → padfx…  合并后链:knob 组然后 pad 组(各一个实例)
   → [cue tap]         `[channel] cue = "pre"`(缺省)时在这里
   → fader             通道**唯一**的一颗 fader(位置固定,在两条 bank 之后)

@@ -3,9 +3,9 @@
 #
 # Signal path, per channel. The stage order is fixed; configuration decides what sits in each bank:
 #
-#   per flow:   source fader (stem mute/solo gate) → flow fader → eq → filter → flowfx… ─┐
-#                                                                             Σ ────────┘
-#   per deck:   trim → knobfx… → padfx… → [cue tap `pre`] → fader → [cue tap `post`]
+#   per flow:   source fader (stem mute/solo gate) → flow fader → trim → eq → filter → flowfx… ─┐
+#                                                                                     Σ ────────┘
+#   per deck:   knobfx… → padfx… → [cue tap `pre`] → fader → [cue tap `post`]
 #               → crossfader → master
 #
 # `eq` and `filter` are part of the path (the only choice is the sweep's kind); `flowfx` runs on

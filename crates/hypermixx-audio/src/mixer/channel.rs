@@ -515,15 +515,16 @@ impl Channel {
     /// Renders one block through the fixed chain, leaving the result in the channel's own bus.
     ///
     /// ```text
-    /// per flow: gate → [crossfader at `source`] → flow fader → eq → filter → flowfx… ─┐
-    ///                                                                              Σ │
-    /// per deck: [crossfader at `flow`] → trim → knobfx… → padfx…                    │
+    /// per flow: gate → [crossfader at `source`] → flow fader → trim → eq → filter → flowfx… ─┐
+    ///                                                                                      Σ │
+    /// per deck: [crossfader at `flow`] → knobfx… → padfx…                                   │
     ///           → [cue tap `pre`] → fader → [cue tap `post`] → [crossfader at `deck`]
     /// ```
     ///
     /// `eq` and the sweep are part of the flow's prefix, so the per-flow inserts run *after* the
     /// tone controls and *before* the merge — which is the whole point of the order. The trim sits
-    /// on the flow sum, so it drives the post-merge banks as a real channel trim does.
+    /// right after the flow fader (the plan's `flowfader → autogain → gain → eq`), so the prefix and
+    /// the inserts see the trimmed signal; autogain will slot in between them.
     ///
     /// Returns a borrow of that bus so the mixer can sum it; the data is the channel's, so a
     /// consumer must read it before driving this channel again.
@@ -557,6 +558,13 @@ impl Channel {
         }
         self.deck.render_streams(&mut stream_buses[..live]);
 
+        // The trim advances once per block, not once per flow: stepping it per stream would shorten
+        // its time constant by the stream count. It is applied per flow, though — the plan puts it
+        // right after the flow fader (`flowfader → autogain → gain → eq …`), so the tone prefix and
+        // the per-flow inserts see the trimmed signal. Autogain will slot in between the two.
+        let trim = self.gain.next_block(ctx.block_frames, ctx.sample_rate);
+        let trim_gain = if trim != 0.0 { trim_amp(trim) } else { 1.0 };
+
         for (stream, sb) in stream_buses[..live].iter_mut().enumerate() {
             // The source gate is the stem mute/solo decision: exactly 1.0 or 0.0, smoothed so a mute
             // is a fade rather than a step. Before the flow chain, so a muted stem's reverb tail goes
@@ -569,7 +577,11 @@ impl Channel {
                 sb.scale(side_gain);
             }
             sb.scale(self.flow_fader[stream].next_amp(ctx));
-            // The tone prefix and the per-flow inserts run after the flow fader, before the sum.
+            if trim != 0.0 {
+                sb.scale(trim_gain);
+            }
+            // The tone prefix and the per-flow inserts run after the flow fader and the trim, before
+            // the sum.
             if self.flow_chains[stream].any_active() {
                 self.flow_chains[stream].process(sb, ctx);
             }
@@ -580,12 +592,6 @@ impl Channel {
             bus.scale(side_gain);
         }
 
-        // The channel trim sits on the flow sum: the only stage that can boost, and it drives the
-        // post-merge banks, exactly like a channel trim on a hardware mixer.
-        let trim = self.gain.next_block(ctx.block_frames, ctx.sample_rate);
-        if trim != 0.0 {
-            bus.scale(trim_amp(trim));
-        }
         if self.post_fx.any_active() {
             self.post_fx.process(&mut bus, ctx);
         }
@@ -960,6 +966,47 @@ mod tests {
         assert!(channel.peak() < 1e-4, "a right channel at hard left still sounded");
         // The cue is taken *before* the crossfader, so a channel faded out of the mix still cues.
         assert!(channel.cue().peak() > 0.0, "cue must ignore the crossfader");
+    }
+
+    /// A non-linear insert makes the trim's *position* observable: the plan puts it right after the
+    /// flow fader, so a squaring insert sees the trimmed signal (output ∝ gain², not gain).
+    #[test]
+    fn the_trim_runs_before_the_flow_chain() {
+        struct Square;
+        impl Fx for Square {
+            fn process(&mut self, bus: &mut Bus, _ctx: &FxContext) {
+                for sample in bus.l.iter_mut().chain(bus.r.iter_mut()) {
+                    *sample = *sample * *sample;
+                }
+            }
+        }
+        let measure = |gain: f32| -> f32 {
+            let mut channel = Channel::new(
+                tone_deck(),
+                &ChannelConfig {
+                    cue_send: 0.0,
+                    gain,
+                    ..Default::default()
+                },
+                CrossfaderConfig::default(),
+                vec![FxChain::from_parts([("square", Box::new(Square) as Box<dyn Fx>)])],
+                FxChain::new(),
+            );
+            channel.deck_mut().play();
+            for _ in 0..40 {
+                channel.process(&ctx());
+            }
+            channel.peak()
+        };
+        let unity = measure(0.0);
+        assert!(unity > 0.5, "reference: {unity}");
+        // The bottom half of the trim law: -0.5 is a quarter of the amplitude.
+        let trimmed = measure(-0.5);
+        let ratio = trimmed / unity;
+        assert!(
+            (ratio - 0.0625).abs() < 0.01,
+            "trim must be inside the flow chain (gain² = 0.0625), got ratio {ratio}"
+        );
     }
 
     /// The cue tap sits after the flow chains *and* after the post-merge banks: a pre-fader cue is
