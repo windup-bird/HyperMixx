@@ -971,17 +971,19 @@ impl App {
                 .and_then(|meters| meters.channels.get(deck))
                 .map(|levels| levels.gain);
         }
-        let (kind, param) = match knob {
+        let (role, param) = match knob {
             Knob::Gain => unreachable!("handled above"),
             Knob::High => ("eq", "high"),
             Knob::Mid => ("eq", "mid"),
             Knob::Low => ("eq", "low"),
+            // Matched by **role**, not kind: the filter slot can hold `moog` instead of `filter`
+            // without the knob losing its home.
             Knob::Filter => ("filter", "value"),
         };
         self.deck_fx
             .get(deck)?
             .iter()
-            .find(|slot| slot.kind.eq_ignore_ascii_case(kind))
+            .find(|slot| slot.role.eq_ignore_ascii_case(role))
             .and_then(|slot| {
                 slot.params
                     .iter()
@@ -991,8 +993,10 @@ impl App {
     }
 
     /// The slot index of a knob's effect in the deck chain, for [`Command::SetFxParam`].
+    ///
+    /// Addressed by role so a swapped effect (`filter` → `moog`) stays under the same knob.
     pub fn knob_slot(&self, deck: usize, knob: Knob) -> Option<usize> {
-        let kind = match knob {
+        let role = match knob {
             Knob::Gain => return None,
             Knob::High | Knob::Mid | Knob::Low => "eq",
             Knob::Filter => "filter",
@@ -1000,7 +1004,7 @@ impl App {
         self.deck_fx
             .get(deck)?
             .iter()
-            .find(|slot| slot.kind.eq_ignore_ascii_case(kind))
+            .find(|slot| slot.role.eq_ignore_ascii_case(role))
             .map(|slot| slot.index)
     }
 

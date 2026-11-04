@@ -53,6 +53,11 @@ pub struct FxSlotRef {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FxSlotStatus {
     pub index: usize,
+    /// Stable identity of the *position*, independent of what is in it (`eq`, `filter`, `fx`, ...).
+    /// A front-end finds its knob's slot by role, so swapping `filter` for `moog` in that slot does
+    /// not move the control out from under the user.
+    pub role: String,
+    /// What is actually in the slot right now.
     pub kind: String,
     pub enabled: bool,
     /// `(name, value)` pairs, in the order the effect declares them.
@@ -644,6 +649,16 @@ pub enum Command {
         name: String,
         value: f32,
     },
+    /// Replaces the effect in a slot, keeping the position, the role and the on/off state. This is
+    /// how a fixed slot's effect changes at run time (`filter` → `moog`, a pad bank retargeted
+    /// between echo and reverb) without renumbering anything a map is bound to.
+    ///
+    /// Parameters whose names the new effect also declares keep their value; the rest take the new
+    /// effect's defaults. A new instance is prepared at the engine's rate before its first block.
+    SetFxKind {
+        slot: FxSlotRef,
+        kind: String,
+    },
     /// Sets the parameter at `index` in the effect's declared parameter order. A mutable FX slot
     /// uses this form because its parameter names change when the effect is swapped.
     SetFxParamIndex {
@@ -899,6 +914,11 @@ impl std::fmt::Debug for Command {
                 .field("slot", slot)
                 .field("index", index)
                 .field("value", value)
+                .finish(),
+            Command::SetFxKind { slot, kind } => f
+                .debug_struct("SetFxKind")
+                .field("slot", slot)
+                .field("kind", kind)
                 .finish(),
             Command::FxTrigger { slot } => f.debug_struct("FxTrigger").field("slot", slot).finish(),
             Command::PadPress { slot } => f.debug_struct("PadPress").field("slot", slot).finish(),

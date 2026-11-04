@@ -19,8 +19,11 @@ pub type FxTarget = hypermixx_core::FxSlotRef;
 /// One effect in a chain, plus its bypass and pad-latch state.
 pub struct FxSlot {
     fx: Box<dyn Fx>,
-    /// Stable identity for reporting (`"eq"`, `"filter"`, ...), independent of position.
+    /// What is in the slot *now* (`"eq"`, `"moog"`, ...).
     kind: &'static str,
+    /// Stable identity of the position, independent of what is in it. A front-end finds its knob
+    /// by role, so [`FxSlot::replace`] can change the effect without moving the control.
+    role: &'static str,
     enabled: AtomicBool,
     /// Audio-thread memory of the previous block's engagement, to catch a bypass→engage edge and
     /// call [`Fx::reset`] exactly once.
@@ -35,10 +38,17 @@ pub struct FxSlot {
 
 impl FxSlot {
     pub fn new(fx: Box<dyn Fx>, kind: &'static str) -> Self {
+        Self::with_role(fx, kind, kind)
+    }
+
+    /// A slot whose role is not its current kind: a fixed stage (`filter`) that may hold one of
+    /// several variants (`linear`, `moog`).
+    pub fn with_role(fx: Box<dyn Fx>, kind: &'static str, role: &'static str) -> Self {
         let enabled = true;
         Self {
             fx,
             kind,
+            role,
             enabled: AtomicBool::new(enabled),
             was_enabled: enabled,
             pad_held: Cell::new(None),
@@ -63,6 +73,30 @@ impl FxSlot {
 
     pub fn kind(&self) -> &'static str {
         self.kind
+    }
+
+    /// The slot's stable position identity; see [`FxSlot::replace`].
+    pub fn role(&self) -> &'static str {
+        self.role
+    }
+
+    /// Replaces the effect, keeping the slot's role, engagement and pad latch.
+    ///
+    /// Parameters are matched **by name**: `value`/`resonance` survive `filter` → `moog`, while a
+    /// retarget from `echo` to `reverb` only carries `mix` and takes the rest from the new effect's
+    /// defaults. A value the new effect refuses is dropped — every effect validates its own range,
+    /// and inventing a fallback here would hide a map that points at the wrong parameter. The new
+    /// instance has no state, and `process` calls its `reset` exactly once before the first block.
+    pub fn replace(&mut self, fx: Box<dyn Fx>, kind: &'static str) {
+        let carried = super::param_snapshot(&*self.fx);
+        self.kind = kind;
+        self.fx = fx;
+        self.was_enabled = false;
+        for (name, value) in carried {
+            if self.fx.get_param(&name).is_some() {
+                let _ = self.fx.set_param(&name, value);
+            }
+        }
     }
 
     #[inline]
@@ -154,6 +188,7 @@ impl FxSlot {
     pub fn status(&self, index: usize) -> FxSlotStatus {
         FxSlotStatus {
             index,
+            role: self.role.to_owned(),
             kind: self.kind.to_owned(),
             enabled: self.is_enabled(),
             params: super::param_snapshot(&*self.fx),

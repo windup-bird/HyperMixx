@@ -303,7 +303,9 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 - `Param` — 参数跨线程的唯一通道:双原子(u32 位转换)+ 指数逼近,块级(`next_block`)
   或逐样本(`next_sample`)步进;`alpha≥1` snap、NaN 消毒、settled 收尾——扫频不
   zipper、fader 移动不咔哒
-- `FxSlot` — 拥有效果实例(`Box<dyn Fx>`);bypass→engage 边沿触发 `Fx::reset()`
+- `FxSlot` — 拥有效果实例(`Box<dyn Fx>`)+**role**:role 是槽位的固定身份,`kind` 是里面现在装的效果;
+  `FxSlot::replace` 换效果时保留 role/开关/pad latch,并把同名参数带过去(所以 `filter`↔`moog` 换完
+  旋钮不跳),新实例按引擎率 `prepare` 后下一块重新 `reset`;bypass→engage 边沿触发 `Fx::reset()`
   (不带陈旧滤波器记忆复活的咔哒声);pad 按住即 engaged,松开恢复最近意图
 - `FxChain` — `Vec<FxSlot>` 有序表,槽位增删在 producer 线程块边界(move,无锁热交换)
 - `dsp.rs` — RBJ biquad(LPF/HPF/BPF/bell/shelf):bell 用 `10^(dB/20)`、shelf 用

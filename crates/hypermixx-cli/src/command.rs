@@ -50,13 +50,23 @@ pub enum UiEvent {
     },
 }
 
-/// The slot kinds of every chain.
+/// One slot as the front-end remembers it: the stable **role** of the position, and what is in it
+/// now. They differ after `fx kind` swaps the effect, and every lookup prefers the role — that is
+/// what keeps a mapped knob on its slot when `filter` becomes `moog`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotEntry {
+    pub role: String,
+    pub kind: String,
+}
+
+/// The slots of every chain.
 ///
 /// The front-end owns all chain mutations, so it can keep this accurate without asking the engine:
-/// `FxAdded` appends, a dispatched `fx remove` drops locally, and `fx list` replaces. It is filled
-/// once at startup (see [`Dispatcher::prime`]) so a slot can be named from the very first command.
+/// `FxAdded` appends, a dispatched `fx remove` drops locally, `fx kind` replaces the kind, and
+/// `fx list` replaces the whole chain. It is filled once at startup (see [`Dispatcher::prime`]) so
+/// a slot can be named from the very first command.
 pub struct SlotBook {
-    slots: Mutex<HashMap<String, Vec<String>>>,
+    slots: Mutex<HashMap<String, Vec<SlotEntry>>>,
 }
 
 impl Default for SlotBook {
@@ -75,7 +85,13 @@ impl SlotBook {
                 if let Ok(mut book) = self.slots.lock() {
                     book.insert(
                         chain.label(),
-                        slots.iter().map(|slot| slot.kind.clone()).collect(),
+                        slots
+                            .iter()
+                            .map(|slot| SlotEntry {
+                                role: slot.role.clone(),
+                                kind: slot.kind.clone(),
+                            })
+                            .collect(),
                     );
                 }
             }
@@ -83,7 +99,13 @@ impl SlotBook {
                 if let Ok(mut book) = self.slots.lock() {
                     let entry = book.entry(chain.label()).or_default();
                     if *index <= entry.len() {
-                        entry.insert(*index, kind.clone());
+                        entry.insert(
+                            *index,
+                            SlotEntry {
+                                role: kind.clone(),
+                                kind: kind.clone(),
+                            },
+                        );
                     }
                 }
             }
@@ -91,7 +113,10 @@ impl SlotBook {
         }
     }
 
-    /// Resolves a slot argument: a bare index, or an effect name.
+    /// Resolves a slot argument: a bare index, a role (`filter`), or an effect name (`echo`).
+    ///
+    /// The role is tried first, so `filter` keeps addressing the same slot after the effect in it
+    /// was swapped for `moog` (whose kind name would otherwise be all that matched).
     pub fn resolve(&self, chain: &str, token: &str) -> Result<usize, String> {
         if let Ok(index) = token.parse::<usize>() {
             return Ok(index);
@@ -101,11 +126,29 @@ impl SlotBook {
             .lock()
             .map_err(|_| "slot book poisoned".to_owned())?;
         match book.get(chain) {
-            Some(kinds) => kinds
+            Some(entries) => entries
                 .iter()
-                .position(|kind| kind.eq_ignore_ascii_case(token))
-                .ok_or_else(|| format!("no `{token}` in {chain}; slots are {}", list_kinds(kinds))),
+                .position(|entry| entry.role.eq_ignore_ascii_case(token))
+                .or_else(|| {
+                    entries
+                        .iter()
+                        .position(|entry| entry.kind.eq_ignore_ascii_case(token))
+                })
+                .ok_or_else(|| {
+                    format!("no `{token}` in {chain}; slots are {}", list_slots(entries))
+                }),
             None => Err(format!("{chain} has no known slots")),
+        }
+    }
+
+    /// Records a `fx kind` this front-end sent. The engine validated the name, so no round-trip.
+    pub fn set_kind(&self, chain: &str, index: usize, kind: &str) {
+        if let Ok(mut book) = self.slots.lock() {
+            if let Some(entries) = book.get_mut(chain) {
+                if let Some(entry) = entries.get_mut(index) {
+                    entry.kind = kind.to_owned();
+                }
+            }
         }
     }
 
@@ -120,8 +163,8 @@ impl SlotBook {
         }
     }
 
-    /// A copy of the slot kinds, for the completer (cheap: a handful of chains).
-    pub fn snapshot(&self) -> HashMap<String, Vec<String>> {
+    /// A copy of the slots, for the completer (cheap: a handful of chains).
+    pub fn snapshot(&self) -> HashMap<String, Vec<SlotEntry>> {
         self.slots
             .lock()
             .map(|book| book.clone())
@@ -1343,6 +1386,32 @@ fn fx<'a>(
             dispatcher.slots().remove(&chain.label(), index);
             action
         }
+        // Swap the effect *in* a slot: same index, same role, same on/off state. The kind is
+        // validated here, so the local slot book can be updated without a round-trip.
+        "kind" => {
+            let index = match resolve_slot(words.next(), chain, dispatcher) {
+                Ok(index) => index,
+                Err(e) => return Action::Failed(e),
+            };
+            let Some(kind) = words.next() else {
+                return Action::Failed("usage: [deck|master] fx kind <slot> <kind>".into());
+            };
+            let parsed = match FxKind::parse(kind) {
+                Ok(parsed) => parsed,
+                Err(err) => return Action::Failed(err.message()),
+            };
+            let action = send(
+                command_tx,
+                Command::SetFxKind {
+                    slot: FxSlotRef { chain, index },
+                    kind: kind.to_owned(),
+                },
+            );
+            dispatcher
+                .slots()
+                .set_kind(&chain.label(), index, parsed.name());
+            action
+        }
         "list" | "ls" => send(command_tx, Command::ListFx { chain }),
         // The engine owns a slot's a/b state, so a toggle is a command rather than a front-end flip.
         "toggle" | "tgl" => {
@@ -1448,11 +1517,11 @@ fn parse_param_value(_param: &str, raw: &str) -> Result<f32, String> {
         .map_err(|_| format!("value must be a number, got `{raw}`"))
 }
 
-fn list_kinds(kinds: &[String]) -> String {
-    kinds
+fn list_slots(entries: &[SlotEntry]) -> String {
+    entries
         .iter()
         .enumerate()
-        .map(|(index, kind)| format!("{index} {kind}"))
+        .map(|(index, entry)| format!("{index} {}", entry.role))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -2900,6 +2969,34 @@ mod tests {
             dispatch("play", &dispatcher, &pipeline, Backend::Auto, 2, Some(1)),
             Action::Failed(_)
         ));
+    }
+
+    /// `fx kind` swaps the effect in a slot and the slot book follows it: the role keeps resolving
+    /// (`filter`), the new kind resolves too, and a parameter set through the role still lands.
+    #[test]
+    fn fx_kind_swaps_the_effect_but_keeps_the_role_addressable() {
+        let cfg = hypermixx_audio::MixerConfig {
+            outputs: vec![],
+            ..hypermixx_audio::simple_dj()
+        };
+        let pipeline =
+            hypermixx_audio::AudioPipeline::start(cfg).expect("a headless engine starts");
+        let (notice_tx, _notice_rx) = unbounded();
+        let dispatcher = Dispatcher::new(pipeline.command_tx(), notice_tx);
+        dispatcher.prime(1, pipeline.response_rx());
+
+        // The reference channel is `[eq, filter]`.
+        assert_eq!(dispatcher.slots().resolve("deck1", "filter"), Ok(1));
+        for line in ["deck1 fx kind filter moog", "deck1 fx set filter value -0.3"] {
+            let action = dispatch(line, &dispatcher, &pipeline, Backend::Auto, 2, Some(0));
+            assert!(
+                !matches!(action, Action::Failed(_)),
+                "`{line}` failed: {action:?}"
+            );
+        }
+        // The role is stable across the swap, and the kind is now a second name for the same slot.
+        assert_eq!(dispatcher.slots().resolve("deck1", "filter"), Ok(1));
+        assert_eq!(dispatcher.slots().resolve("deck1", "moog"), Ok(1));
     }
 
     /// `profile show` names what this session runs with, and `profile reload` switches the parts of

@@ -249,8 +249,9 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 `deck1 fx …` 作用于 deck1。
 
 ```
-[deck|master] fx add <kind>                追加到链尾（eq|filter|gain|limiter|echo|reverb|flanger|phaser|cut，含别名）
+[deck|master] fx add <kind>                追加到链尾（eq|filter|moog|gain|limiter|echo|reverb|flanger|phaser|cut，含别名）
 [deck|master] fx remove|rm <slot>          删除该槽，后续槽位前移
+[deck|master] fx kind <slot> <kind>        换掉槽里的效果（序号、role、开关状态都不变）
 [deck|master] fx toggle <slot>             翻转槽位（引擎持有状态，前端不留镜像）
 [deck|master] fx list|ls                   列出槽位：索引、kind、开关、参数
 [deck|master] fx set <slot> <param> <value>   设参数（指数平滑，不咔哒）
@@ -260,8 +261,10 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 [deck|master] fx help|h                    效果清单（从注册表生成，永不与引擎脱节）
 ```
 
-- `<slot>` 可以是**索引**或**效果名**（启动时已 `ListFx` 预载，无需先 `list`）。
-  效果名按链内第一个同名槽解析。
+- `<slot>` 可以是**索引**、**role** 或**效果名**（启动时已 `ListFx` 预载，无需先 `list`）。
+  **role 优先**：槽位有一个与内容无关的固定身份（`eq`、`filter`、`echo`…），`fx kind` 换掉效果后
+  role 不变，所以 `fx set filter value -0.3` 在槽里换成 `moog` 之后仍然指同一个槽
+  （`fx list` 会显示成 `filter (moog)`）。效果名按链内第一个同名槽解析。
 - MIDI map 的 `fx param` 可以写参数名，也可以写 1-based 序号（`fx param 1`）；序号按效果
   当前声明的参数顺序解析，给可切换效果的 `fx1/fx2/fx3` 指针槽使用。
 - 内置效果与参数（`fx help` 输出，来自 `FxKind::ALL` 注册表）：

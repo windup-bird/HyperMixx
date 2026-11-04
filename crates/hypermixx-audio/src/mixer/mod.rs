@@ -42,7 +42,7 @@ use hypermixx_core::{CommandResponse, FxChainId, FxSlotStatus, KeylockSettings, 
 use channel::Channel as ChannelInner;
 use crate::deck::Deck;
 use crate::fx::sample::Fader;
-use crate::fx::{FxChain, FxContext, FxSlot, FxTarget};
+use crate::fx::{FxChain, FxContext, FxKind, FxSlot, FxTarget};
 use crate::BLOCK_SIZE;
 #[cfg(test)]
 use crate::SAMPLE_RATE;
@@ -713,6 +713,23 @@ impl Mixer {
                 }
                 None => CommandResponse::Error(slot_error(&slot)),
             },
+            Command::SetFxKind { slot, kind } => match FxKind::parse(&kind) {
+                Ok(parsed) => {
+                    let rate = self.sample_rate;
+                    match self.resolve_fx_mut(&slot) {
+                        Some(found) => {
+                            // Same position, same role, same engagement; only the effect changes.
+                            // Parameters with a shared name (a filter's `value`/`resonance`) carry
+                            // over, so a swap under a mapped knob is seamless.
+                            found.replace(parsed.build(), parsed.name());
+                            found.prepare(rate);
+                            CommandResponse::Ok
+                        }
+                        None => CommandResponse::Error(slot_error(&slot)),
+                    }
+                }
+                Err(err) => CommandResponse::Error(err.message()),
+            },
             Command::SetFxParam { slot, name, value } => match self.resolve_fx(&slot) {
                 Some(found) => match found.set_param(&name, value) {
                     Ok(()) => CommandResponse::Ok,
@@ -1297,6 +1314,76 @@ mod tests {
             mixer.channel(0).unwrap().slot_statuses(SlotChain::Deck).unwrap().len(),
             base
         );
+    }
+
+    /// A fixed slot changes its effect without moving: same index, same role, same engagement, and
+    /// the parameters both effects declare survive — that is what lets a mapped knob ride a
+    /// `filter` → `moog` swap without jumping.
+    #[test]
+    fn swapping_a_slots_effect_keeps_its_role_index_and_engagement() {
+        use hypermixx_core::Command;
+        let mut mixer = loaded(simple_dj(), 1);
+        // The reference channel is `[eq, filter]`, so the sweep is slot 1, role "filter".
+        let slot = FxTarget {
+            chain: FxChainId::Deck(0),
+            index: 1,
+        };
+        assert_eq!(mixer.resolve_fx(&slot).unwrap().role(), "filter");
+        mixer.handle_fx_command(Command::SetFxParam {
+            slot,
+            name: "value".into(),
+            value: -0.4,
+        });
+        mixer.handle_fx_command(Command::SetFxParam {
+            slot,
+            name: "resonance".into(),
+            value: 0.8,
+        });
+        mixer.handle_fx_command(Command::SetFxEnabled { slot, enabled: false });
+
+        match mixer.handle_fx_command(Command::SetFxKind {
+            slot,
+            kind: "moog".into(),
+        }) {
+            CommandResponse::Ok => {}
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        let swapped = mixer.resolve_fx(&slot).unwrap();
+        assert_eq!(swapped.kind(), "moog");
+        assert_eq!(
+            swapped.role(),
+            "filter",
+            "the position identity must not move with the effect"
+        );
+        assert!(
+            !swapped.is_enabled(),
+            "a bypassed slot stays bypassed across the swap"
+        );
+        assert_eq!(swapped.get_param("value"), Some(-0.4));
+        assert_eq!(swapped.get_param("resonance"), Some(0.8));
+
+        // The protocol reports both: the role a map binds, and the kind that is in the slot.
+        match mixer.handle_fx_command(Command::ListFx {
+            chain: FxChainId::Deck(0),
+        }) {
+            CommandResponse::FxListed { slots, .. } => {
+                assert_eq!(slots[1].role, "filter");
+                assert_eq!(slots[1].kind, "moog");
+            }
+            other => panic!("expected FxListed, got {other:?}"),
+        }
+        // An unknown kind is an answer, not a broken slot: the old effect stays.
+        assert!(matches!(
+            mixer.handle_fx_command(Command::SetFxKind {
+                slot,
+                kind: "shimmer".into()
+            }),
+            CommandResponse::Error(_)
+        ));
+        assert_eq!(mixer.resolve_fx(&slot).unwrap().kind(), "moog");
+        // The deck still renders through the swapped chain.
+        tick(&mut mixer, 4);
+        assert!(mixer.master_peak() > 0.0);
     }
 
     /// The run-time insert path has one extra obligation the config path does not: an effect that

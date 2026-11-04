@@ -70,11 +70,17 @@ pub fn format_response(response: &CommandResponse, sample_rate: u32) -> Vec<LogL
             }
             for slot in slots {
                 let state = if slot.enabled { "on" } else { "off" };
+                // The role is what a map binds; the kind is what is in it right now. They only
+                // differ after `fx kind`, and then the difference is worth showing.
+                let what = if slot.role == slot.kind {
+                    slot.role.clone()
+                } else {
+                    format!("{} ({})", slot.role, slot.kind)
+                };
                 out.push(LogLine::info(format!(
-                    "{} fx[{}] {} [{state}]",
+                    "{} fx[{}] {what} [{state}]",
                     chain.label(),
                     slot.index,
-                    slot.kind
                 )));
                 for (name, value) in &slot.params {
                     out.push(LogLine::info(format!("    {name} = {value:.4}")));
@@ -433,6 +439,7 @@ pub fn fx_help_text() -> String {
         "fx commands (the chain is the line's target: the focused deck by default,\n`master` for the summed output, e.g. `master fx list`):
   fx add <kind>                    append an effect to the end of the chain
   fx remove <slot>                 drop a slot (later slots shift down)
+  fx kind <slot> <kind>            swap the effect in a slot (same index, same role)
   fx list                          show every slot with its index, kind and parameters
   fx set <slot> <param> <value>    set one parameter (value is smoothed, no clicks)
   fx on|off <slot>                 engage / bypass a slot

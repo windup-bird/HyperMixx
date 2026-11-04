@@ -1052,6 +1052,7 @@ mod tests {
         app.deck_fx[1] = vec![
             hypermixx_core::FxSlotStatus {
                 index: 0,
+                role: "eq".to_owned(),
                 kind: "eq".to_owned(),
                 enabled: true,
                 params: vec![
@@ -1062,6 +1063,7 @@ mod tests {
             },
             hypermixx_core::FxSlotStatus {
                 index: 1,
+                role: "filter".to_owned(),
                 kind: "filter".to_owned(),
                 enabled: true,
                 params: vec![("value".to_owned(), 0.0)],
@@ -1154,6 +1156,30 @@ mod tests {
         assert_eq!(app.pad_mode[0], crate::tui::app::PadMode::BeatJump);
         assert_eq!(app.beat_mode[0], crate::tui::app::BeatMode::ManualLoop);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A knob finds its slot by role, so swapping the effect in it does not move the control.
+    #[test]
+    fn a_swapped_effect_stays_under_the_same_knob() {
+        let (mut app, _dispatcher, _rx) = wired();
+        app.deck_fx[0] = vec![
+            hypermixx_core::FxSlotStatus {
+                index: 0,
+                role: "eq".to_owned(),
+                kind: "eq".to_owned(),
+                enabled: true,
+                params: vec![("low".to_owned(), 0.0)],
+            },
+            hypermixx_core::FxSlotStatus {
+                index: 1,
+                role: "filter".to_owned(),
+                kind: "moog".to_owned(),
+                enabled: true,
+                params: vec![("value".to_owned(), -0.4), ("resonance".to_owned(), 0.3)],
+            },
+        ];
+        assert_eq!(app.knob_slot(0, Knob::Filter), Some(1));
+        assert_eq!(app.knob_value(0, Knob::Filter), Some(-0.4));
     }
 
     #[test]
