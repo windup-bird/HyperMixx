@@ -74,6 +74,10 @@ pub struct Deck {
     /// wrong key, and re-separating a stem would produce garbage and a bogus cache entry. So the mix
     /// is held separately and [`source`](Self::source) returns it.
     original: Arc<dyn Source>,
+    /// The track's measured loudness (average level of its loudest section, dBFS), if the
+    /// front-end measured one while decoding. Auto-gain derives its gain from this, which is what
+    /// makes the live switch re-derive for whatever is loaded.
+    loudness_db: Option<f32>,
     /// The deck's streams, in order. One for a plain track; one per stem once they are installed.
     /// The audible voice is the authority on how many are rendered right now — a source swap lands
     /// on the next block, so `sources.len()` alone can be ahead of the audio. Use
@@ -170,6 +174,7 @@ impl Deck {
                 .expect("stretch engine config is statically valid");
         Self {
             original,
+            loudness_db: None,
             sources,
             playing,
             shadow: None,
@@ -455,6 +460,16 @@ impl Deck {
             EngineProfile::Tape => KeylockMode::Off,
             EngineProfile::Keylock(_) => KeylockMode::On,
         }
+    }
+
+    /// The track's measured loudness, dBFS (see [`Command::Load`](hypermixx_core::Command::Load)).
+    pub fn loudness_db(&self) -> Option<f32> {
+        self.loudness_db
+    }
+
+    /// Records the measured loudness of the loaded track.
+    pub fn set_loudness(&mut self, loudness_db: Option<f32>) {
+        self.loudness_db = loudness_db.filter(|db| db.is_finite());
     }
 
     /// The STFT window keylock will use when enabled.

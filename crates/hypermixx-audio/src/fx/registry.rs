@@ -5,7 +5,7 @@
 //! registry would add a plugin surface with nothing to plug into it. Adding an effect means one
 //! variant, one `build` arm and one line in `ALL`.
 
-use super::sample::{Cut, Echo, Eq, Filter, Flanger, Gain, Limiter, Phaser, Reverb};
+use super::sample::{Cut, Echo, Empty, Eq, Filter, Flanger, Gain, Limiter, Phaser, Reverb};
 use super::{Fx, FxError};
 
 /// Every built-in effect class.
@@ -31,11 +31,13 @@ pub enum FxKind {
     Phaser,
     /// Beat-locked gate: the DJM's Trans, in one insert.
     Cut,
+    /// An empty slot: mounted and addressable, processing nothing.
+    None,
 }
 
 impl FxKind {
     /// Every kind, in the order `help` should list them.
-    pub const ALL: [FxKind; 10] = [
+    pub const ALL: [FxKind; 11] = [
         FxKind::Eq,
         FxKind::Filter,
         FxKind::Moog,
@@ -46,6 +48,7 @@ impl FxKind {
         FxKind::Flanger,
         FxKind::Phaser,
         FxKind::Cut,
+        FxKind::None,
     ];
 
     /// The canonical name, and the only spelling [`FxKind::parse`] accepts.
@@ -61,6 +64,7 @@ impl FxKind {
             FxKind::Flanger => "flanger",
             FxKind::Phaser => "phaser",
             FxKind::Cut => "cut",
+            FxKind::None => "none",
         }
     }
 
@@ -79,6 +83,7 @@ impl FxKind {
             FxKind::Flanger => &["flanger", "flange"],
             FxKind::Phaser => &["phaser", "phase"],
             FxKind::Cut => &["cut", "gate", "trans"],
+            FxKind::None => &["none", "empty"],
         }
     }
 
@@ -104,6 +109,7 @@ impl FxKind {
             FxKind::Flanger => Box::new(Flanger::new()),
             FxKind::Phaser => Box::new(Phaser::new()),
             FxKind::Cut => Box::new(Cut::new()),
+            FxKind::None => Box::new(Empty),
         }
     }
 
@@ -123,6 +129,7 @@ impl FxKind {
             FxKind::Flanger => Flanger::PARAMS,
             FxKind::Phaser => Phaser::PARAMS,
             FxKind::Cut => Cut::PARAMS,
+            FxKind::None => &[],
         }
     }
 

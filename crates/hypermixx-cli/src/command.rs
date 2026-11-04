@@ -902,6 +902,12 @@ fn live_command<'a>(words: &mut impl Iterator<Item = &'a str>, dispatcher: &Disp
                              (the engine's clock, rings and keylock window are set when it starts)",
                         );
                     }
+                    // Auto-gain is the one part of `live.toml` that applies to the running engine
+                    // immediately: the measurement is already on each deck.
+                    let _ = dispatcher.command_tx.send(Command::SetAutogain {
+                        enabled: live.autogain.enabled,
+                        target_db: live.autogain.target_db,
+                    });
                     dispatcher.with_live(live, Some(path));
                     Action::Message(text)
                 }
@@ -2439,6 +2445,10 @@ pub(crate) fn spawn_load_with(
             move || match hypermixx_media::decode_file_at(&path, sample_rate) {
                 Ok(decoded) => {
                     let total_frames = decoded.total_frames;
+                    // Auto-gain's measurement is a track property: measure it here, while the PCM is
+                    // hot, and let the engine derive the gain (so the live switch can retarget it).
+                    let loudness_db =
+                        hypermixx_library::loudness_db(&decoded.pcm, sample_rate, decoded.channels);
                     let analysis = analysis
                         .map(|analysis| analysis_at_rate(analysis, sample_rate))
                         .or_else(|| {
@@ -2471,6 +2481,7 @@ pub(crate) fn spawn_load_with(
                         deck_id,
                         source,
                         analysis,
+                        loudness_db,
                     });
                     if let Some(cues) = cues {
                         let _ = command_tx.send(Command::SetCues {

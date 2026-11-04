@@ -8,12 +8,14 @@ pub mod analyser;
 pub mod beat_spec;
 pub mod grid_compiler;
 pub mod library;
+pub mod loudness;
 pub mod track;
 pub mod waveform;
 
 pub use analyser::{analyze, AnalyserError, Backend, RawAnalysis, RefineConfig};
 pub use beat_spec::{BeatSpec, Segment};
 pub use grid_compiler::GridCompiler;
+pub use loudness::loudness_db;
 pub use library::Result;
 pub use library::{
     cache_root, default_database_path, detect_source_kinds, FileTags, LibraryDb, LibraryError,

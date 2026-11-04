@@ -436,6 +436,7 @@ fn route(mixer: &mut Mixer, sync: &mut SyncGroup, command: Command) -> Option<Co
             deck_id,
             source,
             analysis,
+            loudness_db,
         } => {
             let total_frames = source.total_frames();
             // The fader range is a controller setting, not a track property: read it before the
@@ -463,6 +464,7 @@ fn route(mixer: &mut Mixer, sync: &mut SyncGroup, command: Command) -> Option<Co
             if let Some(analysis) = analysis {
                 deck.set_analysis(analysis);
             }
+            deck.set_loudness(loudness_db);
             channel.replace_deck(deck);
             Some(CommandResponse::Loaded {
                 deck_id,
@@ -514,6 +516,10 @@ fn route(mixer: &mut Mixer, sync: &mut SyncGroup, command: Command) -> Option<Co
         Vinyl { deck_id, op } => transport(mixer, deck_id, move |deck| deck.apply_vinyl(op)),
         SetFader { target, value } => answered(mixer.set_fader(target, value)),
         Loop { deck_id, op } => transport_result(mixer, deck_id, move |deck| deck.apply_loop(op)),
+        SetAutogain { enabled, target_db } => {
+            mixer.set_autogain(hypermixx_core::AutogainSettings { enabled, target_db });
+            Some(CommandResponse::Ok)
+        }
         SetKeylock { deck_id, mode } => {
             transport(mixer, deck_id, move |deck| deck.set_keylock_mode(mode))
         }

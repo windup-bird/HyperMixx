@@ -38,7 +38,8 @@ pub use output::{
 };
 
 use hypermixx_core::{
-    CommandResponse, FxChainId, FxSlotStatus, KeylockSettings, Stem, StemOp, StemSet,
+    AutogainSettings, CommandResponse, FxChainId, FxSlotStatus, KeylockSettings, Stem, StemOp,
+    StemSet,
 };
 
 use channel::Channel as ChannelInner;
@@ -99,6 +100,8 @@ pub struct Mixer {
     ring_capped: bool,
     /// Keylock STFT window from the live config; re-applied to every freshly loaded deck.
     keylock: KeylockSettings,
+    /// Auto-gain preference from the live config; the per-track measurement lives on the deck.
+    autogain: AutogainSettings,
 }
 
 impl Mixer {
@@ -182,6 +185,7 @@ impl Mixer {
             tuning,
             ring_capped: false,
             keylock: KeylockSettings::default(),
+            autogain: AutogainSettings::default(),
         })
     }
 
@@ -310,6 +314,7 @@ impl Mixer {
             );
             channel.set_block_seconds(block_seconds_of(self.sample_rate));
             channel.prepare_fx(self.sample_rate);
+            channel.set_autogain(self.autogain);
             // Whatever was playing on this index keeps playing: a deck is not a config value.
             if let Some(previous) = old.get_mut(channels.len()) {
                 channel.replace_deck(previous.take_deck());
@@ -333,6 +338,21 @@ impl Mixer {
         // Destinations are the part that most often *needs* a reload (a device that appeared), so
         // they are rebuilt last and reported.
         Ok(self.refresh_outputs())
+    }
+
+    /// Applies the auto-gain preference (from `live.toml`) to every channel. The gain is derived
+    /// per block from the deck's measured loudness, so this takes effect on the next block for
+    /// whatever is already loaded — no reload, no re-measure.
+    pub fn set_autogain(&mut self, settings: AutogainSettings) {
+        self.autogain = settings.sanitised();
+        for channel in &mut self.channels {
+            channel.set_autogain(self.autogain);
+        }
+    }
+
+    /// The auto-gain preference in effect.
+    pub fn autogain(&self) -> AutogainSettings {
+        self.autogain
     }
 
     /// The keylock window every deck uses (from `live.toml`).
@@ -714,25 +734,11 @@ impl Mixer {
                     .ok_or_else(|| unknown_deck(deck_id, count))?;
                 Ok(flow_len + appended)
             }
-            FxChainId::Stem { deck, .. } => {
-                let count = self.channels.len();
-                let channel = self
-                    .channels
-                    .get_mut(deck as usize)
-                    .ok_or_else(|| unknown_deck(deck, count))?;
-                // A `flowfx` slot is one control over N flows, so every flow gets its own instance
-                // (its own filter/delay state) built from the same kind and role.
-                let kind = crate::fx::FxKind::parse(slot.kind()).map_err(|err| err.message())?;
-                let role = slot.role().to_owned();
-                let mut index = 0;
-                for stem in Stem::ALL {
-                    let fresh = FxSlot::with_role(kind.build(), kind.name(), role.clone());
-                    index = channel
-                        .add_slot(SlotChain::Flow(stem), fresh)
-                        .ok_or_else(|| unknown_deck(deck, count))?;
-                }
-                Ok(index)
-            }
+            FxChainId::Stem { .. } => Err(
+                "the flow banks are declared in mixer.toml — use `fx kind <slot> <kind>` to change \
+                 an existing slot (or edit `[[channel.flow_fx]]`)"
+                    .to_owned(),
+            ),
         }
     }
 
@@ -752,23 +758,23 @@ impl Mixer {
                     .get_mut(deck_id as usize)
                     .ok_or_else(|| unknown_deck(deck_id, count))?;
                 let flow_len = channel.flow_len();
+                // Only the last slot of the whole flat space can go: anything else would renumber
+                // the slots after it, and a map is bound to those numbers. To empty a slot in
+                // place, `fx kind <slot> none` keeps the index.
+                if target.index + 1 != flow_len + channel.post_fx().len() {
+                    return Err(
+                        "only the last bank slot can be removed (removal renumbers the slots \
+                         after it); use `fx kind <slot> none` to empty a slot in place"
+                            .to_owned(),
+                    );
+                }
                 if target.index >= flow_len {
                     channel
                         .remove_slot(SlotChain::Deck, target.index - flow_len)
                         .ok_or_else(|| slot_error(target))?
                 } else {
-                    // The tone prefix is part of the topology, not a bank: only the `flowfx` slots
-                    // after it can be removed.
-                    let protected = channel
-                        .slot(SlotChain::Flow(Stem::Drums), target.index)
-                        .map(FxSlot::role)
-                        .map(str::to_owned)
-                        .unwrap_or_default();
-                    if matches!(protected.as_str(), "eq" | "filter") {
-                        return Err(format!(
-                            "`{protected}` is a fixed stage, not a slot — use `fx kind` to change it"
-                        ));
-                    }
+                    // The post bank is empty, so the last slot is the last `flowfx` one: remove it
+                    // from every flow's chain to keep the group aligned.
                     let mut first = None;
                     for stem in Stem::ALL {
                         let removed = channel
@@ -784,6 +790,14 @@ impl Mixer {
                     .channels
                     .get_mut(deck as usize)
                     .ok_or_else(|| unknown_deck(deck, count))?;
+                // One view of the group: the flow banks are fixed, so `Stem` removal only works
+                // from the end of that flow's chain.
+                if target.index + 1 != channel.flow_len() {
+                    return Err(
+                        "only the last flow slot can be removed; use `fx kind <slot> none` instead"
+                            .to_owned(),
+                    );
+                }
                 let mut first = None;
                 for stem in Stem::ALL {
                     let removed = channel
@@ -1532,6 +1546,86 @@ mod tests {
                 "{stem}: a group write must reach every flow"
             );
         }
+    }
+
+    /// Auto-gain is a live preference: setting it re-derives the gain for whatever is loaded, and
+    /// clearing it returns to unity — no reload, no re-measure.
+    #[test]
+    fn set_autogain_applies_to_already_loaded_channels() {
+        let mut mixer = headless(silent_test_channel());
+        let mut deck = Deck::new(tone(10));
+        deck.play();
+        deck.set_loudness(Some(-6.0));
+        mixer.channel_mut(0).unwrap().replace_deck(deck);
+        tick(&mut mixer, 60);
+        let off = mixer.master_peak();
+        assert!(off > 0.5, "reference {off}");
+
+        mixer.set_autogain(AutogainSettings {
+            enabled: true,
+            target_db: -12.0,
+        });
+        tick(&mut mixer, 60);
+        let on = mixer.master_peak();
+        assert!(
+            (on / off - 0.5).abs() < 0.03,
+            "the live switch must apply to the loaded track: {on} vs {off}"
+        );
+
+        mixer.set_autogain(AutogainSettings::default());
+        tick(&mut mixer, 60);
+        assert!((mixer.master_peak() / off - 1.0).abs() < 0.02);
+    }
+
+    /// A bank only grows at its end and only shrinks from its end, so a map's slot number never
+    /// moves; `fx kind <slot> none` is how a slot is emptied in place.
+    #[test]
+    fn removal_is_tail_only_and_none_empties_in_place() {
+        use hypermixx_core::Command;
+        let mut cfg = simple_dj();
+        cfg.channels[0].knob_fx = vec!["echo".into(), "reverb".into()];
+        let mut mixer = loaded(cfg, 1);
+        let flow_len = mixer.channel(0).unwrap().flow_len();
+        // Removing a slot that is not last would renumber the ones after it.
+        assert!(matches!(
+            mixer.handle_fx_command(Command::RemoveFx {
+                chain: FxChainId::Deck(0),
+                index: flow_len,
+            }),
+            CommandResponse::Error(_)
+        ));
+        // The last one can go.
+        assert!(matches!(
+            mixer.handle_fx_command(Command::RemoveFx {
+                chain: FxChainId::Deck(0),
+                index: flow_len + 1,
+            }),
+            CommandResponse::Ok
+        ));
+        // Emptying in place keeps the index and the role: a mapped knob still points at it.
+        let slot = FxTarget {
+            chain: FxChainId::Deck(0),
+            index: 0,
+        };
+        assert!(matches!(
+            mixer.handle_fx_command(Command::SetFxKind {
+                slot,
+                kind: "none".into()
+            }),
+            CommandResponse::Ok
+        ));
+        let found = mixer.resolve_fx(&slot).unwrap();
+        assert_eq!(found.kind(), "none");
+        assert_eq!(found.role(), "eq", "the position identity survives emptying");
+        // And it can be filled again.
+        assert!(matches!(
+            mixer.handle_fx_command(Command::SetFxKind {
+                slot,
+                kind: "eq".into()
+            }),
+            CommandResponse::Ok
+        ));
+        assert_eq!(mixer.resolve_fx(&slot).unwrap().kind(), "eq");
     }
 
     /// The flow whitelist: one mask per slot, broadcast to every flow's instance, reported in the

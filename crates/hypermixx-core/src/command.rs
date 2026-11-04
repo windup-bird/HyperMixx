@@ -473,6 +473,10 @@ pub enum Command {
         source: Shared,
         /// Optional caller-supplied constant grid (deterministic testing / beat-match).
         analysis: Option<TrackAnalysis>,
+        /// The track's loudness (the average level of its loudest section, dBFS), measured by the
+        /// front-end while decoding. Auto-gain derives its gain from this at play time, so toggling
+        /// auto-gain or changing its target applies to whatever is already loaded.
+        loudness_db: Option<f32>,
     },
     Play {
         deck_id: DeckId,
@@ -584,6 +588,12 @@ pub enum Command {
         op: StemOp,
     },
     /// Switches the keylock profile (`off` = tape, `on` = the configured keylock window).
+    /// Replaces the engine's auto-gain preference (from `live.toml`). Applies immediately to every
+    /// loaded track: the measurement lives on the deck, the gain is derived here.
+    SetAutogain {
+        enabled: bool,
+        target_db: f32,
+    },
     SetKeylock {
         deck_id: DeckId,
         mode: KeylockMode,
@@ -759,11 +769,15 @@ impl std::fmt::Debug for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Command::Load {
-                deck_id, analysis, ..
+                deck_id,
+                analysis,
+                loudness_db,
+                ..
             } => f
                 .debug_struct("Load")
                 .field("deck_id", deck_id)
                 .field("has_analysis", &analysis.is_some())
+                .field("loudness_db", loudness_db)
                 .finish(),
             Command::Play { deck_id } => f.debug_struct("Play").field("deck_id", deck_id).finish(),
             Command::Pause { deck_id } => {
@@ -860,6 +874,14 @@ impl std::fmt::Debug for Command {
                 .debug_struct("SetFader")
                 .field("target", target)
                 .field("value", value)
+                .finish(),
+            Command::SetAutogain {
+                enabled,
+                target_db,
+            } => f
+                .debug_struct("SetAutogain")
+                .field("enabled", enabled)
+                .field("target_db", target_db)
                 .finish(),
             Command::SetKeylock { deck_id, mode } => f
                 .debug_struct("SetKeylock")

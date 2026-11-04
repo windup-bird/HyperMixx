@@ -35,7 +35,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
-use hypermixx_core::{FxSlotStatus, Stem, StemOp, StemStatus};
+use hypermixx_core::{AutogainSettings, FxSlotStatus, Stem, StemOp, StemStatus};
 
 use super::bus::Bus;
 use super::config::{ChannelConfig, CrossfaderConfig};
@@ -188,6 +188,10 @@ pub struct Channel {
     /// The channel fader — one fader, after the post-merge chain.
     fader: Fader,
     crossfader: Fader,
+    /// Auto-gain, in dB, smoothed: derived every block from the deck's measured loudness and the
+    /// live preference, so toggling or retargeting it never steps.
+    autogain: Param,
+    autogain_settings: AutogainSettings,
     /// The channel trim: a static setting between the deck fader and the sum, `[`trim_amp`]`'s law.
     /// Kept apart from the faders because a fader is a performance control (attenuate only) while a
     /// trim is headroom you set once — including up to +6 dB.
@@ -238,6 +242,8 @@ impl Channel {
             stem_solo: AtomicU8::new(0),
             fader: Fader::new(cfg.deck_fader, FADER_TAU),
             crossfader: Fader::new(cross.start, CROSSFADE_TAU),
+            autogain: Param::new(0.0, AUTOGAIN_TAU),
+            autogain_settings: AutogainSettings::default(),
             gain: Param::new(clamp_pos(cfg.gain), FADER_TAU),
             cue_send: Param::new(cfg.cue_send.clamp(0.0, 1.0), FADER_TAU),
             side: cfg.side,
@@ -491,6 +497,12 @@ impl Channel {
         self.gain.target()
     }
 
+    /// Applies the live auto-gain preference. The gain itself is re-derived each block from the
+    /// deck's loudness, so this is a cheap settings swap, not a level jump.
+    pub fn set_autogain(&mut self, settings: AutogainSettings) {
+        self.autogain_settings = settings.sanitised();
+    }
+
     /// Shared crossfader position: `-1.0` hard left, `0.0` both decks open, `1.0` hard right.
     pub fn set_crossfader(&self, position: f32) {
         self.crossfader.set(clamp_pos(position));
@@ -558,10 +570,18 @@ impl Channel {
         }
         self.deck.render_streams(&mut stream_buses[..live]);
 
-        // The trim advances once per block, not once per flow: stepping it per stream would shorten
-        // its time constant by the stream count. It is applied per flow, though — the plan puts it
-        // right after the flow fader (`flowfader → autogain → gain → eq …`), so the tone prefix and
-        // the per-flow inserts see the trimmed signal. Autogain will slot in between the two.
+        // Auto-gain and the trim advance once per block, not once per flow: stepping a smoother per
+        // stream would shorten its time constant by the stream count. Both are applied per flow —
+        // the plan's `flowfader → autogain → gain → eq …` — so the tone prefix and the per-flow
+        // inserts see the gained and trimmed signal.
+        self.autogain
+            .set(self.autogain_settings.gain_db(self.deck.loudness_db()));
+        let autogain_db = self.autogain.next_block(ctx.block_frames, ctx.sample_rate);
+        let autogain_gain = if autogain_db != 0.0 {
+            10f32.powf(autogain_db / 20.0)
+        } else {
+            1.0
+        };
         let trim = self.gain.next_block(ctx.block_frames, ctx.sample_rate);
         let trim_gain = if trim != 0.0 { trim_amp(trim) } else { 1.0 };
 
@@ -577,6 +597,9 @@ impl Channel {
                 sb.scale(side_gain);
             }
             sb.scale(self.flow_fader[stream].next_amp(ctx));
+            if autogain_gain != 1.0 {
+                sb.scale(autogain_gain);
+            }
             if trim != 0.0 {
                 sb.scale(trim_gain);
             }
@@ -727,6 +750,9 @@ pub enum SlotChain {
 /// Fader smoothing: short enough that a blend feels immediate, long enough that a stepped command
 /// from a keyboard cannot click.
 const FADER_TAU: f32 = 0.008;
+/// Auto-gain smoothing: a load (or a live toggle) changes the level by up to ±12 dB, so it gets a
+/// longer ramp than a fader — audible as a quick match, not a click.
+const AUTOGAIN_TAU: f32 = 0.02;
 /// The crossfade is the one move a listener watches for continuity, so it gets the longest ramp.
 const CROSSFADE_TAU: f32 = 0.02;
 /// A mute is a *gate*, not a fade: short enough to feel instant, long enough not to step.
@@ -1117,6 +1143,68 @@ mod tests {
             (ratio - 0.0625).abs() < 0.01,
             "trim must be inside the flow chain (gain² = 0.0625), got ratio {ratio}"
         );
+    }
+
+    /// Auto-gain derives its gain from the deck's measured loudness and the live target, clamps it,
+    /// and leaves an unmeasured track alone.
+    #[test]
+    fn autogain_matches_the_measured_loudness_to_the_target() {
+        let measure = |settings: AutogainSettings, loudness: Option<f32>| -> f32 {
+            let mut channel = Channel::new(
+                tone_deck(),
+                &ChannelConfig {
+                    side: DeckSide::Center,
+                    cue_send: 0.0,
+                    ..Default::default()
+                },
+                CrossfaderConfig::default(),
+                vec![FxChain::new()],
+                FxChain::new(),
+            );
+            channel.set_autogain(settings);
+            channel.deck_mut().set_loudness(loudness);
+            channel.deck_mut().play();
+            for _ in 0..60 {
+                channel.process(&ctx());
+            }
+            channel.peak()
+        };
+        let off = measure(AutogainSettings::default(), Some(-6.0));
+        assert!(off > 0.9, "reference peak {off}");
+        // -6 dB of measured loudness against a -12 dBFS target is a -6 dB gain.
+        let on = measure(
+            AutogainSettings {
+                enabled: true,
+                target_db: -12.0,
+            },
+            Some(-6.0),
+        );
+        assert!(
+            (on / off - 0.5).abs() < 0.02,
+            "expected -6 dB, got {:.2}",
+            on / off
+        );
+        // A very quiet track is clamped to the maximum gain instead of being pushed 28 dB.
+        let clamped = measure(
+            AutogainSettings {
+                enabled: true,
+                target_db: -12.0,
+            },
+            Some(-40.0),
+        );
+        assert!(
+            (clamped / off - 3.98).abs() < 0.1,
+            "+12 dB is the ceiling, got {:.2}",
+            clamped / off
+        );
+        // No measurement (or disabled) is unity, not a guess.
+        for (settings, loudness) in [
+            (AutogainSettings { enabled: true, target_db: -12.0 }, None),
+            (AutogainSettings::default(), Some(-40.0)),
+        ] {
+            let level = measure(settings, loudness);
+            assert!((level / off - 1.0).abs() < 0.01, "must stay at unity");
+        }
     }
 
     /// The cue tap sits after the flow chains *and* after the post-merge banks: a pre-fader cue is

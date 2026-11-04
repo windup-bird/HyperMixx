@@ -13,6 +13,7 @@ mod filter;
 mod flanger;
 mod gain;
 mod limiter;
+mod none;
 mod phaser;
 mod reverb;
 
@@ -23,5 +24,6 @@ pub use filter::{Filter, Mode as FilterMode, MAX_HZ, MIN_HZ};
 pub use flanger::Flanger;
 pub use gain::{Fader, Gain};
 pub use limiter::{Limiter, LOOKAHEAD, RELEASE_RANGE_DB};
+pub use none::Empty;
 pub use phaser::Phaser;
 pub use reverb::Reverb;

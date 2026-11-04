@@ -49,6 +49,14 @@ device_buffer_frames = 512
 # block = 2048
 # interval = 512
 
+[autogain]
+# Normalise every track to a target level, measured from the average level of its loudest ~3 s.
+# Applied per flow, right after the flow fader and before the channel trim, so the tone controls and
+# the per-flow inserts see the matched level. `live reload` applies a change immediately to whatever
+# is loaded (the measurement lives on the deck; only the preference changes here).
+enabled = false               # off by default: a mixer should not change levels unasked
+target_db = -12.0             # dBFS for the loudest section; the gain is clamped to ±12 dB
+
 [stems]
 # Everything the separator is asked for. These are *machine* settings, which is why they live here
 # and not on the command line: `stem separate` takes no options, and `live reload` applies an edit

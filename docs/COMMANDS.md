@@ -249,8 +249,8 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 `deck1 fx …` 作用于 deck1。
 
 ```
-[deck|master] fx add <kind>                追加到链尾（eq|filter|moog|gain|limiter|echo|reverb|flanger|phaser|cut，含别名）
-[deck|master] fx remove|rm <slot>          删除该槽，后续槽位前移
+[deck|master] fx add <kind>                追加到 bank 末尾（eq|filter|moog|gain|limiter|echo|reverb|flanger|phaser|cut|none，含别名）
+[deck|master] fx remove|rm <slot>          只允许删 bank 的最后一个槽（删中间会重编号）
 [deck|master] fx kind <slot> <kind>        换掉槽里的效果（序号、role、开关状态都不变）
 [deck] fx flows <slot> all|none|a,b        flowfx 槽只作用于哪些 flow（stem 名，逗号分隔）
 [deck|master] fx toggle <slot>             翻转槽位（引擎持有状态，前端不留镜像）
@@ -282,6 +282,7 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 | `flanger` | flange | `mix` `depth` `rate`（每拍周期数，1/16..4）`feedback`（−0.95..0.95） |
 | `phaser` | phase | `mix` `depth` `rate` `feedback`（6 级全通级联，系数查表） |
 | `cut` | gate, trans | `depth` `div`（拍，1/16..4）`width`（占空比 0.05..0.95）`edge`（ms，0..20）；按拍锁相的梯形门 |
+| `none` | empty | 无参数：槽位留着当占位，不处理任何样本（`fx kind <槽> none` 用来原地清空、保住序号） |
 
 - 时间类效果（`echo` / `reverb` / `flanger` / `phaser` / `cut`）的节拍参数走
   `FxContext` 的拍网格；曲目还没分析时回落到 120 BPM，不会静音。
@@ -323,6 +324,13 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 | `shifts` | 1 | `0` 与 `1` 等价（单趟）；`2` 多跑一次带偏移的平均，**+98% 时间**（81→161 s）、+360 MB |
 | `overlap` | 0.25 | `0.0` **−24% 时间**（81→62 s，窗口数 38→29）；代价是窗口边缘的模型估计权重更大，需要耳朵判断 |
 | `provider` | `cpu` | `cuda`：**13 s**（vs CPU 87 s，RTX 4050），显存 ~3.2 GB。需要 `--features cuda` 构建 + 宿主 CUDA 13 / cuDNN 9 |
+
+### 3.8 Auto-gain
+
+`live.toml` 的 `[autogain] enabled/target_db` 决定是否把每首曲子的最响 3 s 归一化到目标电平。
+响度在**装载时**从 PCM 测一次（存在 deck 上），增益在引擎里按当前设置推导（±12 dB 钳制），
+所以 `live reload` 改开关/目标对**已经装载**的曲子立即生效，不需要重测。它在逐 flow 的
+`flow fader` 之后、channel trim 之前。
 
 `provider = "cuda"` 是**要求而不是建议**：CUDA 不能接管整张图时会直接报错，而不是悄悄在 CPU 上跑
 （那样只是慢 9 倍，看起来却像成功了）。窗口长度不可调 —— 导出把它钉在 343,980 采样（7.8 s）。

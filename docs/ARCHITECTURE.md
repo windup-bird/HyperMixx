@@ -211,8 +211,10 @@ mixer 只负责把 deck 变成采样;谁跟谁、共享 BPM 是什么,是**关�
     → source_fader[i] 逐流**门**:stem 的 mute/solo 决策,恰好 1.0 或 0.0(GATE_TAU 平滑)
     → [crossfader at "source"]
     → flow_fader[i]   逐流电平(只衰减,行程顶端 0 dB;这是**每 stem 的**电平)
+    → autogain         每块由 deck 上测得的响度 + live 目标推导(±12 dB 钳制、20ms 平滑);
+                       没测过响度的曲子保持 unity
     → gain             channel trim:0 dB .. +6 dB(唯一能 boost 的一级;在 flow fader 之后、
-                       eq 之前,所以音色前缀看到的是 trim 过的信号;autogain 将来插在两者之间)
+                       eq 之前,所以音色前缀看到的是 trim 过的信号)
     → eq → filter → flowfx…   逐流链:固定前缀 + `flowfx` 槽;**每 flow 一套实例**(状态独立)
     → Σ 到 channel bus
   → [crossfader at "flow"]
@@ -238,6 +240,10 @@ kind:`linear`/`moog`),`flowfx` 在合并前逐流跑,`knobfx`/`padfx` 在合并�
 共享 crossfader 的按侧增益坐在三个位置之一(`[crossfader] place = source|flow|deck`,
 缺省 `deck`),**恒在该位置的 cue tap 之后**,所以分叉点与它是同一点时 cue 不受 crossfader
 影响;分叉在它之后则跟着它(把 crossfader 放早的代价,文档写明)。
+
+**autogain**:响度是**曲目属性**(装载时对 PCM 做一次滑窗 RMS,取最响的 3 s 的平均值,存在
+`Deck` 上),增益是**机器偏好**(`live.toml` 的 `[autogain] enabled/target_db`)。所以 `live reload`
+改目标或开关会立刻对已装载的曲子重新推导,不需要重测;`Command::SetAutogain` 把它推进引擎。
 
 `MasterBus::render`:`sum → master_fx → master_fader → limiter(安全级)`。
 `CueBus`:`sum → cue_fader → blend_with(master.sum)` —— 耳机是 cue 与 master 的混合,
@@ -325,7 +331,7 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 - `delay.rs` — 时间类效果的原语:`DelayLine`(线性插值分数延迟,先读后写)、
   `OnePole`(反馈阻尼)、`SineLfo`(flanger/phaser 调制);容量在 `prepare` 里按引擎率定,
   之后 `process` 不再分配
-- `sample/` 十个内置效果:
+- `sample/` 十一个内置效果:
   - `Eq` — 三段 ISO:low shelf 320Hz / bell 1.2kHz / high shelf 3.6kHz,±26 dB 线性 dB
     律;系数仅在控制移动时重算,平坦时整段跳过
   - `Filter`/`Moog` — 同一套 TPT 状态变量核(`filter` 两极点 12dB/oct,`moog` 四极点级联 24dB/oct):
@@ -347,6 +353,8 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
     (避免每样本 `tan`),LFO 扫 150Hz..3kHz
   - `Cut` — 拍锁梯形门:`div` 拍、`width` 占空比、`depth` 关断深度、`edge` ms 过渡;
     相位由 `beat_position` 推导,loop/jump 后仍落在拍上
+  - `Empty`(`none`) — 空槽:挂载、可寻址、不处理任何样本。固定 bank 里"去掉一个效果"就是
+    `fx kind <槽> none`(序号和 role 不变),所以 map 不需要重绑
 - `registry.rs` — `FxKind` 封闭枚举(eq/filter/gain/limiter/echo/reverb/flanger/
   phaser/cut)+ 别名解析;加效果 = 一个 variant + 一个 `build` arm + 一行 `ALL`,无插件面
 

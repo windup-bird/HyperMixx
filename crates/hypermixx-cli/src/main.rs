@@ -195,6 +195,12 @@ fn main() {
         }
     };
     let command_tx = pipeline.command_tx();
+    // Auto-gain is a live preference pushed to the engine (the per-track measurement is part of the
+    // load); the mixer starts disabled until this arrives.
+    let _ = command_tx.send(hypermixx_core::Command::SetAutogain {
+        enabled: live.autogain.enabled,
+        target_db: live.autogain.target_db,
+    });
     // A custom topology may name any number of channels, so the deck-id range comes from the
     // engine rather than the built-in constant.
     let decks = pipeline.channel_count().unwrap_or(DECK_COUNT).max(1);
