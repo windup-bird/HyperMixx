@@ -24,8 +24,9 @@ cue = "pre"                   # pre | post — which side of the fader the cue s
 # deck_fader = 0.0            # the channel fader's starting level; top of travel = 0 dB
 # gain = 0.0                  # channel trim: 0 = 0 dB, +1 = +6 dB, -1 = silence
 cue_send = 1.0                # linear 0..1 into the cue bus
-# flow_fx = []                # per-flow inserts (after eq/filter, before the flow sum): one chain
-#                             # per flow, so four stems get four independent instances
+# [[channel.flow_fx]]        # per-flow inserts (after eq/filter, before the flow sum): one chain
+# kind = "echo"               # per flow (four independent instances), one shared control
+# flows = ["vocals"]          # routed flows (stem names); omitted = all, [] = none
 # knob_fx = []                # post-merge knob bank, e.g. ["echo"]
 # pad_fx = []                 # post-merge pad bank, e.g. ["reverb"]
 # flow_fader = 0.0            # per-flow (stem) level; top of travel = 0 dB

@@ -60,6 +60,10 @@ pub struct FxSlotStatus {
     /// What is actually in the slot right now.
     pub kind: String,
     pub enabled: bool,
+    /// Which flows this slot is routed to — `None` for a slot that is not in a flow chain (a
+    /// knob/pad/master slot, which sees one bus). An empty list is a valid answer: the slot is
+    /// mounted but routed to no flow, so it processes nothing.
+    pub flows: Option<Vec<Stem>>,
     /// `(name, value)` pairs, in the order the effect declares them.
     pub params: Vec<(String, f32)>,
 }
@@ -649,6 +653,17 @@ pub enum Command {
         name: String,
         value: f32,
     },
+    /// Routes a flow slot to a set of flows. Only the `flowfx` bank has flows; `eq`, `filter`, the
+    /// post-merge banks and master are single-bus and refuse this.
+    ///
+    /// An empty list routes the slot to no flow — it stays mounted (index, role and kind unchanged)
+    /// but processes nothing, which is the difference between "off" and "not routed here". Narrowing
+    /// the set cuts a ringing tail on the flows that leave; widening resets the instances that
+    /// enter, so no flow ever resumes with another flow's history.
+    SetFxFlows {
+        slot: FxSlotRef,
+        flows: Vec<Stem>,
+    },
     /// Replaces the effect in a slot, keeping the position, the role and the on/off state. This is
     /// how a fixed slot's effect changes at run time (`filter` → `moog`, a pad bank retargeted
     /// between echo and reverb) without renumbering anything a map is bound to.
@@ -914,6 +929,11 @@ impl std::fmt::Debug for Command {
                 .field("slot", slot)
                 .field("index", index)
                 .field("value", value)
+                .finish(),
+            Command::SetFxFlows { slot, flows } => f
+                .debug_struct("SetFxFlows")
+                .field("slot", slot)
+                .field("flows", flows)
                 .finish(),
             Command::SetFxKind { slot, kind } => f
                 .debug_struct("SetFxKind")

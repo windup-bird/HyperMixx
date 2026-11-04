@@ -1055,6 +1055,7 @@ mod tests {
                 role: "eq".to_owned(),
                 kind: "eq".to_owned(),
                 enabled: true,
+                flows: None,
                 params: vec![
                     ("low".to_owned(), 0.0),
                     ("mid".to_owned(), 0.0),
@@ -1066,6 +1067,7 @@ mod tests {
                 role: "filter".to_owned(),
                 kind: "filter".to_owned(),
                 enabled: true,
+                flows: None,
                 params: vec![("value".to_owned(), 0.0)],
             },
         ];
@@ -1168,6 +1170,7 @@ mod tests {
                 role: "eq".to_owned(),
                 kind: "eq".to_owned(),
                 enabled: true,
+                flows: None,
                 params: vec![("low".to_owned(), 0.0)],
             },
             hypermixx_core::FxSlotStatus {
@@ -1175,6 +1178,7 @@ mod tests {
                 role: "filter".to_owned(),
                 kind: "moog".to_owned(),
                 enabled: true,
+                flows: None,
                 params: vec![("value".to_owned(), -0.4), ("resonance".to_owned(), 0.3)],
             },
         ];

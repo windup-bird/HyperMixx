@@ -632,6 +632,29 @@ impl Mixer {
         }
     }
 
+    /// Whether `slot` addresses a `flowfx` slot — the only place a flow mask means anything.
+    ///
+    /// A deck's flat index counts the flow chain first, so the post-merge banks and master are
+    /// rejected by position; `eq`/`filter` are fixed stages and always see every flow.
+    fn is_flowfx_slot(&self, target: &FxTarget) -> bool {
+        let channel = match target.chain {
+            FxChainId::Deck(deck) => match self.channels.get(deck as usize) {
+                Some(channel) if target.index < channel.flow_len() => channel,
+                _ => return false,
+            },
+            FxChainId::Stem { deck, .. } => match self.channels.get(deck as usize) {
+                Some(channel) => channel,
+                None => return false,
+            },
+            FxChainId::Master => return false,
+        };
+        channel
+            .chain(SlotChain::Flow(Stem::Drums))
+            .and_then(|chain| chain.slot(target.index))
+            .map(|slot| !matches!(slot.role(), "eq" | "filter"))
+            .unwrap_or(false)
+    }
+
     /// Runs one mutation through [`Mixer::for_each_fx_mut`] and turns the outcome into a response.
     fn answer(
         &mut self,
@@ -854,6 +877,21 @@ impl Mixer {
                 }
                 Err(err) => CommandResponse::Error(err.message()),
             },
+            Command::SetFxFlows { slot, flows } => {
+                if !self.is_flowfx_slot(&slot) {
+                    return CommandResponse::Error(format!(
+                        "{}: not a flow slot — only the flowfx bank is routed per flow",
+                        slot.chain.label()
+                    ));
+                }
+                let mask = flows
+                    .iter()
+                    .fold(0u8, |mask, stem| mask | (1u8 << (stem.index() & 7)));
+                self.answer(slot, |found| {
+                    found.set_flows(mask);
+                    Ok(())
+                })
+            }
             Command::SetFxParam { slot, name, value } => {
                 let label = slot.chain.label();
                 self.answer(slot, |found| {
@@ -1067,7 +1105,9 @@ pub(crate) fn unknown_deck(deck_id: u8, count: usize) -> String {
 impl MasterBus {
     /// fx → fader → limiter, in that order, leaving the result in [`MasterBus::sum`].
     fn render(&mut self, ctx: &FxContext) {
-        if self.fx.any_active() {
+        // Driven even when every slot is bypassed, so each slot sees its own bypass edge (and
+        // resets exactly once when it is engaged again).
+        if !self.fx.is_empty() {
             self.fx.process(&mut self.sum, ctx);
         }
         self.sum.scale(self.fader.next_amp(ctx));
@@ -1442,7 +1482,7 @@ mod tests {
     fn the_deck_listing_is_the_flow_chain_then_the_post_banks() {
         use hypermixx_core::Command;
         let mut cfg = simple_dj();
-        cfg.channels[0].flow_fx = vec!["echo".into()];
+        cfg.channels[0].flow_fx = vec![crate::mixer::config::FlowSlotConfig::all("echo")];
         cfg.channels[0].knob_fx = vec!["filter".into()];
         cfg.channels[0].pad_fx = vec!["reverb".into()];
         let mut mixer = loaded(cfg, 1);
@@ -1492,6 +1532,108 @@ mod tests {
                 "{stem}: a group write must reach every flow"
             );
         }
+    }
+
+    /// The flow whitelist: one mask per slot, broadcast to every flow's instance, reported in the
+    /// listing, and refused everywhere a flow mask has no meaning.
+    #[test]
+    fn set_fx_flows_routes_a_group_and_reports_it() {
+        use hypermixx_core::Command;
+        let mut cfg = simple_dj();
+        cfg.channels[0].flow_fx = vec![config::FlowSlotConfig::only("echo", [Stem::Vocals])];
+        let mut mixer = loaded(cfg, 1);
+        let target = FxTarget {
+            chain: FxChainId::Deck(0),
+            index: 2, // eq 0, filter 1, flowfx1 2
+        };
+        let listing = |mixer: &mut Mixer| match mixer.handle_fx_command(Command::ListFx {
+            chain: FxChainId::Deck(0),
+        }) {
+            CommandResponse::FxListed { slots, .. } => slots,
+            other => panic!("expected FxListed, got {other:?}"),
+        };
+        assert_eq!(
+            listing(&mut mixer)[2].flows,
+            Some(vec![Stem::Vocals]),
+            "the config's whitelist is what the slot is built with"
+        );
+
+        assert!(matches!(
+            mixer.handle_fx_command(Command::SetFxFlows {
+                slot: target,
+                flows: vec![Stem::Drums, Stem::Bass],
+            }),
+            CommandResponse::Ok
+        ));
+        // Every instance carries the same mask; which flow it *runs on* is decided per flow at
+        // process time, from that instance's own bit.
+        let expected_mask = (1u8 << Stem::Drums.index()) | (1u8 << Stem::Bass.index());
+        for stem in Stem::ALL {
+            assert_eq!(
+                mixer
+                    .channel(0)
+                    .unwrap()
+                    .slot(SlotChain::Flow(stem), 2)
+                    .unwrap()
+                    .flows(),
+                expected_mask,
+                "{stem}: the write must reach every instance"
+            );
+        }
+        assert_eq!(
+            listing(&mut mixer)[2].flows,
+            Some(vec![Stem::Drums, Stem::Bass])
+        );
+        // An empty list is "no flow": still mounted, processing nothing.
+        assert!(matches!(
+            mixer.handle_fx_command(Command::SetFxFlows {
+                slot: target,
+                flows: vec![],
+            }),
+            CommandResponse::Ok
+        ));
+        assert_eq!(listing(&mut mixer)[2].flows, Some(vec![]));
+
+        // `eq` and `filter` are fixed stages; the post-merge banks and master are single-bus.
+        for index in [0, 1] {
+            assert!(matches!(
+                mixer.handle_fx_command(Command::SetFxFlows {
+                    slot: FxTarget {
+                        chain: FxChainId::Deck(0),
+                        index
+                    },
+                    flows: vec![Stem::Vocals],
+                }),
+                CommandResponse::Error(_)
+            ));
+        }
+        let knob = match mixer.handle_fx_command(Command::AddFx {
+            chain: FxChainId::Deck(0),
+            kind: "gain".into(),
+        }) {
+            CommandResponse::FxAdded { index, .. } => index,
+            other => panic!("expected FxAdded, got {other:?}"),
+        };
+        assert!(matches!(
+            mixer.handle_fx_command(Command::SetFxFlows {
+                slot: FxTarget {
+                    chain: FxChainId::Deck(0),
+                    index: knob
+                },
+                flows: vec![Stem::Vocals],
+            }),
+            CommandResponse::Error(_)
+        ));
+        assert!(matches!(
+            mixer.handle_fx_command(Command::SetFxFlows {
+                slot: FxTarget {
+                    chain: FxChainId::Master,
+                    index: 0
+                },
+                flows: vec![Stem::Vocals],
+            }),
+            CommandResponse::Error(_)
+        ));
     }
 
     #[test]

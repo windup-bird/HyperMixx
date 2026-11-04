@@ -582,8 +582,12 @@ impl Channel {
             }
             // The tone prefix and the per-flow inserts run after the flow fader and the trim, before
             // the sum.
-            if self.flow_chains[stream].any_active() {
-                self.flow_chains[stream].process(sb, ctx);
+            // The chain is driven even when every slot is bypassed or masked out: the per-slot
+            // checks are a couple of branches, and skipping the chain here would hide the
+            // bypass/mask edges that reset an effect's state (a re-enabled slot must not resume
+            // with the audio it missed).
+            if !self.flow_chains[stream].is_empty() {
+                self.flow_chains[stream].process_for_flow(sb, ctx, stream);
             }
             bus.add_from(sb);
         }
@@ -592,7 +596,7 @@ impl Channel {
             bus.scale(side_gain);
         }
 
-        if self.post_fx.any_active() {
+        if !self.post_fx.is_empty() {
             self.post_fx.process(&mut bus, ctx);
         }
 
@@ -667,8 +671,23 @@ impl Channel {
     }
 
     /// Every slot in one chain.
+    ///
+    /// A flow chain reports each slot's flow mask; a single-bus chain leaves it `None`.
     pub fn slot_statuses(&self, chain: SlotChain) -> Option<Vec<FxSlotStatus>> {
-        Some(self.chain(chain)?.statuses())
+        let chain_ref = self.chain(chain)?;
+        let mut statuses = chain_ref.statuses();
+        if matches!(chain, SlotChain::Flow(_)) {
+            for (status, slot) in statuses.iter_mut().zip(chain_ref.slots()) {
+                status.flows = Some(
+                    Stem::ALL
+                        .iter()
+                        .copied()
+                        .filter(|stem| slot.flows() & (1u8 << (stem.index() & 7)) != 0)
+                        .collect(),
+                );
+            }
+        }
+        Some(statuses)
     }
 
     /// Appends an effect to one chain, returning its index within *that* chain's own index space.
@@ -966,6 +985,97 @@ mod tests {
         assert!(channel.peak() < 1e-4, "a right channel at hard left still sounded");
         // The cue is taken *before* the crossfader, so a channel faded out of the mix still cues.
         assert!(channel.cue().peak() > 0.0, "cue must ignore the crossfader");
+    }
+
+    /// A flow slot runs only on the flows it is routed to, and an instance that was masked out is
+    /// reset when it is routed back in.
+    #[test]
+    fn a_flow_slot_only_runs_on_the_flows_it_is_routed_to() {
+        struct Counted {
+            hits: Arc<AtomicUsize>,
+            resets: Arc<AtomicUsize>,
+        }
+        impl Fx for Counted {
+            fn process(&mut self, _bus: &mut Bus, _ctx: &FxContext) {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+            }
+            fn reset(&mut self) {
+                self.resets.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let hits: [Arc<AtomicUsize>; 4] = std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
+        let resets: [Arc<AtomicUsize>; 4] = std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
+        let chains: Vec<FxChain> = (0..4)
+            .map(|index| {
+                FxChain::from_parts([(
+                    "counter",
+                    Box::new(Counted {
+                        hits: hits[index].clone(),
+                        resets: resets[index].clone(),
+                    }) as Box<dyn Fx>,
+                )])
+            })
+            .collect();
+        let mut channel = Channel::new(
+            deck_at_zero(),
+            &ChannelConfig {
+                side: DeckSide::Center,
+                cue_send: 0.0,
+                ..Default::default()
+            },
+            CrossfaderConfig::default(),
+            chains,
+            FxChain::new(),
+        );
+        install_stems(&mut channel);
+        for counter in hits.iter().chain(resets.iter()) {
+            counter.store(0, Ordering::Relaxed);
+        }
+
+        let route = |channel: &mut Channel, mask: u8| {
+            for stem in Stem::ALL {
+                channel
+                    .chain_mut(SlotChain::Flow(stem))
+                    .unwrap()
+                    .slot_mut(0)
+                    .unwrap()
+                    .set_flows(mask);
+            }
+        };
+        // Routed to vocals only (index 3): exactly one instance runs per block.
+        route(&mut channel, 1 << Stem::Vocals.index());
+        channel.process(&ctx());
+        assert_eq!(hits[Stem::Vocals.index()].load(Ordering::Relaxed), 1);
+        for stem in [Stem::Drums, Stem::Bass, Stem::Other] {
+            assert_eq!(
+                hits[stem.index()].load(Ordering::Relaxed),
+                0,
+                "{stem} is not routed and must not run"
+            );
+        }
+        // Routing everything back in resets the three idle instances, once, and the one that was
+        // running keeps its state.
+        route(&mut channel, 0xff);
+        channel.process(&ctx());
+        for stem in [Stem::Drums, Stem::Bass, Stem::Other] {
+            assert_eq!(
+                resets[stem.index()].load(Ordering::Relaxed),
+                1,
+                "{stem} must be reset when it re-enters"
+            );
+            assert_eq!(hits[stem.index()].load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(
+            resets[Stem::Vocals.index()].load(Ordering::Relaxed),
+            0,
+            "a flow that never left keeps its state"
+        );
+        // A slot routed to no flow (`flows = []`) processes nothing at all.
+        route(&mut channel, 0);
+        let before: Vec<usize> = hits.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        channel.process(&ctx());
+        let after: Vec<usize> = hits.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        assert_eq!(before, after, "an empty whitelist runs the effect on no flow");
     }
 
     /// A non-linear insert makes the trim's *position* observable: the plan puts it right after the

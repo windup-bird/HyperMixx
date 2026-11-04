@@ -14,7 +14,7 @@ use hypermixx_core::{OutputRole, Stem, CHANNELS};
 use super::channel::{CrossfaderCurve, CrossfaderPlace, CueTap, DeckSide};
 use super::output::OutputId;
 use crate::fx::sample::FilterMode;
-use crate::fx::{FxChain, FxError, FxKind, FxSlot};
+use crate::fx::{FxChain, FxError, FxKind, FxSlot, FLOW_ALL};
 /// Why a mixer could not be built from a config.
 #[derive(Clone, Debug, PartialEq)]
 pub enum MixerError {
@@ -87,8 +87,9 @@ pub struct ChannelConfig {
     /// Per-flow inserts, as a **template**: every flow gets its own chain built from this list, so
     /// four streams get four independent instances (separate filter state, not one shared filter).
     ///
-    /// These run *after* the tone prefix (`eq`, `filter`) and *before* the flows are summed.
-    pub flow_fx: Vec<String>,
+    /// These run *after* the tone prefix (`eq`, `filter`) and *before* the flows are summed. Each
+    /// slot can name the flows it is routed to (`flows = ["vocals"]`); omitted means every flow.
+    pub flow_fx: Vec<FlowSlotConfig>,
     /// Post-merge knob bank: continuous effects (a sweep, an echo) addressed by the first knob.
     pub knob_fx: Vec<String>,
     /// Post-merge pad bank: momentary effects (a gate, a roll), after the knob bank.
@@ -129,11 +130,60 @@ impl Default for ChannelConfig {
     }
 }
 
+/// One entry of the `flowfx` bank: the effect and which flows it is routed to.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FlowSlotConfig {
+    /// The effect kind (a name from `fx help`).
+    pub kind: String,
+    /// The flows this slot is routed to, by stem name. Omitted = every flow; `[]` = no flow (the
+    /// slot is mounted but processes nothing).
+    pub flows: Option<Vec<Stem>>,
+}
+
+impl Default for FlowSlotConfig {
+    fn default() -> Self {
+        Self {
+            kind: String::new(),
+            flows: None,
+        }
+    }
+}
+
+impl FlowSlotConfig {
+    /// A slot routed to every flow.
+    pub fn all(kind: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            flows: None,
+        }
+    }
+
+    /// A slot routed to exactly `flows`.
+    pub fn only(kind: impl Into<String>, flows: impl IntoIterator<Item = Stem>) -> Self {
+        Self {
+            kind: kind.into(),
+            flows: Some(flows.into_iter().collect()),
+        }
+    }
+
+    /// The flow mask the mixer stores on the slot.
+    pub fn mask(&self) -> u8 {
+        match &self.flows {
+            None => FLOW_ALL,
+            Some(flows) => flows
+                .iter()
+                .fold(0u8, |mask, stem| mask | (1u8 << (stem.index() & 7))),
+        }
+    }
+}
+
 impl ChannelConfig {
     /// Every FX name this channel names — every bank — for validation and `fx help`.
     pub fn all_fx(&self) -> impl Iterator<Item = &String> {
         self.flow_fx
             .iter()
+            .map(|slot| &slot.kind)
             .chain(self.knob_fx.iter())
             .chain(self.pad_fx.iter())
     }
@@ -507,8 +557,11 @@ fn build_channel_chains(cfg: &ChannelConfig) -> Result<BuiltChains, MixerError> 
                 slot_with_role("eq", Some("eq"))?,
                 slot_with_role(cfg.filter.name(), Some("filter"))?,
             ];
-            for (index, name) in cfg.flow_fx.iter().enumerate() {
-                slots.push(slot_with_role(name, Some(&format!("flowfx{}", index + 1)))?);
+            for (index, slot_cfg) in cfg.flow_fx.iter().enumerate() {
+                let mut slot =
+                    slot_with_role(&slot_cfg.kind, Some(&format!("flowfx{}", index + 1)))?;
+                slot.set_flows(slot_cfg.mask());
+                slots.push(slot);
             }
             Ok(FxChain::from_slots(slots))
         })
@@ -734,7 +787,7 @@ side = \"spinward\"",
     #[test]
     fn the_banks_build_in_the_documented_order_with_numbered_roles() {
         let mut cfg = simple_dj();
-        cfg.channels[0].flow_fx = vec!["gain".into()];
+        cfg.channels[0].flow_fx = vec![FlowSlotConfig::all("gain")];
         cfg.channels[0].knob_fx = vec!["echo".into(), "filter".into()];
         cfg.channels[0].pad_fx = vec!["reverb".into()];
         let chains = cfg.build_chains().unwrap();
@@ -794,9 +847,15 @@ side = \"spinward\"",
     fn a_flowfx_slot_exists_once_per_flow_but_is_one_control() {
         let text = r#"
             [[channel]]
-            flow_fx = ["filter", "echo"]
             knob_fx = ["filter"]
             pad_fx = []
+
+            [[channel.flow_fx]]
+            kind = "filter"
+
+            [[channel.flow_fx]]
+            kind = "echo"
+            flows = ["vocals", "drums"]
         "#;
         let cfg = MixerConfig::from_toml_str(text).expect("parses");
         let chains = cfg.build_chains().unwrap();
@@ -805,10 +864,31 @@ side = \"spinward\"",
             assert_eq!(chain.len(), 2 + 2, "eq, filter, then two flow slots");
             assert_eq!(chain.slots()[2].role(), "flowfx1");
             assert_eq!(chain.slots()[3].role(), "flowfx2");
+            // No `flows` on the first slot = every flow; the second is routed to vocals+drums.
+            assert_eq!(
+                chain.slots()[2].flows(),
+                crate::fx::FLOW_ALL,
+                "an omitted whitelist routes every flow"
+            );
+            let mask = (1u8 << (Stem::Vocals.index() & 7)) | (1u8 << (Stem::Drums.index() & 7));
+            assert_eq!(chain.slots()[3].flows(), mask);
         }
+        // An explicit empty whitelist is a mounted slot that processes nothing.
+        let cfg = MixerConfig::from_toml_str(
+            r#"
+            [[channel]]
+            [[channel.flow_fx]]
+            kind = "echo"
+            flows = []
+        "#,
+        )
+        .expect("parses");
+        let chains = cfg.build_chains().unwrap();
+        assert_eq!(chains[0].0[0].slots()[2].flows(), 0);
+
         // And an unknown name in any bank is a construction error.
         let mut cfg = cfg;
-        cfg.channels[0].flow_fx.push("shimmer".into());
+        cfg.channels[0].flow_fx.push(FlowSlotConfig::all("shimmer"));
         assert!(matches!(
             cfg.build_chains(),
             Err(MixerError::UnknownFx(_))

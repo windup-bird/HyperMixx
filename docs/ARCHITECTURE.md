@@ -257,8 +257,11 @@ kind:`linear`/`moog`),`flowfx` 在合并前逐流跑,`knobfx`/`padfx` 在合并�
 `[crossfader]`(place/curve/cut_width/start)、`[cue]`(fader/blend/curve/cut_width)、
 以及 fader 起始位与位置(`fader = pre_fx|post_fx`)、cue_send/side、master fx/limiter/fader、
 输出列表(name/role(`master`|`cue`)/channels/gain)。
-`flow_fx` 是**模板**:每条 flow 各建一条独立的链(4 stems = 4 条,各自状态);要做"只给人声加
-filter"这类逐流差异,用 flowfx 的白名单(见计划中的 `flows` 字段,下一片实现)。
+`flow_fx` 是**模板**:每条 flow 各建一条独立的链(4 stems = 4 条,各自状态);逐流差异用每个槽的
+**白名单**(`[[channel.flow_fx]] flows = ["vocals"]`)——一个控件、N 份实例,`flows` 决定哪条 flow
+真正处理。mask 收窄时那条 flow 上的尾巴被硬切(不是淡出);放宽时新进入的实例先 `reset()`。
+每条链每块都被驱动(即使全部 bypass/mask 掉):跳过整条链会漏掉 bypass/mask 的边沿,让重新接上
+的效果带着它没听到的音频复活。
 
 - `Bus` — 面内(L/R 分离)块单位,构造时分配,热路径零分配;效果器逐面迭代省去步长乘法
 - `Channel` — 拥有自己的 deck、**每 stream 一条 flow 链**(`Vec<FxChain>`,从 config 的

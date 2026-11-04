@@ -82,6 +82,20 @@ pub fn format_response(response: &CommandResponse, sample_rate: u32) -> Vec<LogL
                     chain.label(),
                     slot.index,
                 )));
+                if let Some(flows) = &slot.flows {
+                    let text = if flows.len() == hypermixx_core::Stem::COUNT {
+                        "all".to_owned()
+                    } else if flows.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        flows
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    out.push(LogLine::info(format!("    flows = {text}")));
+                }
                 for (name, value) in &slot.params {
                     out.push(LogLine::info(format!("    {name} = {value:.4}")));
                 }
@@ -440,6 +454,7 @@ pub fn fx_help_text() -> String {
   fx add <kind>                    append an effect to the end of the chain
   fx remove <slot>                 drop a slot (later slots shift down)
   fx kind <slot> <kind>            swap the effect in a slot (same index, same role)
+  fx flows <slot> all|none|a,b     route a flowfx slot to some of the flows
   fx list                          show every slot with its index, kind and parameters
   fx set <slot> <param> <value>    set one parameter (value is smoothed, no clicks)
   fx on|off <slot>                 engage / bypass a slot

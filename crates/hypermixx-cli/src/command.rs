@@ -1386,6 +1386,44 @@ fn fx<'a>(
             dispatcher.slots().remove(&chain.label(), index);
             action
         }
+        // Route a flow slot to a subset of the flows. Only the flowfx bank has flows; the engine
+        // refuses the rest, so this arm just parses.
+        "flows" | "flow" => {
+            let index = match resolve_slot(words.next(), chain, dispatcher) {
+                Ok(index) => index,
+                Err(e) => return Action::Failed(e),
+            };
+            let Some(raw) = words.next() else {
+                return Action::Failed(
+                    "usage: [deck] fx flows <slot> <all|none|stem[,stem...]>".into(),
+                );
+            };
+            let flows = match raw {
+                "all" | "*" => Stem::ALL.to_vec(),
+                "none" => Vec::new(),
+                list => {
+                    let mut flows = Vec::new();
+                    for name in list.split(',') {
+                        match Stem::parse(name) {
+                            Some(stem) => flows.push(stem),
+                            None => {
+                                return Action::Failed(format!(
+                                    "unknown flow `{name}` (drums | bass | other | vocals)"
+                                ))
+                            }
+                        }
+                    }
+                    flows
+                }
+            };
+            send(
+                command_tx,
+                Command::SetFxFlows {
+                    slot: FxSlotRef { chain, index },
+                    flows,
+                },
+            )
+        }
         // Swap the effect *in* a slot: same index, same role, same on/off state. The kind is
         // validated here, so the local slot book can be updated without a round-trip.
         "kind" => {
@@ -2997,6 +3035,43 @@ mod tests {
         // The role is stable across the swap, and the kind is now a second name for the same slot.
         assert_eq!(dispatcher.slots().resolve("deck1", "filter"), Ok(1));
         assert_eq!(dispatcher.slots().resolve("deck1", "moog"), Ok(1));
+    }
+
+    /// `fx flows` parses `all`, `none` and a comma-separated stem list; an invented flow name is
+    /// refused before the engine sees it.
+    #[test]
+    fn fx_flows_parses_all_none_and_stem_lists() {
+        let cfg = hypermixx_audio::MixerConfig {
+            outputs: vec![],
+            ..hypermixx_audio::simple_dj()
+        };
+        let pipeline =
+            hypermixx_audio::AudioPipeline::start(cfg).expect("a headless engine starts");
+        let (notice_tx, _notice_rx) = unbounded();
+        let dispatcher = Dispatcher::new(pipeline.command_tx(), notice_tx);
+        dispatcher.prime(1, pipeline.response_rx());
+        for line in [
+            "deck1 fx flows filter all",
+            "deck1 fx flows filter none",
+            "deck1 fx flows filter vocals,bass",
+        ] {
+            let action = dispatch(line, &dispatcher, &pipeline, Backend::Auto, 2, Some(0));
+            assert!(
+                !matches!(action, Action::Failed(_)),
+                "`{line}`: {action:?}"
+            );
+        }
+        match dispatch(
+            "deck1 fx flows filter martian",
+            &dispatcher,
+            &pipeline,
+            Backend::Auto,
+            2,
+            Some(0),
+        ) {
+            Action::Failed(message) => assert!(message.contains("martian"), "{message}"),
+            other => panic!("an unknown flow must be refused, got {other:?}"),
+        }
     }
 
     /// `profile show` names what this session runs with, and `profile reload` switches the parts of

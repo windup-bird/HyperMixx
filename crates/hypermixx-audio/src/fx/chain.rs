@@ -28,6 +28,12 @@ pub struct FxSlot {
     /// Audio-thread memory of the previous block's engagement, to catch a bypass→engage edge and
     /// call [`Fx::reset`] exactly once.
     was_enabled: bool,
+    /// Which flows this slot is routed to (bit per stem index). `0xff` = every flow, which is what
+    /// a non-flow slot (knob/pad/master) keeps so the mask never matters there.
+    flows: u8,
+    /// Audio-thread memory of whether this instance ran on its flow last block, to catch the
+    /// masked-in edge and reset a state that has been sitting idle.
+    was_flow_active: bool,
     /// Some(_) while a pad holds this slot engaged; the value is what to restore on release.
     ///
     /// `Cell`, not an atomic: only the producer thread ever presses or releases, and commands are
@@ -49,6 +55,8 @@ impl FxSlot {
             fx,
             kind,
             role: role.into(),
+            flows: FLOW_ALL,
+            was_flow_active: false,
             enabled: AtomicBool::new(enabled),
             was_enabled: enabled,
             pad_held: Cell::new(None),
@@ -78,6 +86,36 @@ impl FxSlot {
     /// The slot's stable position identity; see [`FxSlot::replace`].
     pub fn role(&self) -> &str {
         &self.role
+    }
+
+    /// The flows this slot is routed to, as a bit per stem index.
+    pub fn flows(&self) -> u8 {
+        self.flows
+    }
+
+    /// Routes this slot to the flows in `mask`. Control-thread only (the field is not shared: every
+    /// flow has its own instance and the mixer writes all of them).
+    pub fn set_flows(&mut self, mask: u8) {
+        self.flows = mask;
+    }
+
+    /// Runs the slot for one flow, respecting the flow mask and the bypass state.
+    ///
+    /// The mask is checked per flow, and an instance that has been idle (masked out) is reset on
+    /// the block it is masked back in — otherwise a filter or delay would resume with whatever it
+    /// was doing before it left. Narrowing the mask does not fade a ringing tail: the flow simply
+    /// stops running the effect, which is a cut (documented on [`Command::SetFxFlows`]).
+    #[inline]
+    pub fn process_for_flow(&mut self, flow: usize, bus: &mut Bus, ctx: &FxContext) {
+        if self.flows & (1u8 << (flow & 7)) == 0 {
+            self.was_flow_active = false;
+            return;
+        }
+        if !self.was_flow_active {
+            self.fx.reset();
+            self.was_flow_active = true;
+        }
+        self.process(bus, ctx);
     }
 
     /// Replaces the effect, keeping the slot's role, engagement and pad latch.
@@ -191,6 +229,8 @@ impl FxSlot {
             role: self.role.clone(),
             kind: self.kind.to_owned(),
             enabled: self.is_enabled(),
+            // Filled in by the channel for a flow chain; a single-bus slot has no flows.
+            flows: None,
             params: super::param_snapshot(&*self.fx),
         }
     }
@@ -213,6 +253,9 @@ impl FxSlot {
         self.fx.on_trigger();
     }
 }
+
+/// Every flow bit set: the mask of a slot that is not routed per flow.
+pub const FLOW_ALL: u8 = 0xff;
 
 /// An ordered list of slots. Order is the processing order — no graph, no sorting.
 #[derive(Default)]
@@ -298,6 +341,13 @@ impl FxChain {
     /// skip a chain of bypassed effects entirely.
     pub fn any_active(&self) -> bool {
         self.slots.iter().any(FxSlot::is_enabled)
+    }
+
+    /// Runs every engaged slot in order, for one flow.
+    pub fn process_for_flow(&mut self, bus: &mut Bus, ctx: &FxContext, flow: usize) {
+        for slot in &mut self.slots {
+            slot.process_for_flow(flow, bus, ctx);
+        }
     }
 
     /// Runs every engaged slot in order.

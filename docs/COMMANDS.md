@@ -252,6 +252,7 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 [deck|master] fx add <kind>                追加到链尾（eq|filter|moog|gain|limiter|echo|reverb|flanger|phaser|cut，含别名）
 [deck|master] fx remove|rm <slot>          删除该槽，后续槽位前移
 [deck|master] fx kind <slot> <kind>        换掉槽里的效果（序号、role、开关状态都不变）
+[deck] fx flows <slot> all|none|a,b        flowfx 槽只作用于哪些 flow（stem 名，逗号分隔）
 [deck|master] fx toggle <slot>             翻转槽位（引擎持有状态，前端不留镜像）
 [deck|master] fx list|ls                   列出槽位：索引、kind、开关、参数
 [deck|master] fx set <slot> <param> <value>   设参数（指数平滑，不咔哒）
@@ -336,14 +337,19 @@ CPU 与 CUDA 的结果 Σ 残差一致（实测都是 −32.9 dB 量级），但
 [[channel]]
 filter = "linear"              # linear | moog：固定 filter 级的 kind（`fx kind filter moog` 可运行时换）
 cue = "pre"                    # pre | post：cue send 抽在 fader 的哪一侧（post 时推子连耳机一起关）
-flow_fx = ["gain"]             # 合并前、逐 flow 的插入：模板，每条 flow 各建一条独立链（4 stems = 4 条）
 knob_fx = ["echo"]             # 合并后 knob bank
 pad_fx = ["reverb"]            # 合并后 pad bank（在 knob 之后）
+
+[[channel.flow_fx]]            # 合并前、逐 flow 的插入
+kind = "filter"
+flows = ["vocals"]             # 只作用于人声；省略 = 全部 flow；[] = 哪条都不作用
 ```
 
-`flow_fx` 是**模板而不是一条链**：`flow_fx = ["filter"]` 意味着四个独立的滤波器（各自状态，
-互不串味），不是一个滤波器加在求和之后。三个 bank 里的名字在构造时校验，写错会在启动时失败
-而不是等到用的时候。一个 deck 的平坦槽位序号是 `[eq, filter, flowfx…, knobfx…, padfx…]`。
+`flow_fx` 是**模板而不是一条链**：每条 flow 都有同一组槽位、各自独立的实例（状态互不串味），
+但**控制是一份**：参数、开关、pad 状态广播到所有实例；`flows` 决定哪条 flow 真正跑它。
+白名单收窄时那条 flow 上的尾巴会被切（不是淡出），放宽时新进来的实例会先 `reset()`，
+不会带着旧状态复活。三个 bank 里的名字在构造时校验，写错会在启动时失败而不是等到用的时候。
+一个 deck 的平坦槽位序号是 `[eq, filter, flowfx…, knobfx…, padfx…]`。
 
 三条容易混淆的语义，都是刻意的：
 

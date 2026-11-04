@@ -569,6 +569,7 @@ fn route(mixer: &mut Mixer, sync: &mut SyncGroup, command: Command) -> Option<Co
         fx @ (AddFx { .. }
         | RemoveFx { .. }
         | SetFxKind { .. }
+        | SetFxFlows { .. }
         | SetFxEnabled { .. }
         | ToggleFx { .. }
         | SetFxParam { .. }
