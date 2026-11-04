@@ -378,11 +378,13 @@ pub fn help_text(decks: usize) -> String {
 
 In the TUI: `load` with no path opens a file picker; F9 opens the settings screen (controller port
 and map file, mixer outputs, live/preference files). The browser is a soft focus: it takes the arrow
-keys (Miller columns; Enter opens a list or the deck chooser, Esc goes back) but a typed deck
-command still goes to the focused deck.
+keys (Miller columns; Enter opens a list or the deck chooser, Esc goes back) and it is the command
+target: a bare deck verb is refused while it is selected, so a stray `play` cannot stop a deck.
+`Tab` picks a deck.
 
 A leading `deck1` / `1` selects a deck (numbers are 1-based), `master` the summed output. Without
-one the command follows the focused deck (TUI: `Tab` cycles deck1 → deck2 → browser).
+one the command follows the selected target (TUI: `Tab` cycles deck1 → deck2 → browser); while
+browser is selected, name the deck in the line instead.
 startup flags: --config <file> (custom topology), --profile <name|file> (which files to use),
                --print-config (reference TOML), --live <file> (engine rate, ring, stem defaults),
                --backend auto|stratum|timestretch, --cli (line REPL; the TUI is the default),

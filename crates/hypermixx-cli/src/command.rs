@@ -140,6 +140,10 @@ enum Target {
     /// next word decides), and the stem-scoped verbs (`level`, `mute`, `solo`) use the stem.
     Stem(u8, Stem),
     Master,
+    /// The browser is the command target, so a bare line implies **no** deck. A deck verb must name
+    /// one (`deck1 play`), because the alternative — silently falling back to whichever deck was
+    /// focused last — is how `play` ends up stopping a track while the user is browsing.
+    Unset,
 }
 
 /// Everything a dispatch needs to act.
@@ -316,14 +320,18 @@ impl Dispatcher {
     }
 }
 
-/// Turns a line into engine effects. `focused` is the deck a bare command targets.
+/// Turns a line into engine effects.
+///
+/// `focused` is the deck a bare command targets — `None` when the front-end's target is not a deck
+/// (the browser), in which case a deck verb has to name its deck. Global verbs (`master fx …`,
+/// `browser …`, `mixer …`, `live …`) ignore it either way.
 pub fn dispatch(
     line: &str,
     dispatcher: &Dispatcher,
     pipeline: &AudioPipeline,
     backend: Backend,
     decks: usize,
-    focused: u8,
+    focused: Option<u8>,
 ) -> Action {
     let mut words = line.split_whitespace();
     let Some(first) = words.next() else {
@@ -334,7 +342,7 @@ pub fn dispatch(
     // `deck1 vocals mute`, `deck1 vocals fx add filter`.
     let (mut target, verb) = match parse_target(first, decks) {
         Some(target) => (target, words.next().unwrap_or_default()),
-        None => (Target::Deck(focused), first),
+        None => (focused.map_or(Target::Unset, Target::Deck), first),
     };
     if let Target::Deck(deck_id) = target {
         if let Some(stem) = Stem::parse(verb) {
@@ -557,7 +565,7 @@ fn fader_command<'a>(
     if matches!(stage, "cuesend" | "cue_send") && raw.eq_ignore_ascii_case("toggle") {
         let deck_id = match deck_only(target) {
             Ok(deck_id) => deck_id,
-            Err(_) => return Action::Failed("`fader cuesend toggle` needs a deck".into()),
+            Err(message) => return Action::Failed(message),
         };
         return send(command_tx, Command::ToggleCueSend { deck_id });
     }
@@ -573,7 +581,7 @@ fn fader_command<'a>(
         deck_stage => {
             let deck_id = match deck_only(target) {
                 Ok(deck_id) => deck_id,
-                Err(_) => return Action::Failed(format!("`fader {deck_stage}` needs a deck")),
+                Err(message) => return Action::Failed(message),
             };
             match deck_stage {
                 "flow" => FaderTarget::Flow(deck_id),
@@ -1298,6 +1306,12 @@ fn fx<'a>(
         Target::Deck(deck_id) => FxChainId::Deck(deck_id),
         Target::Stem(deck, stem) => FxChainId::Stem { deck, stem },
         Target::Master => FxChainId::Master,
+        Target::Unset => {
+            return Action::Failed(
+                "no chain is targeted — press Tab to pick a deck, or write `deck1 fx …` / `master fx …`"
+                    .into(),
+            )
+        }
     };
     let command_tx = &dispatcher.command_tx;
     let Some(sub) = words.next() else {
@@ -1451,6 +1465,9 @@ fn deck_only(target: Target) -> Result<u8, String> {
         // deck 0 rather than making the user retype the line.
         Target::Stem(deck_id, _) => Ok(deck_id),
         Target::Master => Err("`master` only takes `fx` commands".into()),
+        Target::Unset => Err(
+            "no deck is targeted — press Tab to pick one, or write `deck1 <command>`".into(),
+        ),
     }
 }
 
@@ -1458,7 +1475,7 @@ fn deck_only(target: Target) -> Result<u8, String> {
 fn with_deck(target: Target, verb: &str, apply: impl FnOnce(u8) -> Action) -> Action {
     match deck_only(target) {
         Ok(deck_id) => apply(deck_id),
-        Err(_) => Action::Failed(format!("`{verb}` needs a deck, not `master`")),
+        Err(message) => Action::Failed(format!("`{verb}`: {message}")),
     }
 }
 
@@ -1470,7 +1487,7 @@ fn forward(
 ) -> Action {
     match deck_only(target) {
         Ok(deck_id) => send(command_tx, build(deck_id)),
-        Err(_) => Action::Failed("that command needs a deck, not `master`".into()),
+        Err(message) => Action::Failed(message),
     }
 }
 
@@ -1506,8 +1523,9 @@ fn stem_family<'a>(
     dispatcher: &Dispatcher,
     pipeline: &AudioPipeline,
 ) -> Action {
-    let Ok(deck_id) = deck_only(target) else {
-        return Action::Failed("`stem` needs a deck, not `master`".into());
+    let deck_id = match deck_only(target) {
+        Ok(deck_id) => deck_id,
+        Err(message) => return Action::Failed(format!("`stem`: {message}")),
     };
     let command_tx = &dispatcher.command_tx;
     let Some(sub) = words.next() else {
@@ -2827,7 +2845,7 @@ mod tests {
             };
             let full = format!("deck1 {line}");
             if let Action::Failed(message) =
-                dispatch(&full, &dispatcher, &pipeline, Backend::Auto, 2, 0)
+                dispatch(&full, &dispatcher, &pipeline, Backend::Auto, 2, Some(0))
             {
                 panic!("`{full}` failed: {message}");
             }
@@ -2839,10 +2857,49 @@ mod tests {
             &pipeline,
             Backend::Auto,
             2,
-            0,
+            Some(0),
         ) {
             panic!("`deck1 keylock toggle` failed: {message}");
         }
+    }
+
+    /// A bare deck verb needs a deck target. With the browser as the front-end's target there is
+    /// none, so the line is refused instead of quietly landing on whichever deck was focused last; a
+    /// line that names its deck, and a global verb, still work.
+    #[test]
+    fn a_bare_deck_verb_is_refused_when_the_browser_is_the_target() {
+        let cfg = hypermixx_audio::MixerConfig {
+            outputs: vec![],
+            ..hypermixx_audio::simple_dj()
+        };
+        let pipeline =
+            hypermixx_audio::AudioPipeline::start(cfg).expect("a headless engine starts");
+        let (notice_tx, _notice_rx) = unbounded();
+        let dispatcher = Dispatcher::new(pipeline.command_tx(), notice_tx);
+        dispatcher.prime(1, pipeline.response_rx());
+
+        for line in ["play", "cue", "fader flow -0.2", "fx list", "stem status"] {
+            match dispatch(line, &dispatcher, &pipeline, Backend::Auto, 2, None) {
+                Action::Failed(message) => assert!(
+                    message.contains("Tab"),
+                    "`{line}` should point at `Tab`, got: {message}"
+                ),
+                other => panic!("`{line}` must be refused under the browser, got {other:?}"),
+            }
+        }
+        // An explicit target, and a verb that never needed a deck, still work.
+        for line in ["deck1 play", "deck2 cue", "master fx list", "state"] {
+            let action = dispatch(line, &dispatcher, &pipeline, Backend::Auto, 2, None);
+            assert!(
+                !matches!(action, Action::Failed(_)),
+                "`{line}` should work with no deck target, got {action:?}"
+            );
+        }
+        // The REPL passes a deck, and keeps its old fallback.
+        assert!(!matches!(
+            dispatch("play", &dispatcher, &pipeline, Backend::Auto, 2, Some(1)),
+            Action::Failed(_)
+        ));
     }
 
     /// `profile show` names what this session runs with, and `profile reload` switches the parts of

@@ -435,17 +435,20 @@ fn submit(app: &mut App, dispatcher: &Dispatcher, pipeline: &AudioPipeline) {
     if apply_ui_command(app, &line, dispatcher) {
         return;
     }
-    // The browser is a soft focus: the arrows belong to the library, but a typed deck command still
-    // goes to the last focused deck, so a fresh session (which starts in the browser) can be driven
-    // from the command line without first pressing `Tab`.
-    let deck = app.default_deck();
+    // A deck verb needs a deck target: while the browser owns the command line there is none, so
+    // `play` is refused instead of quietly landing on whichever deck was focused last. `Tab` picks a
+    // deck, and a line that names one (`deck1 play`) needs no target at all.
+    let deck = match app.target {
+        Target::Deck(index) => Some(index as u8),
+        Target::Browser => None,
+    };
     let action = command::dispatch(
         &line,
         dispatcher,
         pipeline,
         app.backend,
         app.decks,
-        deck as u8,
+        deck,
     );
     match action {
         Action::Continue => {}
@@ -1187,13 +1190,12 @@ mod tests {
         assert!(sent(&rx).contains("ToggleKeylock"));
     }
 
-    /// While the browser owns the arrow keys it must not take the command line with it.
+    /// The browser owns the arrow keys *and* the command line: a bare `load` is still the UI's own
+    /// picker affordance, but a bare deck verb is refused (see `command.rs`'s `Target::Unset`).
     #[test]
-    fn deck_actions_still_work_while_the_browser_is_focused() {
+    fn a_bare_load_under_the_browser_still_opens_the_picker() {
         let (mut app, dispatcher, _rx) = wired();
         app.target = Target::Browser;
-        // A bare `load` used to be refused under the browser target; it now opens the picker for
-        // the last focused deck, which is the same routing a typed `play` takes.
         assert!(apply_ui_command(&mut app, "load", &dispatcher));
         let expected = app.default_deck();
         match app.overlay {

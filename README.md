@@ -175,8 +175,8 @@ browser | command
   和横着的 crossfader 看起来是同一根推子。电平条各 1 列，分居框的中线两侧，让 crossfader 的中点落在中线上。
 - crossfader 用 fader 的样式（`█` 实心 / `░` 空格），但它是**双极**的：中间 0 位时两边都不填充，
   向左/向右才从中点往外填。
-- 启动时焦点在 **browser**：方向键直接浏览曲库。browser 是"软焦点"——它只拿走方向键，命令行的 deck
-  命令仍然落到最近聚焦的 deck（默认 deck1），不用先按 `Tab`。
+- 启动时焦点在 **browser**：方向键直接浏览曲库。browser 也是命令行的目标——此时**裸的 deck 命令会被拒绝**
+  （`play` 不会悄悄落到上次的 deck），按 `Tab` 选到 deck，或直接在行首写 `deck1 play`。
 - 宽度 < 112 或高度 < 26 时整条控件带隐藏，只留 header + deck 信息 + 波形 + browser/command；宽度不到 120 时
   mixer 旋钮自动省掉数值，只留长条。
 - 控件全部可用鼠标点：pads 三档、beat 三档、fader/knob/crossfader 按位置取值。键盘仍然只属于命令行

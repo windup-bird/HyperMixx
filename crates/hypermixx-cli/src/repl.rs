@@ -55,7 +55,7 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
             if line.is_empty() {
                 continue;
             }
-            match command::dispatch(line, &dispatcher, pipeline, backend, decks, 0) {
+            match command::dispatch(line, &dispatcher, pipeline, backend, decks, Some(0)) {
                 Action::Continue => {}
                 Action::Quit => break,
                 Action::Message(text) => println!("{text}"),
