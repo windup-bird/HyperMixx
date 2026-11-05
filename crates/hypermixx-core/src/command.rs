@@ -587,13 +587,13 @@ pub enum Command {
         deck_id: DeckId,
         op: StemOp,
     },
-    /// Switches the keylock profile (`off` = tape, `on` = the configured keylock window).
     /// Replaces the engine's auto-gain preference (from `live.toml`). Applies immediately to every
     /// loaded track: the measurement lives on the deck, the gain is derived here.
     SetAutogain {
         enabled: bool,
         target_db: f32,
     },
+    /// Switches the keylock profile (`off` = tape, `on` = the configured keylock window).
     SetKeylock {
         deck_id: DeckId,
         mode: KeylockMode,

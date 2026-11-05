@@ -473,23 +473,21 @@ impl Mixer {
     /// Deck 0 wins when both have a grid, which is the convention a two-deck crossfade needs — a
     /// tempo-synced effect must not change its notion of "beat 1" halfway through a blend.
     pub fn make_ctx(&self, sample_rate: u32) -> FxContext {
-        let grid = self
-            .channels
-            .iter()
-            .find_map(|channel| channel.deck().analysis())
-            .map(|analysis| analysis.beatgrid.clone());
+        // One scan and only a cheap Arc clone: the grid itself is borrowed, not copied. A BeatGrid
+        // is one u64 per beat, so cloning it on every block was a real allocation on the producer.
+        let grid = self.channels.iter().find_map(|channel| {
+            let deck = channel.deck();
+            deck.analysis()
+                .map(|analysis| (analysis, deck.current_frame()))
+        });
         let (frames_per_beat, beat_position) = match &grid {
-            Some(grid) => {
-                let deck = self
-                    .channels
-                    .iter()
-                    .find(|c| c.deck().analysis().is_some())
-                    .map(|c| c.deck().current_frame())
-                    .unwrap_or(0);
-                let width = grid
-                    .beat_width(grid.floor_beat(deck))
-                    .max(1) as f64;
-                (width, grid.floor_beat(deck) as f64 + f64::from(grid.phase(deck)))
+            Some((analysis, frame)) => {
+                let grid = &analysis.beatgrid;
+                let width = grid.beat_width(grid.floor_beat(*frame)).max(1) as f64;
+                (
+                    width,
+                    grid.floor_beat(*frame) as f64 + f64::from(grid.phase(*frame)),
+                )
             }
             None => (0.0, 0.0),
         };
@@ -900,7 +898,7 @@ impl Mixer {
                 }
                 let mask = flows
                     .iter()
-                    .fold(0u8, |mask, stem| mask | (1u8 << (stem.index() & 7)));
+                    .fold(0u8, |mask, stem| mask | config::flow_bit(stem.index()));
                 self.answer(slot, |found| {
                     found.set_flows(mask);
                     Ok(())

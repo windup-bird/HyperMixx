@@ -705,7 +705,7 @@ impl Channel {
                     Stem::ALL
                         .iter()
                         .copied()
-                        .filter(|stem| slot.flows() & (1u8 << (stem.index() & 7)) != 0)
+                        .filter(|stem| slot.flows() & super::config::flow_bit(stem.index()) != 0)
                         .collect(),
                 );
             }

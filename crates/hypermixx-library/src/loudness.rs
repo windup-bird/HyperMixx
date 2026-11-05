@@ -34,7 +34,9 @@ pub fn loudness_db(pcm: &[f32], sample_rate: u32, channels: usize) -> Option<f32
     let hop = ((rate * HOP_SECONDS) as usize).clamp(1, frames);
     let per_window = ((WINDOW_SECONDS * rate) / hop as f64).ceil().max(1.0) as usize;
 
-    let mut hop_sums = std::collections::VecDeque::with_capacity(per_window + 1);
+    // A track shorter than one hop can never fill a window, so cap the ring by the frames that
+    // actually exist: `per_window` is huge there and would allocate far more than it ever uses.
+    let mut hop_sums = std::collections::VecDeque::with_capacity(per_window.min(frames) + 1);
     let mut best = 0.0f64;
     let mut pos = 0usize;
     let mut any = false;

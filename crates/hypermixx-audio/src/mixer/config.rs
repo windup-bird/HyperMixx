@@ -131,7 +131,7 @@ impl Default for ChannelConfig {
 }
 
 /// One entry of the `flowfx` bank: the effect and which flows it is routed to.
-#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct FlowSlotConfig {
     /// The effect kind (a name from `fx help`).
@@ -141,13 +141,10 @@ pub struct FlowSlotConfig {
     pub flows: Option<Vec<Stem>>,
 }
 
-impl Default for FlowSlotConfig {
-    fn default() -> Self {
-        Self {
-            kind: String::new(),
-            flows: None,
-        }
-    }
+/// The bit a flow index occupies in a slot's flow mask. One definition, shared by the config, the
+/// command surface and status reporting so the three cannot disagree about the encoding.
+pub(crate) fn flow_bit(index: usize) -> u8 {
+    1u8 << (index & 7)
 }
 
 impl FlowSlotConfig {
@@ -173,7 +170,7 @@ impl FlowSlotConfig {
             None => FLOW_ALL,
             Some(flows) => flows
                 .iter()
-                .fold(0u8, |mask, stem| mask | (1u8 << (stem.index() & 7))),
+                .fold(0u8, |mask, stem| mask | flow_bit(stem.index())),
         }
     }
 }
@@ -535,7 +532,7 @@ pub fn build_slots(names: &[String]) -> Result<Vec<FxSlot>, MixerError> {
 /// One FX by name, at its defaults. Its role is the kind's name — a bank slot gets a numbered role
 /// from [`build_channel_chains`] instead.
 pub fn build_slot(name: &str) -> Result<FxSlot, MixerError> {
-    Ok(slot_with_role(name, None)?)
+    slot_with_role(name, None)
 }
 
 /// One FX by name with an explicit role (the slot's stable identity; see [`FxSlot`]).

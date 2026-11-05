@@ -1448,7 +1448,7 @@ fn fx<'a>(
                 command_tx,
                 Command::SetFxKind {
                     slot: FxSlotRef { chain, index },
-                    kind: kind.to_owned(),
+                    kind: parsed.name().to_owned(),
                 },
             );
             dispatcher
