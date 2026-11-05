@@ -400,8 +400,16 @@ impl MixerConfig {
     /// *construction* error ([`MixerError::UnknownFx`] from `build_chains`), surfaced when a mixer
     /// is built rather than when the text is read, because that is where the registry is consulted.
     pub fn from_toml_str(text: &str) -> Result<Self, MixerError> {
-        let file: MixerFile =
+        // A single-file config keeps the topology under `[mixer]`; a standalone topology file (the
+        // historical `--config` shape, and `reference_toml()`) has the same keys at the root. Both
+        // are accepted, so one whole config can be emitted by `--print-config` while an old file
+        // still loads. Parsing to a Value first keeps syntax errors pointing at their line.
+        let value: toml::Value =
             toml::from_str(text).map_err(|err| MixerError::Parse(err.to_string()))?;
+        let section = value.get("mixer").cloned().unwrap_or(value);
+        let file: MixerFile = section
+            .try_into()
+            .map_err(|err| MixerError::Parse(err.to_string()))?;
         Ok(file.into())
     }
 }
@@ -484,15 +492,16 @@ pub fn simple_dj() -> MixerConfig {
     }
 }
 
-/// The reference topology as TOML — the starting point for a custom config (`--print-config`
-/// emits it). Parsing this text must yield exactly [`simple_dj`], which is the test that keeps the
-/// schema and the constructor honest with each other.
+/// The shipped config as TOML — the starting point for a hand-written config (`--print-config`
+/// emits it, and the first-start copy writes it). Parsing this text must yield exactly [`simple_dj`]
+/// for the mixer, which is the test that keeps the schema and the constructor honest with each
+/// other. The other sections are the front-end's and are ignored here.
 pub fn reference_toml() -> &'static str {
-    // The reference topology ships as a file so there is exactly one source of truth: this text,
-    // `--print-config` and `profile/mixer.toml` are the same bytes.
+    // One file is the single source of truth: the built-in topology, `--print-config` and the
+    // first-start copy are the same bytes. `from_toml_str` reads only its `[mixer]` section.
     include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../profile/mixer.toml"
+        "/../../profile/config.toml"
     ))
 }
 
@@ -658,6 +667,32 @@ mod tests {
         // And it must actually build: chains resolve, limiter wires.
         assert!(parsed.build_chains().is_ok());
         assert!(parsed.master_limiter);
+    }
+
+    #[test]
+    fn a_single_file_config_reads_only_its_mixer_section() {
+        let cfg = MixerConfig::from_toml_str(
+            r#"
+            [mixer]
+            [[mixer.channel]]
+            side = "left"
+            [[mixer.output]]
+            name = "main"
+            role = "master"
+
+            [live]
+            audio.sample_rate = 48000
+
+            [preference]
+            theme = "dark"
+            "#,
+        )
+        .expect("the [mixer] section parses");
+        assert_eq!(cfg.channels.len(), 1);
+        assert_eq!(cfg.outputs.len(), 1);
+        assert_eq!(cfg.channels[0].side, DeckSide::Left);
+        // The other sections belong to the front-end, not the mixer's schema, so they must not
+        // trip `deny_unknown_fields` or change the topology.
     }
 
     #[test]

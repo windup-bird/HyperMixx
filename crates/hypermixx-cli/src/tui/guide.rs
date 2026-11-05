@@ -198,7 +198,7 @@ fn read_outputs(path: &str) -> Vec<OutputEntry> {
     let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
         return Vec::new();
     };
-    let Some(tables) = doc.get("output").and_then(|item| item.as_array_of_tables()) else {
+    let Some(tables) = crate::profile::output_tables(&doc) else {
         return Vec::new();
     };
     tables
@@ -848,12 +848,10 @@ fn delete_output(session: &mut Session) {
 fn remove_output(path: &str, index: usize) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|err| format!("{path}: {err}"))?;
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|err| format!("{path}: {err}"))?;
-    let tables = doc
-        .get_mut("output")
-        .and_then(|item| item.as_array_of_tables_mut())
-        .ok_or_else(|| format!("{path}: no [[output]] table"))?;
+    let tables = crate::profile::output_tables_mut(&mut doc)
+        .map_err(|err| format!("{path}: {err}"))?;
     if index >= tables.len() {
-        return Err(format!("{path}: no [[output]] #{index}"));
+        return Err(format!("{path}: no [[mixer.output]] #{index}"));
     }
     tables.remove(index);
     std::fs::write(path, doc.to_string()).map_err(|err| format!("{path}: {err}"))
@@ -1641,7 +1639,7 @@ fn output_labels(path: &str) -> Vec<String> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    if let Some(tables) = doc.get("output").and_then(|item| item.as_array_of_tables()) {
+    if let Some(tables) = crate::profile::output_tables(&doc) {
         for table in tables.iter() {
             let name = table
                 .get("name")
@@ -1661,7 +1659,7 @@ fn output_labels(path: &str) -> Vec<String> {
 fn bound_device(path: &str, index: usize) -> Option<(String, Option<(u16, u16)>)> {
     let text = std::fs::read_to_string(path).ok()?;
     let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
-    let table = doc.get("output")?.as_array_of_tables()?.get(index)?;
+    let table = crate::profile::output_tables(&doc)?.get(index)?;
     let device = table
         .get("device")
         .and_then(|item| item.as_str())
@@ -1692,16 +1690,8 @@ fn bind_device(
 ) -> Result<String, String> {
     let text = std::fs::read_to_string(path).map_err(|err| format!("{path}: {err}"))?;
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|err| format!("{path}: {err}"))?;
-    if doc.get("output").is_none() {
-        doc.insert(
-            "output",
-            toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
-        );
-    }
-    let tables = doc
-        .get_mut("output")
-        .and_then(|item| item.as_array_of_tables_mut())
-        .ok_or_else(|| format!("{path}: `output` is not an array of tables"))?;
+    let tables = crate::profile::output_tables_mut(&mut doc)
+        .map_err(|err| format!("{path}: {err}"))?;
     let index = match target {
         DeviceTarget::Output(index) => index,
         DeviceTarget::NewOutput(role) => {
@@ -1722,7 +1712,7 @@ fn bind_device(
     };
     let table = tables
         .get_mut(index)
-        .ok_or_else(|| format!("{path}: no [[output]] #{index}"))?;
+        .ok_or_else(|| format!("{path}: no [[mixer.output]] #{index}"))?;
     let role = table
         .get("role")
         .and_then(|item| item.as_str())
@@ -1888,8 +1878,8 @@ mod tests {
         let mixer = dir.join("mixer.toml");
         std::fs::write(
             &mixer,
-            "# my rig\n[[output]]\nname = \"main\"\nrole = \"master\"\n\n\
-             [[output]]\nname = \"phones\"\nrole = \"cue\"\n",
+            "# my rig\n[mixer]\n[[mixer.output]]\nname = \"main\"\nrole = \"master\"\n\n\
+             [[mixer.output]]\nname = \"phones\"\nrole = \"cue\"\n",
         )
         .unwrap();
         let path = mixer.display().to_string();
@@ -1970,8 +1960,8 @@ mod tests {
         let mixer = dir.join("mixer.toml");
         std::fs::write(
             &mixer,
-            "[[output]]\nname = \"main\"\nrole = \"master\"\n\n\
-             [[output]]\nname = \"phones\"\nrole = \"cue\"\n",
+            "[mixer]\n[[mixer.output]]\nname = \"main\"\nrole = \"master\"\n\n\
+             [[mixer.output]]\nname = \"phones\"\nrole = \"cue\"\n",
         )
         .unwrap();
         let mut session = test_session();
@@ -2041,7 +2031,7 @@ mod tests {
     fn the_output_overlay_moves_with_the_cursor() {
         let mut session = test_session();
         session.outputs = Outputs {
-            mixer_path: "profile/mixer.toml".to_owned(),
+            mixer_path: "profile/config.toml".to_owned(),
             devices: vec![
                 hypermixx_audio::DeviceInfo {
                     name: "A".to_owned(),

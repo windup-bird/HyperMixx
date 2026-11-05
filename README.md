@@ -83,7 +83,7 @@ deck1> fader gain 1.0              # 通道 trim：0 = 0 dB，1 = +6 dB
 deck1> fader cross -1.0            # crossfader（共用；位置与曲线见 [crossfader]）
 deck1> tempofader 0.5              # 推子位置（tempo = 1 + pos × temporange）
 deck1> temporange 0.16             # 推子满量程 ±16%（缺省 0.1）
-deck1> keylock on                  # 变调引擎：on（默认）| off；窗口在 live.toml 的 [keylock]
+deck1> keylock on                  # 变调引擎：on（默认）| off；窗口在 config.toml 的 [keylock]
 deck1> key 1                       # 变调半音（占位：只记录，暂不发声）
 deck1> beatjump 16
 deck1> fx list                    # 列出fx
@@ -102,8 +102,8 @@ deck1> master fx list
 # stems：离线分离 4 条轨，然后逐条控制（分离在后台跑，期间照常 play/loop/jump/sync）
 deck1> stem separate         # 分段分离：先装四路流（此刻仍听原曲），每 5.85s 一块落地即可用
 deck1> stem status           # 水位：`25% separated`（未装入部分是原曲回落）
-deck1> stem separate --model htdemucs-fp16   # 临时换模型（provider/overlap/shifts 在 live.toml）
-# CUDA：在 live.toml 设 `[stems] provider = "cuda"`，需 --features cuda 构建（13s，RTX 4050）
+deck1> stem separate --model htdemucs-fp16   # 临时换模型（provider/overlap/shifts 在 config.toml）
+# CUDA：在 config.toml 设 `[stems] provider = "cuda"`，需 --features cuda 构建（13s，RTX 4050）
 # 更快：设 `[stems] overlap = 0.0` 后 `live reload`，分离时间少约 24%，窗口边缘权重更大
 deck1> stem acapella         # 只要人声（instrumental | drums | bass | full）
 deck1> vocals level -0.5     # 单条 stem 电平（-1 = 精确静音）
@@ -126,20 +126,19 @@ deck1> quit
 cargo run -p hypermixx-cli -- --cli                  # 纯 REPL（默认是 TUI）
 cargo run -p hypermixx-cli -- --guide                # controller-guide（不启动引擎）
 cargo run -p hypermixx-cli -- --backend auto        # 分析后端 auto | stratum | timestretch
-cargo run -p hypermixx-cli -- --config topo.toml    # 自定义拓扑
-cargo run -p hypermixx-cli -- --print-config        # 打印参考 TOML（= profile/mixer.toml）
-cargo run -p hypermixx-cli -- --profile dj          # 用 profile/dj.toml 指路（拓扑 + 本机设置 + MIDI 设备）
-#   会话内切换：`profile show` 看当前 profile，`profile reload dj` 换一套（控制器下次启动生效）
-cargo run -p hypermixx-cli -- --live live.toml      # 引擎采样率 / ring 大小 / keylock 窗口 / stem 默认值
-cargo run -p hypermixx-cli -- --controller 0       # 打开 0 号控制器输入，用 profile/controller.toml
-cargo run -p hypermixx-cli -- --controller 0 --controller-map my.toml   # 指定映射文件
-cargo run -p hypermixx-cli -- --guide              # learn 模式编辑映射（不启动引擎，端口/文件在 TUI 里选）
-#   旧的 --tui / --midi / --midi-map / --midi-guide 已移除
+cargo run -p hypermixx-cli -- --config config.toml  # 指定配置文件；不给则用平台默认路径
+cargo run -p hypermixx-cli -- --print-config        # 打印配置模板后退出
+cargo run -p hypermixx-cli -- --controller 0       # 打开 0 号控制器输入
+#   配置是单文件多段落：[mixer] / [live] / [preference] / [controller]
+#   不给 --config 时：Linux/Termux 读 $XDG_CONFIG_HOME/hypermixx/config.toml，
+#   Windows 读 %APPDATA%/Hypermixx/config.toml；首次启动从内置模板复制一份
+#   `config show` 看当前配置，`config reload` 重读；`HYPERMIXX_CONFIG` 可覆盖路径
+#   旧的 --profile / --live / --controller-map / --tui / --midi* 已移除
 ```
 
 TUI 内尽量不用启动参数:`F9` 打开设置（控制器端口、映射文件、拓扑文件、输出设备都在这里选，取代了旧的 F2/F3）；
 `load` 不带路径则弹出文件浏览器；`--guide` 即使不跟路径也会在 TUI 里选端口与文件。波形左右声道上下镜像，三频段颜色、
-分频点（`low_hz`/`high_hz`，内置默认 200/4000Hz，随附文件用 250/4000Hz）、渲染 backend 与图像刷新率在 `profile/preference.toml` 配置：
+分频点（`low_hz`/`high_hz`，内置默认 200/4000Hz，随附文件用 250/4000Hz）、渲染 backend 与图像刷新率在 `config.toml` 配置：
 `auto` 按 kitty → braille 选择（tmux/screen 暂回 braille）；kitty 可用 60Hz。
 Windows 上经 ConPTY 时 kitty graphics 的 APC 序列会被丢掉（表现为选中 kitty 但波形区空白），
 原因与修法见 [`docs/WAVEFORM.md`](docs/WAVEFORM.md)。
@@ -181,28 +180,29 @@ browser | command
   mixer 旋钮自动省掉数值，只留长条。
 - 控件全部可用鼠标点：pads 三档、beat 三档、fader/knob/crossfader 按位置取值。键盘仍然只属于命令行
   （`Tab` 切目标，`F9` 设置）。
-- 颜色集中在 `preference.toml` 的 `[theme]`（`accent`/`dim`/`text`/`error`/`warn`/`pad`，`#rrggbb`）。
+- 颜色集中在 `config.toml` 的 `[theme]`（`accent`/`dim`/`text`/`error`/`warn`/`pad`，`#rrggbb`）。
 - 封面与 overview 和波形共用渲染后端：kitty 下都走 graphics 协议（同一个 image/placement 生命周期，
   弹层打开时不发送也不放置，关闭后重传重放，避免残留），其它终端下封面用半格真彩、overview 用 braille。
 
-`profile/` 放全部默认文件：`mixer.toml`（拓扑，含 `[[output]]` 输出设备）、
-`live.toml`（本机设置）、`controller.toml`（映射文件，设备名在 `[meta].device`；旧的 `midi.toml` 仍会被读）、
-`preference.toml`（主题/波形/曲库）。命名 profile 也放这里（`example.toml` 是样例；`--profile dj` →
-`profile/dj.toml`，不给则找 `profile/profile.toml`，没有就用文件夹默认）。文件里的相对路径都相对它所在的文件夹。
-运行时改配置不必重启：`mixer reload` 重建拓扑（保留走带），`live reload` 重读本机设置
+配置是**一个文件**：`[mixer]`（拓扑，含 `[[mixer.output]]` 输出设备）、`[live]`（本机设置）、
+`[preference]`（主题/波形/曲库）、`[controller]`（映射文件指针 `map` 与可选 `device`）。
+不给 `--config` 时用平台默认路径，首次启动从内置模板复制一份；`--print-config` 打印模板。
+仓库里的 `profile/config.toml` 是模板本身，`profile/mapping.toml` 是 unit-map 样例。
+`[controller].map` 是文件指针，相对 config 所在目录。
+运行时改配置不必重启：`config reload` / `mixer reload` 重建拓扑（保留走带），`live reload` 重读本机设置
 （引擎率/ring 需重启，`[stems]` 立即生效）。
 
 终端内 `controller ports` 列出可用输入端口（`midi ports` 仍可）；映射表格式与全部 action 见
-`profile/controller.toml` 注释与 [`docs/MIDI.md`](docs/MIDI.md)。
+`profile/mapping.toml` 注释与 [`docs/MIDI.md`](docs/MIDI.md)。
 
 `F9`（或 header 右侧的 settings 按钮）打开设置界面——**它不是 TOML 编辑器**，只有五项：
 
 ```
-> controller   Numark Party Mix III · profile/controller.toml
+> controller   Numark Party Mix III · mapping.toml
   output       2 output(s)
-  mixer        profile/mixer.toml
-  live         profile/live.toml
-  preference   profile/preference.toml
+  mixer        config.toml
+  live         config.toml
+  preference   config.toml
 ```
 
 `→`/`Enter` 进下一层，`←` 退回上一层，`Esc` 关闭；每一层都是同一个**单栏平铺**列表（和 `--guide` 里的弹窗完全一样，
@@ -227,7 +227,7 @@ browser | command
 
 `output` 绑定的设备若被别的客户端（通常是 PipeWire/PulseAudio）独占，引擎会把它报成 `missing` 而不是假装在放——
 此时选 `default`/`pipewire` 这类**走声音服务器**的目的地，或让出该声卡后 `output refresh`。该原因会打在 stderr 上。
-`live.toml` 的 `device_buffer_frames` 只是延迟偏好：ALSA 的 `dmix`/`plug`（`sysdefault`/`default`，USB 声卡常见路径）
+`config.toml` 的 `device_buffer_frames` 只是延迟偏好：ALSA 的 `dmix`/`plug`（`sysdefault`/`default`，USB 声卡常见路径）
 会拒绝固定 buffer，此时引擎自动退回后端默认值，不会因此变成静音输出。这种情况下设备一次回调可能要一整个 PCM buffer，
 而 `ring_frames` 只是下限：引擎会把该输出的 ring 自动长到装得下一次回调（日志里给出建议值），否则每次回调都会补静音——
 听起来就是“变慢 + 破碎”。
@@ -246,7 +246,7 @@ browser | command
 `$HYPERMIXX_CACHE/library/library.sqlite3`（默认 `.cache/library/`）。U 盘只读，不写回。
 
 ```toml
-# profile/preference.toml
+# config.toml
 [library]
 local = ["rkb", "serato", "vdj"]   # 本机用户目录里的库
 usb   = ["rkb", "serato", "vdj"]   # 插拔 U 盘时自动挂载并发现的库
@@ -275,7 +275,7 @@ rekordbox / VirtualDJ / Serato 会作为三个不同 library 出现。USB 插拔
   Serato tag 晚约 16.5ms，因此默认 `serato_offset_ms = -16.5`。
   加载时先减掉解码器 gapless 起点（MP3 样本 25.0567ms），再加可配置的微调，最后换算到帧。
 - 默认 RB 口令是公开常量；需要覆盖时设 `HYPERMIXX_REKORDBOX_KEY`。
-- `profile/preference.toml` 的 `[library] local|usb|folders` 决定启动时扫描/显示哪些来源。
+- `config.toml` 的 `[library] local|usb|folders` 决定启动时扫描/显示哪些来源。
   `decoder_start_ms`、`grid_offset_ms` 以及 `rkb_mp3_offset_ms` / `serato_offset_ms` /
   `vdj_offset_ms` 控制导入网格的时间补偿。`[display] key = "camelot"`（默认）可改为 `"classic"`。
 

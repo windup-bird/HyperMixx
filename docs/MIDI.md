@@ -250,13 +250,13 @@ CLI 启动时用 `ListFx` 拿到每条链的槽位名，再 `Map::resolve_fx` �
 通道 fader，和 `fx = "gain"` 这种插入效果分开。`deckfx1/2/3` 只控制 deck 链；stem 自己的
 FX 链要用 `chain = "vocals"` / `chain = "deck1/vocals"`，这次不提供 stemfx preset。
 
-`fx1` / `fx2` / `fx3` 是给未来可变 FX 指针预留的稳定槽位名。当前默认 `mixer.toml` 还没有
+`fx1` / `fx2` / `fx3` 是给未来可变 FX 指针预留的稳定槽位名。当前默认 `config.toml` 还没有
 暴露这些名字，所以真实运行时会提示 unresolved 并跳过对应绑定；guide 仍可保存和编辑它们。
 
 ## 9. 打开与编辑
 
-- `--controller <port> [--controller-map <file>]`：启动时打开端口并按映射翻译。
-  （旧的 `--midi` / `--midi-map` 拼写已移除；会话里 `controller ports` 仍接受 `midi ports` 别名。）
+- `--controller <port>`：启动时打开端口并按映射翻译；映射文件由 config 的 `[controller].map` 指定。
+  （旧的 `--profile` / `--live` / `--controller-map` / `--midi*` 拼写已移除；会话里 `controller ports` 仍接受 `midi ports` 别名。）
 - TUI 下 `F9` 打开设置界面选端口与映射文件（取代旧的 `F2`/`F3`）。
 - `--guide [<file>] [--controller <port>] [--decks <n>]`：learn 模式编辑器，不启动音频引擎。
   顶栏显示 file/controller；下面是带边框的 `deck | unit | slot`、`info | watch dog`、

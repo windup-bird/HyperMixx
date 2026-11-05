@@ -2,9 +2,8 @@
 //! fact (the waveform backend, its three colours, image refresh target).
 //!
 //! Deliberately forgiving: a typo in a colour must not stop the music. Unknown keys are reported as
-//! notes, invalid values fall back to the built-in default, and a missing file is simply "use the
-//! defaults". The file lives next to the profile that names it (`profile/preference.toml` by
-//! default).
+//! notes, invalid values fall back to the built-in default, and a missing key is simply "use the
+//! defaults". These are the `[preference]` section of the one config file.
 
 use std::fs;
 
@@ -12,8 +11,8 @@ use hypermixx_core::KeyFormat;
 use hypermixx_library::SourceKind;
 use ratatui::style::Color;
 
-/// Where the TUI looks for preferences when no profile points at another folder.
-pub const DEFAULT_PATH: &str = "profile/preference.toml";
+/// Where the TUI looks for preferences when no config path was handed to the session.
+pub const DEFAULT_PATH: &str = "profile/config.toml";
 
 /// Which waveform renderer to use. `Auto` resolves to Kitty when the terminal advertises Kitty
 /// graphics, otherwise Braille; an explicit choice overrides detection (except under tmux/screen,
@@ -231,7 +230,10 @@ pub fn load(path: &str) -> Result<(Preference, Vec<String>), String> {
 /// Parses the file body. Unknown keys are notes, not failures.
 pub fn parse(text: &str) -> Result<(Preference, Vec<String>), String> {
     let value: toml::Value = toml::from_str(text).map_err(|err| err.to_string())?;
-    let table = value
+    // The one-file config carries these settings under `[preference]`; a standalone preference
+    // file has the same keys at the root. Both are accepted.
+    let section = value.get("preference").cloned().unwrap_or(value);
+    let table = section
         .as_table()
         .ok_or_else(|| "preferences are a table of sections".to_owned())?;
     let mut preference = Preference::default();

@@ -21,7 +21,6 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         notice_tx,
         notice_rx,
         topology,
-        profile,
         live,
         live_source,
         midi_control,
@@ -33,7 +32,6 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     let response_rx = pipeline.response_rx().clone();
     let mut dispatcher = command::Dispatcher::new(command_tx.clone(), notice_tx);
     dispatcher.with_topology(topology);
-    dispatcher.with_profile(profile);
     dispatcher.with_live(live, live_source);
     dispatcher.with_library(library);
     if let (Some(control), Some(state)) = (midi_control, midi_state) {

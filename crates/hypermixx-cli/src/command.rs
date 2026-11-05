@@ -197,11 +197,8 @@ pub struct Dispatcher {
     /// Where `mixer reload` reads from when no path is given: `--config`'s file, or the shipped
     /// default under `./config/`. The front-end owns file IO, so the engine only ever sees text.
     topology: Arc<Mutex<Option<String>>>,
-    /// Where `live reload` reads from: `--live`'s file, or the shipped default.
+    /// Where `live reload` reads from: the config file the session started with.
     live_path: Arc<Mutex<Option<String>>>,
-    /// The profile this session started with, or `None` for the folder defaults. `profile show`
-    /// reports it and `profile reload` replaces it.
-    profile: Arc<Mutex<Option<String>>>,
     /// The machine's settings: the engine rate, the ring sizes, and the stem defaults.
     live: Arc<Mutex<LiveConfig>>,
     slots: Slots,
@@ -229,7 +226,6 @@ impl Dispatcher {
             events: None,
             topology: Arc::new(Mutex::new(None)),
             live_path: Arc::new(Mutex::new(None)),
-            profile: Arc::new(Mutex::new(None)),
             live: Arc::new(Mutex::new(LiveConfig::default())),
             slots: Arc::new(SlotBook::default()),
             separations: Arc::new(Mutex::new(HashMap::new())),
@@ -273,19 +269,6 @@ impl Dispatcher {
     pub fn tap_events(mut self, events: Sender<UiEvent>) -> Self {
         self.events = Some(events);
         self
-    }
-
-    /// Remembers the profile this session started with, so `profile show` can name it and
-    /// `profile reload` can default to it.
-    pub fn with_profile(&self, path: Option<String>) {
-        if let Ok(mut slot) = self.profile.lock() {
-            *slot = path;
-        }
-    }
-
-    /// The profile in effect, if any.
-    pub fn profile_path(&self) -> Option<String> {
-        self.profile.lock().ok().and_then(|slot| slot.clone())
     }
 
     /// Installs the live settings and remembers where they came from, so `live reload` can re-read
@@ -576,7 +559,7 @@ pub fn dispatch(
         "output" | "outputs" => output_command(&mut words, command_tx),
         "mixer" => mixer_command(&mut words, dispatcher),
         "live" => live_command(&mut words, dispatcher),
-        "profile" => profile_command(&mut words, dispatcher),
+        "config" => config_command(&mut words, dispatcher),
         "controller" | "midi" => midi_command(&mut words, dispatcher),
         "help" | "h" | "?" => Action::Message(help_text(decks)),
         "quit" | "exit" => Action::Quit,
@@ -648,11 +631,9 @@ fn fader_command<'a>(
     )
 }
 
-/// The shipped default topology, under `./profile/`. Also what a run without `--config` reads.
-pub const DEFAULT_TOPOLOGY: &str = crate::profile::DEFAULT_MIXER;
-
-/// The shipped live settings, under `./profile/`. Also what a run without `--live` reads.
-pub const DEFAULT_LIVE: &str = crate::profile::DEFAULT_LIVE;
+/// The shipped config, used only as a last-resort fallback when a session carries no config path.
+pub const DEFAULT_TOPOLOGY: &str = "profile/config.toml";
+pub const DEFAULT_LIVE: &str = "profile/config.toml";
 
 /// Downloads a model on a worker thread, reporting progress through the notice channel.
 fn spawn_model_pull(
@@ -737,109 +718,76 @@ fn model_choice(
 /// substituted, so the caller can say so once rather than silently changing a user's machine.
 pub fn read_live_config(path: &str) -> Result<(LiveConfig, Vec<String>), String> {
     let text = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
-    let parsed: LiveConfig = toml::from_str(&text).map_err(|err| err.to_string())?;
+    read_live_text(&text).map_err(|err| format!("{path}: {err}"))
+}
+
+/// Parses the `[live]` section of a one-file config; a standalone live file (the same keys at the
+/// root) still parses. Clamped values come back as notes rather than silently taking effect.
+pub fn read_live_text(text: &str) -> Result<(LiveConfig, Vec<String>), String> {
+    let value: toml::Value = toml::from_str(text).map_err(|err| err.to_string())?;
+    let section = value.get("live").cloned().unwrap_or(value);
+    let parsed: LiveConfig = section.try_into().map_err(|err| err.to_string())?;
     let live = parsed.clone().sanitised();
     let mut notes = Vec::new();
     if live != parsed {
-        notes.push(format!(
-            "{path}: some values were out of range and were clamped"
-        ));
+        notes.push("some live values were out of range and were clamped".to_owned());
     }
     Ok((live, notes))
 }
 
-/// The `profile` family: which files this session is running with, and switching them.
+/// The `config` family: show the one file this session runs on, or reload it into the engine.
 ///
-/// A profile is read **once at startup** (`--profile <name|path>`, else `profile/profile.toml` when
-/// it exists). This family is how a running session answers "which one am I on?" and how it switches
-/// without a restart: everything a profile names can be re-read, except the MIDI input, which is
-/// attached once at launch.
-fn profile_command<'a>(
+/// Reloading re-reads the whole config: the mixer topology goes to the engine as text, the live
+/// settings replace the dispatcher's, and auto-gain is pushed immediately (the one live setting
+/// that applies without a restart). MIDI is attached once at launch and cannot change here.
+fn config_command<'a>(
     words: &mut impl Iterator<Item = &'a str>,
     dispatcher: &Dispatcher,
 ) -> Action {
     let Some(sub) = words.next() else {
-        return Action::Message(profile_report(dispatcher));
+        return Action::Message(config_report(dispatcher));
     };
     match sub {
-        "show" | "list" => Action::Message(profile_report(dispatcher)),
-        "reload" | "use" => {
+        "show" | "list" => Action::Message(config_report(dispatcher)),
+        "reload" | "load" => {
             let path = words
                 .next()
-                .map(crate::profile::resolve)
-                .or_else(|| dispatcher.profile_path())
-                .unwrap_or_else(|| crate::profile::AMBIENT.to_owned());
-            match crate::profile::load(&path) {
-                Ok((profile, notes)) => {
-                    let mut applied = Vec::new();
-                    // Reloading a profile is **exactly "start as if with `--profile X`"**, minus the
-                    // MIDI input (attached once at launch): a key the profile does not name falls back
-                    // to the folder default, rather than leaving whatever happened to be running.
-                    let mixer = profile
-                        .mixer
-                        .clone()
-                        .unwrap_or_else(|| crate::profile::DEFAULT_MIXER.to_owned());
-                    match std::fs::read_to_string(&mixer) {
-                        Ok(text) => {
-                            let _ = dispatcher.command_tx.send(Command::MixerReload { text });
-                            dispatcher.with_topology(Some(mixer.clone()));
-                            applied.push(format!("topology <- {mixer}"));
-                        }
-                        Err(err) => applied.push(format!("topology: {mixer}: {err}")),
-                    }
-                    // The live settings: they are read from the dispatcher on every use, so a reload
-                    // lands on the next separation.
-                    let live = profile
-                        .live
-                        .clone()
-                        .unwrap_or_else(|| crate::profile::DEFAULT_LIVE.to_owned());
-                    match read_live_config(&live) {
-                        Ok((config, live_notes)) => {
-                            for note in &live_notes {
-                                notices::info(&dispatcher.notices, format!("[live] {note}"));
-                            }
-                            applied.push(format!("live <- {live}"));
-                            dispatcher.with_live(config, Some(live));
-                        }
-                        Err(err) => applied.push(format!("live: {err}")),
-                    }
-                    if profile.midi.device.is_some() || profile.midi.map.is_some() {
-                        // Honest about the one thing that cannot change under a running session.
-                        applied.push(format!(
-                            "midi: {} — takes effect at the next launch",
-                            profile.midi.device.as_deref().unwrap_or("(no device)")
-                        ));
-                    }
-                    dispatcher.with_profile(Some(path.clone()));
-                    for note in notes {
-                        applied.push(note);
-                    }
-                    Action::Message(format!(
-                        "profile {path}:{}\n  (live reload applies now; MIDI only at launch)",
-                        applied
-                            .iter()
-                            .map(|line| format!("\n  {line}"))
-                            .collect::<String>()
-                    ))
-                }
-                Err(err) => Action::Failed(err),
+                .map(str::to_owned)
+                .unwrap_or_else(|| dispatcher.topology_path());
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(err) => return Action::Failed(format!("{path}: {err}")),
+            };
+            // Validate before sending anything, so a bad file leaves the running mixer untouched.
+            if let Err(err) = hypermixx_audio::MixerConfig::from_toml_str(&text) {
+                return Action::Failed(format!("{path}: {}", err.message()));
             }
+            let (live, notes) = match read_live_text(&text) {
+                Ok(pair) => pair,
+                Err(err) => return Action::Failed(format!("{path}: {err}")),
+            };
+            let _ = dispatcher.command_tx.send(Command::MixerReload { text });
+            let _ = dispatcher.command_tx.send(Command::SetAutogain {
+                enabled: live.autogain.enabled,
+                target_db: live.autogain.target_db,
+            });
+            dispatcher.with_topology(Some(path.clone()));
+            dispatcher.with_live(live, Some(path.clone()));
+            let mut report = format!("config {path} reloaded");
+            for note in notes {
+                report.push_str(&format!("\n  {note}"));
+            }
+            report.push_str("\n  audio/keylock settings apply on the next launch; MIDI too.");
+            Action::Message(report)
         }
-        other => Action::Failed(format!(
-            "unknown profile subcommand `{other}` (show|reload)"
-        )),
+        other => Action::Failed(format!("unknown config subcommand `{other}` (show|reload)")),
     }
 }
 
-/// What this session is running with: the profile, and the files it resolved to.
-fn profile_report(dispatcher: &Dispatcher) -> String {
-    let mut text = match dispatcher.profile_path() {
-        Some(path) => format!("profile: {path}"),
-        None => "profile: none (folder defaults; `--profile <name>` reads profile/<name>.toml)"
-            .to_owned(),
-    };
-    text.push_str(&format!("\n  topology: {}", dispatcher.topology_path()));
-    text.push_str(&format!("\n  live:     {}", dispatcher.live_path()));
+/// What this session is running with: the config file and the live settings it carried.
+fn config_report(dispatcher: &Dispatcher) -> String {
+    let mut text = format!("config: {}", dispatcher.topology_path());
+    text.push_str(&format!("\n  live: {}", dispatcher.live_path()));
     let live = dispatcher.live();
     text.push_str(&format!(
         "\n  stems:    model {}  provider {}  overlap {:.2}  shifts {}  threads {}  memory {}",
@@ -858,7 +806,6 @@ fn profile_report(dispatcher: &Dispatcher) -> String {
             "max-speed"
         },
     ));
-    text.push_str("\n  MIDI is attached at launch, so a switch takes effect on the next one.");
     text
 }
 
@@ -2820,12 +2767,12 @@ mod tests {
         // A missing file is the caller's to handle (the CLI falls back to the built-ins).
         assert!(read_live_config("/nonexistent/live.toml").is_err());
 
-        // The shipped file parses and is sane.
-        let shipped = format!("{}/../../profile/live.toml", env!("CARGO_MANIFEST_DIR"));
-        let (live, notes) = read_live_config(&shipped).expect("the shipped live file parses");
+        // The shipped config's `[live]` section parses and is sane.
+        let (live, notes) =
+            read_live_text(crate::profile::template()).expect("the shipped config parses");
         assert!(
             notes.is_empty(),
-            "the shipped file needs no clamping: {notes:?}"
+            "the shipped config needs no clamping: {notes:?}"
         );
         // The engine rate is a device fact, not a compile-time constant: any rate a sound card
         // takes is legal, and the shipped file only has to name one of them.
@@ -3085,104 +3032,75 @@ mod tests {
         }
     }
 
-    /// `profile show` names what this session runs with, and `profile reload` switches the parts of
-    /// it that can change under a running engine (the topology and the live settings — MIDI is
-    /// attached at launch, and the reply says so).
+    /// `config show` reports the one file this session runs on; `config reload` re-reads it, sends
+    /// the mixer text to the engine, applies the live settings and pushes auto-gain immediately.
     #[test]
-    fn the_profile_family_reports_and_switches() {
+    fn the_config_family_reports_and_reloads() {
+        let dir = std::env::temp_dir().join(format!("hypermixx-config-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[mixer]
+[[mixer.channel]]
+side = "center"
+
+[live]
+[live.autogain]
+enabled = true
+target_db = -9.0
+"#,
+        )
+        .unwrap();
+        let config_path = path.to_string_lossy().into_owned();
+
         let (tx, _rx) = unbounded();
         let dispatcher = Dispatcher::new(tx, crossbeam_channel::unbounded().0);
-        dispatcher.with_topology(Some("profile/mixer.toml".to_owned()));
-        dispatcher.with_live(LiveConfig::default(), Some("profile/live.toml".to_owned()));
-        dispatcher.with_profile(Some("profile/dj.toml".to_owned()));
-
-        // `show` (and a bare `profile`) reports the profile and the files it resolved to.
+        dispatcher.with_topology(Some(config_path.clone()));
         for line in ["", "show"] {
-            match profile_command(&mut line.split_whitespace(), &dispatcher) {
+            match config_command(&mut line.split_whitespace(), &dispatcher) {
                 Action::Message(text) => {
-                    assert!(text.contains("profile/dj.toml"), "{text}");
-                    assert!(text.contains("profile/mixer.toml"), "{text}");
-                    assert!(text.contains("profile/live.toml"), "{text}");
+                    assert!(text.contains("config.toml"), "{text}");
                     assert!(text.contains("model htdemucs"), "{text}");
-                    assert!(text.to_lowercase().contains("midi"), "{text}");
                 }
                 other => panic!("expected a report, got {other:?}"),
             }
         }
-        // With no profile the report says so rather than looking broken.
-        let bare = Dispatcher::new(
-            crossbeam_channel::unbounded().0,
-            crossbeam_channel::unbounded().0,
-        );
-        match profile_command(&mut "".split_whitespace(), &bare) {
-            Action::Message(text) => assert!(text.contains("none"), "{text}"),
-            other => panic!("expected a report, got {other:?}"),
-        }
 
-        // A profile that names a topology: reload sends the file's *text* to the engine, and the
-        // profile becomes the current one.
-        let dir = std::env::temp_dir().join("hypermixx-profile-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("club.toml"), "[[channel]]\nside = \"center\"\n").unwrap();
-        let profile_file = dir.join("dj.toml");
-        std::fs::write(&profile_file, "mixer = \"club.toml\"\n").unwrap();
         let (tx, rx) = unbounded();
         let dispatcher = Dispatcher::new(tx, crossbeam_channel::unbounded().0);
-        let line = format!("reload {}", profile_file.display());
-        match profile_command(&mut line.split_whitespace(), &dispatcher) {
-            Action::Message(text) => assert!(text.contains("club.toml"), "{text}"),
+        dispatcher.with_topology(Some(config_path));
+        let line = format!("reload {}", path.display());
+        match config_command(&mut line.split_whitespace(), &dispatcher) {
+            Action::Message(text) => assert!(text.contains("reloaded"), "{text}"),
             other => panic!("expected a report, got {other:?}"),
         }
         match rx.recv().unwrap() {
             Command::MixerReload { text } => assert!(text.contains("center"), "{text}"),
             other => panic!("expected MixerReload, got {other:?}"),
         }
-        assert_eq!(
-            dispatcher.profile_path().as_deref(),
-            Some(profile_file.to_string_lossy().as_ref())
-        );
-        // The report follows the switch: the topology slot is the one the session is *running*, not
-        // the one it started with (a stale slot would make `profile show` lie).
-        assert_eq!(
-            dispatcher.topology_path(),
-            dir.join("club.toml").to_string_lossy(),
-            "the reload must record the topology it just loaded"
-        );
-        // A key the profile does not name falls back to the folder default — a reload is "start as
-        // if with `--profile X`", not a patch over whatever was running.
-        let bare_profile = dir.join("bare.toml");
-        std::fs::write(&bare_profile, "[preference]\n").unwrap();
-        let line = format!("reload {}", bare_profile.display());
-        dispatcher.with_topology(Some("stale/other.toml".to_owned()));
-        match profile_command(&mut line.split_whitespace(), &dispatcher) {
-            Action::Message(text) => {
-                assert!(text.contains(crate::profile::DEFAULT_MIXER), "{text}");
-                assert!(
-                    text.contains("topology:"),
-                    "a failure is reported, not hidden: {text}"
-                );
+        match rx.recv().unwrap() {
+            Command::SetAutogain { enabled, target_db } => {
+                assert!(enabled);
+                assert_eq!(target_db, -9.0);
             }
-            other => panic!("expected a report, got {other:?}"),
+            other => panic!("expected SetAutogain, got {other:?}"),
         }
-        // The default file is not there in this test's working directory, so nothing was loaded —
-        // and the slot says exactly that rather than naming a file the session is not running.
-        assert_eq!(
-            dispatcher.topology_path(),
-            "stale/other.toml",
-            "a failed load must not be recorded as the running topology"
-        );
+        assert!(dispatcher.live().autogain.enabled);
+        assert_eq!(dispatcher.topology_path(), path.to_string_lossy());
 
-        // A profile that is not there is a failure, and a mistyped subcommand too.
+        // A missing file and a mistyped subcommand are failures.
         assert!(matches!(
-            profile_command(
-                &mut "reload /nonexistent/p.toml".split_whitespace(),
+            config_command(
+                &mut "reload /nonexistent/c.toml".split_whitespace(),
                 &dispatcher
             ),
             Action::Failed(_)
         ));
         assert!(matches!(
-            profile_command(&mut "swtich".split_whitespace(), &dispatcher),
+            config_command(&mut "swtich".split_whitespace(), &dispatcher),
             Action::Failed(_)
         ));
         let _ = std::fs::remove_dir_all(&dir);

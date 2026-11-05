@@ -11,7 +11,7 @@
 
 - **离线分离 + 热装**：`stem separate` 把当前曲目分离成 4 条 stem（drums/bass/other/vocals）。
   分离在后台跑，期间照常 play/loop/jump/sync；装上的那一刻是一次**换源 jump**，所以无缝、不丢循环。
-- **逐 stem 播放**：每 stem 一条独立效果链（`flow_fx` 是模板，`[channel.stem_fx]` 是逐 stem 覆盖），
+- **逐 stem 播放**：每条 flow 一条独立效果链（`flow_fx` 是模板，每项可用 `flows` 指定作用哪些 flow），
   加上逐 stem 的**电平 / 静音 / 独奏**——三件独立事实，由一处合成，所以 solo 压过 mute、取消静音能
   回到原电平。
 - **MIDI**：`fader.stem.<stem>`、`stem.<stem>.mute|solo`（latch 按钮，引擎自己翻转状态）。
@@ -40,7 +40,7 @@ out stems :: Float32 [1, 4, 2, 343980]
 
 ## 3. 两个旋钮（都改变产出的音频 → 都进缓存 key）
 
-| 旋钮（`live.toml` 的 `[stems]`） | 默认 | 实测（`stem-test.mp3` 3:39） | 轴 |
+| 旋钮（`config.toml` 的 `[stems]`） | 默认 | 实测（`stem-test.mp3` 3:39） | 轴 |
 |---|---|---|---|
 | `overlap`（0..=0.5） | 0.25 | `0.0` = **−24% 时间**（82→61 s）；代价：窗口边缘估计主导的采样从 0.0% 升到 12.8% | 空间：相邻窗口的估计互相融合 |
 | `shifts`（0..=2） | 1 | `2` = **+98% 时间**（82→164 s）、+360 MB；`0` 与 `1` 完全等价 | 相位：同一段音乐在不同窗口对位下重跑取平均 |

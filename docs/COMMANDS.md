@@ -15,17 +15,15 @@ cargo run -p hypermixx-cli -- [flags]
 | 参数 | 说明 |
 |---|---|
 | `--cli` | 行式 REPL；不给则启动 TUI（默认） |
-| `--config <file>` | 自定义混音拓扑 TOML（通道/效果链/输出）；不给则读 `./profile/mixer.toml`（缺文件/坏文件回落内置参考拓扑）。这个路径也是 `mixer reload` 不带参数时的默认 |
-| `--print-config` | 打印参考拓扑 TOML 后退出（不启动引擎） |
-| `--profile <name\|file>` | 一个**指路文件**：写 `mixer` / `live` / `controller`（`controller` 是映射文件路径，端口名在该文件的 `[meta].device`；旧的 `midi` 键仍解析）。裸名字解析成 `profile/<name>.toml`；不给则读 `profile/profile.toml`（没有就用文件夹默认）。显式 flag 优先于它 |
-| `--live <file>` | 本机设置 TOML（引擎采样率、ring 大小、stem 默认值）；缺省 `./profile/live.toml`，两边都没有则用内置默认 |
+| `--config <file>` | 指定配置文件（单文件多段落）；不给则用平台默认路径，首次启动从内置模板复制一份。`HYPERMIXX_CONFIG` 可覆盖路径 |
+| `--print-config` | 打印配置模板后退出（不启动引擎） |
 | `--backend auto\|stratum\|timestretch` | 离线分析后端，缺省 `auto`（stratum 优先，失败回落） |
-| `--controller <port>` | 启动时打开控制器输入（端口号或名字，`controller ports` 可列；`midi ports` 别名仍可） |
-| `--controller-map <file>` | 映射文件；不给则用 profile 指的文件，再缺省 `profile/controller.toml`（旧的 `midi.toml` 会回退读取）。映射文件自己的 `[meta].device` 也能给出端口 |
-| `--guide [<file>]` | learn 模式地图编辑器（**不启动音频引擎**）；文件缺省 `midi-map.toml` |
+| `--controller <port>` | 启动时打开控制器输入（端口号或名字，`controller ports` 可列；`midi ports` 别名仍可）。映射文件由 config 的 `[controller].map` 指定 |
+| `--guide [<file>]` | learn 模式地图编辑器（**不启动音频引擎**）；缺省编辑 config 同目录的 `mapping.toml`，不存在则从内置模板创建 |
 | `--decks <n>` | 仅作用于 `--guide` 的 deck 栏宽度，缺省 1 |
 
-- 未知参数是硬错误（`error: unknown argument …`），不会静默忽略；`--tui` / `--midi` / `--midi-map` / `--midi-guide` 已移除。
+- 未知参数是硬错误（`error: unknown argument …`），不会静默忽略；
+  `--profile` / `--live` / `--controller-map` / `--tui` / `--midi*` 已移除。
 - `--guide` 即使不跟端口也能在 TUI 里选端口/文件；给了路径/端口时启动即尝试打开，
   失败会留在 watch dog 里等待 `File` / `Connect`。
 - deck 数量启动时从引擎查询（自定义拓扑可配任意通道数），不是固定常量。
@@ -57,7 +55,7 @@ cargo run -p hypermixx-cli -- [flags]
 
 ### 2.3 时间单位
 
-- 帧 = 1/引擎采样率 秒（缺省 44.1 kHz 立体声；`profile/live.toml` 的 `[audio] sample_rate` 可改）；
+- 帧 = 1/引擎采样率 秒（缺省 44.1 kHz 立体声；`profile/config.toml` 的 `[audio] sample_rate` 可改）；
   `jump` 用帧，`beatjump`/`loop`/`sync` 用拍。
 
 ---
@@ -93,7 +91,7 @@ browser up|down|open|exit|load         TUI 浏览器导航/加载
 browser analyse                       分析当前选中的 track
 ```
 
-来源由 `profile/preference.toml` 的 `[library]` 决定：
+来源由 `config.toml` 的 `[library]` 决定：
 
 ```toml
 [library]
@@ -112,7 +110,7 @@ folders = ["~/Music"]
 - 导入网格会减去解码器 gapless 起点（MP3 样本 25.0567ms），再应用 `grid_offset_ms` 微调；
   RB / Serato / VirtualDJ 的来源偏移和这两个值都在 `[library]` 配置；样本 USB 的默认是
   RB 0、Serato -16.5、VDJ 0。
-- key 默认 Camelot；`profile/preference.toml` 的 `[display] key = "camelot" | "classic"` 切换。
+- key 默认 Camelot；`config.toml` 的 `[display] key = "camelot" | "classic"` 切换。
 - TUI 里 `Tab` 到 browser：`↑/↓` 选择，`→/Enter` 打开（最低一级进入 tracks），`←/Esc` 返回；
   `load [deck]` 加载，`analyse` 分析选中 track；鼠标单击选择，双击 track 弹 deck0/deck1 选择。
 - 默认 rekordbox 口令是公开常量；覆盖用 `HYPERMIXX_REKORDBOX_KEY`。
@@ -137,7 +135,7 @@ folders = ["~/Music"]
 [deck] tempo <ratio>        设 tempo 绝对值（1.0 = 原速，0.25..4.0）
 [deck] tempofader <-1..1>   推子位置，tempo = 1 + pos × temporange（MIDI 走这条）
 [deck] temporange <0..1>    推子满量程（缺省 0.1 = ±10%）；只改映射，不动当前 tempo
-[deck] keylock on|off       变调引擎（缺省 on；off = tape 零延迟直通；窗口见 live.toml 的 [keylock]）
+[deck] keylock on|off       变调引擎（缺省 on；off = tape 零延迟直通；窗口见 config.toml 的 [keylock]）
 [deck] key <semitones>      变调（**占位**：只记录并回读，暂不发声）
 [deck] fader <stage> <pos>  电平：`flow`/`deck`/`gain`/`cuesend` 作用在目标 deck，
                             `cross`/`master`/`cue` 是共用控制（忽略目标）
@@ -301,7 +299,7 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 
 | 命令 | 说明 |
 |---|---|
-| `[deck] stem separate [--model <name\|path>]` | 分离并安装；provider/overlap/shifts 等来自 `live.toml` |
+| `[deck] stem separate [--model <name\|path>]` | 分离并安装；provider/overlap/shifts 等来自 `config.toml` |
 | `[deck] stem status` | 逐 stem 报告：电平、是否被静音/独奏、实际增益 |
 | `[deck] stem full \| acapella \| instrumental \| drums \| bass` | 命名编排（改的是静音位，**你的电平保留**） |
 | `[deck] stem clear` | 四条全开、unity、取消 solo |
@@ -317,7 +315,7 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 `deck0 vocals level -0.5`（电平/静音/独奏是逐 stem 的事实）；`deck0 vocals fx …` 只是选
 *哪条 flow 的视图*，写操作落到流组（whitelist 见下一片）。
 
-分离参数来自 `profile/live.toml` 的 `[stems]`（三个都会改变产出的音频，所以**都进缓存 key**）：
+分离参数来自 `profile/config.toml` 的 `[stems]`（三个都会改变产出的音频，所以**都进缓存 key**）：
 
 | 键 | 缺省 | 效果（`stem-test.mp3`, 3:39, 实测） |
 |---|---|---|
@@ -327,7 +325,7 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 
 ### 3.8 Auto-gain
 
-`live.toml` 的 `[autogain] enabled/target_db` 决定是否把每首曲子的最响 3 s 归一化到目标电平。
+`config.toml` 的 `[autogain] enabled/target_db` 决定是否把每首曲子的最响 3 s 归一化到目标电平。
 响度在**装载时**从 PCM 测一次（存在 deck 上），增益在引擎里按当前设置推导（±12 dB 钳制），
 所以 `live reload` 改开关/目标对**已经装载**的曲子立即生效，不需要重测。它在逐 flow 的
 `flow fader` 之后、channel trim 之前。
@@ -389,7 +387,7 @@ flows = ["vocals"]             # 只作用于人声；省略 = 全部 flow；[] 
 ```
 
 - **`stem separate` 不带调参旗标**：模型、provider、`overlap`、`shifts`、`threads`、`low_memory`
-  全都是 `live.toml` 的 `[stems]` 键 —— 它们是**这台机器**的属性，不是曲目的属性；编辑后
+  全都是 `config.toml` 的 `[stems]` 键 —— 它们是**这台机器**的属性，不是曲目的属性；编辑后
   `live reload` 立即生效（下一次分离就用新的）。唯一的例外是 `--model <name|path>`：临时换一个
   模型（表里名字，或本地 `.onnx` 路径）而不改配置。
 - `overlap` 同时决定块长（`(1−overlap) × 7.8 s`）与窗口重叠：更小 = 更快、块更长、窗口边缘权重更大。
@@ -429,7 +427,7 @@ flows = ["vocals"]             # 只作用于人声；省略 = 全部 flow；[] 
 ### 3.8 热加载拓扑 `mixer reload`
 
 ```
-mixer reload [<file>]   重读拓扑并就地重建；不带路径则读 --config 的文件，否则 ./profile/mixer.toml
+mixer reload [<file>]   重读拓扑并就地重建；不带路径则读 --config 的文件，否则 ./profile/config.toml
 ```
 
 - **语义 = 内置默认 ← 文件**：文件里没写的键取**默认值**，而不是保留运行中的值。所以演出中途 reload
@@ -484,15 +482,15 @@ controller mode     查看/切换已接入映射的 unit 模式
 
 ```
 live show             （bare `live` 同义）打印当前生效的设置：引擎采样率、ring/prefill、stem 默认值
-live reload [<file>]  重读 live 文件（缺省 --live 的路径，否则 ./profile/live.toml）
+live reload [<file>]  重读 config 的 [live] 段（缺省当前 config 路径）
 ```
 
-`profile/live.toml`（启动时读，`--live <file>` 可换）：
+`config.toml` 的 `[live]` 段（启动时读）：
 
 | 键 | 缺省 | 说明 |
 |---|---|---|
 | `[audio] sample_rate` | 44100 | 引擎渲染率，同时也是向每个设备请求的率；素材在装载时重采样到它。填 48000 等任何设备支持的率都可以（8 kHz–384 kHz） |
-| `[audio] ring_frames` | 4096 | 输出 ring 容量（帧）：更多余量 = 更多延迟；随附的 `profile/live.toml` 用 1024（~23 ms） |
+| `[audio] ring_frames` | 4096 | 输出 ring 容量（帧）：更多余量 = 更多延迟；随附的 `profile/config.toml` 用 1024（~23 ms） |
 | `[audio] prefill_frames` | 2048 | 开流前预填的静音，避免设备等第一个块；上限为 ring 的一半；随附 profile 用 512 |
 | `[audio] device_buffer_frames` | 后端默认 | 以 `BufferSize::Fixed(n)` 交给 cpal；ALSA 的 period 为 `n/4`。随附 profile 用 512（~2.9 ms period / ~11.6 ms buffer）；`0` 表示后端默认 |
 | `[stems] model` | htdemucs | 模型名（`stem model list` 可列） |
@@ -510,48 +508,29 @@ live reload [<file>]  重读 live 文件（缺省 --live 的路径，否则 ./pr
 - `[audio] block_frames` **不在这里**，因为它是引擎内部契约（时间拉伸引擎按块喂入），不是本机性能参数。
 - **分离的块长也不在这里**：它就是模型自己的窗口步长（见 §3.7.1），设不了的才是对的。
 
-### 3.12 profile 与 preference
+### 3.12 配置文件
 
-```
-profile/                 # 全部配置文件都在这里
-├── profile.toml         # 可选：--profile 不给时的默认 profile，只写"用哪几个文件"
-├── mixer.toml           # 拓扑（= --config 的默认路径，也是 --print-config 打印的文本）
-├── live.toml            # 本机设置（= --live 的默认路径）
-├── controller.toml      # 控制器映射（设备名在该文件的 [meta].device；旧的 midi.toml 仍会读）
-├── preference.toml      # 前端设置：主题、波形后端/分频点、曲库来源（TUI 启动时读）
-└── example.toml         # 命名 profile 的样例：复制成 <name>.toml 后 --profile <name>
-```
-
-profile 是**指路而不是又一套 schema**：拓扑、本机设置、控制器映射各自保有文件与校验，于是
-`mixer reload` / `live reload` 仍然作用在它们被告知的那个文件上。
-**文件里任何相对路径都相对"写它的那个文件所在的文件夹"** —— 所以 `profile/profile.toml` 里
-`mixer = "mixer.toml"` 就是 `profile/mixer.toml`，命名 profile 和它指的文件放一起时不用写 `../`。
+配置是**一个文件**，四个段落：
 
 ```toml
-# profile/profile.toml 或自建的 profile/dj.toml
-mixer      = "mixer.toml"        # -> profile/mixer.toml
-live       = "live.toml"         # -> profile/live.toml
-controller = "controller.toml"   # 映射文件；端口名在它的 [meta].device（旧的 midi = 仍解析）
-
-[preference]                     # 预留段：写进去的键会被**报告**，而不是被静默忽略
+[mixer]        # 拓扑：[[mixer.channel]] / [mixer.crossfader] / [[mixer.output]] …
+[live]         # 本机设置：[audio] / [keylock] / [stems] / [autogain]
+[preference]   # 前端设置：波形、主题、曲库
+[controller]
+map = "mapping.toml"   # unit-map 文件指针，相对本文件所在目录
+# device = "..."       # 可选，覆盖映射文件的 [meta].device
 ```
 
-- 没有 profile（或 profile 里没写某项）时用文件夹默认：`profile/mixer.toml`、`profile/live.toml`、
-  `profile/controller.toml`，各自缺失则回落内置默认（控制器缺失 = 不打开输入，即出厂状态）。
-- **显式 flag 永远优先**：`--config` / `--live` / `--controller` / `--controller-map` > profile > 文件夹默认 > 内置默认。
-- **切换 profile**：
-  - 启动时 `--profile <name>`（裸名字 → `profile/<name>.toml`；`--profile path/x.toml` 直接给路径）；
-    不给则读 `profile/profile.toml`（存在就用，不存在就是文件夹默认）。仓库里自带 `profile/example.toml`
-    可复制成 `profile/dj.toml` 等处。
-  - 会话内 `profile show` 看当前用的 profile 与它解析出的 topology/live/stems 参数；
-    **`profile reload [<name|path>]` 切一个** —— profile 指到的 topology 走 `MixerReload`（立即生效）、
-    live 立即生效（下一次分离就用新值），**只有控制器是启动时接线的**，reload 会明说"下次启动生效"。
-- 端口打不开时：**显式 `--controller` 直接报错退出**（你点名要的），**profile 里的设备只警告并继续**
-  （"这套设备通常长这样"，控制器没插不该让整场起不来；TUI 里 `F9` 仍可临时选）。
-- `--profile dj` 读 `profile/dj.toml`；`--profile path/to/p.toml` 直接读该路径。
-- 段名拼错（`[mixr]`、`controller` 写成了别的键）是错误，不是静默回落 —— 否则看起来用了某套配置其实没有。
+- 不给 `--config`：Linux/Termux 用 `$XDG_CONFIG_HOME/hypermixx/config.toml`
+  （缺省 `~/.config/hypermixx/config.toml`），Windows 用 `%APPDATA%/Hypermixx/config.toml`；
+  `HYPERMIXX_CONFIG` 可覆盖。
+- 路径不存在时首次启动从内置模板复制一份；已存在绝不覆盖；写不了就用内置模板继续跑。
+  仓库里的 `profile/config.toml` 就是模板，`profile/mapping.toml` 是 unit-map 样例。
+- 会话内 `config show` 看当前配置，`config reload [file]` 重读；`mixer reload` / `live reload`
+  作用于同一份文件。
+- 段名拼错（`[mixr]`）是错误，不是静默回落 —— 否则看起来用了某套配置其实没有。
 - profile 里的 `[preference]` 是空段也合法（= 什么都没设）；真正的前端设置在独立的
-  `profile/preference.toml`，TUI 启动时读取（见 README 的 TUI 布局与 `[theme]` / `[waveform]` / `[library]`）。
+  `config.toml`，TUI 启动时读取（见 README 的 TUI 布局与 `[theme]` / `[waveform]` / `[library]`）。
 
 ### 3.13 帮助与退出
 

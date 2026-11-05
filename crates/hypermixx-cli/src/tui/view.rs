@@ -2577,12 +2577,12 @@ mod tests {
         ];
         let mut screen =
             crate::tui::settings::SettingsScreen::open(crate::tui::settings::Context {
-                profile: Some("profile/profile.toml".to_owned()),
+                profile: None,
                 mixer: Some(mixer.display().to_string()),
-                live: Some("profile/live.toml".to_owned()),
-                preference: Some("profile/preference.toml".to_owned()),
+                live: Some("config.toml".to_owned()),
+                preference: Some("config.toml".to_owned()),
                 controller_port: Some("Numark Party Mix III".to_owned()),
-                controller_map: Some("profile/controller.toml".to_owned()),
+                controller_map: Some("mapping.toml".to_owned()),
                 controller: Some("Numark Party Mix III".to_owned()),
                 engine_rate: 48_000,
                 devices,

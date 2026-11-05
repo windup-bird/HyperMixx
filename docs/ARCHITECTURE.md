@@ -125,7 +125,7 @@ crates/
   `CueOp = Play | Back | Set | Smart`(`Smart` 由 deck 自己的 `is_playing()` 决定,前端不猜)
 - `SetTempo` / `SetTempoFader` / `SetTempoRange` / `SetKeylock { mode: KeylockMode }` / `SetKey { semitones }` / `SetAnalysis` —
   分析结果从这里进入 deck,**没有 `Analyse` 命令**;`KeylockMode = Off | On`(默认 On),
-  STFT 窗口是 live.toml 的 `[keylock]` 设置(见 `KeylockSettings`)
+  STFT 窗口是 config.toml 的 `[keylock]` 设置(见 `KeylockSettings`)
   `SetKey` 是占位(streaming 引擎无变调轴)。**推子是控制器输入**:`SetTempoFader{position}`
   由 deck 按 `1 + position×tempo_range` 算 rate,再走 `SyncGroup::set_tempo` 的三分支
 - sync 族:`Sync { deck_id, op }`,op = `Tempo` / `Phase{mode,t}` / `TempoLock` /
@@ -242,7 +242,7 @@ kind:`linear`/`moog`),`flowfx` 在合并前逐流跑,`knobfx`/`padfx` 在合并�
 影响;分叉在它之后则跟着它(把 crossfader 放早的代价,文档写明)。
 
 **autogain**:响度是**曲目属性**(装载时对 PCM 做一次滑窗 RMS,取最响的 3 s 的平均值,存在
-`Deck` 上),增益是**机器偏好**(`live.toml` 的 `[autogain] enabled/target_db`)。所以 `live reload`
+`Deck` 上),增益是**机器偏好**(`config.toml` 的 `[autogain] enabled/target_db`)。所以 `live reload`
 改目标或开关会立刻对已装载的曲子重新推导,不需要重测;`Command::SetAutogain` 把它推进引擎。
 
 `MasterBus::render`:`sum → master_fx → master_fader → limiter(安全级)`。
@@ -258,10 +258,10 @@ kind:`linear`/`moog`),`flowfx` 在合并前逐流跑,`knobfx`/`padfx` 在合并�
 4. 阶段顺序本身
 
 其余由 `MixerConfig` 纯数据描述(`config.rs`):每通道的 `filter`(linear|moog)、
-`flow_fx`/`knobfx`/`padfx` 名单(`Vec<String>`,经 `FxKind` 注册表解析,未知名 →
-`MixerError::UnknownFx` 构造失败),
+`flow_fx`(`Vec<FlowSlotConfig>`,每项带 `kind` 与 `flows`)/`knob_fx`/`pad_fx` 名单
+(经 `FxKind` 注册表解析,未知名 → `MixerError::UnknownFx` 构造失败)、`cue`(pre|post),
 `[crossfader]`(place/curve/cut_width/start)、`[cue]`(fader/blend/curve/cut_width)、
-以及 fader 起始位与位置(`fader = pre_fx|post_fx`)、cue_send/side、master fx/limiter/fader、
+cue_send/side、master fx/limiter/fader、
 输出列表(name/role(`master`|`cue`)/channels/gain)。
 `flow_fx` 是**模板**:每条 flow 各建一条独立的链(4 stems = 4 条,各自状态);逐流差异用每个槽的
 **白名单**(`[[channel.flow_fx]] flows = ["vocals"]`)——一个控件、N 份实例,`flows` 决定哪条 flow
@@ -289,16 +289,16 @@ kind:`linear`/`moog`),`flowfx` 在合并前逐流跑,`knobfx`/`padfx` 在合并�
   空间),ring 小于一次回调就会**每次**回调都补静音(听感=变慢+破碎)。固定 buffer 被拒的路径
   (`dmix`/`plug`,`sysdefault` 常见)只能拿后端默认值,所以 callback 把自己的帧数记进
   `CallbackStats`;`Mixer::widen_output_rings` 在 block 之间发现不够就把该输出**单独**重开成
-  `wanted + 4×block` 的 ring 并写进日志(`live.toml` 的 `ring_frames` 因此是下限而非定值)。
+  `wanted + 4×block` 的 ring 并写进日志(`config.toml` 的 `ring_frames` 因此是下限而非定值)。
   固定 buffer 只是延迟偏好:被拒就退回后端默认,而不是失败成 sink
 - **同一物理设备只保留一条流**:master+cue 都落在 default device 时,PipeWire 会在
   graph 里把两条流直接相加——main 有 limiter(≤−1 dBFS)但 cue 总线没有(cue_send 1.0
   时电平可达 2.0),DAC 实收 ~2.9 → 硬削波。Mixer 检测设备名重复,第二条降级 sink 不路由
   (设备选择 `[[output]] device` 字段是后续工作)
-- `simple_dj()` — 参考拓扑:2 通道(各 `chain = [eq, filter]`,`fader = post_fx`,cue_send 1.0)+
-  master limiter + master/cue 输出;`reference_toml()` 是它的 TOML 文本 —— 直接
-  `include_str!("profile/mixer.toml")`,所以文件、`--print-config` 与内置构造只有一个真源
-  (测试钉死解析回 `simple_dj()`)
+- `simple_dj()` — 参考拓扑:2 通道(eq/filter 固定前缀、空 bank、cue_send 1.0)+
+  master limiter + master/cue 输出;`reference_toml()` 是配置模板的 TOML 文本 —— 直接
+  `include_str!("profile/config.toml")`,所以模板、`--print-config` 与内置构造只有一个真源
+  (`MixerConfig::from_toml_str` 只读 `[mixer]` 段,测试钉死解析回 `simple_dj()`)
 
 **热加载**:`Command::MixerReload { text }`(文本而非路径 —— 文件 IO 属于前端)在 producer 线程上
 `Mixer::reload(&text)`:先解析+`build_chains` 全量校验,通过后才就地换掉 channels/chains/faders/
@@ -389,7 +389,7 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   `shadow` 是 loop/roll/slip 的第二声部；切换都是块边界硬切，无 crossfade。
 - `Direction::Reverse` — slip roll 用：反向读 loop range 的 PCM，Signalsmith 仍正向处理。
 - `PitchShiftEngine` — 两套后端:`Tape`(零延迟 varispeed) / Signalsmith Stretch
-  (`Keylock` 的窗口来自 live.toml `[keylock]`，默认 2048/512)。一个 2N 通道实例承载全部 stem；
+  (`Keylock` 的窗口来自 config.toml `[keylock]`，默认 2048/512)。一个 2N 通道实例承载全部 stem；
   `prepare_jump` 用 `outputSeek` 对齐，loop wrap 只是喂入流内的 splice，引擎不复位
 - **播放头是曲目帧,不是输出帧**:`output_frame_exact += capacity × ratio`(f64 累加,
   逐块取整不累积漂移)。数输出帧会让位置与 tempo 脱钩——波形、beatjump 的 `cued_from`
@@ -413,11 +413,10 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 
 ## hypermixx-cli
 
-启动参数:默认启动 TUI(`--cli` 切行式 REPL)/ `--config <file>`(TOML 拓扑,自定义通道/链/输出)/
-`--print-config`(输出参考拓扑)/ `--profile <name|file>`(指路拓扑、live 与控制器映射)/
-`--live <file>` / `--backend auto|stratum|timestretch` /
-`--controller <port> [--controller-map <file>]`(打开控制器输入,缺省映射来自 profile 或
-`profile/controller.toml`;端口名或序号,`controller ports` 可列,`midi ports` 是别名);
+启动参数:默认启动 TUI(`--cli` 切行式 REPL)/ `--config <file>`(单文件多段落配置;
+不给则用平台默认路径,首次启动从内置模板复制)/`--print-config`(输出配置模板)/
+`--backend auto|stratum|timestretch` / `--controller <port>`(打开控制器输入;
+映射文件由 config 的 `[controller].map` 指定;端口名或序号,`controller ports` 可列);
 `--guide [<file>]` 是 learn 模式编辑器(不启动引擎)。deck 数量启动时从引擎查询
 (`channel_count`,自定义拓扑可配任意通道)。
 
@@ -441,17 +440,17 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   翻译成 `Command`,接线在 `src/midi.rs`:translator 线程 + 1ms 合并 flush + `ListFx` 名字解析)
 - TUI 布局(`src/tui/view.rs`):顶部一行全局 header;deck 区合计不超过屏幕一半,每个 deck
   只保留一行状态(文件名在边框标题,右侧是 `已播放 / -剩余`)+ 波形(左声道在上、右声道在下的
-  三频段镜像;缩放单位是 frames/cell;分频点默认 200/4000Hz（随附 `preference.toml` 用 250/4000），
+  三频段镜像;缩放单位是 frames/cell;分频点默认 200/4000Hz（随附 `config.toml` 用 250/4000），
   可在 preference 调);底部
   `browser : command = 2 : 1`,browser 内部再按 1 : 3 分栏(目录/歌单 | 曲目列表)。波形 backend
   按 preference 的 `auto`/`kitty`/`braille` 选择(auto 为 kitty → braille;
-  三频段颜色也在 `profile/preference.toml`)。command
+  三频段颜色也在 `profile/config.toml`)。command
   上半是响应日志,下半输入带的顶线嵌入 `deck0 / deck1 / browser` 目标(`Tab` 循环;browser
   目前没有 CLI 前缀),目标文字与面板标题 `command` 左对齐
 - TUI 设置界面(`src/tui/settings.rs`):`F9` 打开,选择控制器端口/映射文件、拓扑文件(`mixer`)、
   输出绑定(`output`,每条 `[[output]]` 的 device/channels,写入拓扑文件并立即重载)、
-  live/preference 文件(取代旧的 `F2`/`F3`);`load` 不带路径弹文件浏览器;`Load` 完成后
-  `App::connect_midi` 连上,`--controller/--controller-map` 仅是免选择的快捷方式
+  live/preference 段(取代旧的 `F2`/`F3`);`load` 不带路径弹文件浏览器;`Load` 完成后
+  `App::connect_midi` 连上,`--controller` 仅是免选择的快捷方式
 - `--guide [<file>] [--controller <port>] [--decks <n>]` — learn 模式地图编辑器(`src/tui/guide.rs`),
   **不启动引擎**;`deck | unit | slot` 三栏、`info | watch dog`、灰色键位提示、居中 command
   (`Enter/Learn/Confirm` + `Delete/Connect/File/Save/Exit`)。方向键换栏/换行,Tab 切 command,
@@ -493,7 +492,7 @@ deck 装好后每个块 append 即可被 `feed()` 读到 —— 不重启 flow�
 
 ## 采样率与 live 设置
 
-引擎率是 **live 设置**（`profile/live.toml` 的 `[audio] sample_rate`，缺省 44.1 kHz，可填任何
+引擎率是 **live 设置**（`config.toml` 的 `[live.audio] sample_rate`，缺省 44.1 kHz，可填任何
 设备支持的率：44.1k / 48k / 88.2k / 96k …，`sanitised()` 只夹到 `8_000 ..= 384_000`）：
 `media::decode_file_at(path, rate)` 在装载时重采样到它，`AudioPipeline::start_with(cfg, rate, tuning)`
 把它和 ring/prefill 大小一起交给引擎，此后引擎内部没有采样率概念（`BeatGrid`/deck/FX 都只认帧）。
