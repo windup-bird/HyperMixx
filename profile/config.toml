@@ -1,0 +1,110 @@
+# Hypermixx configuration — one file, one path.
+#
+# `--config <file>` reads exactly that file. With no flag, the platform default is used:
+#   Linux / Termux : $XDG_CONFIG_HOME/hypermixx/config.toml  (or ~/.config/hypermixx/config.toml)
+#   Windows        : %APPDATA%/Hypermixx/config.toml
+# On the first start this template is copied there; an existing file is never overwritten.
+# `HYPERMIXX_CONFIG` overrides the path. `--print-config` prints this template.
+#
+# Every section is optional: a missing key takes its built-in default. Paths inside the config are
+# relative to this file's folder.
+
+[mixer]
+# The stage order is fixed; a config only chooses what sits in each bank. `eq` and `filter` are
+# always the tone prefix of every flow.
+
+[[mixer.channel]]
+side = "left"
+filter = "linear"        # linear | moog — the fixed sweep stage's kind
+cue = "pre"              # pre | post — which side of the fader the cue send taps
+cue_send = 1.0
+# knob_fx = ["echo"]     # post-merge knob bank
+# pad_fx = ["reverb"]    # post-merge pad bank
+# [[mixer.channel.flow_fx]]
+# kind = "filter"
+# flows = ["vocals"]     # omitted = every flow, [] = none
+
+[[mixer.channel]]
+side = "right"
+filter = "linear"
+cue = "pre"
+cue_send = 1.0
+
+[mixer.crossfader]
+place = "deck"           # source | flow | deck
+curve = "classic"        # classic | constant_power | cut
+
+[mixer.master]
+limiter = true            # the safety stage; on unless explicitly turned off
+ceiling_db = -1.0         # dBFS, −40 .. +12; the limiter's ceiling
+# fx = []
+
+[mixer.cue]
+# blend = -1.0           # -1 = cue only (default), 0 = both, +1 = master only
+
+[[mixer.output]]
+name = "main"
+role = "master"
+channels = [0, 1]
+# device = "..."         # name substring or device index; omit = the system default
+
+[[mixer.output]]
+name = "headphones"
+role = "cue"
+channels = [2, 3]
+
+[live]
+# Machine settings. Omitted keys take the built-in defaults.
+# [live.audio]
+# sample_rate = 44100
+# [live.keylock]
+# block = 2048
+# [live.stems]
+# provider = "cpu"
+# [live.autogain]
+# enabled = false
+# target_db = -12.0
+
+[preference]
+# TUI tastes. Omitted keys take the built-in defaults.
+
+[preference.waveform]
+backend = "auto"         # auto (kitty -> braille) | kitty | braille
+low_hz = 250
+high_hz = 4000
+# refresh_hz = 60       # image backend target, 10..60
+# cell = "8x16"         # terminal cell size in pixels
+
+# Interface colours. `#rgb` or `#rrggbb`; the commented values are the built-in defaults.
+[preference.theme]
+# accent = "#00ffff"
+# dim = "#444444"
+# text = "#ffffff"
+# error = "#ff0000"
+# warn = "#ffff00"
+# pad = "#406080"
+
+# Library sources. An absent or empty category is neither scanned nor displayed.
+# local: formats in local user locations (`~/Music`, `~/.VirtualDJ`, ...)
+# usb: formats on automatically discovered/mounted removable media
+# folders: plain folders to index; `~` expands to the home directory
+[preference.library]
+local = []
+usb = ["rkb", "serato", "vdj"]
+folders = ["~/Music"]
+
+# Imported-grid calibration. "auto" probes each file; a number overrides it, 0 disables the fix.
+decoder_start_ms = "auto"
+grid_offset_ms = 0.0
+rkb_mp3_offset_ms = 0.0
+serato_offset_ms = -16.5
+vdj_offset_ms = 0.0
+
+[preference.display]
+key = "camelot"          # camelot (8A/8B) | classic (Am/C)
+
+[controller]
+# `map` is a file pointer to a unit-map file, relative to this config's folder. Leaving it out
+# means no controller input. `device` overrides the map's `[meta].device`.
+# map = "mapping.toml"
+# device = "..."

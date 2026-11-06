@@ -70,12 +70,32 @@ pub fn format_response(response: &CommandResponse, sample_rate: u32) -> Vec<LogL
             }
             for slot in slots {
                 let state = if slot.enabled { "on" } else { "off" };
+                // The role is what a map binds; the kind is what is in it right now. They only
+                // differ after `fx kind`, and then the difference is worth showing.
+                let what = if slot.role == slot.kind {
+                    slot.role.clone()
+                } else {
+                    format!("{} ({})", slot.role, slot.kind)
+                };
                 out.push(LogLine::info(format!(
-                    "{} fx[{}] {} [{state}]",
+                    "{} fx[{}] {what} [{state}]",
                     chain.label(),
                     slot.index,
-                    slot.kind
                 )));
+                if let Some(flows) = &slot.flows {
+                    let text = if flows.len() == hypermixx_core::Stem::COUNT {
+                        "all".to_owned()
+                    } else if flows.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        flows
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    out.push(LogLine::info(format!("    flows = {text}")));
+                }
                 for (name, value) in &slot.params {
                     out.push(LogLine::info(format!("    {name} = {value:.4}")));
                 }
@@ -378,11 +398,13 @@ pub fn help_text(decks: usize) -> String {
 
 In the TUI: `load` with no path opens a file picker; F9 opens the settings screen (controller port
 and map file, mixer outputs, live/preference files). The browser is a soft focus: it takes the arrow
-keys (Miller columns; Enter opens a list or the deck chooser, Esc goes back) but a typed deck
-command still goes to the focused deck.
+keys (Miller columns; Enter opens a list or the deck chooser, Esc goes back) and it is the command
+target: a bare deck verb is refused while it is selected, so a stray `play` cannot stop a deck.
+`Tab` picks a deck.
 
 A leading `deck1` / `1` selects a deck (numbers are 1-based), `master` the summed output. Without
-one the command follows the focused deck (TUI: `Tab` cycles deck1 → deck2 → browser).
+one the command follows the selected target (TUI: `Tab` cycles deck1 → deck2 → browser); while
+browser is selected, name the deck in the line instead.
 startup flags: --config <file> (custom topology), --profile <name|file> (which files to use),
                --print-config (reference TOML), --live <file> (engine rate, ring, stem defaults),
                --backend auto|stratum|timestretch, --cli (line REPL; the TUI is the default),
@@ -431,6 +453,8 @@ pub fn fx_help_text() -> String {
         "fx commands (the chain is the line's target: the focused deck by default,\n`master` for the summed output, e.g. `master fx list`):
   fx add <kind>                    append an effect to the end of the chain
   fx remove <slot>                 drop a slot (later slots shift down)
+  fx kind <slot> <kind>            swap the effect in a slot (same index, same role)
+  fx flows <slot> all|none|a,b     route a flowfx slot to some of the flows
   fx list                          show every slot with its index, kind and parameters
   fx set <slot> <param> <value>    set one parameter (value is smoothed, no clicks)
   fx on|off <slot>                 engage / bypass a slot

@@ -224,14 +224,25 @@ fn line(area: Rect, row: u16, column: u16, width: u16) -> Rect {
 
 // ---- header -----------------------------------------------------------------
 
+/// Gain reduction (dB) at which the header's `out` field turns red. Below this the limiter is
+/// only trimming rounding noise, not holding the signal down.
+const LIMITING_DB: f32 = -0.5;
+
 fn render_top(frame: &mut Frame, area: Rect, app: &App, hits: &mut Vec<(Rect, Hit)>) {
     if area.height == 0 {
         return;
     }
     let (peak, cue, _) = app.peaks();
     let overruns = app.meters.as_ref().map_or(0, |meters| meters.overruns);
+    // A transient can be over the ceiling for a block without an audible reduction; half a dB is
+    // the point where the limiter is actually holding the signal down.
+    let limiting = app
+        .meters
+        .as_ref()
+        .is_some_and(|meters| meters.master_reduction_db < LIMITING_DB);
     let ring_ms = app.ring_frames as f64 * 1000.0 / f64::from(app.sample_rate);
     let theme = app.theme;
+    let out_color = if limiting { theme.error } else { theme.text };
 
     let badge = Span::styled(
         format!(" HYPERMIXX {} ", app.version),
@@ -243,14 +254,17 @@ fn render_top(frame: &mut Frame, area: Rect, app: &App, hits: &mut Vec<(Rect, Hi
     // Most useful first: the tail is what gets dropped when the terminal is narrow, and a meter
     // the user cannot see is worth less than the settings button.
     let fields = [
-        format!(" {}Hz ", app.sample_rate),
-        format!(" out {} ", db(peak)),
-        format!(" cue {} ", db(cue)),
-        format!(" drop {overruns} "),
-        format!(" cpu {} ", cpu_label(app.process.cpu_percent())),
-        format!(" mem {} ", mem_label(app.process.memory_bytes())),
-        format!(" ui {:.1}ms {:.0}fps ", app.ui_draw_ms, app.ui_fps),
-        format!(" ring {ring_ms:.0}ms "),
+        (format!(" {}Hz ", app.sample_rate), theme.text),
+        (format!(" out {} ", db(peak)), out_color),
+        (format!(" cue {} ", db(cue)), theme.text),
+        (format!(" drop {overruns} "), theme.text),
+        (format!(" cpu {} ", cpu_label(app.process.cpu_percent())), theme.text),
+        (format!(" mem {} ", mem_label(app.process.memory_bytes())), theme.text),
+        (
+            format!(" ui {:.1}ms {:.0}fps ", app.ui_draw_ms, app.ui_fps),
+            theme.text,
+        ),
+        (format!(" ring {ring_ms:.0}ms "), theme.text),
     ];
     let button = " ⚙ settings ";
     let button_w = width(button) as u16;
@@ -263,12 +277,12 @@ fn render_top(frame: &mut Frame, area: Rect, app: &App, hits: &mut Vec<(Rect, Hi
 
     let mut spans = vec![badge];
     let mut remaining = (text_w as usize).saturating_sub(width(" HYPERMIXX 0.1.0 "));
-    for field in fields {
+    for (field, color) in fields {
         let field_width = width(&field);
         if field_width > remaining {
             break;
         }
-        spans.push(Span::styled(field, Style::default().fg(theme.text)));
+        spans.push(Span::styled(field, Style::default().fg(color)));
         remaining -= field_width;
     }
     frame.render_widget(
@@ -1869,6 +1883,7 @@ mod tests {
         app.meters = Some(Meters {
             master_peak: 0.1,
             cue_peak: 0.05,
+            master_reduction_db: 0.0,
             overruns: 0,
             deck_peaks: vec![0.2, 0.1],
             channels: vec![
@@ -1925,6 +1940,30 @@ mod tests {
             .expect("settings button hit");
         assert_eq!(settings.0.y, 0);
         assert!(settings.0.right() <= 120);
+    }
+
+    #[test]
+    fn the_out_field_turns_red_while_the_limiter_works() {
+        let mut app = test_app();
+        let colour = app.theme.error;
+        let calm = render_at(&mut app, 120, 40);
+        assert!(
+            !header_has_colour(&calm, colour),
+            "no reduction means the out field keeps the normal text colour"
+        );
+
+        app.meters.as_mut().unwrap().master_reduction_db = -3.0;
+        let limiting = render_at(&mut app, 120, 40);
+        assert!(
+            header_has_colour(&limiting, colour),
+            "the out field should turn red while the limiter holds the signal down"
+        );
+    }
+
+    fn header_has_colour(buffer: &ratatui::buffer::Buffer, colour: Color) -> bool {
+        (0..buffer.area.width)
+            .filter_map(|x| buffer.cell((x, 0)))
+            .any(|cell| cell.fg == colour)
     }
 
     #[test]
@@ -2082,6 +2121,7 @@ mod tests {
         app.meters = Some(Meters {
             master_peak: deck_one.max(deck_two),
             cue_peak: 0.0,
+            master_reduction_db: 0.0,
             overruns: 0,
             deck_peaks: vec![deck_one, deck_two],
             channels: vec![
@@ -2577,12 +2617,12 @@ mod tests {
         ];
         let mut screen =
             crate::tui::settings::SettingsScreen::open(crate::tui::settings::Context {
-                profile: Some("profile/profile.toml".to_owned()),
+                profile: None,
                 mixer: Some(mixer.display().to_string()),
-                live: Some("profile/live.toml".to_owned()),
-                preference: Some("profile/preference.toml".to_owned()),
+                live: Some("config.toml".to_owned()),
+                preference: Some("config.toml".to_owned()),
                 controller_port: Some("Numark Party Mix III".to_owned()),
-                controller_map: Some("profile/controller.toml".to_owned()),
+                controller_map: Some("mapping.toml".to_owned()),
                 controller: Some("Numark Party Mix III".to_owned()),
                 engine_rate: 48_000,
                 devices,

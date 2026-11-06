@@ -496,6 +496,7 @@ fn draw_playhead_overlay(frame: &mut Frame, area: Rect) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_braille(
     frame: &mut Frame,
     area: Rect,

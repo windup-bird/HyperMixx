@@ -44,8 +44,9 @@ pub const COMPLETION_ROWS: usize = 8;
 
 /// Which prefix the command line currently speaks for.
 ///
-/// `Browser` has no CLI prefix yet, so a submitted line falls back to the last focused deck; when
-/// the browser grows its own command family it will route there instead.
+/// `Browser` is a target of its own: while it owns the command line a bare deck verb is refused
+/// (the front-end passes `None` to `command::dispatch`), because falling back to the last focused
+/// deck is how a stray `play` stops a track mid-browse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     Deck(usize),
@@ -467,8 +468,8 @@ impl App {
             ring_frames: hypermixx_audio::OUTPUT_RING_CAPACITY,
             decks,
             focused: 0,
-            // A session starts in the library. The browser is a soft focus: it takes the arrow keys
-            // but not the command line, so a typed deck command still lands on the last focused deck.
+            // A session starts in the library. The browser takes the arrow keys *and* the command
+            // line: a bare deck verb is refused until `Tab` picks a deck (or the line names one).
             target: Target::Browser,
             browser,
             images_hidden: false,
@@ -970,17 +971,19 @@ impl App {
                 .and_then(|meters| meters.channels.get(deck))
                 .map(|levels| levels.gain);
         }
-        let (kind, param) = match knob {
+        let (role, param) = match knob {
             Knob::Gain => unreachable!("handled above"),
             Knob::High => ("eq", "high"),
             Knob::Mid => ("eq", "mid"),
             Knob::Low => ("eq", "low"),
+            // Matched by **role**, not kind: the filter slot can hold `moog` instead of `filter`
+            // without the knob losing its home.
             Knob::Filter => ("filter", "value"),
         };
         self.deck_fx
             .get(deck)?
             .iter()
-            .find(|slot| slot.kind.eq_ignore_ascii_case(kind))
+            .find(|slot| slot.role.eq_ignore_ascii_case(role))
             .and_then(|slot| {
                 slot.params
                     .iter()
@@ -990,8 +993,10 @@ impl App {
     }
 
     /// The slot index of a knob's effect in the deck chain, for [`Command::SetFxParam`].
+    ///
+    /// Addressed by role so a swapped effect (`filter` → `moog`) stays under the same knob.
     pub fn knob_slot(&self, deck: usize, knob: Knob) -> Option<usize> {
-        let kind = match knob {
+        let role = match knob {
             Knob::Gain => return None,
             Knob::High | Knob::Mid | Knob::Low => "eq",
             Knob::Filter => "filter",
@@ -999,7 +1004,7 @@ impl App {
         self.deck_fx
             .get(deck)?
             .iter()
-            .find(|slot| slot.kind.eq_ignore_ascii_case(kind))
+            .find(|slot| slot.role.eq_ignore_ascii_case(role))
             .map(|slot| slot.index)
     }
 
@@ -1113,8 +1118,9 @@ impl App {
         changed
     }
 
-    /// The deck a command with no explicit target acts on. The browser has no commands of its
-    /// own yet, so it keeps pointing at the last focused deck instead of silently disabling input.
+    /// The deck a *UI affordance* acts on when it needs one (the bare-`load` picker, a browser
+    /// load): the targeted deck, or the last focused one while the browser is the target. Deck
+    /// commands do not use this — they need a real deck target (`command::Target::Unset`).
     pub fn default_deck(&self) -> usize {
         match self.target {
             Target::Deck(index) => index,

@@ -27,7 +27,7 @@ mod param;
 mod registry;
 pub mod sample;
 
-pub use chain::{FxChain, FxSlot, FxTarget};
+pub use chain::{FxChain, FxSlot, FxTarget, FLOW_ALL};
 pub use param::Param;
 pub use registry::FxKind;
 

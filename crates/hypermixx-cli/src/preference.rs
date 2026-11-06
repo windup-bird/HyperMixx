@@ -2,9 +2,8 @@
 //! fact (the waveform backend, its three colours, image refresh target).
 //!
 //! Deliberately forgiving: a typo in a colour must not stop the music. Unknown keys are reported as
-//! notes, invalid values fall back to the built-in default, and a missing file is simply "use the
-//! defaults". The file lives next to the profile that names it (`profile/preference.toml` by
-//! default).
+//! notes, invalid values fall back to the built-in default, and a missing key is simply "use the
+//! defaults". These are the `[preference]` section of the one config file.
 
 use std::fs;
 
@@ -12,8 +11,8 @@ use hypermixx_core::KeyFormat;
 use hypermixx_library::SourceKind;
 use ratatui::style::Color;
 
-/// Where the TUI looks for preferences when no profile points at another folder.
-pub const DEFAULT_PATH: &str = "profile/preference.toml";
+/// Where the TUI looks for preferences when no config path was handed to the session.
+pub const DEFAULT_PATH: &str = "profile/config.toml";
 
 /// Which waveform renderer to use. `Auto` resolves to Kitty when the terminal advertises Kitty
 /// graphics, otherwise Braille; an explicit choice overrides detection (except under tmux/screen,
@@ -231,7 +230,21 @@ pub fn load(path: &str) -> Result<(Preference, Vec<String>), String> {
 /// Parses the file body. Unknown keys are notes, not failures.
 pub fn parse(text: &str) -> Result<(Preference, Vec<String>), String> {
     let value: toml::Value = toml::from_str(text).map_err(|err| err.to_string())?;
-    let table = value
+    // The one-file config carries these settings under `[preference]`; a standalone preference
+    // file has the same keys at the root. If a one-file config omits the section, the other
+    // sections are not preferences — use the built-in defaults instead of reporting each of them
+    // as an unknown section.
+    let section = match value.get("preference") {
+        Some(section) => section.clone(),
+        None if ["mixer", "live", "controller"]
+            .iter()
+            .any(|key| value.get(key).is_some()) =>
+        {
+            return Ok((Preference::default(), Vec::new()))
+        }
+        None => value,
+    };
+    let table = section
         .as_table()
         .ok_or_else(|| "preferences are a table of sections".to_owned())?;
     let mut preference = Preference::default();
@@ -696,5 +709,32 @@ mod tests {
             load("/tmp/hypermixx-preference-that-does-not-exist.toml").unwrap();
         assert_eq!(preference, Preference::default());
         assert!(notes.is_empty());
+    }
+
+    /// These values used to live in `profile/preference.toml`. They now live under
+    /// `[preference.library]` in the one config; dropping them silently disables USB indexing.
+    #[test]
+    fn the_shipped_config_keeps_the_library_sources() {
+        let (preference, notes) =
+            parse(crate::profile::template()).expect("the shipped config parses");
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(preference.library.usb.len(), 3, "rkb | serato | vdj");
+        assert_eq!(preference.library.folders, vec!["~/Music".to_owned()]);
+        assert_eq!(preference.library.serato_offset_ms, -16.5);
+        assert_eq!(preference.library.decoder_start_ms, None, "\"auto\" probes");
+    }
+
+    #[test]
+    fn a_config_without_a_preference_section_uses_the_built_in_defaults() {
+        // The other sections are not preferences; they must not be reported as unknown sections.
+        let text = "[mixer]\n[[mixer.channel]]\nside = \"center\"\n[live]\n[controller]\n";
+        let (preference, notes) = parse(text).expect("a partial config parses");
+        assert_eq!(preference, Preference::default());
+        assert!(notes.is_empty(), "{notes:?}");
+
+        // A standalone preference file is still read at the root.
+        let (standalone, standalone_notes) = parse("[waveform]\nbackend = \"braille\"\n").unwrap();
+        assert_eq!(standalone.waveform.backend, WaveformBackend::Braille);
+        assert!(standalone_notes.is_empty(), "{standalone_notes:?}");
     }
 }

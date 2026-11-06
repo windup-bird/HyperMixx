@@ -205,7 +205,9 @@ fn be_u32(bytes: &[u8], offset: usize) -> std::result::Result<u32, String> {
 
 fn decode_utf16be(data: &[u8]) -> String {
     let units: Vec<u16> = data
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
         .take_while(|unit| *unit != 0)
         .collect();

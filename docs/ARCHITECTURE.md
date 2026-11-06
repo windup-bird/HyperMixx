@@ -125,7 +125,7 @@ crates/
   `CueOp = Play | Back | Set | Smart`(`Smart` 由 deck 自己的 `is_playing()` 决定,前端不猜)
 - `SetTempo` / `SetTempoFader` / `SetTempoRange` / `SetKeylock { mode: KeylockMode }` / `SetKey { semitones }` / `SetAnalysis` —
   分析结果从这里进入 deck,**没有 `Analyse` 命令**;`KeylockMode = Off | On`(默认 On),
-  STFT 窗口是 live.toml 的 `[keylock]` 设置(见 `KeylockSettings`)
+  STFT 窗口是 config.toml 的 `[keylock]` 设置(见 `KeylockSettings`)
   `SetKey` 是占位(streaming 引擎无变调轴)。**推子是控制器输入**:`SetTempoFader{position}`
   由 deck 按 `1 + position×tempo_range` 算 rate,再走 `SyncGroup::set_tempo` 的三分支
 - sync 族:`Sync { deck_id, op }`,op = `Tempo` / `Phase{mode,t}` / `TempoLock` /
@@ -206,31 +206,44 @@ mixer 只负责把 deck 变成采样;谁跟谁、共享 BPM 是什么,是**关�
 固定信号路径(`Channel::process`):
 
 ```
-(逐 stream 循环:一个 deck 有 1 条,装了 stems 就有 4 条)
+(逐 flow 循环:一个 deck 有 1 条,装了 stems 就有 4 条)
     deck.render_stream(i)
     → source_fader[i] 逐流**门**:stem 的 mute/solo 决策,恰好 1.0 或 0.0(GATE_TAU 平滑)
-    → flow_fx[i]      逐流插入(换流即重置滤波记忆;**每 stream 一条,状态独立**)
+    → [crossfader at "source"]
     → flow_fader[i]   逐流电平(只衰减,行程顶端 0 dB;这是**每 stem 的**电平)
+    → autogain         每块由 deck 上测得的响度 + live 目标推导(±12 dB 钳制、20ms 平滑);
+                       没测过响度的曲子保持 unity
+    → gain             channel trim:0 dB .. +6 dB(唯一能 boost 的一级;在 flow fader 之后、
+                       eq 之前,所以音色前缀看到的是 trim 过的信号)
+    → eq → filter → flowfx…   逐流链:固定前缀 + `flowfx` 槽;**每 flow 一套实例**(状态独立)
     → Σ 到 channel bus
-  → [cue tap]         恒在 channel fader **之前**
-  → fader             通道**唯一**的一颗 fader;`[channel] fader = "pre_fx"` 放在这里
-  → chain             通道插入(跨跳转持久,整 deck 共用;`[channel] chain = [...]`)
-  → [cue tap]         `fader = "post_fx"` 时在这里
-  → fader
-  → gain              channel trim:0 dB .. +6 dB(唯一能 boost 的一级)
+  → [crossfader at "flow"]
+  → knobfx… → padfx…  合并后链:knob 组然后 pad 组(各一个实例)
+  → [cue tap]         `[channel] cue = "pre"`(缺省)时在这里
+  → fader             通道**唯一**的一颗 fader(位置固定,在两条 bank 之后)
+  → [cue tap]         `cue = "post"` 时在这里(推子的另一侧)
+  → [crossfader at "deck"]
   → 求和
 ```
 
-**一通道一颗 fader,位置是配置**:`pre_fx` = 历史上的 flow fader 位置(先衰减再进音色),
-`post_fx` = 历史上的 deck fader 位置(缺省,音色随电平一起衰减)。**precue send 永远抽在
-fader 之前**,所以把推子拉到底只静音房间、不静音耳机——这就是 cue 的意义;也因此
-`cue_tap` 不再是配置项(它由 fader 位置唯一确定),TOML 只配一次 channel。
+**顺序是设计参数,槽位由配置给**:`eq` 和 `filter` 是路径的一部分(唯一的配置是 filter 的
+kind:`linear`/`moog`),`flowfx` 在合并前逐流跑,`knobfx`/`padfx` 在合并后跑,channel fader 固定
+在最后一条 bank 之后。`[channel] cue = "pre"`(缺省)把 cue send 抽在推子之前——把推子拉到底只
+静音房间、不静音耳机,这就是 cue 的意义;`cue = "post"` 抽在推子之后(仍是 crossfader 之前),
+所以推子会连耳机一起关,这是给 scratch/throw 用法的显式选项,不是缺省。
+
+**一个 deck 的平坦槽位序号**:`[eq, filter, flowfx…, knobfx…, padfx…]`。map 绑的就是这个序号
+(或 role),所以 bank 只在队尾增长时,前面的序号永不移动。逐流槽位是**一个控件、N 份实例**:
+写 `fx` 时 mixer 把同一条命令广播到每条 flow 链的同号实例,参数目标一致、平滑轨迹一致,而滤波
+器/延迟状态各自独立。
 
 共享 crossfader 的按侧增益坐在三个位置之一(`[crossfader] place = source|flow|deck`,
-缺省 `deck` = 历史位置),**恒在该位置的 cue tap 之后**,所以分叉点与它是同一点时 cue 不受
-crossfader 影响;分叉在它之后则跟着它(把 crossfader 放早的代价,文档写明)。
+缺省 `deck`),**恒在该位置的 cue tap 之后**,所以分叉点与它是同一点时 cue 不受 crossfader
+影响;分叉在它之后则跟着它(把 crossfader 放早的代价,文档写明)。
 
-单 stream、`post_fx`、crossfader 在 `deck` 位置时,上面这段与历史路径**逐位相同**。
+**autogain**:响度是**曲目属性**(装载时对 PCM 做一次滑窗 RMS,取最响的 3 s 的平均值,存在
+`Deck` 上),增益是**机器偏好**(`config.toml` 的 `[autogain] enabled/target_db`)。所以 `live reload`
+改目标或开关会立刻对已装载的曲子重新推导,不需要重测;`Command::SetAutogain` 把它推进引擎。
 
 `MasterBus::render`:`sum → master_fx → master_fader → limiter(安全级)`。
 `CueBus`:`sum → cue_fader → blend_with(master.sum)` —— 耳机是 cue 与 master 的混合,
@@ -240,18 +253,21 @@ crossfader 影响;分叉在它之后则跟着它(把 crossfader 放早的代价,
 
 1. limiter 是 `MasterBus` 的字段而非槽位——配置忘写 `"limiter"` 也不可能把全尺度音频
    送到 DAC(且不走链跳过优化,engaged 即执行)
-2. cue tap 是"fader 前"这一个点,由 fader 位置决定,不是自由路由
+2. cue tap 只有 fader 两侧两个点(`pre`/`post`),没有第三种路由
 3. **fader 只衰减**:`fader_amp` 的上半段恒为 1.0;headroom 只在 `gain`(`trim_amp`,+6 dB 封顶)
 4. 阶段顺序本身
 
-其余由 `MixerConfig` 纯数据描述(`config.rs`):每通道的 flow_fx/**stem_fx**/`chain` 名单
-(`Vec<String>`,经 `FxKind` 注册表解析,未知名 → `MixerError::UnknownFx` 构造失败;
-`chain` 是通道共用那条链,旧名 `deck_fx` 仍接受),
+其余由 `MixerConfig` 纯数据描述(`config.rs`):每通道的 `filter`(linear|moog)、
+`flow_fx`(`Vec<FlowSlotConfig>`,每项带 `kind` 与 `flows`)/`knob_fx`/`pad_fx` 名单
+(经 `FxKind` 注册表解析,未知名 → `MixerError::UnknownFx` 构造失败)、`cue`(pre|post),
 `[crossfader]`(place/curve/cut_width/start)、`[cue]`(fader/blend/curve/cut_width)、
-以及 fader 起始位与位置(`fader = pre_fx|post_fx`)、cue_send/side、master fx/limiter/fader、
+cue_send/side、master fx/limiter/fader、
 输出列表(name/role(`master`|`cue`)/channels/gain)。
-`flow_fx` 是**模板**:每条 stream 各建一条独立的链(4 stems = 4 条,各自状态),`[channel.stem_fx]`
-按 stem 覆写模板 —— 所以"只给人声加 filter"可以写在配置里,不必只靠运行时命令。
+`flow_fx` 是**模板**:每条 flow 各建一条独立的链(4 stems = 4 条,各自状态);逐流差异用每个槽的
+**白名单**(`[[channel.flow_fx]] flows = ["vocals"]`)——一个控件、N 份实例,`flows` 决定哪条 flow
+真正处理。mask 收窄时那条 flow 上的尾巴被硬切(不是淡出);放宽时新进入的实例先 `reset()`。
+每条链每块都被驱动(即使全部 bypass/mask 掉):跳过整条链会漏掉 bypass/mask 的边沿,让重新接上
+的效果带着它没听到的音频复活。
 
 - `Bus` — 面内(L/R 分离)块单位,构造时分配,热路径零分配;效果器逐面迭代省去步长乘法
 - `Channel` — 拥有自己的 deck、**每 stream 一条 flow 链**(`Vec<FxChain>`,从 config 的
@@ -273,16 +289,16 @@ crossfader 影响;分叉在它之后则跟着它(把 crossfader 放早的代价,
   空间),ring 小于一次回调就会**每次**回调都补静音(听感=变慢+破碎)。固定 buffer 被拒的路径
   (`dmix`/`plug`,`sysdefault` 常见)只能拿后端默认值,所以 callback 把自己的帧数记进
   `CallbackStats`;`Mixer::widen_output_rings` 在 block 之间发现不够就把该输出**单独**重开成
-  `wanted + 4×block` 的 ring 并写进日志(`live.toml` 的 `ring_frames` 因此是下限而非定值)。
+  `wanted + 4×block` 的 ring 并写进日志(`config.toml` 的 `ring_frames` 因此是下限而非定值)。
   固定 buffer 只是延迟偏好:被拒就退回后端默认,而不是失败成 sink
 - **同一物理设备只保留一条流**:master+cue 都落在 default device 时,PipeWire 会在
   graph 里把两条流直接相加——main 有 limiter(≤−1 dBFS)但 cue 总线没有(cue_send 1.0
   时电平可达 2.0),DAC 实收 ~2.9 → 硬削波。Mixer 检测设备名重复,第二条降级 sink 不路由
   (设备选择 `[[output]] device` 字段是后续工作)
-- `simple_dj()` — 参考拓扑:2 通道(各 `chain = [eq, filter]`,`fader = post_fx`,cue_send 1.0)+
-  master limiter + master/cue 输出;`reference_toml()` 是它的 TOML 文本 —— 直接
-  `include_str!("profile/mixer.toml")`,所以文件、`--print-config` 与内置构造只有一个真源
-  (测试钉死解析回 `simple_dj()`)
+- `simple_dj()` — 参考拓扑:2 通道(eq/filter 固定前缀、空 bank、cue_send 1.0)+
+  master limiter + master/cue 输出;`reference_toml()` 是配置模板的 TOML 文本 —— 直接
+  `include_str!("profile/config.toml")`,所以模板、`--print-config` 与内置构造只有一个真源
+  (`MixerConfig::from_toml_str` 只读 `[mixer]` 段,测试钉死解析回 `simple_dj()`)
 
 **热加载**:`Command::MixerReload { text }`(文本而非路径 —— 文件 IO 属于前端)在 producer 线程上
 `Mixer::reload(&text)`:先解析+`build_chains` 全量校验,通过后才就地换掉 channels/chains/faders/
@@ -303,7 +319,9 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 - `Param` — 参数跨线程的唯一通道:双原子(u32 位转换)+ 指数逼近,块级(`next_block`)
   或逐样本(`next_sample`)步进;`alpha≥1` snap、NaN 消毒、settled 收尾——扫频不
   zipper、fader 移动不咔哒
-- `FxSlot` — 拥有效果实例(`Box<dyn Fx>`);bypass→engage 边沿触发 `Fx::reset()`
+- `FxSlot` — 拥有效果实例(`Box<dyn Fx>`)+**role**:role 是槽位的固定身份,`kind` 是里面现在装的效果;
+  `FxSlot::replace` 换效果时保留 role/开关/pad latch,并把同名参数带过去(所以 `filter`↔`moog` 换完
+  旋钮不跳),新实例按引擎率 `prepare` 后下一块重新 `reset`;bypass→engage 边沿触发 `Fx::reset()`
   (不带陈旧滤波器记忆复活的咔哒声);pad 按住即 engaged,松开恢复最近意图
 - `FxChain` — `Vec<FxSlot>` 有序表,槽位增删在 producer 线程块边界(move,无锁热交换)
 - `dsp.rs` — RBJ biquad(LPF/HPF/BPF/bell/shelf):bell 用 `10^(dB/20)`、shelf 用
@@ -313,10 +331,13 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 - `delay.rs` — 时间类效果的原语:`DelayLine`(线性插值分数延迟,先读后写)、
   `OnePole`(反馈阻尼)、`SineLfo`(flanger/phaser 调制);容量在 `prepare` 里按引擎率定,
   之后 `process` 不再分配
-- `sample/` 九个内置效果:
+- `sample/` 十一个内置效果:
   - `Eq` — 三段 ISO:low shelf 320Hz / bell 1.2kHz / high shelf 3.6kHz,±26 dB 线性 dB
     律;系数仅在控制移动时重算,平坦时整段跳过
-  - `Filter` — 共振扫频:LP/HP(Q 律)/ BP(恒峰值增益,构造性安全);cutoff 指数映射
+  - `Filter`/`Moog` — 同一套 TPT 状态变量核(`filter` 两极点 12dB/oct,`moog` 四极点级联 24dB/oct):
+    LP/HP 两条支路**始终并行**、各自 cutoff 连续,中间用逐样本平滑的权重交叉淡化 —— 换的是权重不是拓扑,
+    所以 `value` 过零不会把旧滤波器的状态交给新拓扑(旧实现正是这样掉的声)。两者参数面完全相同
+    (`value`/`resonance`),是同一个固定位置槽位可以互换的两种 kind。cutoff 指数映射
     20Hz..18kHz,模式热切换
   - `Gain` / `Fader` — 线性增益(mixer 自己的 fader 也建在这上)
   - `Limiter` — 安全级:**64 帧前瞻**(1.45ms,位于混音后不影响 deck 相位)+ **逐样本
@@ -332,6 +353,8 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
     (避免每样本 `tan`),LFO 扫 150Hz..3kHz
   - `Cut` — 拍锁梯形门:`div` 拍、`width` 占空比、`depth` 关断深度、`edge` ms 过渡;
     相位由 `beat_position` 推导,loop/jump 后仍落在拍上
+  - `Empty`(`none`) — 空槽:挂载、可寻址、不处理任何样本。固定 bank 里"去掉一个效果"就是
+    `fx kind <槽> none`(序号和 role 不变),所以 map 不需要重绑
 - `registry.rs` — `FxKind` 封闭枚举(eq/filter/gain/limiter/echo/reverb/flanger/
   phaser/cut)+ 别名解析;加效果 = 一个 variant + 一个 `build` arm + 一行 `ALL`,无插件面
 
@@ -366,7 +389,7 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   `shadow` 是 loop/roll/slip 的第二声部；切换都是块边界硬切，无 crossfade。
 - `Direction::Reverse` — slip roll 用：反向读 loop range 的 PCM，Signalsmith 仍正向处理。
 - `PitchShiftEngine` — 两套后端:`Tape`(零延迟 varispeed) / Signalsmith Stretch
-  (`Keylock` 的窗口来自 live.toml `[keylock]`，默认 2048/512)。一个 2N 通道实例承载全部 stem；
+  (`Keylock` 的窗口来自 config.toml `[keylock]`，默认 2048/512)。一个 2N 通道实例承载全部 stem；
   `prepare_jump` 用 `outputSeek` 对齐，loop wrap 只是喂入流内的 splice，引擎不复位
 - **播放头是曲目帧,不是输出帧**:`output_frame_exact += capacity × ratio`(f64 累加,
   逐块取整不累积漂移)。数输出帧会让位置与 tempo 脱钩——波形、beatjump 的 `cued_from`
@@ -390,11 +413,10 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 
 ## hypermixx-cli
 
-启动参数:默认启动 TUI(`--cli` 切行式 REPL)/ `--config <file>`(TOML 拓扑,自定义通道/链/输出)/
-`--print-config`(输出参考拓扑)/ `--profile <name|file>`(指路拓扑、live 与控制器映射)/
-`--live <file>` / `--backend auto|stratum|timestretch` /
-`--controller <port> [--controller-map <file>]`(打开控制器输入,缺省映射来自 profile 或
-`profile/controller.toml`;端口名或序号,`controller ports` 可列,`midi ports` 是别名);
+启动参数:默认启动 TUI(`--cli` 切行式 REPL)/ `--config <file>`(单文件多段落配置;
+不给则用平台默认路径,首次启动从内置模板复制)/`--print-config`(输出配置模板)/
+`--backend auto|stratum|timestretch` / `--controller <port>`(打开控制器输入;
+映射文件由 config 的 `[controller].map` 指定;端口名或序号,`controller ports` 可列);
 `--guide [<file>]` 是 learn 模式编辑器(不启动引擎)。deck 数量启动时从引擎查询
 (`channel_count`,自定义拓扑可配任意通道)。
 
@@ -418,17 +440,17 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   翻译成 `Command`,接线在 `src/midi.rs`:translator 线程 + 1ms 合并 flush + `ListFx` 名字解析)
 - TUI 布局(`src/tui/view.rs`):顶部一行全局 header;deck 区合计不超过屏幕一半,每个 deck
   只保留一行状态(文件名在边框标题,右侧是 `已播放 / -剩余`)+ 波形(左声道在上、右声道在下的
-  三频段镜像;缩放单位是 frames/cell;分频点默认 200/4000Hz（随附 `preference.toml` 用 250/4000），
+  三频段镜像;缩放单位是 frames/cell;分频点默认 200/4000Hz（随附 `config.toml` 用 250/4000），
   可在 preference 调);底部
   `browser : command = 2 : 1`,browser 内部再按 1 : 3 分栏(目录/歌单 | 曲目列表)。波形 backend
   按 preference 的 `auto`/`kitty`/`braille` 选择(auto 为 kitty → braille;
-  三频段颜色也在 `profile/preference.toml`)。command
+  三频段颜色也在 `profile/config.toml`)。command
   上半是响应日志,下半输入带的顶线嵌入 `deck0 / deck1 / browser` 目标(`Tab` 循环;browser
   目前没有 CLI 前缀),目标文字与面板标题 `command` 左对齐
 - TUI 设置界面(`src/tui/settings.rs`):`F9` 打开,选择控制器端口/映射文件、拓扑文件(`mixer`)、
   输出绑定(`output`,每条 `[[output]]` 的 device/channels,写入拓扑文件并立即重载)、
-  live/preference 文件(取代旧的 `F2`/`F3`);`load` 不带路径弹文件浏览器;`Load` 完成后
-  `App::connect_midi` 连上,`--controller/--controller-map` 仅是免选择的快捷方式
+  live/preference 段(取代旧的 `F2`/`F3`);`load` 不带路径弹文件浏览器;`Load` 完成后
+  `App::connect_midi` 连上,`--controller` 仅是免选择的快捷方式
 - `--guide [<file>] [--controller <port>] [--decks <n>]` — learn 模式地图编辑器(`src/tui/guide.rs`),
   **不启动引擎**;`deck | unit | slot` 三栏、`info | watch dog`、灰色键位提示、居中 command
   (`Enter/Learn/Confirm` + `Delete/Connect/File/Save/Exit`)。方向键换栏/换行,Tab 切 command,
@@ -470,7 +492,7 @@ deck 装好后每个块 append 即可被 `feed()` 读到 —— 不重启 flow�
 
 ## 采样率与 live 设置
 
-引擎率是 **live 设置**（`profile/live.toml` 的 `[audio] sample_rate`，缺省 44.1 kHz，可填任何
+引擎率是 **live 设置**（`config.toml` 的 `[live.audio] sample_rate`，缺省 44.1 kHz，可填任何
 设备支持的率：44.1k / 48k / 88.2k / 96k …，`sanitised()` 只夹到 `8_000 ..= 384_000`）：
 `media::decode_file_at(path, rate)` 在装载时重采样到它，`AudioPipeline::start_with(cfg, rate, tuning)`
 把它和 ring/prefill 大小一起交给引擎，此后引擎内部没有采样率概念（`BeatGrid`/deck/FX 都只认帧）。

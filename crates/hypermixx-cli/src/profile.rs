@@ -1,447 +1,406 @@
-//! Profiles: one file that says which topology, which live settings and which MIDI input to use.
+//! The one configuration file: where it lives, how it is created, and how its sections are read.
 //!
-//! The `profile/` folder holds everything — the profile itself, the toml files it points at, and any
-//! other named profile (`profile/dj.toml`, run with `--profile dj`). A profile is a **pointer file**,
-//! not another schema to keep in step: the mixer topology, the live settings and the MIDI input each
-//! keep their own file and their own validation, which is what lets `mixer reload` and `live reload`
-//! keep working on the file they were told about.
+//! A config is a single TOML file with `[mixer]`, `[live]`, `[preference]` and `[controller]`
+//! sections. `--config <file>` reads exactly that file; without it the platform default is used, and
+//! on the first start the shipped template is copied there. An existing file is never overwritten,
+//! and a read-only config directory does not stop the engine: the built-in template runs instead.
 //!
-//! **Every relative path resolves against the folder of the file that contains it.** So
-//! `profile/profile.toml`'s `mixer = "mixer.toml"` means `profile/mixer.toml`, and a named profile
-//! sitting next to the sets it names needs no `../` arithmetic. One rule, wherever a path appears.
+//! All file IO stays in this front-end crate — the audio engine only ever reads text. In particular
+//! the template is the single source of truth for `--print-config`, the first-start copy and the
+//! engine's built-in topology (`reference_toml()` embeds the same bytes).
 //!
-//! `[preference]` is accepted and **reserved**: the front-end's own settings will live there, and
-//! until they exist a key in it is reported rather than silently ignored.
+//! `[controller].map` is a **file pointer** to a unit map, resolved relative to this config's
+//! folder. Leaving it out means no controller input, which is the shipped state.
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-/// Where a profile is looked for when `--profile` is not given.
-pub const AMBIENT: &str = "profile/profile.toml";
-/// Where the folder defaults live, used when a profile names nothing (or there is no profile).
-pub const DEFAULT_MIXER: &str = "profile/mixer.toml";
-pub const DEFAULT_LIVE: &str = "profile/live.toml";
-pub const DEFAULT_MIDI: &str = "profile/controller.toml";
-/// The pre-rename default, read when `controller.toml` is not there. Keeping both is what lets an
-/// existing folder keep working without a migration step.
-pub const LEGACY_MIDI: &str = "profile/midi.toml";
-/// Where a bare profile *name* is resolved: the folder itself, so `--profile dj` is
-/// `profile/dj.toml` next to the files it names.
-pub const PROFILES_DIR: &str = "profile";
-/// The mapping file used when nothing names one (the historical default, in the working directory).
-pub const DEFAULT_MAP: &str = "midi-map.toml";
+use hypermixx_audio::{reference_toml, MixerConfig};
+use hypermixx_core::LiveConfig;
 
-/// The MIDI input a profile asks for.
+/// The shipped template. `--print-config` emits it and the first-start copy writes it verbatim.
+pub fn template() -> &'static str {
+    reference_toml()
+}
+
+/// The shipped unit-map template (`profile/mapping.toml`), embedded so `--guide` has a map to edit
+/// on a machine with no checkout. It is written only when the guide opens a map that does not exist
+/// yet, never at startup — the first start still creates exactly one file, the config.
+pub const MAP_TEMPLATE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../profile/mapping.toml"
+));
+
+/// The `[controller]` section: a pointer to one unit-map file, plus an optional port override.
+/// Parsed by hand because this crate does not depend on serde; two keys do not warrant one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MidiSettings {
-    /// A port name substring (case-insensitive, first match wins) or an index from `controller ports`.
-    /// `None` means no input at startup — the TUI can still pick one at runtime.
-    pub device: Option<String>,
-    /// The mapping file. Already resolved against the folder of the file that named it.
+struct ControllerSection {
+    map: Option<String>,
+    device: Option<String>,
+}
+
+/// What the session needs from `[controller]`, with `map` already resolved to a usable path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Controller {
     pub map: Option<String>,
+    pub device: Option<String>,
 }
 
-/// The controller file to read when nothing names one: `controller.toml` if it exists, the legacy
-/// `midi.toml` otherwise. A folder that predates the rename keeps working untouched.
-pub fn default_midi_path() -> &'static str {
-    if Path::new(DEFAULT_MIDI).is_file() {
-        DEFAULT_MIDI
-    } else {
-        LEGACY_MIDI
+/// One parsed config, and the path it came from.
+#[derive(Debug)]
+pub struct Config {
+    pub path: PathBuf,
+    pub mixer: MixerConfig,
+    pub live: LiveConfig,
+    pub controller: Controller,
+    /// Notes worth showing at startup (a first-start copy, clamped live values, ...).
+    pub notes: Vec<String>,
+}
+
+/// The platform's config path. `HYPERMIXX_CONFIG` wins when set, which is also how a test or a
+/// Termux/proot session names its own location.
+pub fn default_path() -> Option<PathBuf> {
+    // An empty value means "not set" — joining onto it would put the config in the working
+    // directory instead of the user's config directory.
+    if let Some(path) = std::env::var_os("HYPERMIXX_CONFIG").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(path));
     }
-}
-
-/// The **mapping file** to open when a front-end has a port but no file: the shipped one when it is
-/// there, and otherwise the historical working-directory default. One definition, used by
-/// `--guide`, the TUI's controller pickers and the session's fallback, so the four cannot drift.
-pub fn default_map_path() -> &'static str {
-    let shipped = default_midi_path();
-    if Path::new(shipped).is_file() {
-        shipped
+    let dir = if cfg!(windows) {
+        std::env::var_os("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(|base| PathBuf::from(base).join("Hypermixx"))
     } else {
-        DEFAULT_MAP
-    }
+        std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(|home| PathBuf::from(home).join(".config"))
+            })
+            .map(|base| base.join("hypermixx"))
+    }?;
+    Some(dir.join("config.toml"))
 }
 
-/// What a profile names.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Profile {
-    /// The mixer topology, already resolved. `None` = the folder default that already applies.
-    pub mixer: Option<String>,
-    /// This machine's settings, already resolved.
-    pub live: Option<String>,
-    /// The MIDI input, already resolved.
-    pub midi: MidiSettings,
+/// Loads `explicit`, or the platform default. Only the *default* path is created on a first start:
+/// a path the user named must exist, so a typo is an error rather than a silently copied template.
+pub fn load_or_create(explicit: Option<&str>) -> Result<Config, String> {
+    let (path, create_missing) = match explicit {
+        Some(path) => (PathBuf::from(path), false),
+        None => (
+            default_path().ok_or_else(|| {
+                "cannot find the platform config directory (set HYPERMIXX_CONFIG)".to_owned()
+            })?,
+            true,
+        ),
+    };
+    load_or_create_at(&path, create_missing)
 }
 
-impl Profile {
-    /// Parses a profile found in `dir`. Unknown sections and non-string paths are errors — a profile
-    /// that quietly ignored `[mixr]` would run the default topology while looking like it had not.
-    ///
-    /// `midi` is a **path** to a map file. The device lives in that map's `[meta].device`; there is
-    /// no second settings shape to keep in step.
-    pub fn from_toml_str(text: &str, dir: &Path) -> Result<(Self, Vec<String>), String> {
-        let value: toml::Value = toml::from_str(text).map_err(|err| err.to_string())?;
-        let table = value
-            .as_table()
-            .ok_or_else(|| "a profile is a table of sections".to_owned())?;
-        let mut profile = Self::default();
-        let mut notes = Vec::new();
-        for (key, value) in table {
-            match key.as_str() {
-                "mixer" => profile.mixer = path_value(key, value, dir)?,
-                "live" => profile.live = path_value(key, value, dir)?,
-                "controller" | "midi" => match value {
-                    toml::Value::String(path) => {
-                        let path = resolve_against(dir, path.trim());
-                        let (settings, midi_notes) = load_midi(&path)?;
-                        profile.midi = settings;
-                        notes.extend(midi_notes);
-                    }
-                    toml::Value::Table(_) => {
-                        return Err(
-                            "inline `[midi]` is no longer supported; point `midi` at a map file                              (the device lives in that file's `[meta].device`)"
-                                .to_owned(),
-                        )
-                    }
-                    _ => return Err("`midi` must be a map file path".to_owned()),
-                },
-                "preference" => {
-                    // Reserved. An empty table is exactly what an unimplemented section looks like.
-                    let table = value
-                        .as_table()
-                        .ok_or_else(|| "`preference` must be a table".to_owned())?;
-                    if !table.is_empty() {
-                        notes.push(format!(
-                            "preference key(s) {} are not used yet — the front-end will define them",
-                            table.keys().cloned().collect::<Vec<_>>().join(", ")
-                        ));
-                    }
-                }
-                other => {
-                    return Err(format!(
-                        "unknown section `{other}` (mixer | live | controller | preference)"
-                    ))
+/// The same load with the "create on first start" decision already made, so a test can exercise
+/// the first-start path without touching the process-wide config environment variables.
+fn load_or_create_at(path: &Path, create_missing: bool) -> Result<Config, String> {
+    let mut notes = Vec::new();
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == ErrorKind::NotFound && create_missing => {
+            match first_copy(path) {
+                Ok(()) => notes.push(format!("created {}", path.display())),
+                Err(err) => notes.push(format!(
+                    "{}: {err}; running on the built-in template",
+                    path.display()
+                )),
+            }
+            template().to_owned()
+        }
+        Err(err) => return Err(format!("{}: {err}", path.display())),
+    };
+    parse(path, &text, notes)
+}
+
+/// Writes the template once. The caller has already established the file is absent.
+fn first_copy(path: &Path) -> Result<(), String> {
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    std::fs::write(path, template()).map_err(|err| err.to_string())
+}
+
+/// Splits the sections. Each keeps its own schema and validation: the mixer's own parser reads
+/// `[mixer]` (or the whole text for a standalone topology), `LiveConfig` deserializes `[live]`,
+/// and preferences are read from `[preference]` by `preference::parse`.
+fn parse(path: &Path, text: &str, mut notes: Vec<String>) -> Result<Config, String> {
+    let value: toml::Value =
+        toml::from_str(text).map_err(|err| format!("{}: {err}", path.display()))?;
+    let mixer = MixerConfig::from_toml_str(text)
+        .map_err(|err| format!("{}: {}", path.display(), err.message()))?;
+
+    let live = match value.get("live") {
+        Some(section) => {
+            let parsed: LiveConfig = section
+                .clone()
+                .try_into()
+                .map_err(|err| format!("{}: [live]: {err}", path.display()))?;
+            let live = parsed.clone().sanitised();
+            if live != parsed {
+                notes.push(format!("{}: some live values were clamped", path.display()));
+            }
+            live
+        }
+        None => LiveConfig::default(),
+    };
+
+    let section = match value.get("controller") {
+        Some(section) => controller_section(section)
+            .map_err(|err| format!("{}: [controller]: {err}", path.display()))?,
+        None => ControllerSection::default(),
+    };
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let map = section.map.map(|map| resolve_against(dir, &map));
+    // A configured but unreadable map is a silent "no controller" otherwise; say exactly why.
+    if let Some(map) = &map {
+        match std::fs::read_to_string(map) {
+            Ok(text) => {
+                let base = Path::new(map)
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                if let Err(err) = hypermixx_midi::Map::from_toml_str_at(&text, base) {
+                    notes.push(format!(
+                        "{}: [controller].map `{map}` does not parse: {err}",
+                        path.display()
+                    ));
                 }
             }
+            Err(err) => notes.push(format!(
+                "{}: [controller].map `{map}` cannot be read: {err}",
+                path.display()
+            )),
         }
-        Ok((profile, notes))
     }
+    let controller = Controller {
+        map,
+        device: section.device,
+    };
+
+    Ok(Config {
+        path: path.to_path_buf(),
+        mixer,
+        live,
+        controller,
+        notes,
+    })
 }
 
-/// Reads and parses a profile file.
-pub fn load(path: &str) -> Result<(Profile, Vec<String>), String> {
-    // Every failure names the file: a profile is chosen by name, so "No such file" without it says
-    // nothing about which name was wrong.
-    let text = std::fs::read_to_string(path).map_err(|err| format!("{path}: {err}"))?;
-    let dir = parent_dir(path);
-    Profile::from_toml_str(&text, &dir).map_err(|err| format!("{path}: {err}"))
+/// The conventional name of a unit-map file, used by the TUI's pickers when no config path is at
+/// hand. A real map path always comes from `[controller].map` or `map_path_for`.
+pub fn default_map_path() -> &'static str {
+    "mapping.toml"
 }
 
-/// Reads a `profile/midi.toml`-shaped map file.
-///
-/// There is exactly one shape: a map file (`[[unit]]`, optional `[meta]`). The device is
-/// `[meta].device`; `--controller` still overrides it. The old two-part settings table (`device` +
-/// `map`) is refused with a migration message rather than silently ignored.
-pub fn load_midi(path: &str) -> Result<(MidiSettings, Vec<String>), String> {
-    let text = std::fs::read_to_string(path).map_err(|err| format!("{path}: {err}"))?;
-    let value: toml::Value = toml::from_str(&text).map_err(|err| format!("{path}: {err}"))?;
-    let table = value
-        .as_table()
-        .ok_or_else(|| format!("{path}: a midi file must be a map table"))?;
-    if table.contains_key("device") || table.contains_key("map") {
-        return Err(format!(
-            "{path}: the old two-part midi file is no longer supported; keep one map file and put              the port in `[meta].device`"
-        ));
+/// The unit-map file next to one specific config: the guide's default target and the path a session
+/// shows. `[controller].map` overrides it, but a config that names no map simply opens no input.
+pub fn map_path_for(config_path: &Path) -> String {
+    config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("mapping.toml")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The `[[mixer.output]]` array of a one-file config. The TUI's device pickers read it; a missing
+/// or malformed section means "no outputs declared" rather than an error.
+pub fn output_tables(doc: &toml_edit::DocumentMut) -> Option<&toml_edit::ArrayOfTables> {
+    doc.get("mixer")?
+        .as_table()?
+        .get("output")?
+        .as_array_of_tables()
+}
+
+/// The same array, mutable, creating `[mixer]` and the array when the config omits them. Used by
+/// the settings screens, which write a device back into the config the session is running on.
+pub fn output_tables_mut(
+    doc: &mut toml_edit::DocumentMut,
+) -> Result<&mut toml_edit::ArrayOfTables, String> {
+    if doc.get("mixer").is_none() {
+        doc.insert("mixer", toml_edit::Item::Table(toml_edit::Table::new()));
     }
-    let map = hypermixx_midi::Map::from_toml_str_at(&text, &parent_dir(path))
-        .map_err(|err| format!("{path}: {err}"))?;
-    let device = map.meta.as_ref().and_then(|meta| meta.device.clone());
-    let mut notes = Vec::new();
-    if device.is_none() {
-        notes.push(
-            "`[meta].device` is not set; no controller input opens until `--controller` or F9"
-                .to_owned(),
+    let mixer = doc
+        .get_mut("mixer")
+        .and_then(|item| item.as_table_mut())
+        .ok_or_else(|| "`mixer` is not a table".to_owned())?;
+    if mixer.get("output").is_none() {
+        mixer.insert(
+            "output",
+            toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
         );
     }
-    Ok((
-        MidiSettings {
-            device,
-            map: Some(path.to_owned()),
-        },
-        notes,
-    ))
+    mixer
+        .get_mut("output")
+        .and_then(|item| item.as_array_of_tables_mut())
+        .ok_or_else(|| "`[[mixer.output]]` is not an array of tables".to_owned())
 }
 
-/// Where `--profile <arg>` points: a bare name is a file in the `profile/` folder, anything that
-/// looks like a path is used as it stands.
-pub fn resolve(arg: &str) -> String {
-    if arg.ends_with(".toml") || arg.contains('/') {
-        return arg.to_owned();
+fn controller_section(value: &toml::Value) -> Result<ControllerSection, String> {
+    let table = value
+        .as_table()
+        .ok_or_else(|| "must be a table".to_owned())?;
+    let mut section = ControllerSection::default();
+    for (key, value) in table {
+        let text = value
+            .as_str()
+            .ok_or_else(|| format!("`{key}` must be a string"))?
+            .trim()
+            .to_owned();
+        match key.as_str() {
+            "map" => section.map = Some(text),
+            "device" => section.device = Some(text),
+            other => return Err(format!("unknown key `{other}` (map | device)")),
+        }
     }
-    format!("{PROFILES_DIR}/{arg}.toml")
+    Ok(section)
 }
 
-/// A path as written in a file found in `dir`: absolute stays absolute, relative joins `dir`.
+/// A path written inside the config: absolute stays absolute, relative joins the config's folder.
 fn resolve_against(dir: &Path, path: &str) -> String {
-    let path = Path::new(path);
+    let path = Path::new(path.trim());
     if path.is_absolute() {
         return path.to_string_lossy().into_owned();
     }
     dir.join(path).to_string_lossy().into_owned()
 }
 
-/// The folder a file lives in, or `.` for a bare name.
-fn parent_dir(path: &str) -> PathBuf {
-    Path::new(path)
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-/// One of the profile's path keys.
-fn path_value(key: &str, value: &toml::Value, dir: &Path) -> Result<Option<String>, String> {
-    match string_value(key, value)? {
-        Some(path) if !path.is_empty() => Ok(Some(resolve_against(dir, &path))),
-        _ => Ok(None),
-    }
-}
-
-/// A string-valued key, or an error naming it.
-fn string_value(key: &str, value: &toml::Value) -> Result<Option<String>, String> {
-    match value {
-        toml::Value::String(text) => Ok(Some(text.trim().to_owned())),
-        // A section header where a path belongs is the mistake a hand-written file actually makes,
-        // so it gets its own message rather than "expected string, found table".
-        toml::Value::Table(_) => Err(format!(
-            "`{key}` takes a path or a string; `[{key}]` is a section (see profile/profile.toml)"
-        )),
-        _ => Err(format!("`{key}` must be a string")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parse(text: &str) -> Result<(Profile, Vec<String>), String> {
-        Profile::from_toml_str(text, Path::new("profile"))
-    }
-
-    fn toml_path(path: &Path) -> String {
-        format!("\"{}\"", path.display().to_string().replace('\\', "\\\\"))
-    }
-
-    fn is_path(actual: Option<&str>, expected: &Path) -> bool {
-        actual.is_some_and(|path| Path::new(path) == expected)
+    fn temp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("hypermixx-config-{}-{name}", std::process::id()))
     }
 
     #[test]
-    fn a_profile_names_the_files_it_needs() {
-        let (profile, notes) = parse(
-            r#"
-            mixer = "mixer.toml"
-            live = "live.toml"
-            "#,
-        )
-        .unwrap();
-        // Relative to the profile's own folder, so a name alone is enough.
-        assert!(is_path(
-            profile.mixer.as_deref(),
-            &Path::new("profile").join("mixer.toml")
-        ));
-        assert!(is_path(
-            profile.live.as_deref(),
-            &Path::new("profile").join("live.toml")
-        ));
-        assert!(notes.is_empty());
-        assert_eq!(profile.midi, MidiSettings::default());
+    fn the_template_parses_into_a_usable_config() {
+        let cfg = parse(Path::new("config.toml"), template(), Vec::new()).expect("parses");
+        assert_eq!(cfg.mixer.channels.len(), 2, "the reference topology has two decks");
+        assert_eq!(cfg.mixer.outputs.len(), 2);
+        assert!(!cfg.live.autogain.enabled, "auto-gain is off in the template");
+        assert_eq!(cfg.controller, Controller::default());
     }
 
     #[test]
-    fn paths_resolve_against_the_profile_that_names_them() {
-        let absolute = std::env::temp_dir().join("hypermixx-live.toml");
-        let text = format!(
-            "mixer = \"../sets/club.toml\"\nlive = {}\n",
-            toml_path(&absolute)
-        );
-        let (profile, _) = Profile::from_toml_str(&text, Path::new("profile")).unwrap();
-        assert!(is_path(
-            profile.mixer.as_deref(),
-            &Path::new("profile").join("../sets/club.toml")
-        ));
-        assert!(
-            is_path(profile.live.as_deref(), &absolute),
-            "absolute stays: {:?}",
-            profile.live
-        );
-        // A profile at the root of the tree resolves against the root.
-        let (profile, _) =
-            Profile::from_toml_str("mixer = \"profile/mixer.toml\"\n", Path::new(".")).unwrap();
-        assert!(is_path(
-            profile.mixer.as_deref(),
-            &Path::new(".").join("profile/mixer.toml")
-        ));
-    }
+    fn sections_are_read_independently_and_map_is_a_resolved_pointer() {
+        let dir = temp("sections");
+        let path = dir.join("config.toml");
+        let text = r#"
+[mixer]
+[[mixer.channel]]
+side = "center"
 
-    #[test]
-    fn the_controller_file_is_a_map_file_only() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let map = root.join(DEFAULT_MIDI);
-        let text = format!("controller = {}\n", toml_path(&map));
-        let (profile, notes) = parse(&text).unwrap();
-        assert!(
-            is_path(profile.midi.map.as_deref(), &map),
-            "the map path is what the profile carries: {:?}",
-            profile.midi.map
-        );
-        // The pre-rename key still parses, so an old profile keeps working.
-        let legacy = parse(&format!("midi = {}\n", toml_path(&map))).unwrap().0;
-        assert_eq!(legacy.midi.map, profile.midi.map);
-        // The shipped map names the development controller, so there is nothing to warn about.
-        let device = profile.midi.device.clone();
-        assert_eq!(
-            device.is_none(),
-            notes.iter().any(|note| note.contains("device"))
-        );
+[live]
+[live.autogain]
+enabled = true
+target_db = -9.0
 
-        // The old inline settings table is refused with a migration message.
-        let error = parse("[midi]\ndevice = \"DDJ-400\"\nmap = \"m.toml\"\n").unwrap_err();
-        assert!(
-            error.contains("inline") && error.contains("map file"),
-            "{error}"
-        );
-    }
+[preference]
+[preference.waveform]
+backend = "braille"
 
-    #[test]
-    fn an_empty_profile_means_the_defaults() {
-        let (profile, notes) = parse("").unwrap();
-        assert_eq!(
-            profile,
-            Profile::default(),
-            "nothing named, nothing overridden"
-        );
-        assert!(notes.is_empty());
-        // A section that is present but empty is the same as absent.
-        let (profile, notes) = parse("[preference]\n").unwrap();
-        assert_eq!(profile, Profile::default());
-        assert!(notes.is_empty());
-    }
-
-    #[test]
-    fn the_reserved_preference_section_is_reported_but_not_fatal() {
-        let (_, notes) = parse("[preference]\ntheme = \"dark\"\n").unwrap();
-        assert_eq!(notes.len(), 1);
-        assert!(notes[0].contains("theme"), "{notes:?}");
-    }
-
-    #[test]
-    fn typos_and_wrong_types_are_errors() {
-        assert!(parse("[mixr]\npath = \"x\"\n")
-            .unwrap_err()
-            .contains("mixr"));
-        assert!(parse("mixer = 3\n").unwrap_err().contains("mixer"));
-        // A section header where a path belongs gets a message about the spelling, not about types.
-        let err = parse("[mixer]\nfile = \"x\"\n").unwrap_err();
-        assert!(err.contains("mixer") && err.contains("section"), "{err}");
-        assert!(parse("[midi]\nportt = \"1\"\n")
-            .unwrap_err()
-            .contains("inline"));
-        assert!(parse("midi = 3\n").unwrap_err().contains("midi"));
-    }
-
-    #[test]
-    fn a_bare_name_is_a_file_in_the_profile_folder() {
-        assert_eq!(resolve("dj"), "profile/dj.toml");
-        assert_eq!(resolve("dj.toml"), "dj.toml");
-        assert_eq!(resolve("profile/dj.toml"), "profile/dj.toml");
-        assert_eq!(resolve("/tmp/p.toml"), "/tmp/p.toml");
-    }
-
-    /// The shipped folder must be loadable: the example profile points at files that exist, and the
-    /// resolution rule (every path relative to the file that names it) holds for all of them.
-    ///
-    /// Written against `profile/example.toml` rather than `profile/profile.toml` on purpose: the
-    /// ambient profile is optional, so a test that starts with it silently tested nothing on a
-    /// checkout that does not ship one. `example.toml` is tracked, so this always runs.
-    #[test]
-    fn the_shipped_profile_folder_loads() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        // Canonical, because that is what the profile's own resolution produces: every relative path
-        // is joined onto the folder of the file that named it.
-        let folder = std::fs::canonicalize(root.join(PROFILES_DIR)).expect("the profile folder");
-        let root = &folder.parent().expect("the checkout root");
-        for name in ["mixer.toml", "live.toml", "controller.toml", "example.toml"] {
-            assert!(
-                folder.join(name).is_file(),
-                "profile/{name} is part of the shipped folder"
-            );
-        }
-        let example = folder.join("example.toml");
-        let (profile, notes) =
-            load(&example.to_string_lossy()).expect("the shipped profile parses");
-        assert!(
-            notes.iter().all(|note| note.contains("device")),
-            "the only note is that the map names no port: {notes:?}"
-        );
-        // Each pointer resolved against the profile's own folder — compared as a `Path`, so this is
-        // about the rule rather than about which separator the platform uses.
-        for (actual, expected) in [
-            (profile.mixer.as_deref(), "mixer.toml"),
-            (profile.live.as_deref(), "live.toml"),
-            (profile.midi.map.as_deref(), "controller.toml"),
-        ] {
-            assert!(
-                is_path(actual, &folder.join(expected)),
-                "{actual:?} should resolve to profile/{expected}"
-            );
-            // ...and the file it names is really there.
-            assert!(
-                root.join(actual.expect("named")).is_file(),
-                "{actual:?} does not exist"
-            );
-        }
-        // The ambient profile is optional: a checkout without one runs on the folder defaults.
-        let root = folder.parent().expect("the checkout root");
-        if root.join(AMBIENT).is_file() {
-            load(&root.join(AMBIENT).to_string_lossy()).expect("the ambient profile parses");
-        }
-    }
-
-    #[test]
-    fn a_map_file_carries_its_device_and_old_shapes_are_refused() {
-        let dir =
-            std::env::temp_dir().join(format!("hypermixx-midi-profile-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("midi.toml");
-        std::fs::write(
-            &path,
-            r#"
-[meta]
+[controller]
+map = "mapping.toml"
 device = "DDJ-400"
+"#;
+        let cfg = parse(&path, text, Vec::new()).expect("parses");
+        assert_eq!(cfg.mixer.channels.len(), 1);
+        assert!(cfg.live.autogain.enabled);
+        assert_eq!(cfg.live.autogain.target_db, -9.0);
+        assert_eq!(
+            cfg.controller.map,
+            Some(dir.join("mapping.toml").to_string_lossy().into_owned())
+        );
+        assert_eq!(cfg.controller.device.as_deref(), Some("DDJ-400"));
+    }
 
-[[unit]]
-id = "u"
-deck = 1
-[[unit.mode]]
-name = "m"
-"#,
-        )
-        .unwrap();
-        let (settings, notes) = load_midi(&path.display().to_string()).unwrap();
-        assert_eq!(settings.device.as_deref(), Some("DDJ-400"));
-        assert!(settings.map.is_some());
-        assert!(notes.is_empty());
+    #[test]
+    fn an_existing_file_is_read_not_overwritten() {
+        let path = temp("existing.toml");
+        std::fs::write(&path, "[mixer]\n[[mixer.channel]]\nside = \"center\"\n").unwrap();
+        let cfg = load_or_create(Some(path.to_string_lossy().as_ref())).expect("reads");
+        assert_eq!(cfg.mixer.channels.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[mixer]\n[[mixer.channel]]\nside = \"center\"\n",
+            "loading must not rewrite the user's file"
+        );
+        std::fs::remove_file(&path).ok();
+    }
 
+    #[test]
+    fn a_missing_explicit_config_is_an_error() {
+        let path = temp("absent.toml");
+        std::fs::remove_file(&path).ok();
+        assert!(load_or_create(Some(path.to_string_lossy().as_ref())).is_err());
+    }
+
+    #[test]
+    fn first_copy_creates_the_parent_directories() {
+        let dir = temp("copy");
+        let path = dir.join("nested/config.toml");
+        std::fs::remove_dir_all(&dir).ok();
+        first_copy(&path).expect("copies");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), template());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_first_start_creates_the_config_and_never_overwrites_it() {
+        let dir = temp("first-start");
+        let path = dir.join("nested/config.toml");
+        std::fs::remove_dir_all(&dir).ok();
+        let cfg = load_or_create_at(&path, true).expect("first start creates the config");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), template());
+        assert_eq!(cfg.path, path);
+        assert!(cfg.notes.iter().any(|note| note.contains("created")));
+
+        let edited = "[mixer]\n[[mixer.channel]]\nside = \"center\"\n";
+        std::fs::write(&path, edited).unwrap();
+        let again = load_or_create_at(&path, true).expect("reads the edited config");
+        assert_eq!(again.mixer.channels.len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_broken_controller_map_is_reported_not_silent() {
+        let dir = temp("controller-map");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
         std::fs::write(
             &path,
-            r#"device = "DDJ-400"
-map = "m.toml"
-"#,
+            "[mixer]\n[[mixer.channel]]\nside = \"center\"\n[controller]\nmap = \"missing.toml\"\n",
         )
         .unwrap();
-        let error = load_midi(&path.display().to_string()).unwrap_err();
-        assert!(error.contains("two-part"), "{error}");
+        let cfg = load_or_create(Some(path.to_string_lossy().as_ref())).expect("parses");
+        assert!(
+            cfg.notes
+                .iter()
+                .any(|note| note.contains("[controller].map") && note.contains("cannot be read")),
+            "a missing map must be named: {:?}",
+            cfg.notes
+        );
+
+        // Once the map is a real file, no note is produced.
+        std::fs::write(dir.join("missing.toml"), MAP_TEMPLATE).unwrap();
+        let ok = load_or_create(Some(path.to_string_lossy().as_ref())).expect("parses");
+        assert!(ok.notes.is_empty(), "{:?}", ok.notes);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -1,11 +1,11 @@
 //! The settings screen: five things, one flat list.
 //!
 //! ```
-//! > controller   Numark Party Mix III · profile/controller.toml
+//! > controller   Numark Party Mix III · mapping.toml
 //!   output       2 output(s)
-//!   mixer        profile/mixer.toml
-//!   live         profile/live.toml
-//!   preference   profile/preference.toml
+//!   mixer        config.toml
+//!   live         config.toml
+//!   preference   config.toml
 //! ```
 //!
 //! `Enter`/`→` goes a level deeper, `←` comes back, `Esc` closes. Every level is the same
@@ -174,7 +174,7 @@ impl SettingsScreen {
         let mixer_path = context
             .mixer
             .clone()
-            .unwrap_or_else(|| "profile/mixer.toml".to_owned());
+            .unwrap_or_else(|| "profile/config.toml".to_owned());
         let devices = context.devices.clone();
         let mut screen = Self {
             context,
@@ -377,7 +377,6 @@ impl SettingsScreen {
                         self.outputs.len()
                     ));
                     self.stack.push(Level::Outputs { cursor });
-                    return;
                 }
                 _ => self.stack.push(Level::Outputs { cursor }),
             },
@@ -719,7 +718,7 @@ fn read_doc(path: &str) -> Option<DocumentMut> {
 
 /// The `[[output]]` tables of a mixer document.
 fn outputs_of(doc: &DocumentMut) -> Vec<OutputInfo> {
-    let Some(tables) = doc.get("output").and_then(|item| item.as_array_of_tables()) else {
+    let Some(tables) = crate::profile::output_tables(doc) else {
         return Vec::new();
     };
     tables
@@ -762,11 +761,10 @@ fn write_output(
 ) -> Result<(), String> {
     let text = fs::read_to_string(path).map_err(|err| format!("{path}: {err}"))?;
     let mut doc: DocumentMut = text.parse().map_err(|err| format!("{path}: {err}"))?;
-    let table = doc
-        .get_mut("output")
-        .and_then(|item| item.as_array_of_tables_mut())
-        .and_then(|tables| tables.get_mut(index))
-        .ok_or_else(|| format!("{path}: no [[output]] #{index}"))?;
+    let table = crate::profile::output_tables_mut(&mut doc)
+        .map_err(|err| format!("{path}: {err}"))?
+        .get_mut(index)
+        .ok_or_else(|| format!("{path}: no [[mixer.output]] #{index}"))?;
     set_str(table, "device", device);
     if let Some((left, right)) = channels {
         let mut array = toml_edit::Array::new();
@@ -877,8 +875,9 @@ mod tests {
             "mixer.toml",
             concat!(
                 "# my rig\n",
-                "[[output]]\nname = \"main\"\nrole = \"master\"\n\n",
-                "[[output]]\nname = \"phones\"\nrole = \"cue\"\n",
+                "[mixer]\n",
+                "[[mixer.output]]\nname = \"main\"\nrole = \"master\"\n\n",
+                "[[mixer.output]]\nname = \"phones\"\nrole = \"cue\"\n",
             ),
         );
         let map = write(&dir, "controller.toml", "x = 1\n");
@@ -1010,7 +1009,7 @@ mod tests {
         let other = write(
             &dir,
             "aaa.toml",
-            "[[output]]\nname = \"only\"\nrole = \"master\"\n",
+            "[mixer]\n[[mixer.output]]\nname = \"only\"\nrole = \"master\"\n",
         );
         assert!(screen.focus("mixer"));
         screen.handle_key(KeyCode::Enter);

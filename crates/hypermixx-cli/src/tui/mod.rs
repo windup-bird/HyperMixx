@@ -22,7 +22,6 @@ pub mod view;
 pub mod waveform_view;
 
 use std::io;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyEventKind};
@@ -55,7 +54,6 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         notice_tx,
         notice_rx,
         topology,
-        profile,
         live,
         live_source,
         midi_port,
@@ -64,7 +62,7 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         midi_state,
         library,
     } = session;
-    let preference_path = preference_path(profile.as_deref());
+    let preference_path = preference_path(topology.as_deref());
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
     let mut dispatcher = Dispatcher::new(command_tx.clone(), notice_tx).tap_events(event_tx);
     if let (Some(control), Some(state)) = (midi_control, midi_state) {
@@ -74,7 +72,6 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     let topology_path = topology.clone();
     let live_path = live_source.clone();
     dispatcher.with_topology(topology);
-    dispatcher.with_profile(profile.clone());
     let ring_frames = live.audio.ring_frames;
     let sample_rate = live.audio.sample_rate;
     dispatcher.with_live(live, live_source);
@@ -86,8 +83,8 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     // The header reports the configured ring and rate, not the compile-time defaults.
     app.ring_frames = ring_frames;
     app.sample_rate = sample_rate;
-    // The settings screen edits the same files the session was started from.
-    app.profile_path = profile.clone();
+    // The settings screen edits the one config the session was started from.
+    app.profile_path = None;
     // Probe here, not in the settings screen: cpal's ALSA/JACK backends print warnings to stderr, and
     // anything printed after `ratatui::try_init` lands on top of the alternate screen.
     app.devices = hypermixx_audio::output_devices(Some(sample_rate));
@@ -164,15 +161,12 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     }
 }
 
-/// Preferences live next to the profile that names them, so a profile folder carries its own
-/// colours. No profile means the shipped default path.
-pub(crate) fn preference_path(profile: Option<&str>) -> String {
-    profile
-        .and_then(|path| Path::new(path).parent())
-        .map(|dir| dir.join("preference.toml"))
-        .unwrap_or_else(|| std::path::PathBuf::from(preference::DEFAULT_PATH))
-        .to_string_lossy()
-        .into_owned()
+/// Preferences are a section of the one config, so the TUI reads them from the config file. The
+/// fallback is only for a session started without a config path.
+pub(crate) fn preference_path(config: Option<&str>) -> String {
+    config
+        .map(str::to_owned)
+        .unwrap_or_else(|| preference::DEFAULT_PATH.to_owned())
 }
 
 /// A light exponential moving average: enough to keep the header from flickering on every frame,

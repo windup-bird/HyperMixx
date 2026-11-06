@@ -1,5 +1,6 @@
+# Shipped unit-map template. `[controller].map` in config.toml points at a copy of this file.
 [meta]
-device = "Numark Party Mix III:Numark Party Mix III MIDI 1 24:0"
+# device = "..."   # a port name or index; config.toml's [controller] device overrides it
 
 [[unit]]
 id = "global.browser"

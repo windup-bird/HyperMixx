@@ -13,15 +13,17 @@ mod filter;
 mod flanger;
 mod gain;
 mod limiter;
+mod none;
 mod phaser;
 mod reverb;
 
 pub use cut::Cut;
 pub use echo::Echo;
 pub use eq::{Eq, DEFAULT_HIGH_HZ, DEFAULT_LOW_HZ, DEFAULT_MID_HZ};
-pub use filter::{Filter, MAX_HZ, MIN_HZ};
+pub use filter::{Filter, Mode as FilterMode, MAX_HZ, MIN_HZ};
 pub use flanger::Flanger;
 pub use gain::{Fader, Gain};
 pub use limiter::{Limiter, LOOKAHEAD, RELEASE_RANGE_DB};
+pub use none::Empty;
 pub use phaser::Phaser;
 pub use reverb::Reverb;

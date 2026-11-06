@@ -33,8 +33,8 @@ pub struct Ctx<'a> {
     pub decks: usize,
     /// Chain the focused deck targets, e.g. `"deck1"`.
     pub chain: String,
-    /// Chain label -> slot kinds, from the last `fx list`.
-    pub slots: &'a HashMap<String, Vec<String>>,
+    /// Chain label -> slots (role + kind), from the last `fx list`.
+    pub slots: &'a HashMap<String, Vec<crate::command::SlotEntry>>,
 }
 
 const VERBS: &[(&str, &str)] = &[
@@ -113,6 +113,8 @@ const STEM_VERBS: &[(&str, &str)] = &[
 const FX_SUBS: &[(&str, &str)] = &[
     ("add", "append an effect"),
     ("remove", "drop a slot"),
+    ("kind", "swap the effect in a slot"),
+    ("flows", "route a flowfx slot to some flows"),
     ("list", "show slots and names"),
     ("set", "set a parameter"),
     ("on", "engage a slot"),
@@ -416,29 +418,46 @@ fn fx_candidates(rel: &[String], partial: &str, chain: &str, ctx: &Ctx) -> Vec<C
     let Some(sub) = rel.first() else {
         return pairs(FX_SUBS, partial);
     };
-    let kinds = ctx.slots.get(chain).map(Vec::as_slice).unwrap_or(&[]);
+    let slots = ctx.slots.get(chain).map(Vec::as_slice).unwrap_or(&[]);
     match (sub.as_str(), rel.len()) {
         ("add", 1) => fx_kinds(partial),
-        ("remove" | "rm", 1) | ("on" | "off", 1) | ("trigger", 1) | ("set", 1) | ("pad", 1) => {
-            slot_candidates(kinds, partial)
-        }
-        ("set", 2) => slot_param_candidates(kinds, &rel[1], partial),
+        ("remove" | "rm", 1) | ("on" | "off", 1) | ("trigger", 1) | ("set", 1) | ("pad", 1)
+        | ("kind", 1) | ("flows", 1) => slot_candidates(slots, partial),
+        ("set", 2) => slot_param_candidates(slots, &rel[1], partial),
+        ("kind", 2) => fx_kinds(partial),
+        ("flows", 2) => pairs(
+            &[
+                ("all", "every flow"),
+                ("none", "no flow"),
+                ("drums", "gain"),
+                ("bass", "gain"),
+                ("other", "gain"),
+                ("vocals", "gain"),
+            ],
+            partial,
+        ),
         ("pad", 2) => pairs(&[("press", ""), ("release", "")], partial),
         _ => Vec::new(),
     }
 }
 
-/// Slot rows: the effect name (hint `slot N`) and the bare index (hint the kind).
-fn slot_candidates(kinds: &[String], partial: &str) -> Vec<Candidate> {
+/// Slot rows: the role (hint `slot N`), the effect currently in it, and the bare index.
+fn slot_candidates(slots: &[crate::command::SlotEntry], partial: &str) -> Vec<Candidate> {
     let mut items = Vec::new();
-    for (index, kind) in kinds.iter().enumerate() {
+    for (index, entry) in slots.iter().enumerate() {
         items.push(Candidate {
-            text: kind.clone(),
-            hint: format!("slot {index}"),
+            text: entry.role.clone(),
+            hint: format!("slot {index} ({})", entry.kind),
         });
+        if entry.kind != entry.role {
+            items.push(Candidate {
+                text: entry.kind.clone(),
+                hint: format!("slot {index}, now {0}", entry.role),
+            });
+        }
         items.push(Candidate {
             text: index.to_string(),
-            hint: kind.clone(),
+            hint: entry.role.clone(),
         });
     }
     items.retain(|candidate| candidate.text.starts_with(partial));
@@ -446,11 +465,15 @@ fn slot_candidates(kinds: &[String], partial: &str) -> Vec<Candidate> {
 }
 
 /// Parameter names for the slot named or indexed by `token`.
-fn slot_param_candidates(kinds: &[String], token: &str, partial: &str) -> Vec<Candidate> {
-    let Some(kind) = resolve_kind(kinds, token) else {
+fn slot_param_candidates(
+    slots: &[crate::command::SlotEntry],
+    token: &str,
+    partial: &str,
+) -> Vec<Candidate> {
+    let Some(entry) = resolve_entry(slots, token) else {
         return Vec::new();
     };
-    FxKind::parse(kind)
+    FxKind::parse(&entry.kind)
         .ok()
         .map(|kind| {
             kind.param_names()
@@ -465,14 +488,21 @@ fn slot_param_candidates(kinds: &[String], token: &str, partial: &str) -> Vec<Ca
         .unwrap_or_default()
 }
 
-fn resolve_kind<'a>(kinds: &'a [String], token: &str) -> Option<&'a str> {
+fn resolve_entry<'a>(
+    slots: &'a [crate::command::SlotEntry],
+    token: &str,
+) -> Option<&'a crate::command::SlotEntry> {
     if let Ok(index) = token.parse::<usize>() {
-        return kinds.get(index).map(String::as_str);
+        return slots.get(index);
     }
-    kinds
+    slots
         .iter()
-        .find(|kind| kind.eq_ignore_ascii_case(token))
-        .map(String::as_str)
+        .find(|entry| entry.role.eq_ignore_ascii_case(token))
+        .or_else(|| {
+            slots
+                .iter()
+                .find(|entry| entry.kind.eq_ignore_ascii_case(token))
+        })
 }
 
 /// The effect names the engine actually builds, straight from the registry.
@@ -589,7 +619,7 @@ mod tests {
     use super::*;
 
     struct Fixture {
-        slots: HashMap<String, Vec<String>>,
+        slots: HashMap<String, Vec<crate::command::SlotEntry>>,
     }
 
     impl Fixture {
@@ -597,7 +627,16 @@ mod tests {
             let mut slots = HashMap::new();
             slots.insert(
                 "deck1".to_owned(),
-                vec!["eq".to_owned(), "filter".to_owned()],
+                vec![
+                    crate::command::SlotEntry {
+                        role: "eq".to_owned(),
+                        kind: "eq".to_owned(),
+                    },
+                    crate::command::SlotEntry {
+                        role: "filter".to_owned(),
+                        kind: "filter".to_owned(),
+                    },
+                ],
             );
             Self { slots }
         }

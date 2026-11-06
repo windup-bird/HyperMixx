@@ -26,7 +26,7 @@ pub use command::{
 };
 pub use deck::{deck_label, DeckId, DeckState, HotCue, HOT_CUE_SLOTS};
 pub use key::{Key, KeyFormat, KeyMode};
-pub use live::{AudioSettings, KeylockSettings, LiveConfig, StemSettings};
+pub use live::{AudioSettings, AutogainSettings, KeylockSettings, LiveConfig, StemSettings};
 pub use output::{OutputOp, OutputRole, OutputState, OutputStatus};
 pub use source::{Shared, Source};
 pub use stem::{Stem, StemOp, StemPreset, StemSet, StemStatus};

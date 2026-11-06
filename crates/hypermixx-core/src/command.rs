@@ -53,8 +53,17 @@ pub struct FxSlotRef {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FxSlotStatus {
     pub index: usize,
+    /// Stable identity of the *position*, independent of what is in it (`eq`, `filter`, `fx`, ...).
+    /// A front-end finds its knob's slot by role, so swapping `filter` for `moog` in that slot does
+    /// not move the control out from under the user.
+    pub role: String,
+    /// What is actually in the slot right now.
     pub kind: String,
     pub enabled: bool,
+    /// Which flows this slot is routed to — `None` for a slot that is not in a flow chain (a
+    /// knob/pad/master slot, which sees one bus). An empty list is a valid answer: the slot is
+    /// mounted but routed to no flow, so it processes nothing.
+    pub flows: Option<Vec<Stem>>,
     /// `(name, value)` pairs, in the order the effect declares them.
     pub params: Vec<(String, f32)>,
 }
@@ -464,6 +473,10 @@ pub enum Command {
         source: Shared,
         /// Optional caller-supplied constant grid (deterministic testing / beat-match).
         analysis: Option<TrackAnalysis>,
+        /// The track's loudness (the average level of its loudest section, dBFS), measured by the
+        /// front-end while decoding. Auto-gain derives its gain from this at play time, so toggling
+        /// auto-gain or changing its target applies to whatever is already loaded.
+        loudness_db: Option<f32>,
     },
     Play {
         deck_id: DeckId,
@@ -574,6 +587,12 @@ pub enum Command {
         deck_id: DeckId,
         op: StemOp,
     },
+    /// Replaces the engine's auto-gain preference (from `live.toml`). Applies immediately to every
+    /// loaded track: the measurement lives on the deck, the gain is derived here.
+    SetAutogain {
+        enabled: bool,
+        target_db: f32,
+    },
     /// Switches the keylock profile (`off` = tape, `on` = the configured keylock window).
     SetKeylock {
         deck_id: DeckId,
@@ -643,6 +662,27 @@ pub enum Command {
         slot: FxSlotRef,
         name: String,
         value: f32,
+    },
+    /// Routes a flow slot to a set of flows. Only the `flowfx` bank has flows; `eq`, `filter`, the
+    /// post-merge banks and master are single-bus and refuse this.
+    ///
+    /// An empty list routes the slot to no flow — it stays mounted (index, role and kind unchanged)
+    /// but processes nothing, which is the difference between "off" and "not routed here". Narrowing
+    /// the set cuts a ringing tail on the flows that leave; widening resets the instances that
+    /// enter, so no flow ever resumes with another flow's history.
+    SetFxFlows {
+        slot: FxSlotRef,
+        flows: Vec<Stem>,
+    },
+    /// Replaces the effect in a slot, keeping the position, the role and the on/off state. This is
+    /// how a fixed slot's effect changes at run time (`filter` → `moog`, a pad bank retargeted
+    /// between echo and reverb) without renumbering anything a map is bound to.
+    ///
+    /// Parameters whose names the new effect also declares keep their value; the rest take the new
+    /// effect's defaults. A new instance is prepared at the engine's rate before its first block.
+    SetFxKind {
+        slot: FxSlotRef,
+        kind: String,
     },
     /// Sets the parameter at `index` in the effect's declared parameter order. A mutable FX slot
     /// uses this form because its parameter names change when the effect is swapped.
@@ -729,11 +769,15 @@ impl std::fmt::Debug for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Command::Load {
-                deck_id, analysis, ..
+                deck_id,
+                analysis,
+                loudness_db,
+                ..
             } => f
                 .debug_struct("Load")
                 .field("deck_id", deck_id)
                 .field("has_analysis", &analysis.is_some())
+                .field("loudness_db", loudness_db)
                 .finish(),
             Command::Play { deck_id } => f.debug_struct("Play").field("deck_id", deck_id).finish(),
             Command::Pause { deck_id } => {
@@ -831,6 +875,14 @@ impl std::fmt::Debug for Command {
                 .field("target", target)
                 .field("value", value)
                 .finish(),
+            Command::SetAutogain {
+                enabled,
+                target_db,
+            } => f
+                .debug_struct("SetAutogain")
+                .field("enabled", enabled)
+                .field("target_db", target_db)
+                .finish(),
             Command::SetKeylock { deck_id, mode } => f
                 .debug_struct("SetKeylock")
                 .field("deck_id", deck_id)
@@ -899,6 +951,16 @@ impl std::fmt::Debug for Command {
                 .field("slot", slot)
                 .field("index", index)
                 .field("value", value)
+                .finish(),
+            Command::SetFxFlows { slot, flows } => f
+                .debug_struct("SetFxFlows")
+                .field("slot", slot)
+                .field("flows", flows)
+                .finish(),
+            Command::SetFxKind { slot, kind } => f
+                .debug_struct("SetFxKind")
+                .field("slot", slot)
+                .field("kind", kind)
                 .finish(),
             Command::FxTrigger { slot } => f.debug_struct("FxTrigger").field("slot", slot).finish(),
             Command::PadPress { slot } => f.debug_struct("PadPress").field("slot", slot).finish(),

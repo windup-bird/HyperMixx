@@ -141,6 +141,7 @@ pub fn load(
             deck_id,
             source,
             analysis: None,
+            loudness_db: None,
         },
     );
     match answer(rx) {
@@ -170,6 +171,7 @@ pub fn load_both(
                 deck_id,
                 source: Arc::clone(&source),
                 analysis: None,
+                loudness_db: None,
             },
         );
     }

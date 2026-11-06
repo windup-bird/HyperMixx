@@ -1877,7 +1877,7 @@ fn parse_action(line: &str, ctx: &ActionCtx<'_>) -> Result<Action, String> {
             }))
         }
         ["fx", what @ ("on" | "off" | "toggle" | "pad" | "trigger")] => {
-            let slot = fx_action(ctx, named_chain, *what)?;
+            let slot = fx_action(ctx, named_chain, what)?;
             Ok(Action::Fx(slot))
         }
         ["fx", "param", param] => {
@@ -2572,14 +2572,9 @@ start = "beatjump"
     #[test]
     fn the_repositorys_default_maps_parse() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        // `controller.toml` is the shipped map (the name predates the rename); the other two are
-        // optional examples, and a checkout without them is not a failure.
+        // `mapping.toml` is the shipped unit-map template the guide edits.
         let mut checked = 0;
-        for name in [
-            "profile/controller.toml",
-            "profile/midi.toml",
-            "profile/midi-map.toml",
-        ] {
+        for name in ["profile/mapping.toml"] {
             let path = root.join(name);
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;

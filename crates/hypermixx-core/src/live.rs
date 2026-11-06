@@ -146,6 +146,61 @@ impl Default for StemSettings {
     }
 }
 
+/// Auto-gain: normalise every track's loudest section to a target level.
+///
+/// The *measurement* is a track property (computed once, at load, from the PCM); this is the
+/// machine's preference about whether to apply it and to what target. Keeping the two apart is what
+/// makes `enabled`/`target_db` a live switch: the deck carries the measured loudness, the mixer
+/// derives the gain, so changing the target re-derives the gain for whatever is loaded.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AutogainSettings {
+    /// Whether the gain is applied. Off by default: a mixer that silently changes the level of the
+    /// material is a surprise.
+    pub enabled: bool,
+    /// Target level for the loudest ~3 s of a track, dBFS.
+    pub target_db: f32,
+}
+
+impl Default for AutogainSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_db: -12.0,
+        }
+    }
+}
+
+impl AutogainSettings {
+    /// The largest gain auto-gain will apply, so a quiet recording cannot be pushed into the
+    /// limiter (or a hot one cut into nothing) by a single measurement.
+    pub const RANGE_DB: f32 = 12.0;
+
+    /// Clamps what a file can get wrong: a target beyond the usable range is replaced, not trusted.
+    pub fn sanitised(self) -> Self {
+        let target_db = if self.target_db.is_finite() {
+            self.target_db.clamp(-40.0, 0.0)
+        } else {
+            Self::default().target_db
+        };
+        Self {
+            enabled: self.enabled,
+            target_db,
+        }
+    }
+
+    /// The gain a track with this measured loudness needs, dB (0 when disabled or unmeasured).
+    pub fn gain_db(&self, loudness_db: Option<f32>) -> f32 {
+        if !self.enabled {
+            return 0.0;
+        }
+        let Some(loudness) = loudness_db.filter(|db| db.is_finite()) else {
+            return 0.0;
+        };
+        (self.target_db - loudness).clamp(-Self::RANGE_DB, Self::RANGE_DB)
+    }
+}
+
 /// Everything that depends on the machine rather than on the music.
 #[derive(Clone, Debug, PartialEq, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -154,6 +209,8 @@ pub struct LiveConfig {
     /// Keylock STFT window (read at startup; changing it requires a restart).
     pub keylock: KeylockSettings,
     pub stems: StemSettings,
+    /// Auto-gain (applied immediately, unlike the audio/keylock settings).
+    pub autogain: AutogainSettings,
 }
 
 impl LiveConfig {
@@ -201,6 +258,7 @@ impl LiveConfig {
         if stems.provider.trim().is_empty() {
             stems.provider = StemSettings::default().provider;
         }
+        self.autogain = self.autogain.sanitised();
         self
     }
 
@@ -223,6 +281,12 @@ impl LiveConfig {
                 self.keylock.interval,
                 self.keylock.block as f64 * 1000.0 / f64::from(self.audio.sample_rate),
                 self.audio.sample_rate
+            ),
+            format!(
+                "autogain {}  target {:.1} dBFS  (max gain ±{:.0} dB)",
+                if self.autogain.enabled { "on" } else { "off" },
+                self.autogain.target_db,
+                AutogainSettings::RANGE_DB,
             ),
             format!(
                 "stems  model {}  provider {}  overlap {:.2}  shifts {}  threads {}  memory {}  {}",
@@ -264,10 +328,11 @@ mod tests {
         assert_eq!(live.keylock, KeylockSettings::default());
         assert_eq!(live.stems.provider, "cpu", "a machine without a GPU never needs a flag");
 
-        assert_eq!(live.report().len(), 3);
+        assert_eq!(live.report().len(), 4);
         assert!(live.report()[0].contains("44100Hz"));
         assert!(live.report()[0].contains("device buffer backend default"));
         assert!(live.report()[1].contains("keylock block 2048 interval 512"));
+        assert!(live.report()[2].contains("autogain off  target -12.0 dBFS"));
     }
 
     #[test]
@@ -289,6 +354,10 @@ mod tests {
                 model: "  ".to_owned(),
                 ..Default::default()
             },
+            autogain: AutogainSettings {
+                enabled: true,
+                target_db: f32::NAN,
+            },
         }
         .sanitised();
         assert_eq!(live.audio.sample_rate, DEFAULT_SAMPLE_RATE, "an impossible rate is replaced");
@@ -298,6 +367,11 @@ mod tests {
             live.audio.device_buffer_frames,
             Some(MIN_DEVICE_BUFFER_FRAMES),
             "a one-frame device buffer is clamped up"
+        );
+        assert_eq!(
+            live.autogain.target_db,
+            AutogainSettings::default().target_db,
+            "a NaN target is replaced, not trusted"
         );
         assert_eq!(live.stems.overlap, 0.5, "clamped to the useful range");
         assert_eq!(live.stems.shifts, 2, "two passes is the most worth offering");

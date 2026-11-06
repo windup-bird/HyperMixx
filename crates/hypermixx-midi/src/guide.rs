@@ -2205,11 +2205,7 @@ chain = "deck1"
     fn the_shipped_maps_open_in_the_guide() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut checked = 0;
-        for name in [
-            "profile/controller.toml",
-            "profile/midi.toml",
-            "profile/midi-map.toml",
-        ] {
+        for name in ["profile/mapping.toml"] {
             let path = root.join(name);
             if !path.exists() {
                 continue;

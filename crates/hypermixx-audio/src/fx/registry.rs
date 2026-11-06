@@ -5,7 +5,7 @@
 //! registry would add a plugin surface with nothing to plug into it. Adding an effect means one
 //! variant, one `build` arm and one line in `ALL`.
 
-use super::sample::{Cut, Echo, Eq, Filter, Flanger, Gain, Limiter, Phaser, Reverb};
+use super::sample::{Cut, Echo, Empty, Eq, Filter, Flanger, Gain, Limiter, Phaser, Reverb};
 use super::{Fx, FxError};
 
 /// Every built-in effect class.
@@ -13,8 +13,10 @@ use super::{Fx, FxError};
 pub enum FxKind {
     /// 3-band DJ EQ (bass / mid / treble).
     Eq,
-    /// Resonant low-pass / high-pass / band-pass sweep.
+    /// Resonant low-pass / high-pass sweep, two poles (the clean "linear" sweep).
     Filter,
+    /// The same sweep with four poles and a ladder character.
+    Moog,
     /// Straight gain, ±∞ dB law.
     Gain,
     /// Safety limiter with a soft knee and a releasing threshold.
@@ -29,13 +31,16 @@ pub enum FxKind {
     Phaser,
     /// Beat-locked gate: the DJM's Trans, in one insert.
     Cut,
+    /// An empty slot: mounted and addressable, processing nothing.
+    None,
 }
 
 impl FxKind {
     /// Every kind, in the order `help` should list them.
-    pub const ALL: [FxKind; 9] = [
+    pub const ALL: [FxKind; 11] = [
         FxKind::Eq,
         FxKind::Filter,
+        FxKind::Moog,
         FxKind::Gain,
         FxKind::Limiter,
         FxKind::Echo,
@@ -43,6 +48,7 @@ impl FxKind {
         FxKind::Flanger,
         FxKind::Phaser,
         FxKind::Cut,
+        FxKind::None,
     ];
 
     /// The canonical name, and the only spelling [`FxKind::parse`] accepts.
@@ -50,6 +56,7 @@ impl FxKind {
         match self {
             FxKind::Eq => "eq",
             FxKind::Filter => "filter",
+            FxKind::Moog => "moog",
             FxKind::Gain => "gain",
             FxKind::Limiter => "limiter",
             FxKind::Echo => "echo",
@@ -57,6 +64,7 @@ impl FxKind {
             FxKind::Flanger => "flanger",
             FxKind::Phaser => "phaser",
             FxKind::Cut => "cut",
+            FxKind::None => "none",
         }
     }
 
@@ -64,7 +72,8 @@ impl FxKind {
     pub fn aliases(&self) -> &'static [&'static str] {
         match self {
             FxKind::Eq => &["eq", "equalizer", "tone"],
-            FxKind::Filter => &["filter", "lp", "hp", "sweep"],
+            FxKind::Filter => &["filter", "lp", "hp", "sweep", "linear"],
+            FxKind::Moog => &["moog", "ladder"],
             FxKind::Gain => &["gain", "volume", "amp"],
             FxKind::Limiter => &["limiter", "lim", "clip"],
             // "delay" is the plain-language name for what this kind actually is; a future
@@ -74,6 +83,7 @@ impl FxKind {
             FxKind::Flanger => &["flanger", "flange"],
             FxKind::Phaser => &["phaser", "phase"],
             FxKind::Cut => &["cut", "gate", "trans"],
+            FxKind::None => &["none", "empty"],
         }
     }
 
@@ -91,6 +101,7 @@ impl FxKind {
         match self {
             FxKind::Eq => Box::new(Eq::new()),
             FxKind::Filter => Box::new(Filter::new()),
+            FxKind::Moog => Box::new(Filter::moog()),
             FxKind::Gain => Box::new(Gain::new(1.0)),
             FxKind::Limiter => Box::new(Limiter::new()),
             FxKind::Echo => Box::new(Echo::new()),
@@ -98,6 +109,7 @@ impl FxKind {
             FxKind::Flanger => Box::new(Flanger::new()),
             FxKind::Phaser => Box::new(Phaser::new()),
             FxKind::Cut => Box::new(Cut::new()),
+            FxKind::None => Box::new(Empty),
         }
     }
 
@@ -109,6 +121,7 @@ impl FxKind {
         match self {
             FxKind::Eq => Eq::PARAMS,
             FxKind::Filter => Filter::PARAMS,
+            FxKind::Moog => Filter::PARAMS,
             FxKind::Gain => Gain::PARAMS,
             FxKind::Limiter => Limiter::PARAMS,
             FxKind::Echo => Echo::PARAMS,
@@ -116,6 +129,7 @@ impl FxKind {
             FxKind::Flanger => Flanger::PARAMS,
             FxKind::Phaser => Phaser::PARAMS,
             FxKind::Cut => Cut::PARAMS,
+            FxKind::None => &[],
         }
     }
 

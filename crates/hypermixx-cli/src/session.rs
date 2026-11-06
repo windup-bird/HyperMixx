@@ -24,10 +24,9 @@ pub struct Session {
     pub decks: usize,
     pub notice_tx: NoticeTx,
     pub notice_rx: Receiver<LogLine>,
-    /// `--config`'s path: what `mixer reload` falls back to.
+    /// The one config file this session was started with: what `config show` and `mixer reload`
+    /// fall back to.
     pub topology: Option<String>,
-    /// The profile this session was started with, for `profile show`. `None` = folder defaults.
-    pub profile: Option<String>,
     /// This machine's settings, already validated.
     pub live: LiveConfig,
     /// Where the live settings came from, for `live reload`.

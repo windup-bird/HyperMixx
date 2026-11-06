@@ -50,13 +50,23 @@ pub enum UiEvent {
     },
 }
 
-/// The slot kinds of every chain.
+/// One slot as the front-end remembers it: the stable **role** of the position, and what is in it
+/// now. They differ after `fx kind` swaps the effect, and every lookup prefers the role — that is
+/// what keeps a mapped knob on its slot when `filter` becomes `moog`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotEntry {
+    pub role: String,
+    pub kind: String,
+}
+
+/// The slots of every chain.
 ///
 /// The front-end owns all chain mutations, so it can keep this accurate without asking the engine:
-/// `FxAdded` appends, a dispatched `fx remove` drops locally, and `fx list` replaces. It is filled
-/// once at startup (see [`Dispatcher::prime`]) so a slot can be named from the very first command.
+/// `FxAdded` appends, a dispatched `fx remove` drops locally, `fx kind` replaces the kind, and
+/// `fx list` replaces the whole chain. It is filled once at startup (see [`Dispatcher::prime`]) so
+/// a slot can be named from the very first command.
 pub struct SlotBook {
-    slots: Mutex<HashMap<String, Vec<String>>>,
+    slots: Mutex<HashMap<String, Vec<SlotEntry>>>,
 }
 
 impl Default for SlotBook {
@@ -75,7 +85,13 @@ impl SlotBook {
                 if let Ok(mut book) = self.slots.lock() {
                     book.insert(
                         chain.label(),
-                        slots.iter().map(|slot| slot.kind.clone()).collect(),
+                        slots
+                            .iter()
+                            .map(|slot| SlotEntry {
+                                role: slot.role.clone(),
+                                kind: slot.kind.clone(),
+                            })
+                            .collect(),
                     );
                 }
             }
@@ -83,7 +99,13 @@ impl SlotBook {
                 if let Ok(mut book) = self.slots.lock() {
                     let entry = book.entry(chain.label()).or_default();
                     if *index <= entry.len() {
-                        entry.insert(*index, kind.clone());
+                        entry.insert(
+                            *index,
+                            SlotEntry {
+                                role: kind.clone(),
+                                kind: kind.clone(),
+                            },
+                        );
                     }
                 }
             }
@@ -91,7 +113,10 @@ impl SlotBook {
         }
     }
 
-    /// Resolves a slot argument: a bare index, or an effect name.
+    /// Resolves a slot argument: a bare index, a role (`filter`), or an effect name (`echo`).
+    ///
+    /// The role is tried first, so `filter` keeps addressing the same slot after the effect in it
+    /// was swapped for `moog` (whose kind name would otherwise be all that matched).
     pub fn resolve(&self, chain: &str, token: &str) -> Result<usize, String> {
         if let Ok(index) = token.parse::<usize>() {
             return Ok(index);
@@ -101,11 +126,29 @@ impl SlotBook {
             .lock()
             .map_err(|_| "slot book poisoned".to_owned())?;
         match book.get(chain) {
-            Some(kinds) => kinds
+            Some(entries) => entries
                 .iter()
-                .position(|kind| kind.eq_ignore_ascii_case(token))
-                .ok_or_else(|| format!("no `{token}` in {chain}; slots are {}", list_kinds(kinds))),
+                .position(|entry| entry.role.eq_ignore_ascii_case(token))
+                .or_else(|| {
+                    entries
+                        .iter()
+                        .position(|entry| entry.kind.eq_ignore_ascii_case(token))
+                })
+                .ok_or_else(|| {
+                    format!("no `{token}` in {chain}; slots are {}", list_slots(entries))
+                }),
             None => Err(format!("{chain} has no known slots")),
+        }
+    }
+
+    /// Records a `fx kind` this front-end sent. The engine validated the name, so no round-trip.
+    pub fn set_kind(&self, chain: &str, index: usize, kind: &str) {
+        if let Ok(mut book) = self.slots.lock() {
+            if let Some(entries) = book.get_mut(chain) {
+                if let Some(entry) = entries.get_mut(index) {
+                    entry.kind = kind.to_owned();
+                }
+            }
         }
     }
 
@@ -120,8 +163,8 @@ impl SlotBook {
         }
     }
 
-    /// A copy of the slot kinds, for the completer (cheap: a handful of chains).
-    pub fn snapshot(&self) -> HashMap<String, Vec<String>> {
+    /// A copy of the slots, for the completer (cheap: a handful of chains).
+    pub fn snapshot(&self) -> HashMap<String, Vec<SlotEntry>> {
         self.slots
             .lock()
             .map(|book| book.clone())
@@ -140,6 +183,10 @@ enum Target {
     /// next word decides), and the stem-scoped verbs (`level`, `mute`, `solo`) use the stem.
     Stem(u8, Stem),
     Master,
+    /// The browser is the command target, so a bare line implies **no** deck. A deck verb must name
+    /// one (`deck1 play`), because the alternative — silently falling back to whichever deck was
+    /// focused last — is how `play` ends up stopping a track while the user is browsing.
+    Unset,
 }
 
 /// Everything a dispatch needs to act.
@@ -150,11 +197,8 @@ pub struct Dispatcher {
     /// Where `mixer reload` reads from when no path is given: `--config`'s file, or the shipped
     /// default under `./config/`. The front-end owns file IO, so the engine only ever sees text.
     topology: Arc<Mutex<Option<String>>>,
-    /// Where `live reload` reads from: `--live`'s file, or the shipped default.
+    /// Where `live reload` reads from: the config file the session started with.
     live_path: Arc<Mutex<Option<String>>>,
-    /// The profile this session started with, or `None` for the folder defaults. `profile show`
-    /// reports it and `profile reload` replaces it.
-    profile: Arc<Mutex<Option<String>>>,
     /// The machine's settings: the engine rate, the ring sizes, and the stem defaults.
     live: Arc<Mutex<LiveConfig>>,
     slots: Slots,
@@ -182,7 +226,6 @@ impl Dispatcher {
             events: None,
             topology: Arc::new(Mutex::new(None)),
             live_path: Arc::new(Mutex::new(None)),
-            profile: Arc::new(Mutex::new(None)),
             live: Arc::new(Mutex::new(LiveConfig::default())),
             slots: Arc::new(SlotBook::default()),
             separations: Arc::new(Mutex::new(HashMap::new())),
@@ -226,19 +269,6 @@ impl Dispatcher {
     pub fn tap_events(mut self, events: Sender<UiEvent>) -> Self {
         self.events = Some(events);
         self
-    }
-
-    /// Remembers the profile this session started with, so `profile show` can name it and
-    /// `profile reload` can default to it.
-    pub fn with_profile(&self, path: Option<String>) {
-        if let Ok(mut slot) = self.profile.lock() {
-            *slot = path;
-        }
-    }
-
-    /// The profile in effect, if any.
-    pub fn profile_path(&self) -> Option<String> {
-        self.profile.lock().ok().and_then(|slot| slot.clone())
     }
 
     /// Installs the live settings and remembers where they came from, so `live reload` can re-read
@@ -316,14 +346,18 @@ impl Dispatcher {
     }
 }
 
-/// Turns a line into engine effects. `focused` is the deck a bare command targets.
+/// Turns a line into engine effects.
+///
+/// `focused` is the deck a bare command targets — `None` when the front-end's target is not a deck
+/// (the browser), in which case a deck verb has to name its deck. Global verbs (`master fx …`,
+/// `browser …`, `mixer …`, `live …`) ignore it either way.
 pub fn dispatch(
     line: &str,
     dispatcher: &Dispatcher,
     pipeline: &AudioPipeline,
     backend: Backend,
     decks: usize,
-    focused: u8,
+    focused: Option<u8>,
 ) -> Action {
     let mut words = line.split_whitespace();
     let Some(first) = words.next() else {
@@ -334,7 +368,7 @@ pub fn dispatch(
     // `deck1 vocals mute`, `deck1 vocals fx add filter`.
     let (mut target, verb) = match parse_target(first, decks) {
         Some(target) => (target, words.next().unwrap_or_default()),
-        None => (Target::Deck(focused), first),
+        None => (focused.map_or(Target::Unset, Target::Deck), first),
     };
     if let Target::Deck(deck_id) = target {
         if let Some(stem) = Stem::parse(verb) {
@@ -525,7 +559,7 @@ pub fn dispatch(
         "output" | "outputs" => output_command(&mut words, command_tx),
         "mixer" => mixer_command(&mut words, dispatcher),
         "live" => live_command(&mut words, dispatcher),
-        "profile" => profile_command(&mut words, dispatcher),
+        "config" => config_command(&mut words, dispatcher),
         "controller" | "midi" => midi_command(&mut words, dispatcher),
         "help" | "h" | "?" => Action::Message(help_text(decks)),
         "quit" | "exit" => Action::Quit,
@@ -557,7 +591,7 @@ fn fader_command<'a>(
     if matches!(stage, "cuesend" | "cue_send") && raw.eq_ignore_ascii_case("toggle") {
         let deck_id = match deck_only(target) {
             Ok(deck_id) => deck_id,
-            Err(_) => return Action::Failed("`fader cuesend toggle` needs a deck".into()),
+            Err(message) => return Action::Failed(message),
         };
         return send(command_tx, Command::ToggleCueSend { deck_id });
     }
@@ -573,7 +607,7 @@ fn fader_command<'a>(
         deck_stage => {
             let deck_id = match deck_only(target) {
                 Ok(deck_id) => deck_id,
-                Err(_) => return Action::Failed(format!("`fader {deck_stage}` needs a deck")),
+                Err(message) => return Action::Failed(message),
             };
             match deck_stage {
                 "flow" => FaderTarget::Flow(deck_id),
@@ -597,11 +631,9 @@ fn fader_command<'a>(
     )
 }
 
-/// The shipped default topology, under `./profile/`. Also what a run without `--config` reads.
-pub const DEFAULT_TOPOLOGY: &str = crate::profile::DEFAULT_MIXER;
-
-/// The shipped live settings, under `./profile/`. Also what a run without `--live` reads.
-pub const DEFAULT_LIVE: &str = crate::profile::DEFAULT_LIVE;
+/// The shipped config, used only as a last-resort fallback when a session carries no config path.
+pub const DEFAULT_TOPOLOGY: &str = "profile/config.toml";
+pub const DEFAULT_LIVE: &str = "profile/config.toml";
 
 /// Downloads a model on a worker thread, reporting progress through the notice channel.
 fn spawn_model_pull(
@@ -686,109 +718,91 @@ fn model_choice(
 /// substituted, so the caller can say so once rather than silently changing a user's machine.
 pub fn read_live_config(path: &str) -> Result<(LiveConfig, Vec<String>), String> {
     let text = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
-    let parsed: LiveConfig = toml::from_str(&text).map_err(|err| err.to_string())?;
+    read_live_text(&text).map_err(|err| format!("{path}: {err}"))
+}
+
+/// Parses the `[live]` section of a one-file config; a standalone live file (the same keys at the
+/// root) still parses. Clamped values come back as notes rather than silently taking effect.
+pub fn read_live_text(text: &str) -> Result<(LiveConfig, Vec<String>), String> {
+    let value: toml::Value = toml::from_str(text).map_err(|err| err.to_string())?;
+    // A one-file config carries these under `[live]`. If the config omits the section, the rest
+    // of the file is *not* a live file — fall back to the built-in defaults. A standalone live
+    // file (no other sections) is still read at the root.
+    let section = match value.get("live") {
+        Some(section) => section.clone(),
+        None if ["mixer", "preference", "controller"]
+            .iter()
+            .any(|key| value.get(key).is_some()) =>
+        {
+            return Ok((LiveConfig::default(), Vec::new()))
+        }
+        None => value,
+    };
+    let parsed: LiveConfig = section.try_into().map_err(|err| err.to_string())?;
     let live = parsed.clone().sanitised();
     let mut notes = Vec::new();
     if live != parsed {
-        notes.push(format!(
-            "{path}: some values were out of range and were clamped"
-        ));
+        notes.push("some live values were out of range and were clamped".to_owned());
     }
     Ok((live, notes))
 }
 
-/// The `profile` family: which files this session is running with, and switching them.
+/// The `config` family: show the one file this session runs on, or reload it into the engine.
 ///
-/// A profile is read **once at startup** (`--profile <name|path>`, else `profile/profile.toml` when
-/// it exists). This family is how a running session answers "which one am I on?" and how it switches
-/// without a restart: everything a profile names can be re-read, except the MIDI input, which is
-/// attached once at launch.
-fn profile_command<'a>(
+/// Reloading re-reads the whole config: the mixer topology goes to the engine as text, the live
+/// settings replace the dispatcher's, and auto-gain is pushed immediately (the one live setting
+/// that applies without a restart). `[preference]` is read by the TUI at startup, and MIDI is
+/// attached once at launch; neither changes under a running session.
+fn config_command<'a>(
     words: &mut impl Iterator<Item = &'a str>,
     dispatcher: &Dispatcher,
 ) -> Action {
     let Some(sub) = words.next() else {
-        return Action::Message(profile_report(dispatcher));
+        return Action::Message(config_report(dispatcher));
     };
     match sub {
-        "show" | "list" => Action::Message(profile_report(dispatcher)),
-        "reload" | "use" => {
+        "show" | "list" => Action::Message(config_report(dispatcher)),
+        "reload" | "load" => {
             let path = words
                 .next()
-                .map(crate::profile::resolve)
-                .or_else(|| dispatcher.profile_path())
-                .unwrap_or_else(|| crate::profile::AMBIENT.to_owned());
-            match crate::profile::load(&path) {
-                Ok((profile, notes)) => {
-                    let mut applied = Vec::new();
-                    // Reloading a profile is **exactly "start as if with `--profile X`"**, minus the
-                    // MIDI input (attached once at launch): a key the profile does not name falls back
-                    // to the folder default, rather than leaving whatever happened to be running.
-                    let mixer = profile
-                        .mixer
-                        .clone()
-                        .unwrap_or_else(|| crate::profile::DEFAULT_MIXER.to_owned());
-                    match std::fs::read_to_string(&mixer) {
-                        Ok(text) => {
-                            let _ = dispatcher.command_tx.send(Command::MixerReload { text });
-                            dispatcher.with_topology(Some(mixer.clone()));
-                            applied.push(format!("topology <- {mixer}"));
-                        }
-                        Err(err) => applied.push(format!("topology: {mixer}: {err}")),
-                    }
-                    // The live settings: they are read from the dispatcher on every use, so a reload
-                    // lands on the next separation.
-                    let live = profile
-                        .live
-                        .clone()
-                        .unwrap_or_else(|| crate::profile::DEFAULT_LIVE.to_owned());
-                    match read_live_config(&live) {
-                        Ok((config, live_notes)) => {
-                            for note in &live_notes {
-                                notices::info(&dispatcher.notices, format!("[live] {note}"));
-                            }
-                            applied.push(format!("live <- {live}"));
-                            dispatcher.with_live(config, Some(live));
-                        }
-                        Err(err) => applied.push(format!("live: {err}")),
-                    }
-                    if profile.midi.device.is_some() || profile.midi.map.is_some() {
-                        // Honest about the one thing that cannot change under a running session.
-                        applied.push(format!(
-                            "midi: {} — takes effect at the next launch",
-                            profile.midi.device.as_deref().unwrap_or("(no device)")
-                        ));
-                    }
-                    dispatcher.with_profile(Some(path.clone()));
-                    for note in notes {
-                        applied.push(note);
-                    }
-                    Action::Message(format!(
-                        "profile {path}:{}\n  (live reload applies now; MIDI only at launch)",
-                        applied
-                            .iter()
-                            .map(|line| format!("\n  {line}"))
-                            .collect::<String>()
-                    ))
-                }
-                Err(err) => Action::Failed(err),
+                .map(str::to_owned)
+                .unwrap_or_else(|| dispatcher.topology_path());
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(err) => return Action::Failed(format!("{path}: {err}")),
+            };
+            // Validate before sending anything, so a bad file leaves the running mixer untouched.
+            if let Err(err) = hypermixx_audio::MixerConfig::from_toml_str(&text) {
+                return Action::Failed(format!("{path}: {}", err.message()));
             }
+            let (live, notes) = match read_live_text(&text) {
+                Ok(pair) => pair,
+                Err(err) => return Action::Failed(format!("{path}: {err}")),
+            };
+            let _ = dispatcher.command_tx.send(Command::MixerReload { text });
+            let _ = dispatcher.command_tx.send(Command::SetAutogain {
+                enabled: live.autogain.enabled,
+                target_db: live.autogain.target_db,
+            });
+            dispatcher.with_topology(Some(path.clone()));
+            dispatcher.with_live(live, Some(path.clone()));
+            let mut report = format!("config {path} reloaded");
+            for note in notes {
+                report.push_str(&format!("\n  {note}"));
+            }
+            report.push_str(
+                "\n  audio/keylock and [preference] apply on the next launch; MIDI too.",
+            );
+            Action::Message(report)
         }
-        other => Action::Failed(format!(
-            "unknown profile subcommand `{other}` (show|reload)"
-        )),
+        other => Action::Failed(format!("unknown config subcommand `{other}` (show|reload)")),
     }
 }
 
-/// What this session is running with: the profile, and the files it resolved to.
-fn profile_report(dispatcher: &Dispatcher) -> String {
-    let mut text = match dispatcher.profile_path() {
-        Some(path) => format!("profile: {path}"),
-        None => "profile: none (folder defaults; `--profile <name>` reads profile/<name>.toml)"
-            .to_owned(),
-    };
-    text.push_str(&format!("\n  topology: {}", dispatcher.topology_path()));
-    text.push_str(&format!("\n  live:     {}", dispatcher.live_path()));
+/// What this session is running with: the config file and the live settings it carried.
+fn config_report(dispatcher: &Dispatcher) -> String {
+    let mut text = format!("config: {}", dispatcher.topology_path());
+    text.push_str(&format!("\n  live: {}", dispatcher.live_path()));
     let live = dispatcher.live();
     text.push_str(&format!(
         "\n  stems:    model {}  provider {}  overlap {:.2}  shifts {}  threads {}  memory {}",
@@ -807,7 +821,6 @@ fn profile_report(dispatcher: &Dispatcher) -> String {
             "max-speed"
         },
     ));
-    text.push_str("\n  MIDI is attached at launch, so a switch takes effect on the next one.");
     text
 }
 
@@ -851,6 +864,12 @@ fn live_command<'a>(words: &mut impl Iterator<Item = &'a str>, dispatcher: &Disp
                              (the engine's clock, rings and keylock window are set when it starts)",
                         );
                     }
+                    // Auto-gain is the one part of `live.toml` that applies to the running engine
+                    // immediately: the measurement is already on each deck.
+                    let _ = dispatcher.command_tx.send(Command::SetAutogain {
+                        enabled: live.autogain.enabled,
+                        target_db: live.autogain.target_db,
+                    });
                     dispatcher.with_live(live, Some(path));
                     Action::Message(text)
                 }
@@ -1298,6 +1317,12 @@ fn fx<'a>(
         Target::Deck(deck_id) => FxChainId::Deck(deck_id),
         Target::Stem(deck, stem) => FxChainId::Stem { deck, stem },
         Target::Master => FxChainId::Master,
+        Target::Unset => {
+            return Action::Failed(
+                "no chain is targeted — press Tab to pick a deck, or write `deck1 fx …` / `master fx …`"
+                    .into(),
+            )
+        }
     };
     let command_tx = &dispatcher.command_tx;
     let Some(sub) = words.next() else {
@@ -1327,6 +1352,70 @@ fn fx<'a>(
             let action = send(command_tx, Command::RemoveFx { chain, index });
             // We sent the removal, so we can mirror it locally without a round-trip.
             dispatcher.slots().remove(&chain.label(), index);
+            action
+        }
+        // Route a flow slot to a subset of the flows. Only the flowfx bank has flows; the engine
+        // refuses the rest, so this arm just parses.
+        "flows" | "flow" => {
+            let index = match resolve_slot(words.next(), chain, dispatcher) {
+                Ok(index) => index,
+                Err(e) => return Action::Failed(e),
+            };
+            let Some(raw) = words.next() else {
+                return Action::Failed(
+                    "usage: [deck] fx flows <slot> <all|none|stem[,stem...]>".into(),
+                );
+            };
+            let flows = match raw {
+                "all" | "*" => Stem::ALL.to_vec(),
+                "none" => Vec::new(),
+                list => {
+                    let mut flows = Vec::new();
+                    for name in list.split(',') {
+                        match Stem::parse(name) {
+                            Some(stem) => flows.push(stem),
+                            None => {
+                                return Action::Failed(format!(
+                                    "unknown flow `{name}` (drums | bass | other | vocals)"
+                                ))
+                            }
+                        }
+                    }
+                    flows
+                }
+            };
+            send(
+                command_tx,
+                Command::SetFxFlows {
+                    slot: FxSlotRef { chain, index },
+                    flows,
+                },
+            )
+        }
+        // Swap the effect *in* a slot: same index, same role, same on/off state. The kind is
+        // validated here, so the local slot book can be updated without a round-trip.
+        "kind" => {
+            let index = match resolve_slot(words.next(), chain, dispatcher) {
+                Ok(index) => index,
+                Err(e) => return Action::Failed(e),
+            };
+            let Some(kind) = words.next() else {
+                return Action::Failed("usage: [deck|master] fx kind <slot> <kind>".into());
+            };
+            let parsed = match FxKind::parse(kind) {
+                Ok(parsed) => parsed,
+                Err(err) => return Action::Failed(err.message()),
+            };
+            let action = send(
+                command_tx,
+                Command::SetFxKind {
+                    slot: FxSlotRef { chain, index },
+                    kind: parsed.name().to_owned(),
+                },
+            );
+            dispatcher
+                .slots()
+                .set_kind(&chain.label(), index, parsed.name());
             action
         }
         "list" | "ls" => send(command_tx, Command::ListFx { chain }),
@@ -1434,11 +1523,11 @@ fn parse_param_value(_param: &str, raw: &str) -> Result<f32, String> {
         .map_err(|_| format!("value must be a number, got `{raw}`"))
 }
 
-fn list_kinds(kinds: &[String]) -> String {
-    kinds
+fn list_slots(entries: &[SlotEntry]) -> String {
+    entries
         .iter()
         .enumerate()
-        .map(|(index, kind)| format!("{index} {kind}"))
+        .map(|(index, entry)| format!("{index} {}", entry.role))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1451,6 +1540,9 @@ fn deck_only(target: Target) -> Result<u8, String> {
         // deck 0 rather than making the user retype the line.
         Target::Stem(deck_id, _) => Ok(deck_id),
         Target::Master => Err("`master` only takes `fx` commands".into()),
+        Target::Unset => Err(
+            "no deck is targeted — press Tab to pick one, or write `deck1 <command>`".into(),
+        ),
     }
 }
 
@@ -1458,7 +1550,7 @@ fn deck_only(target: Target) -> Result<u8, String> {
 fn with_deck(target: Target, verb: &str, apply: impl FnOnce(u8) -> Action) -> Action {
     match deck_only(target) {
         Ok(deck_id) => apply(deck_id),
-        Err(_) => Action::Failed(format!("`{verb}` needs a deck, not `master`")),
+        Err(message) => Action::Failed(format!("`{verb}`: {message}")),
     }
 }
 
@@ -1470,7 +1562,7 @@ fn forward(
 ) -> Action {
     match deck_only(target) {
         Ok(deck_id) => send(command_tx, build(deck_id)),
-        Err(_) => Action::Failed("that command needs a deck, not `master`".into()),
+        Err(message) => Action::Failed(message),
     }
 }
 
@@ -1506,8 +1598,9 @@ fn stem_family<'a>(
     dispatcher: &Dispatcher,
     pipeline: &AudioPipeline,
 ) -> Action {
-    let Ok(deck_id) = deck_only(target) else {
-        return Action::Failed("`stem` needs a deck, not `master`".into());
+    let deck_id = match deck_only(target) {
+        Ok(deck_id) => deck_id,
+        Err(message) => return Action::Failed(format!("`stem`: {message}")),
     };
     let command_tx = &dispatcher.command_tx;
     let Some(sub) = words.next() else {
@@ -2314,6 +2407,10 @@ pub(crate) fn spawn_load_with(
             move || match hypermixx_media::decode_file_at(&path, sample_rate) {
                 Ok(decoded) => {
                     let total_frames = decoded.total_frames;
+                    // Auto-gain's measurement is a track property: measure it here, while the PCM is
+                    // hot, and let the engine derive the gain (so the live switch can retarget it).
+                    let loudness_db =
+                        hypermixx_library::loudness_db(&decoded.pcm, sample_rate, decoded.channels);
                     let analysis = analysis
                         .map(|analysis| analysis_at_rate(analysis, sample_rate))
                         .or_else(|| {
@@ -2346,6 +2443,7 @@ pub(crate) fn spawn_load_with(
                         deck_id,
                         source,
                         analysis,
+                        loudness_db,
                     });
                     if let Some(cues) = cues {
                         let _ = command_tx.send(Command::SetCues {
@@ -2684,12 +2782,12 @@ mod tests {
         // A missing file is the caller's to handle (the CLI falls back to the built-ins).
         assert!(read_live_config("/nonexistent/live.toml").is_err());
 
-        // The shipped file parses and is sane.
-        let shipped = format!("{}/../../profile/live.toml", env!("CARGO_MANIFEST_DIR"));
-        let (live, notes) = read_live_config(&shipped).expect("the shipped live file parses");
+        // The shipped config's `[live]` section parses and is sane.
+        let (live, notes) =
+            read_live_text(crate::profile::template()).expect("the shipped config parses");
         assert!(
             notes.is_empty(),
-            "the shipped file needs no clamping: {notes:?}"
+            "the shipped config needs no clamping: {notes:?}"
         );
         // The engine rate is a device fact, not a compile-time constant: any rate a sound card
         // takes is legal, and the shipped file only has to name one of them.
@@ -2711,6 +2809,20 @@ mod tests {
             "the shipped provider is a known EP: {}",
             live.stems.provider
         );
+    }
+
+    #[test]
+    fn a_config_without_a_live_section_uses_the_built_in_live_defaults() {
+        // A one-file config that omits `[live]` must not have its `[mixer]` / `[preference]`
+        // sections fed to `LiveConfig` (which would fail with "unknown field `mixer`").
+        let text = "[mixer]\n[[mixer.channel]]\nside = \"center\"\n[preference]\n";
+        let (live, notes) = read_live_text(text).expect("a partial config parses");
+        assert_eq!(live, LiveConfig::default());
+        assert!(notes.is_empty(), "{notes:?}");
+
+        // A standalone live file is still read at the root.
+        let (standalone, _) = read_live_text("[audio]\nsample_rate = 48000\n").unwrap();
+        assert_eq!(standalone.audio.sample_rate, 48_000);
     }
 
     /// `live` reports what is in effect, and a reload says when a setting needs a restart.
@@ -2827,7 +2939,7 @@ mod tests {
             };
             let full = format!("deck1 {line}");
             if let Action::Failed(message) =
-                dispatch(&full, &dispatcher, &pipeline, Backend::Auto, 2, 0)
+                dispatch(&full, &dispatcher, &pipeline, Backend::Auto, 2, Some(0))
             {
                 panic!("`{full}` failed: {message}");
             }
@@ -2839,110 +2951,185 @@ mod tests {
             &pipeline,
             Backend::Auto,
             2,
-            0,
+            Some(0),
         ) {
             panic!("`deck1 keylock toggle` failed: {message}");
         }
     }
 
-    /// `profile show` names what this session runs with, and `profile reload` switches the parts of
-    /// it that can change under a running engine (the topology and the live settings — MIDI is
-    /// attached at launch, and the reply says so).
+    /// A bare deck verb needs a deck target. With the browser as the front-end's target there is
+    /// none, so the line is refused instead of quietly landing on whichever deck was focused last; a
+    /// line that names its deck, and a global verb, still work.
     #[test]
-    fn the_profile_family_reports_and_switches() {
+    fn a_bare_deck_verb_is_refused_when_the_browser_is_the_target() {
+        let cfg = hypermixx_audio::MixerConfig {
+            outputs: vec![],
+            ..hypermixx_audio::simple_dj()
+        };
+        let pipeline =
+            hypermixx_audio::AudioPipeline::start(cfg).expect("a headless engine starts");
+        let (notice_tx, _notice_rx) = unbounded();
+        let dispatcher = Dispatcher::new(pipeline.command_tx(), notice_tx);
+        dispatcher.prime(1, pipeline.response_rx());
+
+        for line in ["play", "cue", "fader flow -0.2", "fx list", "stem status"] {
+            match dispatch(line, &dispatcher, &pipeline, Backend::Auto, 2, None) {
+                Action::Failed(message) => assert!(
+                    message.contains("Tab"),
+                    "`{line}` should point at `Tab`, got: {message}"
+                ),
+                other => panic!("`{line}` must be refused under the browser, got {other:?}"),
+            }
+        }
+        // An explicit target, and a verb that never needed a deck, still work.
+        for line in ["deck1 play", "deck2 cue", "master fx list", "state"] {
+            let action = dispatch(line, &dispatcher, &pipeline, Backend::Auto, 2, None);
+            assert!(
+                !matches!(action, Action::Failed(_)),
+                "`{line}` should work with no deck target, got {action:?}"
+            );
+        }
+        // The REPL passes a deck, and keeps its old fallback.
+        assert!(!matches!(
+            dispatch("play", &dispatcher, &pipeline, Backend::Auto, 2, Some(1)),
+            Action::Failed(_)
+        ));
+    }
+
+    /// `fx kind` swaps the effect in a slot and the slot book follows it: the role keeps resolving
+    /// (`filter`), the new kind resolves too, and a parameter set through the role still lands.
+    #[test]
+    fn fx_kind_swaps_the_effect_but_keeps_the_role_addressable() {
+        let cfg = hypermixx_audio::MixerConfig {
+            outputs: vec![],
+            ..hypermixx_audio::simple_dj()
+        };
+        let pipeline =
+            hypermixx_audio::AudioPipeline::start(cfg).expect("a headless engine starts");
+        let (notice_tx, _notice_rx) = unbounded();
+        let dispatcher = Dispatcher::new(pipeline.command_tx(), notice_tx);
+        dispatcher.prime(1, pipeline.response_rx());
+
+        // The reference channel is `[eq, filter]`.
+        assert_eq!(dispatcher.slots().resolve("deck1", "filter"), Ok(1));
+        for line in ["deck1 fx kind filter moog", "deck1 fx set filter value -0.3"] {
+            let action = dispatch(line, &dispatcher, &pipeline, Backend::Auto, 2, Some(0));
+            assert!(
+                !matches!(action, Action::Failed(_)),
+                "`{line}` failed: {action:?}"
+            );
+        }
+        // The role is stable across the swap, and the kind is now a second name for the same slot.
+        assert_eq!(dispatcher.slots().resolve("deck1", "filter"), Ok(1));
+        assert_eq!(dispatcher.slots().resolve("deck1", "moog"), Ok(1));
+    }
+
+    /// `fx flows` parses `all`, `none` and a comma-separated stem list; an invented flow name is
+    /// refused before the engine sees it.
+    #[test]
+    fn fx_flows_parses_all_none_and_stem_lists() {
+        let cfg = hypermixx_audio::MixerConfig {
+            outputs: vec![],
+            ..hypermixx_audio::simple_dj()
+        };
+        let pipeline =
+            hypermixx_audio::AudioPipeline::start(cfg).expect("a headless engine starts");
+        let (notice_tx, _notice_rx) = unbounded();
+        let dispatcher = Dispatcher::new(pipeline.command_tx(), notice_tx);
+        dispatcher.prime(1, pipeline.response_rx());
+        for line in [
+            "deck1 fx flows filter all",
+            "deck1 fx flows filter none",
+            "deck1 fx flows filter vocals,bass",
+        ] {
+            let action = dispatch(line, &dispatcher, &pipeline, Backend::Auto, 2, Some(0));
+            assert!(
+                !matches!(action, Action::Failed(_)),
+                "`{line}`: {action:?}"
+            );
+        }
+        match dispatch(
+            "deck1 fx flows filter martian",
+            &dispatcher,
+            &pipeline,
+            Backend::Auto,
+            2,
+            Some(0),
+        ) {
+            Action::Failed(message) => assert!(message.contains("martian"), "{message}"),
+            other => panic!("an unknown flow must be refused, got {other:?}"),
+        }
+    }
+
+    /// `config show` reports the one file this session runs on; `config reload` re-reads it, sends
+    /// the mixer text to the engine, applies the live settings and pushes auto-gain immediately.
+    #[test]
+    fn the_config_family_reports_and_reloads() {
+        let dir = std::env::temp_dir().join(format!("hypermixx-config-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[mixer]
+[[mixer.channel]]
+side = "center"
+
+[live]
+[live.autogain]
+enabled = true
+target_db = -9.0
+"#,
+        )
+        .unwrap();
+        let config_path = path.to_string_lossy().into_owned();
+
         let (tx, _rx) = unbounded();
         let dispatcher = Dispatcher::new(tx, crossbeam_channel::unbounded().0);
-        dispatcher.with_topology(Some("profile/mixer.toml".to_owned()));
-        dispatcher.with_live(LiveConfig::default(), Some("profile/live.toml".to_owned()));
-        dispatcher.with_profile(Some("profile/dj.toml".to_owned()));
-
-        // `show` (and a bare `profile`) reports the profile and the files it resolved to.
+        dispatcher.with_topology(Some(config_path.clone()));
         for line in ["", "show"] {
-            match profile_command(&mut line.split_whitespace(), &dispatcher) {
+            match config_command(&mut line.split_whitespace(), &dispatcher) {
                 Action::Message(text) => {
-                    assert!(text.contains("profile/dj.toml"), "{text}");
-                    assert!(text.contains("profile/mixer.toml"), "{text}");
-                    assert!(text.contains("profile/live.toml"), "{text}");
+                    assert!(text.contains("config.toml"), "{text}");
                     assert!(text.contains("model htdemucs"), "{text}");
-                    assert!(text.to_lowercase().contains("midi"), "{text}");
                 }
                 other => panic!("expected a report, got {other:?}"),
             }
         }
-        // With no profile the report says so rather than looking broken.
-        let bare = Dispatcher::new(
-            crossbeam_channel::unbounded().0,
-            crossbeam_channel::unbounded().0,
-        );
-        match profile_command(&mut "".split_whitespace(), &bare) {
-            Action::Message(text) => assert!(text.contains("none"), "{text}"),
-            other => panic!("expected a report, got {other:?}"),
-        }
 
-        // A profile that names a topology: reload sends the file's *text* to the engine, and the
-        // profile becomes the current one.
-        let dir = std::env::temp_dir().join("hypermixx-profile-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("club.toml"), "[[channel]]\nside = \"center\"\n").unwrap();
-        let profile_file = dir.join("dj.toml");
-        std::fs::write(&profile_file, "mixer = \"club.toml\"\n").unwrap();
         let (tx, rx) = unbounded();
         let dispatcher = Dispatcher::new(tx, crossbeam_channel::unbounded().0);
-        let line = format!("reload {}", profile_file.display());
-        match profile_command(&mut line.split_whitespace(), &dispatcher) {
-            Action::Message(text) => assert!(text.contains("club.toml"), "{text}"),
+        dispatcher.with_topology(Some(config_path));
+        let line = format!("reload {}", path.display());
+        match config_command(&mut line.split_whitespace(), &dispatcher) {
+            Action::Message(text) => assert!(text.contains("reloaded"), "{text}"),
             other => panic!("expected a report, got {other:?}"),
         }
         match rx.recv().unwrap() {
             Command::MixerReload { text } => assert!(text.contains("center"), "{text}"),
             other => panic!("expected MixerReload, got {other:?}"),
         }
-        assert_eq!(
-            dispatcher.profile_path().as_deref(),
-            Some(profile_file.to_string_lossy().as_ref())
-        );
-        // The report follows the switch: the topology slot is the one the session is *running*, not
-        // the one it started with (a stale slot would make `profile show` lie).
-        assert_eq!(
-            dispatcher.topology_path(),
-            dir.join("club.toml").to_string_lossy(),
-            "the reload must record the topology it just loaded"
-        );
-        // A key the profile does not name falls back to the folder default — a reload is "start as
-        // if with `--profile X`", not a patch over whatever was running.
-        let bare_profile = dir.join("bare.toml");
-        std::fs::write(&bare_profile, "[preference]\n").unwrap();
-        let line = format!("reload {}", bare_profile.display());
-        dispatcher.with_topology(Some("stale/other.toml".to_owned()));
-        match profile_command(&mut line.split_whitespace(), &dispatcher) {
-            Action::Message(text) => {
-                assert!(text.contains(crate::profile::DEFAULT_MIXER), "{text}");
-                assert!(
-                    text.contains("topology:"),
-                    "a failure is reported, not hidden: {text}"
-                );
+        match rx.recv().unwrap() {
+            Command::SetAutogain { enabled, target_db } => {
+                assert!(enabled);
+                assert_eq!(target_db, -9.0);
             }
-            other => panic!("expected a report, got {other:?}"),
+            other => panic!("expected SetAutogain, got {other:?}"),
         }
-        // The default file is not there in this test's working directory, so nothing was loaded —
-        // and the slot says exactly that rather than naming a file the session is not running.
-        assert_eq!(
-            dispatcher.topology_path(),
-            "stale/other.toml",
-            "a failed load must not be recorded as the running topology"
-        );
+        assert!(dispatcher.live().autogain.enabled);
+        assert_eq!(dispatcher.topology_path(), path.to_string_lossy());
 
-        // A profile that is not there is a failure, and a mistyped subcommand too.
+        // A missing file and a mistyped subcommand are failures.
         assert!(matches!(
-            profile_command(
-                &mut "reload /nonexistent/p.toml".split_whitespace(),
+            config_command(
+                &mut "reload /nonexistent/c.toml".split_whitespace(),
                 &dispatcher
             ),
             Action::Failed(_)
         ));
         assert!(matches!(
-            profile_command(&mut "swtich".split_whitespace(), &dispatcher),
+            config_command(&mut "swtich".split_whitespace(), &dispatcher),
             Action::Failed(_)
         ));
         let _ = std::fs::remove_dir_all(&dir);

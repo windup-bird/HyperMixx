@@ -5,7 +5,7 @@
 
 ## 现象
 
-`profile/preference.toml` 里 `backend = "auto"`，在 WezTerm 里启动 TUI：
+`config.toml` 的 `[preference.waveform]` 里 `backend = "auto"`，在 WezTerm 里启动 TUI：
 
 - 响应日志打出 `[waveform] renderer kitty`（说明检测选了 kitty）；
 - 波形区域**整块空白**：既没有图像，也没有 braille 兜底；
