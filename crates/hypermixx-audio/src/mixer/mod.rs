@@ -11,9 +11,9 @@
 //!
 //! * **The order is fixed, not computed.** No graph, no topological sort. A reader can predict what
 //!   a signal went through from the source alone, which is what makes a click diagnosable.
-//! * **The limiter is not a configurable slot.** [`MasterBus::limiter`] is a field the mixer owns
-//!   unconditionally, so a config that forgets `"limiter"` still cannot feed full-scale audio to a
-//!   DAC. Configuration controls the *chain*; the safety stage is part of the topology.
+//! * **The safety limiter is not a chain slot.** [`MasterBus::limiter`] is a field the mixer owns
+//!   unconditionally, so a config cannot remove it by naming a bad FX list. Its ceiling is
+//!   configurable through `[mixer.master] ceiling_db`; the stage itself is part of the topology.
 //!
 //! [`Mixer::process`] touches no device, which is what makes it unit-testable: build a mixer with
 //! `outputs: vec![]` and inspect the buses.
@@ -156,6 +156,10 @@ impl Mixer {
         master_fx.prepare(sample_rate);
         let mut limiter = build_slot("limiter")?;
         limiter.set_enabled(cfg.master_limiter);
+        // The config spells the ceiling in dBFS; the DSP parameter is a linear amplitude. The
+        // limiter clamps it into its own useful range, so a wild value cannot disable the stage.
+        let ceiling = 10f32.powf(cfg.master_limiter_ceiling_db / 20.0);
+        let _ = limiter.set_param("ceiling", ceiling);
         limiter.prepare(sample_rate);
 
         Ok(Self {
@@ -555,8 +559,12 @@ impl Mixer {
         self.cue.peak
     }
 
-    /// Gain reduction currently applied by the safety limiter, dB (0 = not working).
+    /// Gain reduction currently applied by the safety limiter, dB (0 = not working). A bypassed
+    /// limiter keeps its last internal state, so report zero explicitly rather than a stale GR.
     pub fn master_reduction_db(&self) -> f32 {
+        if !self.master.limiter.is_enabled() {
+            return 0.0;
+        }
         self.master
             .limiter
             .get_param("reduction")
@@ -1328,6 +1336,28 @@ mod tests {
     }
 
     #[test]
+    fn the_master_limiter_ceiling_follows_the_config() {
+        let cfg = MixerConfig {
+            master_limiter: true,
+            master_limiter_ceiling_db: -6.0,
+            outputs: vec![],
+            ..simple_dj()
+        };
+        let mixer = Mixer::new(cfg, SAMPLE_RATE).expect("builds without outputs");
+        let ceiling = mixer
+            .master()
+            .limiter
+            .fx()
+            .get_param("ceiling")
+            .expect("a limiter has a ceiling");
+        let expected = 10f32.powf(-6.0 / 20.0);
+        assert!(
+            (ceiling - expected).abs() < 1e-4,
+            "ceiling {ceiling} should be {expected}"
+        );
+    }
+
+    #[test]
     fn a_hot_master_is_held_under_full_scale() {
         // The acceptance property for the whole safety stage: two decks at unity, no faders down.
         let mut mixer = headless(simple_dj());
@@ -1348,6 +1378,12 @@ mod tests {
             "the limiter let {escaped} through; master peak must stay bounded"
         );
         assert!(mixer.master_reduction_db() < 0.0, "GR never engaged");
+        mixer.master().set_limiter_enabled(false);
+        assert_eq!(
+            mixer.master_reduction_db(),
+            0.0,
+            "a bypassed limiter must not report stale gain reduction"
+        );
     }
 
     #[test]

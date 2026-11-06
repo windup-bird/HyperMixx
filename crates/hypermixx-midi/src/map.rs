@@ -1877,7 +1877,7 @@ fn parse_action(line: &str, ctx: &ActionCtx<'_>) -> Result<Action, String> {
             }))
         }
         ["fx", what @ ("on" | "off" | "toggle" | "pad" | "trigger")] => {
-            let slot = fx_action(ctx, named_chain, *what)?;
+            let slot = fx_action(ctx, named_chain, what)?;
             Ok(Action::Fx(slot))
         }
         ["fx", "param", param] => {

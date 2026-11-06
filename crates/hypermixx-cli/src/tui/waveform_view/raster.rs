@@ -253,6 +253,7 @@ fn draw_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_cue(
     indices: &mut [u8],
     width: u32,

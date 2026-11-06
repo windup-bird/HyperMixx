@@ -9,6 +9,7 @@ use super::super::db::{insert_beatgrid, insert_cue, Result};
 use super::super::model::ScanStats;
 use super::anlz::{Anlz, AnlzCue};
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn import_sidecars(
     conn: &Connection,
     source_id: i64,

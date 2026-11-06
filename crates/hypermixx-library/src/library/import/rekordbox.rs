@@ -308,6 +308,7 @@ fn scan_pdb(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn import_analysis(
     conn: &Connection,
     source_id: i64,

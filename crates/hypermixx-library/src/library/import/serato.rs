@@ -132,10 +132,8 @@ pub(crate) fn scan(
                 "playlist",
                 0,
             )?;
-            let mut position = 0;
-            for location_id in locations.values() {
-                insert_playlist_item(tx, playlist_id, *location_id, position)?;
-                position += 1;
+            for (position, location_id) in locations.values().enumerate() {
+                insert_playlist_item(tx, playlist_id, *location_id, position as i64)?;
             }
         } else {
             for (index, (name, paths)) in crates.iter().enumerate() {
@@ -476,7 +474,9 @@ fn parse_length(text: &str) -> Option<u64> {
 
 fn utf16be(data: &[u8]) -> String {
     let units: Vec<u16> = data
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
         .take_while(|unit| *unit != 0)
         .collect();

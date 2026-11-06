@@ -514,6 +514,11 @@ live reload [<file>]  重读 config 的 [live] 段（缺省当前 config 路径�
 
 ```toml
 [mixer]        # 拓扑：[[mixer.channel]] / [mixer.crossfader] / [[mixer.output]] …
+[[mixer.channel]]
+side = "left"
+[mixer.master]
+limiter = true            # 安全限幅，默认开启；写 false 才关
+ceiling_db = -1.0         # 限幅门限 dBFS（−40 .. +12），省略 = −1
 [live]         # 本机设置：[audio] / [keylock] / [stems] / [autogain]
 [preference]   # 前端设置：波形、主题、曲库
 [controller]
@@ -529,8 +534,8 @@ map = "mapping.toml"   # unit-map 文件指针，相对本文件所在目录
 - 会话内 `config show` 看当前配置，`config reload [file]` 重读；`mixer reload` / `live reload`
   作用于同一份文件。
 - 段名拼错（`[mixr]`）是错误，不是静默回落 —— 否则看起来用了某套配置其实没有。
-- profile 里的 `[preference]` 是空段也合法（= 什么都没设）；真正的前端设置在独立的
-  `config.toml`，TUI 启动时读取（见 README 的 TUI 布局与 `[theme]` / `[waveform]` / `[library]`）。
+- `[preference]` 是空段也合法（= 什么都没设）；波形、主题、曲库见
+  `[preference.waveform]` / `[preference.theme]` / `[preference.library]`。
 
 ### 3.13 帮助与退出
 

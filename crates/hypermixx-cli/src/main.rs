@@ -62,7 +62,10 @@ fn main() {
         // Give the guide a real file to edit; an explicit `--guide <file>` that is missing gets the
         // same starting point rather than an empty editor.
         if !std::path::Path::new(path).is_file() {
-            if let Some(parent) = std::path::Path::new(path).parent() {
+            if let Some(parent) = std::path::Path::new(path)
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
                 if let Err(err) = std::fs::create_dir_all(parent) {
                     eprintln!("warning: {}: {err}", parent.display());
                 }

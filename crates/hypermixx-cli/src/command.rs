@@ -725,7 +725,19 @@ pub fn read_live_config(path: &str) -> Result<(LiveConfig, Vec<String>), String>
 /// root) still parses. Clamped values come back as notes rather than silently taking effect.
 pub fn read_live_text(text: &str) -> Result<(LiveConfig, Vec<String>), String> {
     let value: toml::Value = toml::from_str(text).map_err(|err| err.to_string())?;
-    let section = value.get("live").cloned().unwrap_or(value);
+    // A one-file config carries these under `[live]`. If the config omits the section, the rest
+    // of the file is *not* a live file — fall back to the built-in defaults. A standalone live
+    // file (no other sections) is still read at the root.
+    let section = match value.get("live") {
+        Some(section) => section.clone(),
+        None if ["mixer", "preference", "controller"]
+            .iter()
+            .any(|key| value.get(key).is_some()) =>
+        {
+            return Ok((LiveConfig::default(), Vec::new()))
+        }
+        None => value,
+    };
     let parsed: LiveConfig = section.try_into().map_err(|err| err.to_string())?;
     let live = parsed.clone().sanitised();
     let mut notes = Vec::new();
@@ -739,7 +751,8 @@ pub fn read_live_text(text: &str) -> Result<(LiveConfig, Vec<String>), String> {
 ///
 /// Reloading re-reads the whole config: the mixer topology goes to the engine as text, the live
 /// settings replace the dispatcher's, and auto-gain is pushed immediately (the one live setting
-/// that applies without a restart). MIDI is attached once at launch and cannot change here.
+/// that applies without a restart). `[preference]` is read by the TUI at startup, and MIDI is
+/// attached once at launch; neither changes under a running session.
 fn config_command<'a>(
     words: &mut impl Iterator<Item = &'a str>,
     dispatcher: &Dispatcher,
@@ -777,7 +790,9 @@ fn config_command<'a>(
             for note in notes {
                 report.push_str(&format!("\n  {note}"));
             }
-            report.push_str("\n  audio/keylock settings apply on the next launch; MIDI too.");
+            report.push_str(
+                "\n  audio/keylock and [preference] apply on the next launch; MIDI too.",
+            );
             Action::Message(report)
         }
         other => Action::Failed(format!("unknown config subcommand `{other}` (show|reload)")),
@@ -2794,6 +2809,20 @@ mod tests {
             "the shipped provider is a known EP: {}",
             live.stems.provider
         );
+    }
+
+    #[test]
+    fn a_config_without_a_live_section_uses_the_built_in_live_defaults() {
+        // A one-file config that omits `[live]` must not have its `[mixer]` / `[preference]`
+        // sections fed to `LiveConfig` (which would fail with "unknown field `mixer`").
+        let text = "[mixer]\n[[mixer.channel]]\nside = \"center\"\n[preference]\n";
+        let (live, notes) = read_live_text(text).expect("a partial config parses");
+        assert_eq!(live, LiveConfig::default());
+        assert!(notes.is_empty(), "{notes:?}");
+
+        // A standalone live file is still read at the root.
+        let (standalone, _) = read_live_text("[audio]\nsample_rate = 48000\n").unwrap();
+        assert_eq!(standalone.audio.sample_rate, 48_000);
     }
 
     /// `live` reports what is in effect, and a reload says when a setting needs a restart.

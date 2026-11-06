@@ -109,6 +109,9 @@ pub struct Meters {
     pub master_peak: f32,
     /// Peak of the last cue block, linear.
     pub cue_peak: f32,
+    /// Gain reduction the master limiter applied on the last block, dB. `0.0` when it is not
+    /// working (or disabled); negative while it is holding the signal under its ceiling.
+    pub master_reduction_db: f32,
     /// Output writes whose block did not fully fit in the ring, summed over all outputs. This
     /// counts overrun events, not the samples inside them.
     pub overruns: u64,
@@ -391,6 +394,7 @@ fn drain_queries(mixer: &mut Mixer, rx: &Receiver<(Query, Sender<QueryResponse>)
             Query::Meters => QueryResponse::Meters(Meters {
                 master_peak: mixer.master_peak(),
                 cue_peak: mixer.cue_peak(),
+                master_reduction_db: mixer.master_reduction_db(),
                 // `Outputs` has no aggregate today; summing here keeps the change to this file.
                 overruns: mixer.outputs().iter().map(|output| output.overruns()).sum(),
                 deck_peaks: (0..mixer.channel_count())

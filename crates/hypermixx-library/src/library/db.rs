@@ -844,6 +844,7 @@ pub(crate) fn upsert_track(
     )?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn upsert_location(
     conn: &Connection,
     track_id: i64,
@@ -936,6 +937,7 @@ pub(crate) fn clear_imported_timing(conn: &Connection, source_id: i64) -> Result
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_cue(
     conn: &Connection,
     location_id: i64,
@@ -969,6 +971,7 @@ pub(crate) fn insert_cue(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_beatgrid(
     conn: &Connection,
     location_id: i64,

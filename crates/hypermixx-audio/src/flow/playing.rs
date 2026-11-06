@@ -282,6 +282,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::identity_op)]
     fn loop_mapping_folds_the_audible_position() {
         let mut p = Playing::new(vec![source(100_000)], 0);
         p.set_loop_range(Some(LoopRange::new(10, 74)));
@@ -289,6 +290,8 @@ mod tests {
         let mut out = vec![0.0f32; 128 * CHANNELS];
         p.process_block(&mut out);
         assert_eq!(p.virtual_frame(), 138);
+        // The wrap rule is `base + (virtual - base) % period`; here the offset is a whole number
+        // of periods, so the audible position lands back on the base.
         assert_eq!(p.actual_frame(), 10 + (138 - 10) % 64);
     }
 

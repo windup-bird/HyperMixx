@@ -60,16 +60,23 @@ pub struct Config {
 /// The platform's config path. `HYPERMIXX_CONFIG` wins when set, which is also how a test or a
 /// Termux/proot session names its own location.
 pub fn default_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("HYPERMIXX_CONFIG") {
+    // An empty value means "not set" — joining onto it would put the config in the working
+    // directory instead of the user's config directory.
+    if let Some(path) = std::env::var_os("HYPERMIXX_CONFIG").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(path));
     }
     let dir = if cfg!(windows) {
-        std::env::var_os("APPDATA").map(|base| PathBuf::from(base).join("Hypermixx"))
+        std::env::var_os("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(|base| PathBuf::from(base).join("Hypermixx"))
     } else {
         std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .or_else(|| {
-                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+                std::env::var_os("HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(|home| PathBuf::from(home).join(".config"))
             })
             .map(|base| base.join("hypermixx"))
     }?;
@@ -79,17 +86,26 @@ pub fn default_path() -> Option<PathBuf> {
 /// Loads `explicit`, or the platform default. Only the *default* path is created on a first start:
 /// a path the user named must exist, so a typo is an error rather than a silently copied template.
 pub fn load_or_create(explicit: Option<&str>) -> Result<Config, String> {
-    let path = match explicit {
-        Some(path) => PathBuf::from(path),
-        None => default_path().ok_or_else(|| {
-            "cannot find the platform config directory (set HYPERMIXX_CONFIG)".to_owned()
-        })?,
+    let (path, create_missing) = match explicit {
+        Some(path) => (PathBuf::from(path), false),
+        None => (
+            default_path().ok_or_else(|| {
+                "cannot find the platform config directory (set HYPERMIXX_CONFIG)".to_owned()
+            })?,
+            true,
+        ),
     };
+    load_or_create_at(&path, create_missing)
+}
+
+/// The same load with the "create on first start" decision already made, so a test can exercise
+/// the first-start path without touching the process-wide config environment variables.
+fn load_or_create_at(path: &Path, create_missing: bool) -> Result<Config, String> {
     let mut notes = Vec::new();
-    let text = match std::fs::read_to_string(&path) {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(err) if err.kind() == ErrorKind::NotFound && explicit.is_none() => {
-            match first_copy(&path) {
+        Err(err) if err.kind() == ErrorKind::NotFound && create_missing => {
+            match first_copy(path) {
                 Ok(()) => notes.push(format!("created {}", path.display())),
                 Err(err) => notes.push(format!(
                     "{}: {err}; running on the built-in template",
@@ -100,7 +116,7 @@ pub fn load_or_create(explicit: Option<&str>) -> Result<Config, String> {
         }
         Err(err) => return Err(format!("{}: {err}", path.display())),
     };
-    parse(&path, &text, notes)
+    parse(path, &text, notes)
 }
 
 /// Writes the template once. The caller has already established the file is absent.
@@ -146,8 +162,30 @@ fn parse(path: &Path, text: &str, mut notes: Vec<String>) -> Result<Config, Stri
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    let map = section.map.map(|map| resolve_against(dir, &map));
+    // A configured but unreadable map is a silent "no controller" otherwise; say exactly why.
+    if let Some(map) = &map {
+        match std::fs::read_to_string(map) {
+            Ok(text) => {
+                let base = Path::new(map)
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                if let Err(err) = hypermixx_midi::Map::from_toml_str_at(&text, base) {
+                    notes.push(format!(
+                        "{}: [controller].map `{map}` does not parse: {err}",
+                        path.display()
+                    ));
+                }
+            }
+            Err(err) => notes.push(format!(
+                "{}: [controller].map `{map}` cannot be read: {err}",
+                path.display()
+            )),
+        }
+    }
     let controller = Controller {
-        map: section.map.map(|map| resolve_against(dir, &map)),
+        map,
         device: section.device,
     };
 
@@ -318,6 +356,51 @@ device = "DDJ-400"
         std::fs::remove_dir_all(&dir).ok();
         first_copy(&path).expect("copies");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), template());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_first_start_creates_the_config_and_never_overwrites_it() {
+        let dir = temp("first-start");
+        let path = dir.join("nested/config.toml");
+        std::fs::remove_dir_all(&dir).ok();
+        let cfg = load_or_create_at(&path, true).expect("first start creates the config");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), template());
+        assert_eq!(cfg.path, path);
+        assert!(cfg.notes.iter().any(|note| note.contains("created")));
+
+        let edited = "[mixer]\n[[mixer.channel]]\nside = \"center\"\n";
+        std::fs::write(&path, edited).unwrap();
+        let again = load_or_create_at(&path, true).expect("reads the edited config");
+        assert_eq!(again.mixer.channels.len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_broken_controller_map_is_reported_not_silent() {
+        let dir = temp("controller-map");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[mixer]\n[[mixer.channel]]\nside = \"center\"\n[controller]\nmap = \"missing.toml\"\n",
+        )
+        .unwrap();
+        let cfg = load_or_create(Some(path.to_string_lossy().as_ref())).expect("parses");
+        assert!(
+            cfg.notes
+                .iter()
+                .any(|note| note.contains("[controller].map") && note.contains("cannot be read")),
+            "a missing map must be named: {:?}",
+            cfg.notes
+        );
+
+        // Once the map is a real file, no note is produced.
+        std::fs::write(dir.join("missing.toml"), MAP_TEMPLATE).unwrap();
+        let ok = load_or_create(Some(path.to_string_lossy().as_ref())).expect("parses");
+        assert!(ok.notes.is_empty(), "{:?}", ok.notes);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

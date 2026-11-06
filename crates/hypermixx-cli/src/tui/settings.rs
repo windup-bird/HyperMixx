@@ -377,7 +377,6 @@ impl SettingsScreen {
                         self.outputs.len()
                     ));
                     self.stack.push(Level::Outputs { cursor });
-                    return;
                 }
                 _ => self.stack.push(Level::Outputs { cursor }),
             },

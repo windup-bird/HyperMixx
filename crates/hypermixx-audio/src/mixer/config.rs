@@ -359,7 +359,7 @@ impl OutputConfig {
 }
 
 /// Everything a [`Mixer`](super::Mixer) needs to exist.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MixerConfig {
     pub channels: Vec<ChannelConfig>,
     /// The shared crossfader (one physical control, every channel applies it on its own side).
@@ -368,6 +368,9 @@ pub struct MixerConfig {
     pub master_fx: Vec<String>,
     /// Always-on safety limiter, wired separately so it cannot be configured away by a bad list.
     pub master_limiter: bool,
+    /// The limiter's ceiling, dBFS. Converted to a linear amplitude when the slot is built; the
+    /// limiter clamps it into its own useful range (−40 dBFS .. +12 dBFS).
+    pub master_limiter_ceiling_db: f32,
     /// Master trim, `-1.0 ..= 1.0` (0 dB at the top).
     pub master_fader: f32,
     /// Cue trim, `-1.0 ..= 1.0`.
@@ -375,6 +378,24 @@ pub struct MixerConfig {
     /// How a `cue` output blends the cue sends with the master mix.
     pub cue: CueMixConfig,
     pub outputs: Vec<OutputConfig>,
+}
+
+impl Default for MixerConfig {
+    fn default() -> Self {
+        Self {
+            channels: Vec::new(),
+            crossfader: CrossfaderConfig::default(),
+            master_fx: Vec::new(),
+            // The safety stage is on by default everywhere: in a parsed config (`MasterFile`),
+            // in the reference topology (`simple_dj`) and in this constructor.
+            master_limiter: true,
+            master_limiter_ceiling_db: -1.0,
+            master_fader: 0.0,
+            cue_fader: 0.0,
+            cue: CueMixConfig::default(),
+            outputs: Vec::new(),
+        }
+    }
 }
 
 impl MixerConfig {
@@ -406,7 +427,19 @@ impl MixerConfig {
         // still loads. Parsing to a Value first keeps syntax errors pointing at their line.
         let value: toml::Value =
             toml::from_str(text).map_err(|err| MixerError::Parse(err.to_string()))?;
-        let section = value.get("mixer").cloned().unwrap_or(value);
+        // A one-file config keeps the topology under `[mixer]`. Omitting it is still legal — the
+        // other sections are the front-end's — and falls back to the built-in reference. Only a
+        // bare topology file (no `[mixer]` and none of the other sections) is read at the root.
+        let section = match value.get("mixer") {
+            Some(section) => section.clone(),
+            None if ["live", "preference", "controller"]
+                .iter()
+                .any(|key| value.get(key).is_some()) =>
+            {
+                return Ok(simple_dj())
+            }
+            None => value,
+        };
         let file: MixerFile = section
             .try_into()
             .map_err(|err| MixerError::Parse(err.to_string()))?;
@@ -427,15 +460,28 @@ struct MixerFile {
     output: Vec<OutputConfig>,
 }
 
-/// The `[master]` table: `fx`, `limiter`, `fader`.
-#[derive(Debug, Default, serde::Deserialize)]
+/// The `[master]` table: `fx`, `limiter`, `ceiling_db`, `fader`.
+#[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct MasterFile {
     fx: Vec<String>,
-    /// The safety stage. Opt-in from a file (the built-in reference turns it on; a hand-written
-    /// config that omits it gets exactly what it asked for, and the mixer docs say so).
+    /// The safety stage. On by default — a config has to say `limiter = false` to turn it off.
     limiter: bool,
+    /// Limiter ceiling in dBFS. `"ceiling"` in the DSP is a linear amplitude; the dB spelling is
+    /// what a config author can actually reason about.
+    ceiling_db: f32,
     fader: f32,
+}
+
+impl Default for MasterFile {
+    fn default() -> Self {
+        Self {
+            fx: Vec::new(),
+            limiter: true,
+            ceiling_db: -1.0,
+            fader: 0.0,
+        }
+    }
 }
 
 impl From<MixerFile> for MixerConfig {
@@ -446,6 +492,7 @@ impl From<MixerFile> for MixerConfig {
             crossfader: file.crossfader,
             master_fx: file.master.fx,
             master_limiter: file.master.limiter,
+            master_limiter_ceiling_db: file.master.ceiling_db,
             master_fader: file.master.fader,
             cue_fader: cue.fader,
             cue,
@@ -482,6 +529,7 @@ pub fn simple_dj() -> MixerConfig {
         crossfader: CrossfaderConfig::default(),
         master_fx: vec![],
         master_limiter: true,
+        master_limiter_ceiling_db: -1.0,
         master_fader: 0.0,
         cue_fader: 0.0,
         cue: CueMixConfig::default(),
@@ -526,6 +574,7 @@ pub fn silent_test_channel() -> MixerConfig {
         crossfader: CrossfaderConfig::default(),
         master_fx: vec![],
         master_limiter: false,
+        master_limiter_ceiling_db: -1.0,
         master_fader: 0.0,
         cue_fader: 0.0,
         cue: CueMixConfig::default(),
@@ -696,6 +745,48 @@ mod tests {
     }
 
     #[test]
+    fn a_config_without_a_mixer_section_uses_the_reference_topology() {
+        // Sections are optional. Without `[mixer]` the front-end sections must not be mistaken
+        // for a bare topology file (which used to fail with "unknown field `controller`").
+        let cfg = MixerConfig::from_toml_str(
+            "[live]\n[preference]\n[controller]\nmap = \"mapping.toml\"\n",
+        )
+        .expect("a config with no [mixer] still parses");
+        assert_eq!(cfg, simple_dj());
+        assert!(cfg.build_chains().is_ok());
+    }
+
+    #[test]
+    fn the_struct_default_agrees_with_the_parsed_default() {
+        let cfg = MixerConfig::default();
+        let parsed = MixerConfig::from_toml_str("[[channel]]\nside = \"center\"\n").unwrap();
+        assert!(cfg.master_limiter, "the safety stage is on everywhere");
+        assert_eq!(cfg.master_limiter_ceiling_db, -1.0);
+        assert_eq!(cfg.master_limiter, parsed.master_limiter);
+        assert_eq!(cfg.master_limiter_ceiling_db, parsed.master_limiter_ceiling_db);
+    }
+
+    #[test]
+    fn the_master_limiter_is_on_by_default_and_its_ceiling_is_configurable() {
+        let on = MixerConfig::from_toml_str("[[channel]]\nside = \"center\"\n").unwrap();
+        assert!(on.master_limiter, "omitting [master] must not drop the safety stage");
+        assert_eq!(on.master_limiter_ceiling_db, -1.0);
+
+        let cfg = MixerConfig::from_toml_str(
+            "[master]\nlimiter = true\nceiling_db = -6.0\n[[channel]]\nside = \"center\"\n",
+        )
+        .unwrap();
+        assert!(cfg.master_limiter);
+        assert_eq!(cfg.master_limiter_ceiling_db, -6.0);
+
+        let off = MixerConfig::from_toml_str(
+            "[master]\nlimiter = false\n[[channel]]\nside = \"center\"\n",
+        )
+        .unwrap();
+        assert!(!off.master_limiter, "a config can still turn it off");
+    }
+
+    #[test]
     fn toml_fields_default_to_the_documented_values() {
         // A minimal channel: everything optional takes the defaults the comments promise.
         let cfg = MixerConfig::from_toml_str(
@@ -739,9 +830,10 @@ mod tests {
         assert_eq!(cfg.outputs[0].gain, 1.0);
         assert_eq!(cfg.cue_fader, 0.0);
         assert!(
-            !cfg.master_limiter,
-            "the safety stage is opt-in from a file"
+            cfg.master_limiter,
+            "the safety stage is on by default; a config has to turn it off"
         );
+        assert_eq!(cfg.master_limiter_ceiling_db, -1.0);
         assert_eq!(cfg.master_fader, 0.0);
         // The struct default and the `dj` helper agree with the parsed channel above.
         let default = ChannelConfig::default();
