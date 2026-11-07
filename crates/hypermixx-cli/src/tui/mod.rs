@@ -78,7 +78,14 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     dispatcher.with_library(library.clone());
     // Prime every chain's slot list so `fx remove <name>` works from the first command.
     dispatcher.prime(decks, pipeline.response_rx());
-    let mut app = App::new(decks, backend, notice_rx, event_rx, dispatcher.slots());
+    let mut app = App::new(
+        decks,
+        backend,
+        notice_rx,
+        event_rx,
+        dispatcher.slots(),
+        dispatcher.scan(),
+    );
     app.library = library;
     // The header reports the configured ring and rate, not the compile-time defaults.
     app.ring_frames = ring_frames;
@@ -253,7 +260,8 @@ fn event_loop(
                 break;
             }
             if event::poll(next_tick - now)? {
-                match event::read()? {
+                let event = event::read()?;
+                match event {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         input::handle(app, key, dispatcher, pipeline);
                     }

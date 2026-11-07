@@ -21,7 +21,7 @@ use hypermixx_core::{
     LiveConfig, LoopEditOp, LoopOp, LoopQuantum, NudgeOp, OutputOp, PhaseMode, Shared, Source,
     Stem, StemOp, StemPreset, SyncOp, TrackAnalysis, VinylOp,
 };
-use hypermixx_library::LibraryDb;
+use hypermixx_library::{LibraryDb, ScanService};
 use hypermixx_media::ChunkedStreams;
 use hypermixx_midi::{RouterCommand, RouterState};
 
@@ -208,6 +208,9 @@ pub struct Dispatcher {
     separations: Cancellations,
     /// The library cache, when `main` could open it. `library ...` commands are front-end-owned.
     library: Option<Arc<LibraryDb>>,
+    /// Shared with the front-end: `browser refresh` enqueues here instead of scanning inline, and
+    /// the front-end polls progress. One worker serves both front-ends.
+    scan: Arc<Mutex<ScanService>>,
     /// The live MIDI router's command channel, set by whichever front-end attached an input.
     midi_control: Arc<Mutex<Option<Sender<RouterCommand>>>>,
     /// The router's latest mode snapshot, read by `midi mode` and the TUI header.
@@ -230,6 +233,7 @@ impl Dispatcher {
             slots: Arc::new(SlotBook::default()),
             separations: Arc::new(Mutex::new(HashMap::new())),
             library: None,
+            scan: Arc::new(Mutex::new(ScanService::new())),
             midi_control: Arc::new(Mutex::new(None)),
             midi_state: Arc::new(Mutex::new(None)),
         }
@@ -256,13 +260,25 @@ impl Dispatcher {
         self.midi_state.lock().ok().and_then(|slot| slot.clone())
     }
 
-    /// Attaches the library cache for the `library` command family.
+    /// Attaches the library cache for the `library` command family, and gives the scan worker its
+    /// connection. USB formats start empty: the TUI configures the real ones in `sync_library`,
+    /// while the REPL simply has no removable-media watcher.
     pub fn with_library(&mut self, library: Option<Arc<LibraryDb>>) {
+        if let Some(db) = &library {
+            if let Ok(mut service) = self.scan.lock() {
+                service.configure(db, Vec::new());
+            }
+        }
         self.library = library;
     }
 
     pub fn library(&self) -> Option<&Arc<LibraryDb>> {
         self.library.as_ref()
+    }
+
+    /// The shared scan service. The front-end uses the same handle to poll progress.
+    pub fn scan(&self) -> Arc<Mutex<ScanService>> {
+        Arc::clone(&self.scan)
     }
 
     /// Also forwards front-end events (deck name, compiled grid) to `events`.
@@ -2287,27 +2303,32 @@ fn browser_command(words: &mut std::str::SplitWhitespace<'_>, dispatcher: &Dispa
             Err(err) => Action::Failed(format!("browser list: {err}")),
         },
         "refresh" => {
-            let ids = match words.next() {
+            let sources = match db.sources() {
+                Ok(sources) => sources,
+                Err(err) => return Action::Failed(format!("browser refresh: {err}")),
+            };
+            let sources = match words.next() {
                 Some(raw) => match raw.parse::<i64>() {
-                    Ok(id) => vec![id],
+                    Ok(id) => sources.into_iter().filter(|source| source.id == id).collect(),
                     Err(_) => return Action::Failed("browser refresh: id must be a number".into()),
                 },
-                None => match db.sources() {
-                    Ok(sources) => sources.iter().map(|source| source.id).collect(),
-                    Err(err) => return Action::Failed(format!("browser refresh: {err}")),
-                },
+                None => sources,
             };
-            let mut lines = Vec::new();
-            for id in ids {
-                match db.scan_source(id, &mut |_| {}) {
-                    Ok(stats) => lines.push(format!("source {id}: {}", stats.summary())),
-                    Err(err) => lines.push(format!("source {id}: {err}")),
-                }
+            let count = sources.len();
+            if count == 0 {
+                return Action::Message("browser: no matching sources".into());
             }
-            if lines.is_empty() {
-                Action::Message("browser: no configured sources".into())
+            // Scanning is the library's job, never the command's: hashing a whole USB export on
+            // this thread would freeze both front-ends. Results arrive as scan progress events.
+            let queued = dispatcher
+                .scan()
+                .lock()
+                .map(|mut service| service.enqueue(sources))
+                .unwrap_or(false);
+            if queued {
+                Action::Message(format!("browser: queued {count} source(s) for scan"))
             } else {
-                Action::Message(lines.join("\n"))
+                Action::Failed("browser: could not queue scan".into())
             }
         }
         "show" => {

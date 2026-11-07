@@ -13,12 +13,12 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use super::import::{folder, rekordbox, serato, vdj};
 use super::model::{
-    key_from_columns, key_mode_str, FileTags, Playlist, ScanEvent, ScanStats, Source, SourceKind,
-    SourceOrigin, TrackLoad, TrackRow,
+    key_from_columns, key_mode_str, FileTags, Playlist, ScanDepth, ScanEvent, ScanStats, Source,
+    SourceKind, SourceOrigin, TrackLoad, TrackRow,
 };
 
 /// Bumped whenever `schema.sql` changes in a way that needs a new migration.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 const ANALYSIS_ALGORITHM: &str = "hypermixx";
 const ANALYSIS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SCHEMA: &str = include_str!("schema.sql");
@@ -390,7 +390,27 @@ impl LibraryDb {
         .map_err(LibraryError::from)
     }
 
-    /// Scans one registered folder source. `progress` is called per file on the scanning thread.
+    /// Builds only the source's playlist tree and commits it, without hashing a single audio file.
+    /// This is the fast first phase of a layered scan: the front-end can show lists right away.
+    /// No `scan_run` row is opened — that belongs to the full pass.
+    pub fn scan_lists(&self, source_id: i64) -> Result<()> {
+        let source = self
+            .source(source_id)?
+            .ok_or_else(|| LibraryError::Invalid(format!("no source {source_id}")))?;
+        let mut no_progress = |_| {};
+        let outcome = match source.kind {
+            SourceKind::Folder => folder::scan(self, &source, 0, ScanDepth::Lists, &mut no_progress),
+            SourceKind::Rekordbox => {
+                rekordbox::scan(self, &source, 0, ScanDepth::Lists, &mut no_progress)
+            }
+            SourceKind::VirtualDj => vdj::scan(self, &source, 0, ScanDepth::Lists, &mut no_progress),
+            SourceKind::Serato => serato::scan(self, &source, 0, ScanDepth::Lists, &mut no_progress),
+        };
+        outcome.map(|_| ())
+    }
+
+    /// Scans one registered source in full: the list tree plus every track. `progress` is called
+    /// per file on the scanning thread. This is the second phase of a layered scan.
     pub fn scan_source(
         &self,
         source_id: i64,
@@ -401,10 +421,12 @@ impl LibraryDb {
             .ok_or_else(|| LibraryError::Invalid(format!("no source {source_id}")))?;
         let scan_id = self.begin_scan(source_id)?;
         let outcome = match source.kind {
-            SourceKind::Folder => folder::scan(self, &source, scan_id, progress),
-            SourceKind::Rekordbox => rekordbox::scan(self, &source, scan_id, progress),
-            SourceKind::VirtualDj => vdj::scan(self, &source, scan_id, progress),
-            SourceKind::Serato => serato::scan(self, &source, scan_id, progress),
+            SourceKind::Folder => folder::scan(self, &source, scan_id, ScanDepth::Full, progress),
+            SourceKind::Rekordbox => {
+                rekordbox::scan(self, &source, scan_id, ScanDepth::Full, progress)
+            }
+            SourceKind::VirtualDj => vdj::scan(self, &source, scan_id, ScanDepth::Full, progress),
+            SourceKind::Serato => serato::scan(self, &source, scan_id, ScanDepth::Full, progress),
         };
         let (stats, status) = match &outcome {
             Ok(stats) => (stats.clone(), "ok"),
@@ -733,6 +755,17 @@ fn migrate(conn: &Connection) -> Result<()> {
              UPDATE source SET origin = 'folder' WHERE kind = 'folder';
              PRAGMA user_version = 2;",
         )?;
+        migrate(conn)?;
+    } else if version == 2 {
+        // Search-time merge key. The backfill must match `upsert_track` exactly: trim + lowercase,
+        // no inner-space folding, empty string for a missing title or artist.
+        conn.execute_batch(
+            "ALTER TABLE track ADD COLUMN match_key TEXT;
+             CREATE INDEX IF NOT EXISTS track_match ON track(match_key);
+             UPDATE track SET match_key =
+                lower(trim(coalesce(title, ''))) || '|' || lower(trim(coalesce(artist, '')));
+             PRAGMA user_version = 3;",
+        )?;
     } else if version != SCHEMA_VERSION {
         return Err(LibraryError::Invalid(format!(
             "library schema {} is newer than this build ({SCHEMA_VERSION})",
@@ -777,6 +810,9 @@ pub(crate) fn insert_playlist(
     )
 }
 
+/// Inserts or refreshes one list row, returning its stable id. The `ON CONFLICT` is what keeps
+/// `playlist_item` rows alive across a refresh: an unchanged `native_key` resolves to the same row
+/// id, so the items hanging off it survive the lists phase of a layered scan.
 pub(crate) fn insert_playlist_kind(
     conn: &Connection,
     source_id: i64,
@@ -786,12 +822,35 @@ pub(crate) fn insert_playlist_kind(
     kind: &str,
     position: i64,
 ) -> Result<i64> {
-    conn.execute(
+    let id: i64 = conn.query_row(
         "INSERT INTO playlist (source_id, parent_id, native_key, name, kind, position)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(source_id, native_key) DO UPDATE SET
+            parent_id = excluded.parent_id, name = excluded.name,
+            kind = excluded.kind, position = excluded.position
+         RETURNING id",
         params![source_id, parent_id, native_key, name, kind, position],
+        |row| row.get(0),
     )?;
-    Ok(conn.last_insert_rowid())
+    Ok(id)
+}
+
+/// Deletes the source's list rows that this refresh did not see. Items follow via cascade, which
+/// is the point: a list that is gone takes its cached tracks with it, while every list still on
+/// the device keeps its rows (and their items) untouched.
+pub(crate) fn prune_playlists(
+    conn: &Connection,
+    source_id: i64,
+    seen_native_keys: &[String],
+) -> Result<()> {
+    let seen = serde_json::to_string(seen_native_keys)
+        .unwrap_or_else(|_| "[]".to_owned());
+    conn.execute(
+        "DELETE FROM playlist WHERE source_id = ?1
+         AND native_key NOT IN (SELECT value FROM json_each(?2))",
+        params![source_id, seen],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn upsert_track(
@@ -808,20 +867,29 @@ pub(crate) fn upsert_track(
         ),
         None => (None, None, None),
     };
+    // The search-time merge key: normalized title + artist. Kept identical to the v3 backfill in
+    // `migrate` (trim + lowercase, no inner-space folding) so old and new rows can be grouped.
+    let match_key = format!(
+        "{}|{}",
+        tags.title.as_deref().unwrap_or("").trim().to_lowercase(),
+        tags.artist.as_deref().unwrap_or("").trim().to_lowercase(),
+    );
     conn.execute(
         "INSERT INTO track
-            (content_key, title, artist, album, genre, year, duration_frames, sample_rate,
-             channels, bpm, key_pc, key_mode, key_confidence, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+            (content_key, match_key, title, artist, album, genre, year, duration_frames,
+             sample_rate, channels, bpm, key_pc, key_mode, key_confidence, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
          ON CONFLICT(content_key) DO UPDATE SET
             title = excluded.title, artist = excluded.artist, album = excluded.album,
             genre = excluded.genre, year = excluded.year,
             duration_frames = excluded.duration_frames, sample_rate = excluded.sample_rate,
             channels = excluded.channels, bpm = excluded.bpm,
             key_pc = excluded.key_pc, key_mode = excluded.key_mode,
-            key_confidence = excluded.key_confidence, updated_at = excluded.updated_at",
+            key_confidence = excluded.key_confidence, match_key = excluded.match_key,
+            updated_at = excluded.updated_at",
         params![
             content_key,
+            match_key,
             tags.title,
             tags.artist,
             tags.album,
@@ -872,7 +940,7 @@ pub(crate) fn upsert_location(
          ON CONFLICT(source_id, path) DO UPDATE SET
             track_id = excluded.track_id, relative_path = excluded.relative_path,
             file_size = excluded.file_size, mtime_ns = excluded.mtime_ns,
-            file_hash = excluded.file_hash, last_seen_scan = excluded.last_seen_scan",
+            last_seen_scan = excluded.last_seen_scan",
         params![
             track_id,
             source_id,
@@ -892,20 +960,23 @@ pub(crate) fn upsert_location(
     Ok((id, existing.is_none()))
 }
 
+/// The fast path: same (source, path, size, mtime) means the file is untouched, so the whole row —
+/// including its track and everything hanging off that track — can be reused without reading a
+/// single byte of audio. Returns `(location_id, track_id)`.
 pub(crate) fn unchanged_location(
     conn: &Connection,
     source_id: i64,
     path: &Path,
     file_size: i64,
     mtime_ns: i64,
-) -> Result<Option<i64>> {
+) -> Result<Option<(i64, i64)>> {
     let path = path.to_string_lossy();
     Ok(conn
         .query_row(
-            "SELECT id FROM track_location
+            "SELECT id, track_id FROM track_location
              WHERE source_id = ?1 AND path = ?2 AND file_size = ?3 AND mtime_ns = ?4",
             params![source_id, path.as_ref(), file_size, mtime_ns],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?)
 }
@@ -1137,6 +1208,71 @@ mod tests {
     }
 
     #[test]
+    fn a_lists_pass_keeps_the_cached_playlist_items() {
+        let (db, dir) = temp_db("lists-keep-items");
+        let root = dir.join("music");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.wav"), wav_bytes(100, 400)).unwrap();
+        let source = db.add_folder_source(&root, None).unwrap();
+        db.scan_source(source.id, &mut |_| {}).unwrap();
+        let playlist = db.root_playlists(source.id).unwrap().remove(0);
+        assert_eq!(db.tracks_in_playlist(playlist.id).unwrap().len(), 1);
+
+        // The lists phase rebuilds the tree. It must not touch the items: this is the window the
+        // user is browsing in while the full pass is still running.
+        db.scan_lists(source.id).unwrap();
+        let after = db.root_playlists(source.id).unwrap().remove(0);
+        assert_eq!(after.id, playlist.id, "the row is upserted, not recreated");
+        assert_eq!(
+            db.tracks_in_playlist(after.id).unwrap().len(),
+            1,
+            "cached items survive the lists phase"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unchanged_file_reuses_its_track_row() {
+        let (db, dir) = temp_db("unchanged");
+        let root = dir.join("music");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.wav"), wav_bytes(100, 400)).unwrap();
+        let source = db.add_folder_source(&root, None).unwrap();
+        db.scan_source(source.id, &mut |_| {}).unwrap();
+        let first = db.tracks_in_playlist(db.root_playlists(source.id).unwrap()[0].id)
+            .unwrap()
+            .remove(0);
+
+        // Nothing changed on disk: the second pass takes the unchanged fast path and the track
+        // row — with any cached analysis keyed to it — stays exactly where it is.
+        let again = db.scan_source(source.id, &mut |_| {}).unwrap();
+        assert_eq!(again.files_added, 0);
+        let second = db.tracks_in_playlist(db.root_playlists(source.id).unwrap()[0].id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(second.track_id, first.track_id);
+        assert_eq!(second.location_id, first.location_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_track_gets_a_search_match_key() {
+        let (db, dir) = temp_db("match-key");
+        let root = dir.join("music");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.wav"), wav_bytes(100, 400)).unwrap();
+        let source = db.add_folder_source(&root, None).unwrap();
+        db.scan_source(source.id, &mut |_| {}).unwrap();
+        // No tags in a bare wav: the title falls back to the file stem, the artist stays empty.
+        let conn = db.lock().unwrap();
+        let match_key: String = conn
+            .query_row("SELECT match_key FROM track", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(match_key, "a|");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_analysis_round_trips_through_the_cache() {
         let (db, dir) = temp_db("analysis");
         let root = dir.join("music");
@@ -1274,9 +1410,30 @@ mod tests {
                     last_scan_at INTEGER, UNIQUE (kind, root));
                  INSERT INTO source (kind, name, root, created_at)
                     VALUES ('folder', 'old', '/music', 1);
+                 CREATE TABLE track (
+                    id INTEGER PRIMARY KEY, content_key TEXT NOT NULL UNIQUE,
+                    title TEXT, artist TEXT, album TEXT, genre TEXT, year INTEGER,
+                    duration_frames INTEGER NOT NULL DEFAULT 0, sample_rate INTEGER NOT NULL DEFAULT 0,
+                    channels INTEGER NOT NULL DEFAULT 0, bpm REAL, key_pc INTEGER, key_mode TEXT,
+                    key_confidence REAL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 INSERT INTO track (content_key, title, artist, created_at, updated_at)
+                    VALUES ('sha256:old', 'Old Track', 'Old Artist', 1, 1);
                  PRAGMA user_version = 1;",
             )
             .unwrap();
+        }
+        let db = LibraryDb::open(&path).unwrap();
+        let source = db.sources().unwrap().remove(0);
+        assert_eq!(source.origin, SourceOrigin::Folder);
+        {
+            // The v3 step backfilled the search key with the same rule `upsert_track` uses.
+            let conn = db.lock().unwrap();
+            let match_key: String = conn
+                .query_row("SELECT match_key FROM track WHERE content_key = 'sha256:old'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(match_key, "old track|old artist");
         }
         let db = LibraryDb::open(&path).unwrap();
         let source = db.sources().unwrap().remove(0);

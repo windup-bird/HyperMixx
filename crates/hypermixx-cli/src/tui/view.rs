@@ -1859,7 +1859,14 @@ mod tests {
     fn test_app() -> App {
         let (_notice_tx, notice_rx) = crossbeam_channel::unbounded();
         let (_event_tx, event_rx) = crossbeam_channel::unbounded();
-        let mut app = App::new(2, Backend::Auto, notice_rx, event_rx, Default::default());
+        let mut app = App::new(
+            2,
+            Backend::Auto,
+            notice_rx,
+            event_rx,
+            Default::default(),
+            Default::default(),
+        );
         let buckets: Vec<StereoPeaks> = (0..400)
             .map(|index| StereoPeaks {
                 left: BandPeaks {

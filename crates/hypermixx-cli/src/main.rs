@@ -15,7 +15,6 @@ mod repl;
 mod response;
 mod session;
 mod tui;
-mod usb;
 
 use std::sync::Arc;
 

@@ -1,10 +1,6 @@
 //! Shared file-side helpers for the source adapters: identity, hashing, and the extension set.
 
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-
-use sha2::{Digest, Sha256};
 
 /// Extensions the library indexes. A source may point at any of these; the decoder decides later
 /// whether a particular file is actually playable.
@@ -26,9 +22,11 @@ pub fn relative_key(root: &Path, path: &Path) -> String {
         .into_owned()
 }
 
-/// `(file_size, mtime_ns, sha256)` for one file. Hashing is streaming, so a large track does not
-/// need to be resident in memory.
-pub fn file_identity(path: &Path) -> std::result::Result<(i64, i64, String), String> {
+/// `(file_size, mtime_ns)` for one file — a single `stat`, no content is read. Scans are
+/// metadata-only by design: the export databases carry the tags, and an unchanged
+/// `(source, path, size, mtime)` reuses the cached row wholesale. SHA-256 was dropped from the
+/// scan path; if content-keyed dedup is ever needed again, it belongs in a background job.
+pub fn file_stat(path: &Path) -> std::result::Result<(i64, i64), String> {
     let metadata = std::fs::metadata(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let file_size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
     let mtime_ns = metadata
@@ -37,30 +35,7 @@ pub fn file_identity(path: &Path) -> std::result::Result<(i64, i64, String), Str
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos() as i64)
         .unwrap_or(0);
-    let hash = hash_file(path)?;
-    Ok((file_size, mtime_ns, hash))
-}
-
-pub fn hash_file(path: &Path) -> std::result::Result<String, String> {
-    let mut file = File::open(path).map_err(|err| format!("{}: {err}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|err| format!("{}: {err}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    Ok(out)
+    Ok((file_size, mtime_ns))
 }
 
 /// Resolves a path written by another tool against a USB root. Source files often carry a Windows
@@ -110,17 +85,19 @@ mod tests {
     }
 
     #[test]
-    fn a_hash_is_stable_for_the_same_bytes() {
+    fn a_stat_reports_size_and_mtime() {
         let path = std::env::temp_dir().join(format!(
-            "hypermixx-hash-{}-{}",
+            "hypermixx-stat-{}-{}",
             std::process::id(),
             crate::library::db::unix_now()
         ));
         std::fs::write(&path, b"hypermixx").unwrap();
-        let a = hash_file(&path).unwrap();
-        let b = hash_file(&path).unwrap();
-        assert_eq!(a, b);
-        assert_eq!(a.len(), 64);
+        let (size, mtime) = file_stat(&path).unwrap();
+        assert_eq!(size, 9);
+        assert!(mtime > 0);
+        let again = file_stat(&path).unwrap();
+        assert_eq!(size, again.0);
+        assert_eq!(mtime, again.1);
         let _ = std::fs::remove_file(path);
     }
 }

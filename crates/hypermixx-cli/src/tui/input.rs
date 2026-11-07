@@ -1005,6 +1005,7 @@ mod tests {
             app_notice_rx,
             event_rx,
             Default::default(),
+            Default::default(),
         );
         let dispatcher = Dispatcher::new(command_tx, notice_tx);
         (app, dispatcher, command_rx)

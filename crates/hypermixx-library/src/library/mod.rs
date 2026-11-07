@@ -6,6 +6,7 @@
 pub mod db;
 pub mod import;
 pub mod model;
+pub mod scan_service;
 pub mod tags;
 
 pub use db::{
@@ -13,5 +14,7 @@ pub use db::{
     Result, DEFAULT_CACHE_DIR, SCHEMA_VERSION,
 };
 pub use model::{
-    FileTags, Playlist, ScanEvent, ScanStats, Source, SourceKind, SourceOrigin, TrackLoad, TrackRow,
+    FileTags, Playlist, ScanDepth, ScanEvent, ScanStats, Source, SourceKind, SourceOrigin,
+    TrackLoad, TrackRow,
 };
+pub use scan_service::{ScanProgress, ScanService};

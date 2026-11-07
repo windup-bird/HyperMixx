@@ -10,6 +10,7 @@ pub mod grid_compiler;
 pub mod library;
 pub mod loudness;
 pub mod track;
+pub mod usb;
 pub mod waveform;
 
 pub use analyser::{analyze, AnalyserError, Backend, RawAnalysis, RefineConfig};
@@ -19,7 +20,8 @@ pub use loudness::loudness_db;
 pub use library::Result;
 pub use library::{
     cache_root, default_database_path, detect_source_kinds, FileTags, LibraryDb, LibraryError,
-    ImportCalibration, LoadedCues, Playlist, ScanEvent, ScanStats, Source, SourceKind, SourceOrigin, TrackLoad, TrackRow,
+    ImportCalibration, LoadedCues, Playlist, ScanDepth, ScanEvent, ScanProgress, ScanService,
+    ScanStats, Source, SourceKind, SourceOrigin, TrackLoad, TrackRow,
 };
 pub use track::{Metadata, TrackId, TrackInfo};
 pub use waveform::{BandPeaks, StereoPeaks, Waveform, BASE_BUCKET};

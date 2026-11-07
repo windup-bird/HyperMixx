@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use walkdir::WalkDir;
 
 use super::super::db::{
-    finish_source_scan, insert_playlist, insert_playlist_item, touch_location, unchanged_location,
-    unix_now, upsert_location, upsert_track, LibraryDb, Result,
+    finish_source_scan, insert_playlist, insert_playlist_item, prune_playlists, touch_location,
+    unchanged_location, unix_now, upsert_location, upsert_track, LibraryDb, Result,
 };
-use super::super::model::{ScanEvent, ScanStats, Source};
+use super::super::model::{ScanDepth, ScanEvent, ScanStats, Source};
 use super::super::tags;
 use super::util;
 
@@ -17,6 +17,7 @@ pub(crate) fn scan(
     db: &LibraryDb,
     source: &Source,
     scan_id: i64,
+    depth: ScanDepth,
     progress: &mut dyn FnMut(ScanEvent),
 ) -> Result<ScanStats> {
     let root = source.root.clone();
@@ -27,9 +28,18 @@ pub(crate) fn scan(
     let now = unix_now();
 
     db.with_transaction(|tx| {
-        // Rebuild the source's tree each refresh. Track/location rows survive by content/path, so
-        // analysis and stable track ids are unaffected.
-        tx.execute("DELETE FROM playlist WHERE source_id = ?1", [source.id])?;
+        // List rows are upserted by stable `native_key`, not deleted and rebuilt: an unchanged key
+        // keeps its row id, so cached playlist items survive a refresh and the browser never shows
+        // an empty list mid-scan. The full pass alone rebuilds items (positions may change).
+        if depth == ScanDepth::Full {
+            tx.execute(
+                "DELETE FROM playlist_item WHERE playlist_id IN
+                 (SELECT id FROM playlist WHERE source_id = ?1)",
+                [source.id],
+            )?;
+        }
+        // Every key seen this refresh; rows missing from it are pruned at the end.
+        let mut seen: Vec<String> = vec![String::new()];
         let root_playlist = insert_playlist(tx, source.id, None, "", &root_name, 0)?;
 
         let mut directories: HashMap<PathBuf, i64> = HashMap::new();
@@ -67,8 +77,14 @@ pub(crate) fn scan(
                 let playlist_id =
                     insert_playlist(tx, source.id, Some(parent_id), &relative, &name, *position)?;
                 *position += 1;
+                seen.push(relative);
                 directories.insert(path, playlist_id);
                 positions.insert(playlist_id, 0);
+                continue;
+            }
+            // Phase one only builds the tree. Skipping files is what makes it cheap: no stat, no
+            // tag read — just the directory walk.
+            if depth == ScanDepth::Lists {
                 continue;
             }
             if !util::is_audio(&path) {
@@ -91,7 +107,7 @@ pub(crate) fn scan(
                 .unwrap_or(0);
             let parent = path.parent().unwrap_or(&root);
             let playlist_id = *directories.get(parent).unwrap_or(&root_playlist);
-            if let Some(location_id) =
+            if let Some((location_id, _track_id)) =
                 unchanged_location(tx, source.id, &path, file_size, mtime_ns)?
             {
                 touch_location(tx, location_id, scan_id)?;
@@ -106,13 +122,6 @@ pub(crate) fn scan(
                 });
                 continue;
             }
-            let file_hash = match util::hash_file(&path) {
-                Ok(hash) => hash,
-                Err(err) => {
-                    stats.errors.push(err);
-                    continue;
-                }
-            };
             let mut file_tags = match tags::read_tags(&path) {
                 Ok(tags) => tags,
                 Err(err) => {
@@ -125,11 +134,13 @@ pub(crate) fn scan(
                     .file_stem()
                     .map(|stem| stem.to_string_lossy().into_owned());
             }
-            let content_key = format!("sha256:{file_hash}:{file_size}");
-            let track_id = upsert_track(tx, &content_key, &file_tags, now)?;
+            // A folder source has no native track id; size + mtime + path is its identity. The
+            // unchanged check above means this is only reached for new or modified files.
             let relative = util::relative_key(&root, &path);
+            let content_key = format!("fs:{relative}:{file_size}:{mtime_ns}");
+            let track_id = upsert_track(tx, &content_key, &file_tags, now)?;
             let (location_id, added) = upsert_location(
-                tx, track_id, source.id, &path, &relative, file_size, mtime_ns, &file_hash, scan_id,
+                tx, track_id, source.id, &path, &relative, file_size, mtime_ns, "", scan_id,
             )?;
 
             let position = positions.entry(playlist_id).or_insert(0);
@@ -148,7 +159,12 @@ pub(crate) fn scan(
             });
         }
 
-        stats.files_removed = finish_source_scan(tx, source.id, scan_id)?;
+        prune_playlists(tx, source.id, &seen)?;
+        // Pruning is a full-pass concern: a lists-only pass must not delete locations that belong
+        // to lists it never visited.
+        if depth == ScanDepth::Full {
+            stats.files_removed = finish_source_scan(tx, source.id, scan_id)?;
+        }
         Ok(stats)
     })
 }

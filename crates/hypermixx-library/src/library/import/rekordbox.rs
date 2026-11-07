@@ -12,9 +12,10 @@ use rusqlite::Connection;
 
 use super::super::db::{
     clear_imported_timing, finish_source_scan, insert_playlist_item, insert_playlist_kind,
-    unix_now, upsert_location, upsert_track, LibraryDb, LibraryError, Result,
+    prune_playlists, touch_location, unchanged_location, unix_now, upsert_location, upsert_track,
+    LibraryDb, LibraryError, Result,
 };
-use super::super::model::{ScanEvent, ScanStats, Source};
+use super::super::model::{ScanDepth, ScanEvent, ScanStats, Source};
 use super::super::tags;
 use super::analysis;
 use super::util;
@@ -49,6 +50,7 @@ pub(crate) fn scan(
     db: &LibraryDb,
     source: &Source,
     scan_id: i64,
+    depth: ScanDepth,
     progress: &mut dyn FnMut(ScanEvent),
 ) -> Result<ScanStats> {
     let root = source.root.clone();
@@ -59,7 +61,7 @@ pub(crate) fn scan(
     .into_iter()
     .find(|path| path.is_file());
     let Some(database) = database else {
-        return scan_pdb(db, source, scan_id, progress);
+        return scan_pdb(db, source, scan_id, depth, progress);
     };
     let copy = copy_database(&database)?;
     let conn = open_encrypted(&copy.path)?;
@@ -70,12 +72,24 @@ pub(crate) fn scan(
     let rb_mp3_offset_ms = db.import_calibration().rkb_mp3_offset_ms;
     let now = unix_now();
     let stats = db.with_transaction(|tx| {
-        tx.execute("DELETE FROM playlist WHERE source_id = ?1", [source.id])?;
-        clear_imported_timing(tx, source.id)?;
+        // List rows are upserted by stable `native_key`, so cached playlist items survive the
+        // lists phase. The full pass rebuilds items (positions may change between exports).
+        if depth == ScanDepth::Full {
+            tx.execute(
+                "DELETE FROM playlist_item WHERE playlist_id IN
+                 (SELECT id FROM playlist WHERE source_id = ?1)",
+                [source.id],
+            )?;
+            // Timing is rebuilt by the full pass; a lists-only pass must leave the cached
+            // cues/grids alone, or the browser would show a tree with no analysis behind it.
+            clear_imported_timing(tx, source.id)?;
+        }
 
         let mut stats = ScanStats::default();
+        let mut seen: Vec<String> = Vec::new();
         let mut locations: HashMap<i64, i64> = HashMap::new();
-        for content in &contents {
+        // Phase one skips the whole content loop: no file is read and no location is touched.
+        for content in contents.iter().filter(|_| depth == ScanDepth::Full) {
             let path = util::resolve_under_root(&root, &content.path)
                 .or_else(|| util::resolve_under_root(&root, &content.file_name));
             let Some(path) = path else {
@@ -85,13 +99,27 @@ pub(crate) fn scan(
                 ));
                 continue;
             };
-            let (file_size, mtime_ns, file_hash) = match util::file_identity(&path) {
-                Ok(identity) => identity,
+            let (file_size, mtime_ns) = match util::file_stat(&path) {
+                Ok(stat) => stat,
                 Err(err) => {
                     stats.errors.push(err);
                     continue;
                 }
             };
+            // An unchanged file reuses its whole row, track and analysis included.
+            if let Some((location_id, _track_id)) =
+                unchanged_location(tx, source.id, &path, file_size, mtime_ns)?
+            {
+                touch_location(tx, location_id, scan_id)?;
+                locations.insert(content.content_id, location_id);
+                stats.files_seen += 1;
+                stats.files_updated += 1;
+                progress(ScanEvent {
+                    index: stats.files_seen,
+                    path,
+                });
+                continue;
+            }
             let mut tags = tags::read_tags(&path).unwrap_or_default();
             tags.title = Some(content.title.clone());
             tags.artist = content.artist.clone().or(tags.artist);
@@ -109,11 +137,12 @@ pub(crate) fn scan(
             if let Some(seconds) = content.length_seconds {
                 tags.duration_frames = seconds * u64::from(tags.sample_rate);
             }
-            let content_key = format!("sha256:{file_hash}:{file_size}");
+            // The export database's own id is the track's identity — no audio byte is read.
+            let content_key = format!("native:rb:{}", content.content_id);
             let track_id = upsert_track(tx, &content_key, &tags, now)?;
             let relative = util::relative_key(&root, &path);
             let (location_id, added) = upsert_location(
-                tx, track_id, source.id, &path, &relative, file_size, mtime_ns, &file_hash, scan_id,
+                tx, track_id, source.id, &path, &relative, file_size, mtime_ns, "", scan_id,
             )?;
             locations.insert(content.content_id, location_id);
             stats.files_seen += 1;
@@ -138,8 +167,21 @@ pub(crate) fn scan(
             });
         }
 
-        import_playlists(tx, source.id, &playlists, &items, &locations, &mut stats)?;
-        stats.files_removed = finish_source_scan(tx, source.id, scan_id)?;
+        // With an empty `locations` map this builds the playlist rows and no items, which is
+        // exactly the lists-only tree.
+        import_playlists(
+            tx,
+            source.id,
+            &playlists,
+            &items,
+            &locations,
+            &mut seen,
+            &mut stats,
+        )?;
+        prune_playlists(tx, source.id, &seen)?;
+        if depth == ScanDepth::Full {
+            stats.files_removed = finish_source_scan(tx, source.id, scan_id)?;
+        }
         Ok(stats)
     })?;
     Ok(stats)
@@ -151,6 +193,7 @@ fn scan_pdb(
     db: &LibraryDb,
     source: &Source,
     scan_id: i64,
+    depth: ScanDepth,
     progress: &mut dyn FnMut(ScanEvent),
 ) -> Result<ScanStats> {
     let root = source.root.clone();
@@ -166,8 +209,14 @@ fn scan_pdb(
         .map_err(|err| LibraryError::Invalid(format!("{}: {err}", pdb_path.display())))?;
     let now = unix_now();
     db.with_transaction(|tx| {
-        tx.execute("DELETE FROM playlist WHERE source_id = ?1", [source.id])?;
-        clear_imported_timing(tx, source.id)?;
+        if depth == ScanDepth::Full {
+            tx.execute(
+                "DELETE FROM playlist_item WHERE playlist_id IN
+                 (SELECT id FROM playlist WHERE source_id = ?1)",
+                [source.id],
+            )?;
+            clear_imported_timing(tx, source.id)?;
+        }
 
         let artists: HashMap<u32, &str> = pdb
             .artists
@@ -191,8 +240,11 @@ fn scan_pdb(
             .collect();
 
         let mut stats = ScanStats::default();
+        let mut seen: Vec<String> = Vec::new();
         let mut locations: HashMap<u32, i64> = HashMap::new();
-        for track in &pdb.tracks {
+        // Phase one skips the track loop entirely; the playlist tree below is still built from
+        // the PDB.
+        for track in pdb.tracks.iter().filter(|_| depth == ScanDepth::Full) {
             let Some(path) = util::resolve_under_root(&root, track.file_path()) else {
                 stats.errors.push(format!(
                     "track {}: no file for {}",
@@ -201,13 +253,27 @@ fn scan_pdb(
                 ));
                 continue;
             };
-            let (file_size, mtime_ns, file_hash) = match util::file_identity(&path) {
-                Ok(identity) => identity,
+            let (file_size, mtime_ns) = match util::file_stat(&path) {
+                Ok(stat) => stat,
                 Err(err) => {
                     stats.errors.push(err);
                     continue;
                 }
             };
+            // An unchanged file reuses its whole row, track and analysis included.
+            if let Some((location_id, _track_id)) =
+                unchanged_location(tx, source.id, &path, file_size, mtime_ns)?
+            {
+                touch_location(tx, location_id, scan_id)?;
+                locations.insert(track.id, location_id);
+                stats.files_seen += 1;
+                stats.files_updated += 1;
+                progress(ScanEvent {
+                    index: stats.files_seen,
+                    path,
+                });
+                continue;
+            }
             let mut tags = tags::read_tags(&path).unwrap_or_default();
             tags.title = Some(track.title().to_owned()).filter(|title| !title.is_empty());
             tags.artist = artists.get(&track.artist_id).map(|name| (*name).to_owned());
@@ -225,11 +291,12 @@ fn scan_pdb(
             if track.duration > 0 {
                 tags.duration_frames = u64::from(track.duration) * u64::from(tags.sample_rate);
             }
-            let content_key = format!("sha256:{file_hash}:{file_size}");
+            // The PDB's own track id is the identity — no audio byte is read.
+            let content_key = format!("native:pdb:{}", track.id);
             let track_id = upsert_track(tx, &content_key, &tags, now)?;
             let relative = util::relative_key(&root, &path);
             let (location_id, added) = upsert_location(
-                tx, track_id, source.id, &path, &relative, file_size, mtime_ns, &file_hash, scan_id,
+                tx, track_id, source.id, &path, &relative, file_size, mtime_ns, "", scan_id,
             )?;
             locations.insert(track.id, location_id);
             stats.files_seen += 1;
@@ -267,16 +334,18 @@ fn scan_pdb(
                 if node.parent_id != 0 && parent.is_none() {
                     return true;
                 }
+                let key = format!("pdb:{}", node.id);
                 match insert_playlist_kind(
                     tx,
                     source.id,
                     parent,
-                    &format!("pdb:{}", node.id),
+                    &key,
                     &node.name,
                     if node.is_folder { "folder" } else { "playlist" },
                     i64::from(node.sort_order),
                 ) {
                     Ok(id) => {
+                        seen.push(key);
                         playlist_ids.insert(node.id, id);
                         false
                     }
@@ -303,7 +372,10 @@ fn scan_pdb(
             insert_playlist_item(tx, *playlist_id, *location_id, *position)?;
             *position += 1;
         }
-        stats.files_removed = finish_source_scan(tx, source.id, scan_id)?;
+        prune_playlists(tx, source.id, &seen)?;
+        if depth == ScanDepth::Full {
+            stats.files_removed = finish_source_scan(tx, source.id, scan_id)?;
+        }
         Ok(stats)
     })
 }
@@ -343,6 +415,7 @@ fn import_playlists(
     playlists: &[(i64, i64, String, i64)],
     items: &[(i64, i64, i64)],
     locations: &HashMap<i64, i64>,
+    seen: &mut Vec<String>,
     stats: &mut ScanStats,
 ) -> Result<()> {
     let mut ids: HashMap<i64, i64> = HashMap::new();
@@ -358,16 +431,18 @@ fn import_playlists(
             if *parent > 0 && parent_id.is_none() {
                 return true;
             }
+            let key = format!("rb:{id}");
             match insert_playlist_kind(
                 conn,
                 source_id,
                 parent_id,
-                &format!("rb:{id}"),
+                &key,
                 name,
                 "playlist",
                 *sequence,
             ) {
                 Ok(new_id) => {
+                    seen.push(key);
                     ids.insert(*id, new_id);
                     false
                 }
@@ -383,15 +458,17 @@ fn import_playlists(
         if pending.len() == before {
             // A broken parent chain: keep the rows visible as roots rather than dropping them.
             for (id, sequence, name, _) in pending.drain(..) {
+                let key = format!("rb:{id}");
                 if let Ok(new_id) = insert_playlist_kind(
                     conn,
                     source_id,
                     None,
-                    &format!("rb:{id}"),
+                    &key,
                     name,
                     "playlist",
                     *sequence,
                 ) {
+                    seen.push(key);
                     ids.insert(*id, new_id);
                 }
             }

@@ -30,6 +30,9 @@ CREATE INDEX IF NOT EXISTS playlist_parent ON playlist(source_id, parent_id, pos
 CREATE TABLE IF NOT EXISTS track (
     id               INTEGER PRIMARY KEY,
     content_key      TEXT NOT NULL UNIQUE,
+    -- Search-time merge key: normalized `title|artist`. Rows with the same key are the same song
+    -- as far as cross-device search is concerned; group results by it.
+    match_key        TEXT,
     title            TEXT,
     artist           TEXT,
     album            TEXT,
@@ -45,6 +48,8 @@ CREATE TABLE IF NOT EXISTS track (
     created_at       INTEGER NOT NULL,
     updated_at       INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS track_match ON track(match_key);
 
 CREATE TABLE IF NOT EXISTS track_location (
     id              INTEGER PRIMARY KEY,

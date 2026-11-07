@@ -11,9 +11,10 @@ use hypermixx_core::Key;
 
 use super::super::db::{
     clear_imported_timing, finish_source_scan, insert_beatgrid, insert_cue, insert_playlist_item,
-    insert_playlist_kind, unix_now, upsert_location, upsert_track, LibraryDb, LibraryError, Result,
+    insert_playlist_kind, prune_playlists, touch_location, unchanged_location, unix_now,
+    upsert_location, upsert_track, LibraryDb, LibraryError, Result,
 };
-use super::super::model::{ScanEvent, ScanStats, Source};
+use super::super::model::{ScanDepth, ScanEvent, ScanStats, Source};
 use super::super::tags;
 use super::util;
 
@@ -45,6 +46,7 @@ pub(crate) fn scan(
     db: &LibraryDb,
     source: &Source,
     scan_id: i64,
+    depth: ScanDepth,
     progress: &mut dyn FnMut(ScanEvent),
 ) -> Result<ScanStats> {
     let root = source.root.clone();
@@ -61,23 +63,45 @@ pub(crate) fn scan(
 
     let now = unix_now();
     db.with_transaction(|tx| {
-        tx.execute("DELETE FROM playlist WHERE source_id = ?1", [source.id])?;
-        clear_imported_timing(tx, source.id)?;
+        if depth == ScanDepth::Full {
+            tx.execute(
+                "DELETE FROM playlist_item WHERE playlist_id IN
+                 (SELECT id FROM playlist WHERE source_id = ?1)",
+                [source.id],
+            )?;
+            clear_imported_timing(tx, source.id)?;
+        }
 
         let mut stats = ScanStats::default();
+        let mut seen: Vec<String> = Vec::new();
         let mut locations: HashMap<PathBuf, i64> = HashMap::new();
-        for track in &tracks {
+        // Phase one skips the track loop; the crates below are still built from the database.
+        for track in tracks.iter().filter(|_| depth == ScanDepth::Full) {
             let Some(path) = util::resolve_under_root(&root, &track.path) else {
                 stats.errors.push(format!("no file for {}", track.path));
                 continue;
             };
-            let (file_size, mtime_ns, file_hash) = match util::file_identity(&path) {
-                Ok(identity) => identity,
+            let (file_size, mtime_ns) = match util::file_stat(&path) {
+                Ok(stat) => stat,
                 Err(err) => {
                     stats.errors.push(err);
                     continue;
                 }
             };
+            // An unchanged file reuses its whole row, track and timing data included.
+            if let Some((location_id, _track_id)) =
+                unchanged_location(tx, source.id, &path, file_size, mtime_ns)?
+            {
+                touch_location(tx, location_id, scan_id)?;
+                locations.insert(path.clone(), location_id);
+                stats.files_seen += 1;
+                stats.files_updated += 1;
+                progress(ScanEvent {
+                    index: stats.files_seen,
+                    path,
+                });
+                continue;
+            }
             let mut tags = tags::read_tags(&path).unwrap_or_default();
             tags.title = track.title.clone().or(tags.title);
             tags.artist = track.artist.clone().or(tags.artist);
@@ -90,11 +114,13 @@ pub(crate) fn scan(
             if let Some(seconds) = track.duration_seconds {
                 tags.duration_frames = seconds * u64::from(tags.sample_rate);
             }
-            let content_key = format!("sha256:{file_hash}:{file_size}");
-            let track_id = upsert_track(tx, &content_key, &tags, now)?;
+            // Serato's database V2 carries no native track id: path + size + mtime is the
+            // identity, and the unchanged check above keeps repeat scans off this path.
             let relative = util::relative_key(&root, &path);
+            let content_key = format!("fs:{relative}:{file_size}:{mtime_ns}");
+            let track_id = upsert_track(tx, &content_key, &tags, now)?;
             let (location_id, added) = upsert_location(
-                tx, track_id, source.id, &path, &relative, file_size, mtime_ns, &file_hash, scan_id,
+                tx, track_id, source.id, &path, &relative, file_size, mtime_ns, "", scan_id,
             )?;
             locations.insert(path.clone(), location_id);
             stats.files_seen += 1;
@@ -132,20 +158,23 @@ pub(crate) fn scan(
                 "playlist",
                 0,
             )?;
+            seen.push("serato:tracks".to_owned());
             for (position, location_id) in locations.values().enumerate() {
                 insert_playlist_item(tx, playlist_id, *location_id, position as i64)?;
             }
         } else {
             for (index, (name, paths)) in crates.iter().enumerate() {
+                let key = format!("serato:crate:{index}");
                 let playlist_id = insert_playlist_kind(
                     tx,
                     source.id,
                     None,
-                    &format!("serato:crate:{index}"),
+                    &key,
                     name,
                     "crate",
                     index as i64,
                 )?;
+                seen.push(key);
                 let mut position = 0;
                 for raw in paths {
                     let Some(path) = util::resolve_under_root(&root, raw) else {
@@ -162,7 +191,10 @@ pub(crate) fn scan(
                 }
             }
         }
-        stats.files_removed = finish_source_scan(tx, source.id, scan_id)?;
+        prune_playlists(tx, source.id, &seen)?;
+        if depth == ScanDepth::Full {
+            stats.files_removed = finish_source_scan(tx, source.id, scan_id)?;
+        }
         Ok(stats)
     })
 }

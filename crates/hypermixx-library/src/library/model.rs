@@ -177,8 +177,20 @@ pub struct ScanEvent {
     pub path: PathBuf,
 }
 
-/// What one refresh changed.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// How far a scan goes. `Lists` builds only the playlist tree (no audio file is read) and commits
+/// it so the front-end can show the tree immediately; `Full` then reads every track's metadata.
+/// Keeping this on the adapters means the two phases share the same export parsing instead of
+/// duplicating it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ScanDepth {
+    Lists,
+    #[default]
+    Full,
+}
+
+/// What one refresh changed. Carried in [`super::scan_service::ScanProgress`], so it is serde-ready
+/// for a future FFI boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ScanStats {
     pub files_seen: usize,
     pub files_added: usize,

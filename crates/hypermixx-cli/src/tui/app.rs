@@ -6,7 +6,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -16,7 +16,7 @@ use hypermixx_core::{
     KeyFormat, KeylockMode, StemStatus,
 };
 use hypermixx_library::{
-    detect_source_kinds, ImportCalibration, LibraryDb, ScanStats, Source, SourceKind, SourceOrigin,
+    detect_source_kinds, ImportCalibration, LibraryDb, ScanProgress, ScanService, Source, SourceKind,
 };
 
 use crate::command::{Slots, UiEvent};
@@ -28,7 +28,6 @@ use crate::tui::browser::Browser;
 use crate::tui::completer::{self, Completion, Ctx};
 use crate::tui::picker::{FilePicker, PortList};
 use crate::tui::waveform_view::WaveformView;
-use crate::usb::{self, UsbEvent};
 
 /// Waveform zoom bounds, in frames per terminal cell. 512 frames is ~11.6ms per cell (the finest
 /// the peak pyramid resolves), 131072 is ~3s per cell (a very wide overview). Keeping the unit
@@ -306,26 +305,6 @@ impl Knob {
     }
 }
 
-/// One batch for the single scan worker. Calibration travels with it because it is state on the db
-/// handle, not something the file stores: a fresh connection starts from the defaults.
-struct ScanRequest {
-    sources: Vec<Source>,
-    calibration: ImportCalibration,
-}
-
-/// A background library scan finishing on its worker connection. The scan itself runs there; the
-/// event only carries what the UI needs to log and reload. The UI keeps its own count of sources in
-/// flight, so the browser is reloaded once at the very end instead of once per source (which would
-/// pull the user back to the first library mid-browse).
-enum LibraryScanEvent {
-    Scanned {
-        name: String,
-        kind: SourceKind,
-        outcome: Result<ScanStats, String>,
-    },
-    OpenFailed(String),
-}
-
 /// A deck's transport, as the TUI sees it. Mirrors [`DeckState`] plus front-end-only data.
 pub struct App {
     pub version: &'static str,
@@ -361,19 +340,9 @@ pub struct App {
     /// Sources the configured preference categories allow. Everything else stays in the cache but
     /// is not shown or scanned.
     pub allowed_sources: HashSet<i64>,
-    /// Formats enabled for USB auto-discovery.
-    usb_formats: Vec<SourceKind>,
-    usb_rx: Option<Receiver<UsbEvent>>,
-    /// The one scan worker's queue. Spawned lazily on the first batch because the library handle
-    /// arrives after `App::new`. A single worker matters: `scan_source` holds a write transaction
-    /// for the whole scan, so two workers would only block each other on SQLite's busy timeout.
-    scan_request_tx: Option<Sender<ScanRequest>>,
-    /// Results coming back from that worker, on the worker's own db connection so the browser is
-    /// never held up while a large library is hashed.
-    library_scan_tx: Sender<LibraryScanEvent>,
-    library_scan_rx: Receiver<LibraryScanEvent>,
-    /// Sources queued but not reported yet. Non-zero means "keep the browser where the user put it".
-    library_scan_pending: usize,
+    /// Shared with the command dispatcher: both front-ends and `browser refresh` use the same
+    /// worker. Only `enqueue` and `poll_next` happen on the UI thread.
+    pub scan: Arc<Mutex<ScanService>>,
     /// `None` probes each file; a fixed value overrides the decoder start trim.
     pub decoder_start_ms: Option<f64>,
     /// Extra imported-grid/cue correction, positive = later.
@@ -463,12 +432,12 @@ impl App {
         notice_rx: Receiver<LogLine>,
         event_rx: Receiver<UiEvent>,
         fx_slots: Slots,
+        scan: Arc<Mutex<ScanService>>,
     ) -> Self {
         let decks = decks.max(1);
         let (waveform_tx, waveform_rx) = crossbeam_channel::unbounded();
         let (cover_tx, cover_rx) = crossbeam_channel::unbounded();
         let (browser_tx, browser_rx) = crossbeam_channel::unbounded();
-        let (library_scan_tx, library_scan_rx) = crossbeam_channel::unbounded();
         let browser = Browser::new();
         Self {
             version: crate::VERSION,
@@ -491,12 +460,7 @@ impl App {
             theme: Theme::default(),
             library: None,
             allowed_sources: HashSet::new(),
-            usb_formats: Vec::new(),
-            usb_rx: None,
-            scan_request_tx: None,
-            library_scan_tx,
-            library_scan_rx,
-            library_scan_pending: 0,
+            scan,
             decoder_start_ms: None,
             grid_offset_ms: 0.0,
             states: (0..decks)
@@ -732,178 +696,20 @@ impl App {
                 }
             }
         }
-        self.start_usb_watcher(settings.usb_kinds());
-        // Show the cached tree before touching the disk: the first scan of a large folder can take
-        // minutes, and blocking here would keep the terminal on the normal screen.
+        // The library owns the removable-media watcher and the scan worker; this front-end only
+        // configures them and enqueues the configured sources. Nothing here touches the disk.
+        let mut scan = self.scan.lock().expect("scan service lock");
+        scan.configure(&db, settings.usb_kinds());
+        let count = pending.len();
+        let queued = scan.enqueue(pending);
+        drop(scan);
+        // Show the cached tree before the worker fills it in: the first scan of a large folder can
+        // take a while, and blocking here would keep the terminal on the normal screen.
         self.reload_browser();
-        self.enqueue_scan(pending);
-    }
-
-    /// Queues sources for the single background scan worker, creating that worker on the first
-    /// batch. Everything that touches the disk (opening the second connection, hashing files,
-    /// writing the scan transaction) happens on the worker, never on the UI thread.
-    ///
-    /// Returns whether the batch was queued. A false return means no reload will follow from a scan
-    /// event, so the caller may want to refresh the browser itself.
-    fn enqueue_scan(&mut self, sources: Vec<Source>) -> bool {
-        if sources.is_empty() {
-            return false;
-        }
-        let Some(db) = self.library.as_ref() else {
-            return false;
-        };
-        // The calibration is *state* on the handle, not something the database stores: a fresh
-        // connection starts from the defaults. Carrying it per batch keeps an imported grid on the
-        // same clock as the rest of the session (Rekordbox/Serato/VirtualDJ read it while scanning).
-        let calibration = db.import_calibration();
-        let count = sources.len();
-        let tx = self.library_scan_tx.clone();
-
-        if self.scan_request_tx.is_none() {
-            let path = db.path().to_path_buf();
-            let (request_tx, request_rx) = crossbeam_channel::unbounded::<ScanRequest>();
-            let spawned = std::thread::Builder::new()
-                .name("hypermixx-library".to_owned())
-                .spawn(move || {
-                    let scan_db = match LibraryDb::open(&path) {
-                        Ok(db) => db,
-                        Err(err) => {
-                            let _ = tx.send(LibraryScanEvent::OpenFailed(err.to_string()));
-                            return;
-                        }
-                    };
-                    while let Ok(request) = request_rx.recv() {
-                        scan_db.set_import_calibration(request.calibration);
-                        for source in request.sources {
-                            // One worker serves every batch, so a panic must not kill it. A truncated
-                            // export file can panic inside a decoder; contain it here and turn it into
-                            // a logged scan error so later batches are still scanned.
-                            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                // A device can be pulled between the mount event and this scan.
-                                // Probing the root first keeps a dead mount from hanging on hashing.
-                                if source.root.is_dir() {
-                                    scan_db
-                                        .scan_source(source.id, &mut |_| {})
-                                        .map_err(|err| err.to_string())
-                                } else {
-                                    Err(format!("{} is gone", source.root.display()))
-                                }
-                            }))
-                            .unwrap_or_else(|_| {
-                                Err("scan panicked on a malformed library file".to_owned())
-                            });
-                            let event = LibraryScanEvent::Scanned {
-                                name: source.name,
-                                kind: source.kind,
-                                outcome,
-                            };
-                            if tx.send(event).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                });
-            match spawned {
-                Ok(_) => self.scan_request_tx = Some(request_tx),
-                Err(err) => {
-                    self.push_log(LogLine::error(format!(
-                        "[library] could not start scan: {err}"
-                    )));
-                    return false;
-                }
-            }
-        }
-
-        let Some(request_tx) = &self.scan_request_tx else {
-            return false;
-        };
-        if let Err(err) = request_tx.send(ScanRequest {
-            sources,
-            calibration,
-        }) {
-            self.push_log(LogLine::error(format!(
-                "[library] could not queue scan: {err}"
+        if queued {
+            self.push_log(LogLine::info(format!(
+                "[library] scanning {count} source(s) in background"
             )));
-            return false;
-        }
-        // Count sources, not batches: several batches can be in flight at once, and the browser
-        // must reload only after the very last one reports.
-        self.library_scan_pending += count;
-        self.push_log(LogLine::info(format!(
-            "[library] scanning {count} source(s) in background"
-        )));
-        true
-    }
-
-    fn start_usb_watcher(&mut self, formats: Vec<SourceKind>) {
-        if formats.is_empty() || self.usb_rx.is_some() {
-            return;
-        }
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let spawned = std::thread::Builder::new()
-            .name("hypermixx-usb".to_owned())
-            .spawn(move || usb::watch(tx))
-            .is_ok();
-        if spawned {
-            self.usb_formats = formats;
-            self.usb_rx = Some(rx);
-            self.push_log(LogLine::info("[library] watching removable media"));
-        } else {
-            self.push_log(LogLine::error("[library] could not start USB watcher"));
-        }
-    }
-
-    fn handle_usb_event(&mut self, event: UsbEvent) -> bool {
-        let Some(db) = self.library.clone() else {
-            return false;
-        };
-        match event {
-            UsbEvent::Mounted(root) => {
-                let present = detect_source_kinds(&root);
-                let mut pending = Vec::new();
-                for kind in self.usb_formats.clone() {
-                    if !present.contains(&kind) {
-                        continue;
-                    }
-                    match db.add_source_with_origin(kind, SourceOrigin::Usb, &root, None) {
-                        Ok(source) => {
-                            self.allowed_sources.insert(source.id);
-                            pending.push(source);
-                        }
-                        Err(err) => self.push_log(LogLine::error(format!(
-                            "[library] {}: {err}",
-                            root.display()
-                        ))),
-                    }
-                }
-                if pending.is_empty() {
-                    false
-                } else {
-                    // The worker scans the new sources; `drain` reloads the browser once the last
-                    // one reports. Nothing here hashes a file on the UI thread.
-                    if !self.enqueue_scan(pending) {
-                        self.reload_browser();
-                    }
-                    true
-                }
-            }
-            UsbEvent::Unmounted(root) => {
-                let ids: Vec<i64> = db
-                    .sources()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|source| source.root == root)
-                    .map(|source| source.id)
-                    .collect();
-                let mut changed = false;
-                for id in ids {
-                    changed |= self.allowed_sources.remove(&id);
-                }
-                if changed {
-                    self.reload_browser();
-                }
-                changed
-            }
         }
     }
 
@@ -1109,54 +915,65 @@ impl App {
             }
             changed = true;
         }
-        let mut rescan = false;
-        while let Ok(event) = self.library_scan_rx.try_recv() {
+        // Scan progress comes from the library's own worker. The front-end only maps it onto the
+        // browser and the log; it never scans, watches removable media, or owns a db write here.
+        // Pull the events under the lock, then drop it before touching `self`: the dispatcher may
+        // be waiting to enqueue a `browser refresh`, and `reload_browser` reads the db itself.
+        let events = {
+            let scan = self.scan.lock().expect("scan service lock");
+            let mut events = Vec::new();
+            while let Some(event) = scan.poll_next() {
+                events.push(event);
+            }
+            events
+        };
+        let scan_changed = !events.is_empty();
+        // Reload only when what the browser *shows* can have changed. A rebuild resets navigation
+        // state, so a refresh on every event would make the browser flicker after each scan.
+        let mut reload = false;
+        for event in events {
             match event {
-                LibraryScanEvent::Scanned {
-                    name,
-                    kind,
-                    outcome: Ok(stats),
-                } => {
-                    self.library_scan_pending = self.library_scan_pending.saturating_sub(1);
+                ScanProgress::SourceRegistered { source_id, .. } => {
+                    self.allowed_sources.insert(source_id);
+                    // Redraw now so a freshly mounted device shows all of its sources together,
+                    // each still carrying its cached tracks until its own pass reports.
+                    reload = true;
+                }
+                ScanProgress::SourcesRemoved { source_ids } => {
+                    for id in source_ids {
+                        self.allowed_sources.remove(&id);
+                    }
+                    reload = true;
+                }
+                ScanProgress::ListsReady { name, .. } => {
+                    reload = true;
                     self.push_log(LogLine::info(format!(
-                        "[library] {name} [{}]: {}",
-                        kind.label(),
+                        "[library] {name}: lists ready, reading track metadata"
+                    )));
+                }
+                ScanProgress::SourceDone {
+                    name, kind, stats, ..
+                } => {
+                    // A scan that only re-confirmed what the cache already had produces the very
+                    // same rows; rebuilding the browser for it is what made it flash.
+                    if stats.files_added > 0 || stats.files_removed > 0 {
+                        reload = true;
+                    }
+                    self.push_log(LogLine::info(format!(
+                        "[library] {name} [{kind}]: {}",
                         stats.summary()
                     )));
                 }
-                LibraryScanEvent::Scanned {
-                    name,
-                    outcome: Err(err),
-                    ..
-                } => {
-                    self.library_scan_pending = self.library_scan_pending.saturating_sub(1);
-                    self.push_log(LogLine::error(format!("[library] {name}: {err}")));
-                }
-                LibraryScanEvent::OpenFailed(err) => {
-                    self.library_scan_pending = 0;
-                    // Let the next batch retry with a fresh worker rather than queue into a dead one.
-                    self.scan_request_tx = None;
-                    self.push_log(LogLine::error(format!(
-                        "[library] could not open the scan connection: {err}"
-                    )));
+                ScanProgress::Failed { name, error, .. } => {
+                    self.push_log(LogLine::error(format!("[library] {name}: {error}")))
                 }
             }
-            rescan = true;
+        }
+        if scan_changed {
             changed = true;
         }
-        // One reload, at the end: reloading per source would re-open the browser on its first
-        // library and yank the selection away from wherever the user had browsed to.
-        if rescan && self.library_scan_pending == 0 {
+        if reload {
             self.reload_browser();
-        }
-        let mut usb_events = Vec::new();
-        if let Some(rx) = &self.usb_rx {
-            while let Ok(event) = rx.try_recv() {
-                usb_events.push(event);
-            }
-        }
-        for event in usb_events {
-            changed |= self.handle_usb_event(event);
         }
         changed
     }
@@ -1444,7 +1261,7 @@ mod tests {
     use super::*;
     use crate::preference::LibrarySettings;
     use hypermixx_core::Backend;
-    use std::time::Duration;
+    use hypermixx_library::SourceOrigin;
 
     fn temp_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1541,7 +1358,14 @@ mod tests {
         db.add_folder_source(&hidden, Some("Hidden")).unwrap();
         let (_notice_tx, notice_rx) = crossbeam_channel::unbounded();
         let (_event_tx, event_rx) = crossbeam_channel::unbounded();
-        let mut app = App::new(1, Backend::Auto, notice_rx, event_rx, Default::default());
+        let mut app = App::new(
+            1,
+            Backend::Auto,
+            notice_rx,
+            event_rx,
+            Default::default(),
+            Default::default(),
+        );
         app.library = Some(db);
         let settings = LibrarySettings {
             folders: vec![configured.display().to_string()],
@@ -1556,105 +1380,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A mounted device must be handed to the worker, not scanned inline: `scan_source` hashes
-    /// files, and running it on the UI thread freezes drawing and input for the whole scan.
-    #[test]
-    fn a_usb_mount_queues_a_background_scan() {
-        let dir = temp_dir("usb");
-        let _ = std::fs::remove_dir_all(&dir);
-        let root = dir.join("stick");
-        std::fs::create_dir_all(root.join("PIONEER/rekordbox")).unwrap();
-        // An empty PDB is enough for `detect_source_kinds` to see a Rekordbox export. Its parser
-        // panics on the truncated header, which is exactly what the worker must contain: one bad
-        // file must not take down the shared worker and every batch after it.
-        std::fs::write(root.join("PIONEER/rekordbox/export.pdb"), b"").unwrap();
-
-        let db = Arc::new(LibraryDb::open(dir.join("library.sqlite3")).unwrap());
-        let (_notice_tx, notice_rx) = crossbeam_channel::unbounded();
-        let (_event_tx, event_rx) = crossbeam_channel::unbounded();
-        let mut app = App::new(1, Backend::Auto, notice_rx, event_rx, Default::default());
-        app.library = Some(db);
-        app.usb_formats = vec![SourceKind::Rekordbox];
-
-        assert!(app.handle_usb_event(UsbEvent::Mounted(root)), "a mount registers a source");
-        assert!(
-            app.scan_request_tx.is_some(),
-            "the single scan worker was started"
-        );
-        assert_eq!(
-            app.library_scan_pending, 1,
-            "the source is queued for the worker, not scanned inline"
-        );
-        assert!(
-            !app.allowed_sources.is_empty(),
-            "the new source is allowed in the browser"
-        );
-
-        // The worker reports back through the event channel; draining clears the pending count and
-        // reloads the browser. No file hashing happened on this thread.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while app.library_scan_pending > 0 && Instant::now() < deadline {
-            app.drain();
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(app.library_scan_pending, 0, "the queued scan reports back");
-
-        // The worker survived: a later batch is still queued and reported. A missing root takes the
-        // fast "gone" path, so this stays clear of the malformed file.
-        assert!(app.enqueue_scan(vec![source("pulled", dir.join("pulled"))]));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while app.library_scan_pending > 0 && Instant::now() < deadline {
-            app.drain();
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(
-            app.library_scan_pending, 0,
-            "the worker still serves later batches"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Two batches enqueued while a scan is in flight share one worker and one queue, and their
-    /// source counts add up so the browser reloads only after the last source reports.
-    #[test]
-    fn queued_batches_share_one_worker() {
-        let dir = temp_dir("batches");
-        let _ = std::fs::remove_dir_all(&dir);
-        let a = dir.join("a");
-        let b = dir.join("b");
-        std::fs::create_dir_all(&a).unwrap();
-        std::fs::create_dir_all(&b).unwrap();
-        let db = Arc::new(LibraryDb::open(dir.join("library.sqlite3")).unwrap());
-        let first = db.add_folder_source(&a, None).unwrap();
-        let second = db.add_folder_source(&b, None).unwrap();
-
-        let (_notice_tx, notice_rx) = crossbeam_channel::unbounded();
-        let (_event_tx, event_rx) = crossbeam_channel::unbounded();
-        let mut app = App::new(1, Backend::Auto, notice_rx, event_rx, Default::default());
-        app.library = Some(db);
-        app.allowed_sources.insert(first.id);
-        app.allowed_sources.insert(second.id);
-
-        assert!(app.enqueue_scan(vec![first]));
-        assert_eq!(app.library_scan_pending, 1);
-        let worker = app.scan_request_tx.clone().unwrap();
-
-        assert!(app.enqueue_scan(vec![second]));
-        assert_eq!(
-            app.library_scan_pending, 2,
-            "batches add up instead of overwriting the count"
-        );
-        assert!(
-            worker.same_channel(app.scan_request_tx.as_ref().unwrap()),
-            "both batches went to the same worker"
-        );
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while app.library_scan_pending > 0 && Instant::now() < deadline {
-            app.drain();
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(app.library_scan_pending, 0, "both batches report back");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
