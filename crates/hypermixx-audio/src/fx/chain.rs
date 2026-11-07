@@ -9,7 +9,7 @@ use std::cell::Cell;
 
 use super::{Fx, FxContext, FxError};
 use crate::mixer::Bus;
-use hypermixx_core::FxSlotStatus;
+use hypermixx_core::{FxParamStatus, FxSlotStatus};
 
 /// Addresses one slot: which chain, which index in it.
 ///
@@ -224,6 +224,30 @@ impl FxSlot {
 
     /// The protocol view of this slot at the given chain index.
     pub fn status(&self, index: usize) -> FxSlotStatus {
+        let specs = super::FxKind::parse(self.kind)
+            .map(|kind| kind.param_specs())
+            .unwrap_or(&[]);
+        let params: Vec<FxParamStatus> = self
+            .fx
+            .param_names()
+            .iter()
+            .map(|name| {
+                let value = self.fx.get_param(name).unwrap_or(0.0);
+                let spec = specs.iter().find(|spec| spec.name == *name);
+                FxParamStatus {
+                    name: (*name).to_owned(),
+                    value,
+                    range: spec.map(|spec| (spec.min, spec.max)),
+                    // A declared beat parameter always reports a signed integer code; effects that
+                    // do not use beats leave the field at 0.
+                    beats: if spec.is_some_and(|spec| spec.beats) {
+                        FxParamStatus::beats_code(value)
+                    } else {
+                        0
+                    },
+                }
+            })
+            .collect();
         FxSlotStatus {
             index,
             role: self.role.clone(),
@@ -231,7 +255,7 @@ impl FxSlot {
             enabled: self.is_enabled(),
             // Filled in by the channel for a flow chain; a single-bus slot has no flows.
             flows: None,
-            params: super::param_snapshot(&*self.fx),
+            params,
         }
     }
 }
@@ -405,7 +429,7 @@ impl std::fmt::Debug for FxChain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fx::sample::Gain;
+    use crate::fx::sample::{Echo, Gain};
     use crate::fx::{param_snapshot, Fx};
     use crate::mixer::Bus;
 
@@ -533,5 +557,30 @@ mod tests {
         assert_eq!(snapshot.len(), slot.fx().param_names().len());
         assert_eq!(snapshot[0].0, "gain");
         assert!((snapshot[0].1 - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_echo_status_reports_its_beat_parameter() {
+        let slot = FxSlot::new(Box::new(Echo::new()), "echo");
+        let status = slot.status(0);
+        let time = status
+            .params
+            .iter()
+            .find(|param| param.name == "time")
+            .expect("echo declares time");
+        assert_eq!(time.range, Some((1.0 / 32.0, 4.0)));
+        assert_eq!(time.beats, -2, "the default half-beat is 1/2");
+        assert_eq!(
+            status.params.iter().filter(|param| param.beats != 0).count(),
+            1,
+            "only time is a beat division"
+        );
+        let mix = status
+            .params
+            .iter()
+            .find(|param| param.name == "mix")
+            .expect("echo declares mix");
+        assert_eq!(mix.range, Some((0.0, 1.0)));
+        assert_eq!(mix.beats, 0);
     }
 }

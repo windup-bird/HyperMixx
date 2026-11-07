@@ -19,6 +19,7 @@ use hypermixx_library::{
     analyser::Backends, detect_source_kinds, ImportCalibration, LibraryDb, ScanProgress,
     ScanService, Source, SourceKind,
 };
+use hypermixx_midi::ModeEvent;
 
 use crate::command::{Slots, UiEvent};
 use crate::notices::NoticeTx;
@@ -27,6 +28,7 @@ use crate::procmon::ProcessMonitor;
 use crate::response::{self, LogLine};
 use crate::tui::browser::Browser;
 use crate::tui::completer::{self, Completion, Ctx};
+use crate::tui::intent::UiIntent;
 use crate::tui::picker::{FilePicker, PortList};
 use crate::tui::waveform_view::WaveformView;
 
@@ -192,6 +194,44 @@ impl BeatMode {
     }
 }
 
+/// Which of the two panels the pads slot is showing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PadPanel {
+    #[default]
+    Pads,
+    Fx,
+}
+
+impl PadPanel {
+    pub const ALL: [Self; 2] = [Self::Pads, Self::Fx];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pads => "pads",
+            Self::Fx => "fx",
+        }
+    }
+}
+
+/// Which of the two panels the eq slot is showing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EqPanel {
+    #[default]
+    Eq,
+    Beat,
+}
+
+impl EqPanel {
+    pub const ALL: [Self; 2] = [Self::Eq, Self::Beat];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Eq => "eq",
+            Self::Beat => "beat",
+        }
+    }
+}
+
 /// One clickable region of the drawn interface.
 ///
 /// Rebuilt by the renderer on every frame and consumed by the mouse handler, which is the only way
@@ -210,6 +250,39 @@ pub enum Hit {
     BeatMode {
         deck: usize,
         mode: BeatMode,
+    },
+    /// Switch the pads slot between the pad grid and the FX panel.
+    PadPanel {
+        deck: usize,
+        panel: PadPanel,
+    },
+    /// Switch the eq slot between the EQ knobs and the beat controls.
+    EqPanel {
+        deck: usize,
+        panel: EqPanel,
+    },
+    /// Select one flat FX slot in the deck chain.
+    FxSelect {
+        deck: usize,
+        slot: usize,
+    },
+    /// Bypass/engage the selected FX slot.
+    FxToggle {
+        deck: usize,
+        slot: usize,
+    },
+    /// Set one FX parameter to an absolute value (already mapped to its range).
+    FxParam {
+        deck: usize,
+        slot: usize,
+        param: usize,
+        value: f32,
+    },
+    /// ×2 (`double = true`) or ÷2 the beat parameter of a slot.
+    FxBeats {
+        deck: usize,
+        slot: usize,
+        double: bool,
     },
     /// One step of the tempo fader (`direction` -1 / +1).
     TempoFader {
@@ -356,8 +429,18 @@ pub struct App {
     pub covers: Vec<Option<Arc<hypermixx_media::Cover>>>,
     /// Which command set each deck's pads show.
     pub pad_mode: Vec<PadMode>,
+    /// Which panel each deck's pads slot shows.
+    pub pad_panel: Vec<PadPanel>,
     /// What each deck's beat block is showing.
     pub beat_mode: Vec<BeatMode>,
+    /// Which panel each deck's eq slot shows.
+    pub eq_panel: Vec<EqPanel>,
+    /// The selected flat FX slot per deck (`FxSlotStatus::index`); `0` until the first poll.
+    pub fx_slot: Vec<usize>,
+    /// Whether CLI/MIDI commands and mode triggers may switch panels on their own.
+    pub follow_commands: bool,
+    /// The latest intent produced by the command fan-out.
+    pub intent: Arc<Mutex<Option<UiIntent>>>,
     /// Live FX slot state per deck, polled with [`Command::GetFxState`] so the knobs show the
     /// engine's values rather than a local guess.
     pub deck_fx: Vec<Vec<FxSlotStatus>>,
@@ -417,6 +500,9 @@ pub struct App {
 
     notice_rx: Receiver<LogLine>,
     event_rx: Receiver<UiEvent>,
+    /// Selector presses from the MIDI router, including re-selecting the current mode.
+    mode_tx: Sender<ModeEvent>,
+    mode_rx: Receiver<ModeEvent>,
     /// Browser actions from MIDI (up/down/open/exit/load/refresh).
     pub browser_tx: Sender<BrowserAction>,
     browser_rx: Receiver<BrowserAction>,
@@ -439,6 +525,8 @@ impl App {
         let (waveform_tx, waveform_rx) = crossbeam_channel::unbounded();
         let (cover_tx, cover_rx) = crossbeam_channel::unbounded();
         let (browser_tx, browser_rx) = crossbeam_channel::unbounded();
+        let (mode_tx, mode_rx) = crossbeam_channel::unbounded();
+        let intent = Arc::new(Mutex::new(None));
         let browser = Browser::new();
         Self {
             version: crate::VERSION,
@@ -500,7 +588,12 @@ impl App {
             titles: vec![None; decks],
             covers: vec![None; decks],
             pad_mode: vec![PadMode::default(); decks],
+            pad_panel: vec![PadPanel::default(); decks],
             beat_mode: vec![BeatMode::default(); decks],
+            eq_panel: vec![EqPanel::default(); decks],
+            fx_slot: vec![0; decks],
+            follow_commands: true,
+            intent,
             deck_fx: vec![Vec::new(); decks],
             fx_pending: 0,
             hits: Vec::new(),
@@ -535,6 +628,8 @@ impl App {
             midi_map: None,
             notice_rx,
             event_rx,
+            mode_tx,
+            mode_rx,
             browser_tx,
             browser_rx,
             waveform_tx,
@@ -582,7 +677,14 @@ impl App {
         let unresolved =
             crate::midi::resolve_with(&mut map, |chain, fx| slots.resolve(&chain.label(), fx).ok());
         crate::midi::report_unresolved(notices, unresolved);
-        match crate::midi::attach(&port, map, command_tx, Some(self.browser_tx.clone())) {
+        let mode_tx = self.mode_sender();
+        match crate::midi::attach(
+            &port,
+            map,
+            command_tx,
+            Some(self.browser_tx.clone()),
+            Some(mode_tx),
+        ) {
             Ok(session) => {
                 // The dispatcher is what `midi mode` talks through; install the new router's
                 // channels before replacing the old session (whose drop closes its port).
@@ -597,6 +699,107 @@ impl App {
                 self.overlay = Some(Overlay::Ports {
                     list: PortList::refresh(),
                 });
+            }
+        }
+    }
+
+    /// The shared slot the command fan-out writes intents into.
+    pub fn intent_slot(&self) -> Arc<Mutex<Option<UiIntent>>> {
+        self.intent.clone()
+    }
+
+    /// A sender for selector presses from the MIDI router.
+    pub fn mode_sender(&self) -> Sender<ModeEvent> {
+        self.mode_tx.clone()
+    }
+
+    /// Every FX slot the panel may show: the deck chain minus the fixed `eq`/`filter` stages.
+    pub fn fx_panel_slots(&self, deck: usize) -> Vec<&FxSlotStatus> {
+        self.deck_fx
+            .get(deck)
+            .into_iter()
+            .flatten()
+            .filter(|slot| !matches!(slot.role.as_str(), "eq" | "filter"))
+            .collect()
+    }
+
+    /// The selected FX slot, falling back to the first one when the saved index disappeared.
+    pub fn selected_fx(&self, deck: usize) -> Option<&FxSlotStatus> {
+        let slots = self.fx_panel_slots(deck);
+        let wanted = self.fx_slot.get(deck).copied().unwrap_or(0);
+        slots
+            .iter()
+            .copied()
+            .find(|slot| slot.index == wanted)
+            .or_else(|| slots.first().copied())
+    }
+
+    /// Keeps `fx_slot` pointing at a mounted slot after a `fx remove`/`mixer reload`.
+    pub fn clamp_fx_slot(&mut self, deck: usize) {
+        let indices: Vec<usize> = self
+            .fx_panel_slots(deck)
+            .iter()
+            .map(|slot| slot.index)
+            .collect();
+        if let Some(selected) = self.fx_slot.get_mut(deck) {
+            if !indices.contains(&*selected) {
+                *selected = indices.first().copied().unwrap_or(0);
+            }
+        }
+    }
+
+    /// Applies a command/mode intent. The preference gate lives here so both sources agree.
+    pub fn apply_intent(&mut self, intent: UiIntent) {
+        if !self.follow_commands {
+            return;
+        }
+        match intent {
+            UiIntent::Pads { deck, mode } => {
+                if let Some(panel) = self.pad_panel.get_mut(deck) {
+                    *panel = PadPanel::Pads;
+                }
+                if let Some(slot) = self.pad_mode.get_mut(deck) {
+                    *slot = mode;
+                }
+            }
+            UiIntent::Beat { deck, mode } => {
+                if let Some(panel) = self.eq_panel.get_mut(deck) {
+                    *panel = EqPanel::Beat;
+                }
+                if let Some(slot) = self.beat_mode.get_mut(deck) {
+                    *slot = mode;
+                }
+            }
+            UiIntent::Eq { deck } => {
+                if let Some(panel) = self.eq_panel.get_mut(deck) {
+                    *panel = EqPanel::Eq;
+                }
+            }
+            UiIntent::FxPanel { deck } => {
+                if let Some(panel) = self.pad_panel.get_mut(deck) {
+                    *panel = PadPanel::Fx;
+                }
+            }
+            UiIntent::FxSlot { deck, slot } => {
+                if let Some(panel) = self.pad_panel.get_mut(deck) {
+                    *panel = PadPanel::Fx;
+                }
+                if let Some(selected) = self.fx_slot.get_mut(deck) {
+                    *selected = slot;
+                }
+                self.clamp_fx_slot(deck);
+            }
+            UiIntent::FxOrdinal { deck, ordinal } => {
+                if let Some(panel) = self.pad_panel.get_mut(deck) {
+                    *panel = PadPanel::Fx;
+                }
+                let index = self
+                    .fx_panel_slots(deck)
+                    .get(ordinal.saturating_sub(1))
+                    .map(|slot| slot.index);
+                if let (Some(index), Some(selected)) = (index, self.fx_slot.get_mut(deck)) {
+                    *selected = index;
+                }
             }
         }
     }
@@ -749,6 +952,7 @@ impl App {
                     if let Some(slot) = self.deck_fx.get_mut(*deck_id as usize) {
                         *slot = slots.clone();
                     }
+                    self.clamp_fx_slot(*deck_id as usize);
                 }
                 self.fx_pending = self.fx_pending.saturating_sub(1);
             }
@@ -837,8 +1041,8 @@ impl App {
             .and_then(|slot| {
                 slot.params
                     .iter()
-                    .find(|(name, _)| name == param)
-                    .map(|(_, value)| *value)
+                    .find(|param_status| param_status.name == param)
+                    .map(|param_status| param_status.value)
             })
     }
 
@@ -975,6 +1179,19 @@ impl App {
         }
         if reload {
             self.reload_browser();
+        }
+        // The command fan-out and the MIDI router both leave one lightweight intent; apply the
+        // newest one after the other side channels so a mode/panel change wins over stale data.
+        let intent = self.intent.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(intent) = intent {
+            self.apply_intent(intent);
+            changed = true;
+        }
+        while let Ok(event) = self.mode_rx.try_recv() {
+            if let Some(intent) = crate::tui::intent::from_mode_event(&event, self.decks) {
+                self.apply_intent(intent);
+                changed = true;
+            }
         }
         changed
     }
@@ -1380,4 +1597,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn intents_switch_panels_only_while_following() {
+        let (_notice_tx, notice_rx) = crossbeam_channel::unbounded();
+        let (_event_tx, event_rx) = crossbeam_channel::unbounded();
+        let mut app = App::new(
+            2,
+            Backends::default(),
+            notice_rx,
+            event_rx,
+            Default::default(),
+            Default::default(),
+        );
+        app.apply_intent(UiIntent::Beat {
+            deck: 1,
+            mode: BeatMode::ManualLoop,
+        });
+        assert_eq!(app.eq_panel[1], EqPanel::Beat);
+        assert_eq!(app.beat_mode[1], BeatMode::ManualLoop);
+
+        app.follow_commands = false;
+        app.apply_intent(UiIntent::Pads {
+            deck: 0,
+            mode: PadMode::BeatJump,
+        });
+        assert_eq!(app.pad_panel[0], PadPanel::Pads);
+        assert_eq!(app.pad_mode[0], PadMode::HotCue);
+    }
 }

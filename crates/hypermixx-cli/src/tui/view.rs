@@ -6,8 +6,7 @@
 //! header                                                    (1 row)
 //! deck info: title · status · track overview                (4 rows)
 //! waveform, one per deck                                    (2 rows each)
-//! pads | beatctl | trans | knobs | fader | meter | fader | knobs | trans | beatctl | pads
-//!                        crossfader
+//! 1trans | 1pads/1fx | 1eq/1beatctl | faders | 2trans | 2pads/2fx | 2eq/2beatctl
 //! browser : command                                         (fills the rest)
 //! ```
 //!
@@ -27,12 +26,13 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use hypermixx_core::{BeatGrid, DeckState, Key, Stem};
+use hypermixx_core::{BeatGrid, DeckState, FxSlotStatus, Key, Stem};
 
 use crate::preference::Theme;
 use crate::response::{bpm_label, loop_length, sync_label, time, Level, LogLine};
 use crate::tui::app::{
-    App, BeatMode, Hit, Knob, LoopHit, Overlay, PadMode, Target, TransportHit, COMPLETION_ROWS,
+    App, BeatMode, EqPanel, Hit, Knob, LoopHit, Overlay, PadMode, PadPanel, Target, TransportHit,
+    COMPLETION_ROWS,
 };
 use crate::tui::text::{center_to_width, pad_to_width, truncate_to_width, width};
 use crate::tui::{browser, overview, popup, settings, text};
@@ -41,10 +41,11 @@ use crate::tui::{browser, overview, popup, settings, text};
 const HEADER_H: u16 = 1;
 /// Deck info: a border, the status row, and a two-row overview.
 const INFO_H: u16 = 5;
-/// Height of the control band, borders included: six rows of pads (two rows of three-row pads) plus
-/// the mode/button row. The EQ bars get their breathing room from their own glyphs, not from blank
-/// rows.
-const CONTROL_H: u16 = 9;
+/// Height of the control band, borders included: the panel content plus the mode row, the group
+/// switch row, and the borders.
+const CONTROL_H: u16 = 10;
+/// The borderless transport column. Four buttons stacked vertically, with air between them.
+const TRANS_W: u16 = 8;
 /// The fader / volume-bar / crossfader box in the middle of the band: two channel faders and the
 /// output meter, with the crossfader in the bottom row inside the same frame. The width is what
 /// keeps a column of air between each fader and the meter, and two columns between the meter pair.
@@ -787,29 +788,116 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App, hits: &mut Vec<(Rec
     if app.decks == 0 {
         return;
     }
-    // Each deck gets one half, split 1:1:1 into pads / beatctl / mixer. The faders, the output
-    // meter and the crossfader share the box in the middle, so the two halves stay symmetric.
+    // Literal order, repeated for deck 2: trans | pads/fx | eq/beatctl | faders | the same again.
     let columns = Layout::horizontal([
-        Constraint::Fill(1),
+        Constraint::Length(TRANS_W),
         Constraint::Fill(1),
         Constraint::Fill(1),
         Constraint::Length(CENTER_W),
-        Constraint::Fill(1),
+        Constraint::Length(TRANS_W),
         Constraint::Fill(1),
         Constraint::Fill(1),
     ])
     .split(area);
 
-    // The band is mirrored: deck N on the left, deck N+1 on the right. A single-deck session draws
-    // only the left half, so the same pad is not shown (and clickable) twice.
-    render_pads(frame, columns[0], app, 0, hits);
-    render_beatctl(frame, columns[1], app, 0, hits);
-    render_mixer(frame, columns[2], app, 0, hits);
+    render_trans(frame, columns[0], app, 0, hits);
+    render_pad_group(frame, columns[1], app, 0, hits);
+    render_eq_group(frame, columns[2], app, 0, hits);
     render_center(frame, columns[3], app, hits);
     if app.decks >= 2 {
-        render_mixer(frame, columns[4], app, 1, hits);
-        render_beatctl(frame, columns[5], app, 1, hits);
-        render_pads(frame, columns[6], app, 1, hits);
+        render_trans(frame, columns[4], app, 1, hits);
+        render_pad_group(frame, columns[5], app, 1, hits);
+        render_eq_group(frame, columns[6], app, 1, hits);
+    }
+}
+
+/// The pads slot: the pad grid or the FX panel.
+fn render_pad_group(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    deck: usize,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    match app.pad_panel.get(deck).copied().unwrap_or_default() {
+        PadPanel::Pads => render_pads(frame, area, app, deck, hits),
+        PadPanel::Fx => render_fx(frame, area, app, deck, hits),
+    }
+}
+
+/// The eq slot: the five tone/trim knobs or the beat controls.
+fn render_eq_group(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    deck: usize,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    match app.eq_panel.get(deck).copied().unwrap_or_default() {
+        EqPanel::Eq => render_mixer(frame, area, app, deck, hits),
+        EqPanel::Beat => render_beatctl(frame, area, app, deck, hits),
+    }
+}
+
+/// The borderless transport column. Four buttons, vertically centred with a blank row between
+/// them; no box, because the deck group already reads as one instrument.
+fn render_trans(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    deck: usize,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let state = &app.states[deck];
+    let theme = app.theme;
+    let rows: [(TransportHit, &str); 4] = [
+        (TransportHit::Sync, "sync"),
+        (TransportHit::Keylock, "key"),
+        (TransportHit::Cue, "cue"),
+        (TransportHit::Play, "play"),
+    ];
+    let step = (area.height / rows.len() as u16).max(1);
+    let used = (rows.len() as u16 - 1) * step + 1;
+    let top = area.y + area.height.saturating_sub(used) / 2;
+    for (index, (action, text)) in rows.iter().enumerate() {
+        let y = top + index as u16 * step;
+        if y >= area.bottom() {
+            break;
+        }
+        let rect = Rect::new(area.x, y, area.width, 1);
+        let active = match action {
+            TransportHit::Play => state.playing,
+            TransportHit::Cue => state.cue_frame > 0 && !state.playing,
+            TransportHit::Sync => state.lock || state.sync_mode != "free",
+            TransportHit::Keylock => state.keylock == hypermixx_core::KeylockMode::On,
+        };
+        let label = match action {
+            TransportHit::Sync if active => "sync*",
+            TransportHit::Play if active => "paus",
+            _ => text,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                center_to_width(label, rect.width as usize),
+                if active {
+                    mode_style(app, true)
+                } else {
+                    Style::default().fg(theme.text)
+                },
+            ))),
+            rect,
+        );
+        hit(
+            hits,
+            rect,
+            Hit::Transport {
+                deck,
+                action: *action,
+            },
+        );
     }
 }
 
@@ -933,8 +1021,8 @@ fn render_pads(frame: &mut Frame, area: Rect, app: &App, deck: usize, hits: &mut
 
     let labels = mode.pads();
     let pad_w = (inner.width / 4).max(1);
-    // Two rows of pads over the content rows (everything above the mode row).
-    let pad_h = (inner.height.saturating_sub(1) / 2).max(1);
+    // Two rows of pads over the content rows (everything above the mode and group-switch rows).
+    let pad_h = (inner.height.saturating_sub(2) / 2).max(1);
     // A one-column gutter between pads, but only when the pad stays wide enough for its label
     // (`1/4`, `-16`): a separated grid with truncated labels would be worse than a solid one.
     let gutter = u16::from(pad_w >= 4);
@@ -997,7 +1085,7 @@ fn render_pads(frame: &mut Frame, area: Rect, app: &App, deck: usize, hits: &mut
     render_modes(
         frame,
         app,
-        inner,
+        Rect::new(inner.x, inner.bottom().saturating_sub(2), inner.width, 1),
         PadMode::ALL.map(PadMode::label).to_vec(),
         |index| Hit::PadMode {
             deck,
@@ -1006,14 +1094,316 @@ fn render_pads(frame: &mut Frame, area: Rect, app: &App, deck: usize, hits: &mut
         |index| PadMode::ALL[index] == mode,
         hits,
     );
+    render_group_switch(
+        frame,
+        app,
+        inner,
+        deck,
+        PadPanel::ALL.map(PadPanel::label).to_vec(),
+        |index| Hit::PadPanel {
+            deck,
+            panel: PadPanel::ALL[index],
+        },
+        |index| PadPanel::ALL[index] == app.pad_panel[deck],
+        hits,
+    );
+}
+
+/// The FX panel: one slot from the deck chain, its two most useful parameters, an optional beat
+/// division, and a selector listing every non-eq/filter slot the mixer exposes.
+fn render_fx(frame: &mut Frame, area: Rect, app: &App, deck: usize, hits: &mut Vec<(Rect, Hit)>) {
+    let block = panel(app, deck, &format!("{}-fx", deck + 1));
+    let inner = block.inner(area);
+    if inner.width < 4 || inner.height < 4 {
+        frame.render_widget(block, area);
+        return;
+    }
+    frame.render_widget(block, area);
+    let theme = app.theme;
+    let selected = app.selected_fx(deck).cloned();
+    let choices: Vec<(usize, String)> = app
+        .fx_panel_slots(deck)
+        .iter()
+        .map(|slot| (slot.index, fx_short_label(slot)))
+        .collect();
+
+    // Name / enable row.
+    if let Some(slot) = &selected {
+        let what = if slot.role.eq_ignore_ascii_case(&slot.kind) {
+            slot.role.clone()
+        } else {
+            format!("{} · {}", slot.role, slot.kind)
+        };
+        let state = if slot.enabled { "on" } else { "off" };
+        let name = format!(
+            " {} {} ",
+            truncate_to_width(&what, inner.width.saturating_sub(5) as usize),
+            state
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                name,
+                if slot.enabled {
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.dim)
+                },
+            ))),
+            line(inner, 0, 0, inner.width),
+        );
+        hit(
+            hits,
+            line(inner, 0, 0, inner.width),
+            Hit::FxToggle {
+                deck,
+                slot: slot.index,
+            },
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " no fx ",
+                Style::default().fg(theme.dim),
+            ))),
+            line(inner, 0, 0, inner.width),
+        );
+    }
+
+    let content_rows = inner.height.saturating_sub(3); // name, selector, group switch
+    if let Some(slot) = &selected {
+        if content_rows == 0 {
+            render_group_switch(
+                frame,
+                app,
+                inner,
+                deck,
+                PadPanel::ALL.map(PadPanel::label).to_vec(),
+                |index| Hit::PadPanel {
+                    deck,
+                    panel: PadPanel::ALL[index],
+                },
+                |index| PadPanel::ALL[index] == app.pad_panel[deck],
+                hits,
+            );
+            return;
+        }
+        // The first two non-beat parameters, in declaration order.
+        let params: Vec<(usize, &hypermixx_core::FxParamStatus)> = slot
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(_, param)| param.beats == 0)
+            .take(2)
+            .collect();
+        for (row, (param_index, param)) in params.iter().enumerate() {
+            if row as u16 + 1 >= content_rows {
+                break;
+            }
+            let rect = line(inner, 1 + row as u16, 0, inner.width);
+            render_fx_param(
+                frame,
+                rect,
+                app,
+                deck,
+                slot.index,
+                *param_index,
+                param,
+                hits,
+            );
+        }
+        // Beat division: `-` halves, `+` doubles.
+        if let Some((_, param)) = slot
+            .params
+            .iter()
+            .enumerate()
+            .find(|(_, param)| param.beats != 0)
+        {
+            let row = (1 + params.len() as u16).min(content_rows.saturating_sub(1));
+            let rect = line(inner, row, 0, inner.width);
+            let half = Rect::new(rect.x, rect.y, rect.width / 2, 1);
+            let double = Rect::new(
+                rect.x + rect.width / 2,
+                rect.y,
+                rect.width - rect.width / 2,
+                1,
+            );
+            let label = beats_label(param.beats);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "-",
+                    Style::default().fg(theme.dim),
+                ))),
+                half,
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "+",
+                    Style::default().fg(theme.dim),
+                )))
+                .alignment(Alignment::Right),
+                double,
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    center_to_width(
+                        &format!("beats:{label}"),
+                        rect.width.saturating_sub(2) as usize,
+                    ),
+                    Style::default().fg(theme.text),
+                ))),
+                Rect::new(rect.x + 1, rect.y, rect.width.saturating_sub(2), 1),
+            );
+            hit(
+                hits,
+                half,
+                Hit::FxBeats {
+                    deck,
+                    slot: slot.index,
+                    double: false,
+                },
+            );
+            hit(
+                hits,
+                double,
+                Hit::FxBeats {
+                    deck,
+                    slot: slot.index,
+                    double: true,
+                },
+            );
+        }
+    }
+
+    // Slot selector, styled like the pad-mode row.
+    let selector = Rect::new(inner.x, inner.bottom().saturating_sub(2), inner.width, 1);
+    let labels: Vec<String> = choices.iter().map(|(_, label)| label.clone()).collect();
+    let indices: Vec<usize> = choices.iter().map(|(index, _)| *index).collect();
+    let selected_index = selected.as_ref().map(|slot| slot.index);
+    render_modes(
+        frame,
+        app,
+        selector,
+        labels,
+        |index| Hit::FxSelect {
+            deck,
+            slot: indices[index],
+        },
+        |index| Some(indices[index]) == selected_index,
+        hits,
+    );
+
+    render_group_switch(
+        frame,
+        app,
+        inner,
+        deck,
+        PadPanel::ALL.map(PadPanel::label).to_vec(),
+        |index| Hit::PadPanel {
+            deck,
+            panel: PadPanel::ALL[index],
+        },
+        |index| PadPanel::ALL[index] == app.pad_panel[deck],
+        hits,
+    );
+}
+
+fn render_fx_param(
+    frame: &mut Frame,
+    rect: Rect,
+    app: &App,
+    deck: usize,
+    slot: usize,
+    param_index: usize,
+    param: &hypermixx_core::FxParamStatus,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    if rect.width == 0 {
+        return;
+    }
+    let theme = app.theme;
+    let name_w = (width(&param.name) + 1)
+        .clamp(3, (rect.width as usize / 2).max(3))
+        .min(rect.width as usize);
+    let value_w = if rect.width >= 14 { 5 } else { 0 };
+    let bar_w = (rect.width as usize)
+        .saturating_sub(name_w)
+        .saturating_sub(value_w);
+    let mut spans = vec![Span::styled(
+        pad_to_width(&format!("{} ", param.name), name_w),
+        Style::default().fg(theme.dim),
+    )];
+    let mut interactive = false;
+    let range = param.range.filter(|(min, max)| bar_w > 0 && max > min);
+    if let Some((min, max)) = range {
+        interactive = true;
+        let fraction = ((param.value - min) / (max - min)).clamp(0.0, 1.0);
+        let filled = (fraction * bar_w as f32).round() as usize;
+        spans.push(Span::styled(
+            "▬".repeat(filled),
+            Style::default().fg(theme.accent),
+        ));
+        spans.push(Span::styled(
+            "▬".repeat(bar_w.saturating_sub(filled)),
+            Style::default().fg(theme.dim),
+        ));
+    }
+    if value_w > 0 {
+        spans.push(Span::styled(
+            format!("{:>value_w$.2}", param.value),
+            Style::default().fg(theme.text),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+    if interactive {
+        if let Some((min, max)) = range {
+            for column in 0..bar_w {
+                let value = min + (column as f32 + 0.5) / bar_w as f32 * (max - min);
+                hit(
+                    hits,
+                    Rect::new(rect.x + name_w as u16 + column as u16, rect.y, 1, 1),
+                    Hit::FxParam {
+                        deck,
+                        slot,
+                        param: param_index,
+                        value,
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn fx_short_label(slot: &FxSlotStatus) -> String {
+    let role = slot.role.as_str();
+    for (prefix, short) in [("flowfx", "f"), ("knobfx", "k"), ("padfx", "p")] {
+        if let Some(rest) = role.strip_prefix(prefix) {
+            return format!("{short}{rest}");
+        }
+    }
+    if role.len() <= 3 {
+        role.to_owned()
+    } else {
+        slot.kind.clone()
+    }
+}
+
+fn beats_label(code: i32) -> String {
+    match code {
+        n if n > 0 => n.to_string(),
+        -1 => "1".to_owned(),
+        n if n < 0 => format!("1/{}", -n),
+        _ => "--".to_owned(),
+    }
 }
 
 /// The bottom button row shared by every panel in the band: evenly sized buttons, nothing else.
-fn render_modes(
+fn render_modes<S: AsRef<str>>(
     frame: &mut Frame,
     app: &App,
     inner: Rect,
-    labels: Vec<&'static str>,
+    labels: Vec<S>,
     hit_of: impl Fn(usize) -> Hit,
     active: impl Fn(usize) -> bool,
     hits: &mut Vec<(Rect, Hit)>,
@@ -1036,13 +1426,39 @@ fn render_modes(
         let rect = Rect::new(x, row, width, 1);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                center_to_width(label, rect.width as usize),
+                center_to_width(label.as_ref(), rect.width as usize),
                 mode_style(app, active(index)),
             ))),
             rect,
         );
         hit(hits, rect, hit_of(index));
     }
+}
+
+/// The two-button group switch on the last row of a panel.
+#[allow(clippy::too_many_arguments)]
+fn render_group_switch<S: AsRef<str>>(
+    frame: &mut Frame,
+    app: &App,
+    inner: Rect,
+    _deck: usize,
+    labels: Vec<S>,
+    hit_of: impl Fn(usize) -> Hit,
+    active: impl Fn(usize) -> bool,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    if inner.height == 0 {
+        return;
+    }
+    render_modes(
+        frame,
+        app,
+        Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+        labels,
+        hit_of,
+        active,
+        hits,
+    );
 }
 
 /// Tempo / bend, or the manual loop / jump controls, in three evenly spaced bands.
@@ -1064,9 +1480,8 @@ fn render_beatctl(
     frame.render_widget(block, area);
     let theme = app.theme;
 
-    // Three bands spread over the content rows (the remainder goes to the upper bands), so the
-    // panel reads as one column of evenly spaced instruments.
-    let content_h = inner.height.saturating_sub(1);
+    // The beat bands fill the content rows above the mode row and the group switch.
+    let content_h = inner.height.saturating_sub(2);
     let base = content_h / 3;
     let extra = content_h % 3;
     let band_h = |index: u16| base + u16::from(index < extra);
@@ -1279,7 +1694,7 @@ fn render_beatctl(
     render_modes(
         frame,
         app,
-        inner,
+        Rect::new(inner.x, inner.bottom().saturating_sub(2), inner.width, 1),
         BeatMode::ALL.map(BeatMode::label).to_vec(),
         |index| Hit::BeatMode {
             deck,
@@ -1288,9 +1703,22 @@ fn render_beatctl(
         |index| BeatMode::ALL[index] == mode,
         hits,
     );
+    render_group_switch(
+        frame,
+        app,
+        inner,
+        deck,
+        EqPanel::ALL.map(EqPanel::label).to_vec(),
+        |index| Hit::EqPanel {
+            deck,
+            panel: EqPanel::ALL[index],
+        },
+        |index| EqPanel::ALL[index] == app.eq_panel[deck],
+        hits,
+    );
 }
 
-/// The mixer column: five knobs and the transport buttons under them.
+/// The EQ column: five tone/trim knobs and the group switch.
 fn render_mixer(
     frame: &mut Frame,
     area: Rect,
@@ -1298,7 +1726,6 @@ fn render_mixer(
     deck: usize,
     hits: &mut Vec<(Rect, Hit)>,
 ) {
-    let state = &app.states[deck];
     let block = panel(app, deck, &format!("{}-eq", deck + 1));
     let inner = block.inner(area);
     if inner.width < 5 || inner.height < 3 {
@@ -1310,7 +1737,7 @@ fn render_mixer(
 
     for (row, knob) in Knob::ALL.iter().enumerate() {
         let rect = line(inner, row as u16, 0, inner.width);
-        if rect.y >= inner.bottom().saturating_sub(2) {
+        if rect.y >= inner.bottom().saturating_sub(1) {
             break;
         }
         let value = app.knob_value(deck, *knob);
@@ -1372,59 +1799,19 @@ fn render_mixer(
         }
     }
 
-    // Transport: two rows of two buttons closing the panel, aligned with the neighbours' mode rows.
-    let rows: [[(TransportHit, &str); 2]; 2] = [
-        [(TransportHit::Sync, "sync"), (TransportHit::Keylock, "key")],
-        [(TransportHit::Play, "play"), (TransportHit::Cue, "cue")],
-    ];
-    let half = inner.width / 2;
-    for (row_index, buttons) in rows.iter().enumerate() {
-        for (column, (action, text)) in buttons.iter().enumerate() {
-            let rect = line(
-                inner,
-                inner.height.saturating_sub(2) + row_index as u16,
-                column as u16 * half,
-                if column == 0 {
-                    half
-                } else {
-                    inner.width - half
-                },
-            );
-            if rect.width == 0 {
-                continue;
-            }
-            let active = match action {
-                TransportHit::Play => state.playing,
-                TransportHit::Cue => state.cue_frame > 0 && !state.playing,
-                TransportHit::Sync => state.lock || state.sync_mode != "free",
-                TransportHit::Keylock => state.keylock == hypermixx_core::KeylockMode::On,
-            };
-            let text = match action {
-                TransportHit::Sync if active => "sync*",
-                TransportHit::Play if active => "paus",
-                _ => text,
-            };
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    center_to_width(text, rect.width as usize),
-                    if active {
-                        mode_style(app, true)
-                    } else {
-                        Style::default().fg(theme.text)
-                    },
-                ))),
-                rect,
-            );
-            hit(
-                hits,
-                rect,
-                Hit::Transport {
-                    deck,
-                    action: *action,
-                },
-            );
-        }
-    }
+    render_group_switch(
+        frame,
+        app,
+        inner,
+        deck,
+        EqPanel::ALL.map(EqPanel::label).to_vec(),
+        |index| Hit::EqPanel {
+            deck,
+            panel: EqPanel::ALL[index],
+        },
+        |index| EqPanel::ALL[index] == app.eq_panel[deck],
+        hits,
+    );
 }
 
 /// One channel's vertical fader inside the shared box. The whole travel is the click target.
@@ -1856,6 +2243,23 @@ mod tests {
     use ratatui::Terminal;
     use std::sync::Arc;
 
+    fn fx_status(
+        index: usize,
+        role: &str,
+        kind: &str,
+        enabled: bool,
+        params: Vec<hypermixx_core::FxParamStatus>,
+    ) -> FxSlotStatus {
+        FxSlotStatus {
+            index,
+            role: role.to_owned(),
+            kind: kind.to_owned(),
+            enabled,
+            flows: None,
+            params,
+        }
+    }
+
     fn test_app() -> App {
         let (_notice_tx, notice_rx) = crossbeam_channel::unbounded();
         let (_event_tx, event_rx) = crossbeam_channel::unbounded();
@@ -2002,14 +2406,17 @@ mod tests {
         let mut app = test_app();
         let buffer = render_at(&mut app, 120, 40);
         let text = all_text(&buffer);
-        // One pads / beat / mixer block per deck, mirrored around the shared output meter.
-        for title in ["pads", "beatctl", "eq"] {
+        // The default panels are pads and eq; beat controls share the eq slot.
+        for title in ["pads", "eq"] {
             assert_eq!(
                 text.matches(&format!("-{title} ")).count(),
                 2,
                 "two {title} panels, one per deck: {text}"
             );
         }
+        // The transport moved out of the eq panel into its own borderless column.
+        assert_eq!(text.matches("sync").count(), 2, "{text}");
+        assert_eq!(text.matches("play").count(), 2, "{text}");
         let pads: Vec<usize> = app
             .hits
             .iter()
@@ -2266,24 +2673,53 @@ mod tests {
     }
 
     #[test]
-    fn pads_beat_and_mixer_split_each_deck_into_equal_thirds() {
+    fn the_pad_and_eq_groups_switch_their_content() {
         let mut app = test_app();
         let buffer = render_at(&mut app, 120, 40);
-        let row = find_row(&buffer, "1-pads");
-        let text = row_text(&buffer, row);
-        // Measure in terminal cells: the titles are box-drawing glyphs, so byte offsets lie.
-        let column = |needle: &str| {
-            let byte = text.find(needle).expect("panel title");
-            width(&text[..byte]) as u16
-        };
-        let pads = column("┌ 1-pads ");
-        let beat = column("┌ 1-beatctl ");
-        let mixer = column("┌ 1-eq ");
-        let first = beat - pads;
-        let second = mixer - beat;
-        assert!(
-            first.abs_diff(second) <= 1,
-            "1:1:1 expected, got pads→beatctl {first} and beatctl→mixer {second}: {text}"
+        let text = all_text(&buffer);
+        assert!(text.contains("1-pads "), "{text}");
+        assert!(text.contains("1-eq "), "{text}");
+        assert!(text.contains("pads") && text.contains("fx"), "{text}");
+        assert!(text.contains("eq") && text.contains("beat"), "{text}");
+
+        app.eq_panel[0] = EqPanel::Beat;
+        let buffer = render_at(&mut app, 120, 40);
+        let text = all_text(&buffer);
+        assert!(text.contains("1-beatctl "), "{text}");
+        assert!(!text.contains("1-eq "), "{text}");
+
+        app.pad_panel[0] = PadPanel::Fx;
+        let buffer = render_at(&mut app, 120, 40);
+        let text = all_text(&buffer);
+        assert!(text.contains("1-fx "), "{text}");
+        assert!(!text.contains("1-pads "), "{text}");
+    }
+
+    #[test]
+    fn every_fx_slot_gets_a_selector_button() {
+        let mut app = test_app();
+        app.deck_fx[0] = vec![
+            fx_status(0, "eq", "eq", true, vec![]),
+            fx_status(1, "filter", "filter", true, vec![]),
+            fx_status(2, "flowfx1", "echo", true, vec![]),
+            fx_status(3, "knobfx1", "reverb", false, vec![]),
+            fx_status(4, "padfx1", "cut", false, vec![]),
+        ];
+        app.fx_slot[0] = 2;
+        app.pad_panel[0] = PadPanel::Fx;
+        let _buffer = render_at(&mut app, 120, 40);
+        let selectors: Vec<usize> = app
+            .hits
+            .iter()
+            .filter_map(|(_, hit)| match hit {
+                Hit::FxSelect { deck: 0, slot } => Some(*slot),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            selectors,
+            vec![2, 3, 4],
+            "eq/filter are EQ controls, not FX slots"
         );
     }
 
@@ -2675,6 +3111,44 @@ mod tests {
             let buffer = render_at(&mut app, width, height);
             println!("==== {width}x{height} ====\n{}", all_text(&buffer));
         }
+
+        // The alternate panels: FX + beat controls, with an echo slot and its beat row.
+        app.pad_panel[0] = PadPanel::Fx;
+        app.eq_panel[0] = EqPanel::Beat;
+        app.deck_fx[0] = vec![
+            fx_status(0, "eq", "eq", true, vec![]),
+            fx_status(1, "filter", "filter", true, vec![]),
+            fx_status(
+                2,
+                "knobfx1",
+                "echo",
+                true,
+                vec![
+                    hypermixx_core::FxParamStatus {
+                        name: "mix".to_owned(),
+                        value: 0.35,
+                        range: Some((0.0, 1.0)),
+                        beats: 0,
+                    },
+                    hypermixx_core::FxParamStatus {
+                        name: "feedback".to_owned(),
+                        value: 0.45,
+                        range: Some((0.0, 0.95)),
+                        beats: 0,
+                    },
+                    hypermixx_core::FxParamStatus {
+                        name: "time".to_owned(),
+                        value: 0.5,
+                        range: Some((1.0 / 32.0, 4.0)),
+                        beats: -2,
+                    },
+                ],
+            ),
+            fx_status(3, "padfx1", "cut", true, vec![]),
+        ];
+        app.fx_slot[0] = 2;
+        let buffer = render_at(&mut app, 120, 40);
+        println!("==== 120x40 fx ====\n{}", all_text(&buffer));
     }
 
     #[test]

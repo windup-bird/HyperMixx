@@ -27,7 +27,7 @@ use crossbeam_channel::{Receiver, Sender};
 use hypermixx_core::{BrowserAction, Command, CommandResponse, FxChainId};
 use hypermixx_midi::map::Action;
 use hypermixx_midi::{
-    ports, Input, Map, MergeBuffer, Received, Router, RouterCommand, RouterState,
+    ports, Input, Map, MergeBuffer, ModeEvent, Received, Router, RouterCommand, RouterState,
 };
 
 use crate::notices::{self, NoticeTx};
@@ -96,6 +96,7 @@ pub fn attach(
     map: Map,
     command_tx: Sender<Command>,
     browser_tx: Option<Sender<BrowserAction>>,
+    mode_tx: Option<Sender<ModeEvent>>,
 ) -> Result<MidiSession, String> {
     let (received_tx, received_rx) = crossbeam_channel::unbounded();
     let (control_tx, control_rx) = crossbeam_channel::unbounded();
@@ -113,6 +114,7 @@ pub fn attach(
                 router,
                 translator_command_tx,
                 browser_tx,
+                mode_tx,
                 translator_state,
             )
         })
@@ -140,7 +142,7 @@ pub fn attach_file(
     let mut map = read_map(map_path)?;
     let unresolved = resolve_via_engine(&mut map, decks, &command_tx, responses);
     report_unresolved(notices, unresolved);
-    let session = attach(port, map, command_tx, None)?;
+    let session = attach(port, map, command_tx, None, None)?;
     notices::info(
         notices,
         format!("[midi] listening on `{port}` (map {map_path})"),
@@ -165,6 +167,7 @@ fn pump(
     mut router: Router,
     command_tx: Sender<Command>,
     browser_tx: Option<Sender<BrowserAction>>,
+    mode_tx: Option<Sender<ModeEvent>>,
     state: Arc<Mutex<RouterState>>,
 ) {
     let mut merge = MergeBuffer::new();
@@ -180,6 +183,11 @@ fn pump(
                     if let Some(browser_tx) = &browser_tx {
                         for action in feed.browser {
                             let _ = browser_tx.send(action);
+                        }
+                    }
+                    if let Some(mode_tx) = &mode_tx {
+                        for mode in feed.modes {
+                            let _ = mode_tx.send(mode);
                         }
                     }
                     if feed.state_changed {
@@ -349,7 +357,15 @@ action = "play"
         let router = Router::new(map);
         let state = Arc::new(Mutex::new(router.snapshot()));
         let translator = std::thread::spawn(move || {
-            pump(received_rx, control_rx, router, command_tx, None, state)
+            pump(
+                received_rx,
+                control_rx,
+                router,
+                command_tx,
+                None,
+                None,
+                state,
+            )
         });
 
         let at = SystemTime::now();

@@ -1699,7 +1699,7 @@ mod tests {
         channel.replace_deck(Deck::new(ramp_source(1_000)));
         assert_eq!(channel.levels().0, -0.25, "a load must not reset the fader");
         assert_eq!(
-            channel.slot_statuses(SlotChain::Deck).unwrap()[0].params[0].1,
+            channel.slot_statuses(SlotChain::Deck).unwrap()[0].params[0].value,
             0.5,
             "...or the EQ"
         );

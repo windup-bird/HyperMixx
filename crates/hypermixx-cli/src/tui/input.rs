@@ -221,6 +221,12 @@ fn apply_hit(app: &mut App, hit: Hit, dispatcher: &Dispatcher) {
         Hit::Pad { deck, .. }
         | Hit::PadMode { deck, .. }
         | Hit::BeatMode { deck, .. }
+        | Hit::PadPanel { deck, .. }
+        | Hit::EqPanel { deck, .. }
+        | Hit::FxSelect { deck, .. }
+        | Hit::FxToggle { deck, .. }
+        | Hit::FxParam { deck, .. }
+        | Hit::FxBeats { deck, .. }
         | Hit::TempoFader { deck, .. }
         | Hit::Bend { deck, .. }
         | Hit::LoopBeats { deck, .. }
@@ -251,6 +257,70 @@ fn apply_hit(app: &mut App, hit: Hit, dispatcher: &Dispatcher) {
         Hit::BeatMode { deck, mode } => {
             if let Some(slot) = app.beat_mode.get_mut(deck) {
                 *slot = mode;
+            }
+        }
+        Hit::PadPanel { deck, panel } => {
+            if let Some(slot) = app.pad_panel.get_mut(deck) {
+                *slot = panel;
+            }
+        }
+        Hit::EqPanel { deck, panel } => {
+            if let Some(slot) = app.eq_panel.get_mut(deck) {
+                *slot = panel;
+            }
+        }
+        Hit::FxSelect { deck, slot } => {
+            if let Some(selected) = app.fx_slot.get_mut(deck) {
+                *selected = slot;
+            }
+        }
+        Hit::FxToggle { deck, slot } => send(Command::ToggleFx {
+            slot: FxSlotRef {
+                chain: FxChainId::Deck(deck as u8),
+                index: slot,
+            },
+        }),
+        Hit::FxParam {
+            deck,
+            slot,
+            param,
+            value,
+        } => {
+            let name = app
+                .deck_fx
+                .get(deck)
+                .and_then(|slots| slots.iter().find(|status| status.index == slot))
+                .and_then(|status| status.params.get(param))
+                .map(|param| param.name.clone());
+            if let Some(name) = name {
+                send(Command::SetFxParam {
+                    slot: FxSlotRef {
+                        chain: FxChainId::Deck(deck as u8),
+                        index: slot,
+                    },
+                    name,
+                    value,
+                });
+            }
+        }
+        Hit::FxBeats { deck, slot, double } => {
+            let param = app
+                .deck_fx
+                .get(deck)
+                .and_then(|slots| slots.iter().find(|status| status.index == slot))
+                .and_then(|status| status.params.iter().find(|param| param.beats != 0))
+                .cloned();
+            if let Some(param) = param {
+                if let Some(value) = param.scaled_beat_value(double) {
+                    send(Command::SetFxParam {
+                        slot: FxSlotRef {
+                            chain: FxChainId::Deck(deck as u8),
+                            index: slot,
+                        },
+                        name: param.name,
+                        value,
+                    });
+                }
             }
         }
         Hit::Pad { deck, index } => {
@@ -1058,9 +1128,24 @@ mod tests {
                 enabled: true,
                 flows: None,
                 params: vec![
-                    ("low".to_owned(), 0.0),
-                    ("mid".to_owned(), 0.0),
-                    ("high".to_owned(), 0.0),
+                    hypermixx_core::FxParamStatus {
+                        name: "low".to_owned(),
+                        value: 0.0,
+                        range: Some((-1.0, 1.0)),
+                        beats: 0,
+                    },
+                    hypermixx_core::FxParamStatus {
+                        name: "mid".to_owned(),
+                        value: 0.0,
+                        range: Some((-1.0, 1.0)),
+                        beats: 0,
+                    },
+                    hypermixx_core::FxParamStatus {
+                        name: "high".to_owned(),
+                        value: 0.0,
+                        range: Some((-1.0, 1.0)),
+                        beats: 0,
+                    },
                 ],
             },
             hypermixx_core::FxSlotStatus {
@@ -1069,7 +1154,12 @@ mod tests {
                 kind: "filter".to_owned(),
                 enabled: true,
                 flows: None,
-                params: vec![("value".to_owned(), 0.0)],
+                params: vec![hypermixx_core::FxParamStatus {
+                    name: "value".to_owned(),
+                    value: 0.0,
+                    range: Some((-1.0, 1.0)),
+                    beats: 0,
+                }],
             },
         ];
         apply_hit(
@@ -1172,7 +1262,12 @@ mod tests {
                 kind: "eq".to_owned(),
                 enabled: true,
                 flows: None,
-                params: vec![("low".to_owned(), 0.0)],
+                params: vec![hypermixx_core::FxParamStatus {
+                    name: "low".to_owned(),
+                    value: 0.0,
+                    range: Some((-1.0, 1.0)),
+                    beats: 0,
+                }],
             },
             hypermixx_core::FxSlotStatus {
                 index: 1,
@@ -1180,7 +1275,20 @@ mod tests {
                 kind: "moog".to_owned(),
                 enabled: true,
                 flows: None,
-                params: vec![("value".to_owned(), -0.4), ("resonance".to_owned(), 0.3)],
+                params: vec![
+                    hypermixx_core::FxParamStatus {
+                        name: "value".to_owned(),
+                        value: -0.4,
+                        range: Some((-1.0, 1.0)),
+                        beats: 0,
+                    },
+                    hypermixx_core::FxParamStatus {
+                        name: "resonance".to_owned(),
+                        value: 0.3,
+                        range: Some((0.0, 1.0)),
+                        beats: 0,
+                    },
+                ],
             },
         ];
         assert_eq!(app.knob_slot(0, Knob::Filter), Some(1));

@@ -32,5 +32,5 @@ pub use map::{
 };
 pub use msg::{Decoder, Event};
 pub use ports::{list_ports, Input, PortInfo, Received};
-pub use router::{Feed, Router, RouterCommand, RouterState, UnitModeState};
+pub use router::{Feed, ModeEvent, Router, RouterCommand, RouterState, UnitModeState};
 pub use translate::{apply, default_norm, BindState, MergeBuffer, MergeKey};

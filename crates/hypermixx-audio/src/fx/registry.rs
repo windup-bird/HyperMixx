@@ -8,6 +8,19 @@
 use super::sample::{Cut, Echo, Empty, Eq, Filter, Flanger, Gain, Limiter, Phaser, Reverb};
 use super::{Fx, FxError};
 
+/// One parameter's display metadata. The value itself lives on the effect; this is what a
+/// front-end needs to draw a bar or a beats row without knowing the effect's internals.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParamSpec {
+    pub name: &'static str,
+    pub min: f32,
+    pub max: f32,
+    /// True when the parameter is a musical length. Its current value is reported as the signed
+    /// integral `beats` code in [`hypermixx_core::FxParamStatus`] (positive = beats, negative =
+    /// reciprocal beats). Effects that do not use beats leave this false.
+    pub beats: bool,
+}
+
 /// Every built-in effect class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FxKind {
@@ -133,6 +146,16 @@ impl FxKind {
         }
     }
 
+    /// Display metadata for the parameters of this kind, in the same order as
+    /// [`FxKind::param_names`]. A kind that has not declared specs yet returns an empty slice; a
+    /// front-end then shows the raw value without a bar.
+    pub fn param_specs(&self) -> &'static [ParamSpec] {
+        match self {
+            FxKind::Echo => Echo::SPECS,
+            _ => &[],
+        }
+    }
+
     pub fn is_known(name: &str) -> bool {
         Self::parse(name).is_ok()
     }
@@ -200,5 +223,16 @@ mod tests {
         let count = names.len();
         names.dedup();
         assert_eq!(names.len(), count, "two kinds share a name");
+    }
+
+    #[test]
+    fn echo_is_the_first_kind_with_a_beat_parameter() {
+        let specs = FxKind::Echo.param_specs();
+        assert_eq!(specs.len(), FxKind::Echo.param_names().len());
+        let beat: Vec<_> = specs.iter().filter(|spec| spec.beats).collect();
+        assert_eq!(beat.len(), 1, "{specs:?}");
+        assert_eq!(beat[0].name, "time");
+        // A kind without declared specs asks the front-end to render plain values only.
+        assert!(FxKind::Reverb.param_specs().is_empty());
     }
 }

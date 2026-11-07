@@ -96,8 +96,11 @@ pub fn format_response(response: &CommandResponse, sample_rate: u32) -> Vec<LogL
                     };
                     out.push(LogLine::info(format!("    flows = {text}")));
                 }
-                for (name, value) in &slot.params {
-                    out.push(LogLine::info(format!("    {name} = {value:.4}")));
+                for param in &slot.params {
+                    out.push(LogLine::info(format!(
+                        "    {} = {:.4}",
+                        param.name, param.value
+                    )));
                 }
             }
             out

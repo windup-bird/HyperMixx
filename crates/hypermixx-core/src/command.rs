@@ -49,6 +49,64 @@ pub struct FxSlotRef {
     pub index: usize,
 }
 
+/// One parameter of an FX slot, as the front-end needs to draw it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FxParamStatus {
+    pub name: String,
+    pub value: f32,
+    /// Display/travel range, when the effect declares one. `None` means the front-end should show
+    /// the value as text rather than draw a bar it cannot map.
+    pub range: Option<(f32, f32)>,
+    /// Musical length of this parameter, when it is a beat division. The encoding is deliberately
+    /// signed and integral so a UI can step it without floating-point comparisons:
+    ///
+    /// * `n > 0`  → `n` beats (`1`, `2`, `4`, ...)
+    /// * `n < 0`  → `1 / -n` beat (`-2` = half a beat, `-4` = a quarter, `-32` = a 1/32)
+    /// * `0`      → this parameter is not a beat division (the field is still present, so every
+    ///              effect has the same shape)
+    ///
+    /// The value itself stays `f32`: the DSP still takes a fractional beat length.
+    pub beats: i32,
+}
+
+impl FxParamStatus {
+    /// The parameter's beat length, if it is a beat division.
+    pub fn beat_len(&self) -> Option<f64> {
+        match self.beats {
+            n if n > 0 => Some(f64::from(n)),
+            n if n < 0 => Some(1.0 / f64::from(-n)),
+            _ => None,
+        }
+    }
+
+    /// The nearest signed beat code for `value`: positive whole beats, negative reciprocal beats.
+    ///
+    /// Non-standard values snap to the nearest standard division rather than returning `0`; only a
+    /// non-positive or non-finite value means "not a beat length".
+    pub fn beats_code(value: f32) -> i32 {
+        if !value.is_finite() || value <= 0.0 {
+            return 0;
+        }
+        if value >= 1.0 {
+            return value.round().max(1.0) as i32;
+        }
+        let denominator = (1.0 / value).round().max(1.0);
+        -(denominator as i32)
+    }
+
+    /// The beat length after one ×2 (`double = true`) or ÷2 (`double = false`) press, clamped to
+    /// this parameter's declared range. `None` when the parameter is not a beat division.
+    pub fn scaled_beat_value(&self, double: bool) -> Option<f32> {
+        let length = self.beat_len()?;
+        let next = if double { length * 2.0 } else { length / 2.0 };
+        let next = match self.range {
+            Some((min, max)) => next.clamp(f64::from(min), f64::from(max)),
+            None => next,
+        };
+        Some(next as f32)
+    }
+}
+
 /// One FX slot as reported back to the caller.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FxSlotStatus {
@@ -64,8 +122,8 @@ pub struct FxSlotStatus {
     /// knob/pad/master slot, which sees one bus). An empty list is a valid answer: the slot is
     /// mounted but routed to no flow, so it processes nothing.
     pub flows: Option<Vec<Stem>>,
-    /// `(name, value)` pairs, in the order the effect declares them.
-    pub params: Vec<(String, f32)>,
+    /// Parameters, in the order the effect declares them.
+    pub params: Vec<FxParamStatus>,
 }
 
 /// How `loop out` and loop edits snap to the beat grid: the granularity of the out offset,
@@ -996,5 +1054,59 @@ impl std::fmt::Debug for Command {
                 .finish(),
             Command::Quit => f.write_str("Quit"),
         }
+    }
+}
+
+#[cfg(test)]
+mod fx_param_tests {
+    use super::FxParamStatus;
+
+    fn beat(value: f32) -> FxParamStatus {
+        FxParamStatus {
+            name: "time".to_owned(),
+            value,
+            range: Some((1.0 / 32.0, 4.0)),
+            beats: FxParamStatus::beats_code(value),
+        }
+    }
+
+    #[test]
+    fn positive_beats_are_whole_and_negative_beats_are_reciprocals() {
+        assert_eq!(FxParamStatus::beats_code(1.0), 1);
+        assert_eq!(FxParamStatus::beats_code(2.0), 2);
+        assert_eq!(FxParamStatus::beats_code(0.5), -2);
+        assert_eq!(FxParamStatus::beats_code(0.25), -4);
+        assert_eq!(FxParamStatus::beats_code(1.0 / 32.0), -32);
+        assert_eq!(FxParamStatus::beats_code(0.0), 0);
+    }
+
+    #[test]
+    fn the_buttons_double_and_halve_and_stay_inside_the_range() {
+        let half = beat(0.5);
+        assert_eq!(half.scaled_beat_value(true), Some(1.0), "1/2 x2 = 1");
+        assert_eq!(half.scaled_beat_value(false), Some(0.25), "1/2 /2 = 1/4");
+
+        let one = beat(1.0);
+        assert_eq!(one.scaled_beat_value(false), Some(0.5), "1 /2 = 1/2");
+
+        let top = beat(4.0);
+        assert_eq!(top.scaled_beat_value(true), Some(4.0), "clamped at 4 beats");
+
+        let bottom = beat(1.0 / 32.0);
+        assert_eq!(
+            bottom.scaled_beat_value(false),
+            Some(1.0 / 32.0),
+            "clamped at 1/32"
+        );
+        assert_eq!(
+            FxParamStatus {
+                name: "mix".to_owned(),
+                value: 0.5,
+                range: Some((0.0, 1.0)),
+                beats: 0,
+            }
+            .scaled_beat_value(true),
+            None
+        );
     }
 }

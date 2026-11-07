@@ -35,11 +35,23 @@ pub enum RouterCommand {
     NextMode { unit: String },
 }
 
+/// A selector press that chose a mode. Unlike [`RouterState`] this is an event, so a trigger that
+/// re-selects the **already current** mode is still visible to a front-end (which may have moved
+/// its own view elsewhere).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModeEvent {
+    pub unit: String,
+    pub deck: Option<DeckId>,
+    pub mode: String,
+}
+
 /// What one event produced.
 #[derive(Debug, Default)]
 pub struct Feed {
     pub commands: Vec<Command>,
     pub browser: Vec<BrowserAction>,
+    /// Mode selections, including a trigger that selected the current mode again.
+    pub modes: Vec<ModeEvent>,
     /// A selector (or a command) changed the active mode, so the caller should republish
     /// [`Router::snapshot`].
     pub state_changed: bool,
@@ -245,6 +257,13 @@ impl Router {
                 (self.units[unit].current + 1) % modes
             }
         };
+        // Report the selection before `select` decides whether it changed anything: a trigger that
+        // resolves to the current mode is exactly the "bring the UI back to this panel" gesture.
+        out.modes.push(ModeEvent {
+            unit: self.map.units[unit].id.clone(),
+            deck: self.map.units[unit].deck,
+            mode: self.map.units[unit].modes[target].name.clone(),
+        });
         if self.select(unit, target) {
             out.state_changed = true;
         }
@@ -550,6 +569,8 @@ action = "loop 4"
         let feed = router.feed(&note(0, 24, true));
         assert!(feed.commands.is_empty(), "a mode key is not an action");
         assert!(!feed.state_changed, "it is already in hotcue");
+        assert_eq!(feed.modes.len(), 1, "even a same-mode trigger is an event");
+        assert_eq!(feed.modes[0].mode, "hotcue");
         router.feed(&note(0, 24, false));
 
         let feed = router.feed(&note(0, 25, true));

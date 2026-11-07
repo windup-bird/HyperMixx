@@ -102,6 +102,7 @@ vdj_offset_ms = 0.0
 
 [preference.display]
 key = "camelot"          # camelot (8A/8B) | classic (Am/C)
+follow = true            # CLI/MIDI 命令与 modetrigger 自动切到对应面板
 
 # Analysis backends, named directly — there is no auto fallback.
 #   timestretch : tracked beat sequence + kick-band phase corroboration + key (default)

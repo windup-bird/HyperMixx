@@ -205,22 +205,27 @@ header（状态 + ⚙ settings）
 │        waveform-overview  ││        waveform-overview  │
 └───────────────────────────┘└───────────────────────────┘
 waveform（每 deck 2 行，高终端 ≥34 行时 3 行；无边框无背景）
-┌ 1-pads ───┐┌ 1-beatctl ┐┌ 1-eq ──┐┌ faders ────────┐┌ 2-eq ──┐┌ 2-beatctl ┐┌ 2-pads ───┐
-│ 2×4 pad   ││ tempo     ││ 5 knobs ││fader │meter│ f││ knobs  ││ tempo     ││ 2×4 pad   │
-│ 每块 3 行 ││ range     ││ sync key││                 ││        ││ range     ││ 每块 3 行 │
-│ cue/loop/jump             │ bend      ││ play cue│（空一行）       ││        ││ bend      ││
-└───────────┘└───────────┘└─────────┘│crossfader ░░░░░│└────────┘└───────────┘└───────────┘
-                                     └────────────────┘
+ 1trans ┌ 1-pads/1-fx ─┐┌ 1-eq/1-beatctl ┐┌ faders ────────┐ 2trans ┌ 2-pads/2-fx ─┐┌ 2-eq/2-beatctl ┐
+ sync  │ 2×4 pad      ││ 5 knobs        ││fader │meter│ f│ sync  │ 2×4 pad      ││ 5 knobs        │
+ key   │ 每块 3 行    ││                ││                 │ key   │ 每块 3 行    ││                │
+ cue   │ cue/loop/jump││                ││                 │ cue   │ cue/loop/jump││                │
+ play  │ [pads][fx]   ││ [eq][beat]     ││crossfader ░░░░░│ play  │ [pads][fx]   ││ [eq][beat]     │
+       └──────────────┘└────────────────┘└────────────────┘       └──────────────┘└────────────────┘
 browser | command
 ```
 
-- 每个 deck 的控件带按 **N-pads : N-beatctl : (N-eq + faders) = 1:1:1** 平分（面板标题带碟盘编号）；
-  `trans`（sync/key、play/cue 两行）放在 eq 面板的旋钮下方，这样三块面板的底部按钮行对齐，也不用再挤一列。
+- 控件带按字面顺序重复两组：`trans | pads/fx | eq/beatctl | faders | trans | pads/fx | eq/beatctl`。
+- `trans` 不设边框，`sync / key / cue / play` 纵向排列并留空行；不再占用 eq 面板。
+- `pads` 与 `fx` 共用一格，`eq` 与 `beatctl` 共用一格；各自底部有一行 `[pads][fx]` / `[eq][beat]`
+  切换按钮（样式同 padmode）。
+- `fx` 面板列出当前 deck 链里**所有**非 `eq`/`filter` 槽位（`flowfx1..`、`knobfx1..`、`padfx1..`
+  以及运行时 `fx add` 的槽）。上方显示前两个非节拍参数，若有节拍参数则显示 `- beats:N +`：
+  `-` 减半、`+` 加倍。节拍参数在协议里是整数编码：正数 = N 拍，负数 = 1/N 拍。
 - eq 的 5 个横条用 `▬`（居中矩形，不占满整行）画，空的部分也是 `▬`、只差颜色：这样每条上下
-  自带一点空隙，`filt` 不会贴住下面的 transport 按钮，也不需要为间隙额外加整行。
-- pads 是 2 行 4 列，每块 3 行；pads/beatctl 底部那行只放模式按钮（cue/loop/jump、bpm/loop/jump），
-  按钮内文字居中，没有别的文字；tempo 的读数在上、`range ±N%` 正好在它下方。
-- 两个 deck 的 fader 和它们的电平条**同框**（中间那个 `faders` 框）：**左列是 deck2 的电平、右列是 deck2 的电平**
+  自带一点空隙，`filt` 不会贴住底部按钮，也不需要为间隙额外加整行。
+- pads 是 2 行 4 列，每块 3 行；pads/beatctl 底部模式行只放模式按钮（cue/loop/jump、bpm/loop/jump），
+  再下一行是分组切换；按钮内文字居中，没有别的文字。
+- 两个 deck 的 fader 和它们的电平条**同框**（中间那个 `faders` 框）：**左列是 deck1 的电平、右列是 deck2 的电平**
   （不是 master/cue，那对数值仍在 header 的 `out`/`cue` 里）。crossfader 画在这个框的**最底下一行**，
   与上面空一行；框内横向间隙统一 2 列，与那 1 行空白（约等于 2 列宽）视觉一致。
 - fader 的宽度是 **2 列**，正好等于 crossfader 那 1 行的像素厚度（字符格约 1:2），所以竖着的 deck fader
@@ -229,10 +234,13 @@ browser | command
   向左/向右才从中点往外填。
 - 启动时焦点在 **browser**：方向键直接浏览曲库。browser 也是命令行的目标——此时**裸的 deck 命令会被拒绝**
   （`play` 不会悄悄落到上次的 deck），按 `Tab` 选到 deck，或直接在行首写 `deck1 play`。
-- 宽度 < 112 或高度 < 26 时整条控件带隐藏，只留 header + deck 信息 + 波形 + browser/command；宽度不到 120 时
-  mixer 旋钮自动省掉数值，只留长条。
-- 控件全部可用鼠标点：pads 三档、beat 三档、fader/knob/crossfader 按位置取值。键盘仍然只属于命令行
-  （`Tab` 切目标，`F9` 设置）。
+- 宽度 < 112 或高度 < 26 时整条控件带隐藏，只留 header + deck 信息 + 波形 + browser/command；
+  eq 面板内部宽度不足 11 列时自动省掉数值，只留长条。
+- 控件全部可用鼠标点：pads 三档、beat 三档、分组切换、FX 槽/参数/节拍、fader/knob/crossfader 按位置取值。
+  键盘仍然只属于命令行（`Tab` 切目标，`F9` 设置）。
+- `[preference.display] follow = true`（默认）时，CLI/MIDI 命令和 MIDI 的 `mode_trigger` 会自动切到
+  对应面板：pad 命令切 pads/对应 padmode，beat/tempo 命令切 beatctl，eq/filter 命令切 eq，
+  其他 FX 命令切 fx 并选中对应槽位；关掉后 TUI 只响应鼠标/键盘。
 - 颜色集中在 `config.toml` 的 `[theme]`（`accent`/`dim`/`text`/`error`/`warn`/`pad`，`#rrggbb`）。
 - 封面与 overview 和波形共用渲染后端：kitty 下都走 graphics 协议（同一个 image/placement 生命周期，
   弹层打开时不发送也不放置，关闭后重传重放，避免残留），其它终端下封面用半格真彩、overview 用 braille。

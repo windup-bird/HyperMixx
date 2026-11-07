@@ -284,6 +284,8 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 
 - 时间类效果（`echo` / `reverb` / `flanger` / `phaser` / `cut`）的节拍参数走
   `FxContext` 的拍网格；曲目还没分析时回落到 120 BPM，不会静音。
+- TUI 的 FX 面板把节拍参数显示为 `beats:N`：`N > 0` 是 N 拍，`N < 0` 是 `1/|N|` 拍
+  （`-2` = 1/2，`-4` = 1/4），`0` 表示不是节拍参数；`-` / `+` 分别减半 / 加倍。
 - 时间类效果的主参数排第一，所以 MIDI 的 `fx param 1` 就是"效果量"（`echo` 的 `mix`、
   `cut` 的 `depth`）。
 - 时间类效果在 `prepare` 里按引擎率一次性分配缓冲区，之后 `process` 不再分配；

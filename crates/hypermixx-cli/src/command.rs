@@ -142,6 +142,12 @@ impl SlotBook {
         }
     }
 
+    /// The role at a flat index, for reverse lookups by the command fan-out.
+    pub fn role_at(&self, chain: &str, index: usize) -> Option<String> {
+        let book = self.slots.lock().ok()?;
+        book.get(chain)?.get(index).map(|entry| entry.role.clone())
+    }
+
     /// Records a `fx kind` this front-end sent. The engine validated the name, so no round-trip.
     pub fn set_kind(&self, chain: &str, index: usize, kind: &str) {
         if let Ok(mut book) = self.slots.lock() {

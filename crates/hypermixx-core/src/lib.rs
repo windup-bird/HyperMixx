@@ -20,9 +20,9 @@ pub use analysis::TrackAnalysis;
 pub use beatgrid::BeatGrid;
 pub use browser::BrowserAction;
 pub use command::{
-    Backend, BeatLen, Command, CommandResponse, CueOp, FaderTarget, FxChainId, FxSlotRef,
-    FxSlotStatus, HotCueOp, KeylockMode, LoopEditOp, LoopOp, LoopQuantum, NudgeOp, PhaseMode,
-    SyncOp, VinylOp,
+    Backend, BeatLen, Command, CommandResponse, CueOp, FaderTarget, FxChainId, FxParamStatus,
+    FxSlotRef, FxSlotStatus, HotCueOp, KeylockMode, LoopEditOp, LoopOp, LoopQuantum, NudgeOp,
+    PhaseMode, SyncOp, VinylOp,
 };
 pub use deck::{deck_label, DeckId, DeckState, HotCue, HOT_CUE_SLOTS};
 pub use key::{Key, KeyFormat, KeyMode};

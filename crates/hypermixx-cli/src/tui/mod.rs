@@ -12,6 +12,7 @@ pub mod devices;
 pub mod guide;
 pub mod image_slot;
 pub mod input;
+pub mod intent;
 pub mod overview;
 pub mod picker;
 pub mod popup;
@@ -22,15 +23,17 @@ pub mod view;
 pub mod waveform_view;
 
 use std::io;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyEventKind};
 use hypermixx_audio::{AudioPipeline, Command};
 
-use crate::command::Dispatcher;
+use crate::command::{Dispatcher, Slots};
 use crate::preference;
 use crate::response::LogLine;
 use crate::session::Session;
+use crate::tui::intent::UiIntent;
 use app::App;
 
 /// ~60Hz. The image waveform transports can use the extra ticks; braille is still cheap at this
@@ -48,7 +51,7 @@ const METERS_EVERY: u64 = 6;
 #[allow(clippy::too_many_arguments)]
 pub fn run(pipeline: &AudioPipeline, session: Session) {
     let Session {
-        command_tx,
+        command_tx: engine_tx,
         backends,
         decks,
         notice_tx,
@@ -63,6 +66,10 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         library,
     } = session;
     let preference_path = preference_path(topology.as_deref());
+    // All commands (the command line, mouse hits and MIDI) pass through one fan-out before the
+    // engine. It is the only place that sees both origins; it extracts a lightweight panel intent
+    // and forwards the command unchanged.
+    let (command_tx, command_rx) = crossbeam_channel::unbounded();
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
     let mut dispatcher = Dispatcher::new(command_tx.clone(), notice_tx).tap_events(event_tx);
     if let (Some(control), Some(state)) = (midi_control, midi_state) {
@@ -76,8 +83,6 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     let sample_rate = live.audio.sample_rate;
     dispatcher.with_live(live, live_source);
     dispatcher.with_library(library.clone());
-    // Prime every chain's slot list so `fx remove <name>` works from the first command.
-    dispatcher.prime(decks, pipeline.response_rx());
     let mut app = App::new(
         decks,
         backends,
@@ -86,6 +91,10 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         dispatcher.slots(),
         dispatcher.scan(),
     );
+    // Start the fan-out before `prime` so its `ListFx` requests reach the engine.
+    spawn_command_fanout(command_rx, engine_tx, dispatcher.slots(), app.intent_slot());
+    // Prime every chain's slot list so `fx remove <name>` works from the first command.
+    dispatcher.prime(decks, pipeline.response_rx());
     app.library = library;
     // The header reports the configured ring and rate, not the compile-time defaults.
     app.ring_frames = ring_frames;
@@ -103,6 +112,7 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
             app.waveform = preference.waveform;
             app.theme = preference.theme;
             app.key_format = preference.display.key_format;
+            app.follow_commands = preference.display.follow;
             for note in notes {
                 app.push_log(LogLine::info(format!("[preference] {note}")));
             }
@@ -166,6 +176,32 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     if let Err(err) = outcome {
         eprintln!("tui: {err}");
     }
+}
+
+/// Watches every command before the engine does, leaves the newest panel intent for the UI, and
+/// forwards the command unchanged. The extra hop is on the control thread, never the audio thread.
+fn spawn_command_fanout(
+    command_rx: crossbeam_channel::Receiver<Command>,
+    engine_tx: crossbeam_channel::Sender<Command>,
+    slots: Slots,
+    intent: Arc<Mutex<Option<UiIntent>>>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("hypermixx-command-fanout".to_owned())
+        .spawn(move || {
+            while let Ok(command) = command_rx.recv() {
+                // Polls and state requests classify to `None`; only user-visible actions replace
+                // the pending intent, so a 60Hz poll cannot fight the panel the user chose.
+                if let Some(next) = intent::from_command(&command, &slots) {
+                    if let Ok(mut pending) = intent.lock() {
+                        *pending = Some(next);
+                    }
+                }
+                if engine_tx.send(command).is_err() {
+                    break;
+                }
+            }
+        });
 }
 
 /// Preferences are a section of the one config, so the TUI reads them from the config file. The

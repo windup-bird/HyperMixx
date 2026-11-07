@@ -161,12 +161,15 @@ impl LibrarySettings {
 pub struct DisplaySettings {
     /// How keys are rendered. `Traditional` is the "classic" spelling (`Am`).
     pub key_format: KeyFormat,
+    /// Whether CLI/MIDI commands and MIDI mode triggers switch the visible panels.
+    pub follow: bool,
 }
 
 impl Default for DisplaySettings {
     fn default() -> Self {
         Self {
             key_format: KeyFormat::Camelot,
+            follow: true,
         }
     }
 }
@@ -300,6 +303,10 @@ fn parse_display(
                 Some("camelot" | "camlot") => display.key_format = KeyFormat::Camelot,
                 Some("classic" | "traditional") => display.key_format = KeyFormat::Traditional,
                 _ => notes.push("display.key must be camelot | classic".to_owned()),
+            },
+            "follow" | "follow_commands" => match value.as_bool() {
+                Some(follow) => display.follow = follow,
+                None => notes.push("display.follow must be true | false".to_owned()),
             },
             other => notes.push(format!("unknown display key `{other}` ignored")),
         }
@@ -665,10 +672,14 @@ mod tests {
     fn key_display_defaults_to_camelot_and_can_be_classic() {
         let (preference, notes) = parse("").unwrap();
         assert_eq!(preference.display.key_format, KeyFormat::Camelot);
+        assert!(preference.display.follow, "panel following defaults on");
         assert!(notes.is_empty());
-        let (preference, notes) = parse("[display]\nkey = \"classic\"").unwrap();
+        let (preference, notes) = parse("[display]\nkey = \"classic\"\nfollow = false").unwrap();
         assert_eq!(preference.display.key_format, KeyFormat::Traditional);
+        assert!(!preference.display.follow);
         assert!(notes.is_empty());
+        let (_preference, notes) = parse("[display]\nfollow = \"yes\"").unwrap();
+        assert!(notes.iter().any(|note| note.contains("display.follow")));
     }
 
     #[test]

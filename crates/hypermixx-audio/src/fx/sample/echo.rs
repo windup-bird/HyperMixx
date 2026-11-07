@@ -17,7 +17,7 @@
 //! allocation to [`process`] after [`prepare`] and no latency to the dry path.
 
 use super::super::delay::{DelayLine, OnePole};
-use super::super::{Fx, FxContext, FxError, Param};
+use super::super::{Fx, FxContext, FxError, Param, ParamSpec};
 use crate::mixer::Bus;
 
 /// Longest repeat the buffers hold. Two seconds covers a quarter note at 60 BPM and every musically
@@ -79,6 +79,41 @@ impl Echo {
 
     /// Parameter names in performance order: the wet amount first, then the echo's own shape.
     pub const PARAMS: &'static [&'static str] = &["mix", "feedback", "time", "tone", "pingpong"];
+
+    /// Display metadata, in the same order as [`Echo::PARAMS`]. `time` is the one beat division;
+    /// the others are plain `0..1` controls (feedback stops at the stability ceiling).
+    pub const SPECS: &'static [ParamSpec] = &[
+        ParamSpec {
+            name: "mix",
+            min: 0.0,
+            max: 1.0,
+            beats: false,
+        },
+        ParamSpec {
+            name: "feedback",
+            min: 0.0,
+            max: MAX_FEEDBACK,
+            beats: false,
+        },
+        ParamSpec {
+            name: "time",
+            min: MIN_BEATS,
+            max: MAX_BEATS,
+            beats: true,
+        },
+        ParamSpec {
+            name: "tone",
+            min: 0.0,
+            max: 1.0,
+            beats: false,
+        },
+        ParamSpec {
+            name: "pingpong",
+            min: 0.0,
+            max: 1.0,
+            beats: false,
+        },
+    ];
 
     /// Repeat length applied on the last block, in frames.
     pub fn delay_frames(&self) -> f32 {
