@@ -17,6 +17,7 @@
 
 use hypermixx_core::{BeatGrid, DeckState, HOT_CUE_SLOTS};
 use hypermixx_library::Waveform;
+use ratatui::buffer::CellDiffOption;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::symbols::Marker;
@@ -80,9 +81,11 @@ fn s_curve(value: f64) -> f64 {
     value * value * (3.0 - 2.0 * value)
 }
 
-/// Draws `waveform` across `area` as braille, with the playhead, the loop wash and the cue marks.
+/// Draws `waveform` across `area` as braille, with the loop wash and the cue marks.
 ///
-/// A deck with no waveform yet draws only the playhead line: an empty box would look like a bug.
+/// The playhead is deliberately **not** baked into the canvas or the image: [`draw_playhead`]
+/// paints it over the finished area every frame, so a cached Kitty image cannot leave an old
+/// playhead behind.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -98,7 +101,6 @@ pub fn render(
     let dots_x = f64::from(area.width) * 2.0;
     let height = f64::from(area.height) * 4.0;
     let total = state.total_frames as f64;
-    let playhead = state.current_frame.min(state.total_frames) as f64 / total;
     let profiles = profiles(waveform, state.total_frames, dots_x as usize);
 
     let canvas = Canvas::default()
@@ -118,8 +120,6 @@ pub fn render(
                 ctx.draw(&CanvasLine::new(x, low, x, mid, colors.mid));
                 ctx.draw(&CanvasLine::new(x, mid, x, high, colors.high));
             }
-            let x = playhead * dots_x;
-            ctx.draw(&CanvasLine::new(x, 0.0, x, height, Color::Red));
         });
     frame.render_widget(canvas, area);
 
@@ -127,8 +127,79 @@ pub fn render(
     draw_cues(frame, area, state);
 }
 
+/// Paints the playhead over the whole overview height. A terminal-cell overlay rather than a
+/// braille/RGBA line: it is redrawn every frame, so it stays live even when the image itself is
+/// cached.
+///
+/// `previous` is the column drawn on the last frame. Over a Kitty image the cells of the old
+/// playhead were marked `Skip` (so ratatui would not paint over the image); clearing them with
+/// `AlwaysUpdate` spaces is what removes the old glyph while leaving the image visible. Braille
+/// callers pass `None` because the canvas repaints the old column by itself.
+///
+/// Returns the column drawn this frame, to be handed back on the next call.
+pub fn draw_playhead(
+    frame: &mut Frame,
+    area: Rect,
+    state: &DeckState,
+    color: Color,
+    previous: Option<u16>,
+    protect_origin: bool,
+) -> Option<u16> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    if let Some(previous) = previous {
+        clear_playhead(frame, area, previous, protect_origin);
+    }
+    if state.total_frames == 0 {
+        return None;
+    }
+    let column = (state.current_frame.min(state.total_frames) as f64 / state.total_frames as f64
+        * f64::from(area.width))
+    .floor() as u16;
+    let column = column.min(area.width - 1);
+    let x = area.x + column;
+    // The Kitty placement escape lives in the image rectangle's first cell. A playhead at column
+    // zero would overwrite it, so the top cell of that column is left to the image.
+    let top = if protect_origin && x == area.x {
+        area.top().saturating_add(1)
+    } else {
+        area.top()
+    };
+    let buffer = frame.buffer_mut();
+    for y in top..area.bottom() {
+        if let Some(cell) = buffer.cell_mut((x, y)) {
+            cell.set_symbol("┃")
+                .set_fg(color)
+                .set_diff_option(CellDiffOption::AlwaysUpdate);
+        }
+    }
+    Some(column)
+}
+
+/// Replaces one overlay column with transparent spaces. The explicit `AlwaysUpdate` is required
+/// because an image slot marks every covered cell `Skip`.
+fn clear_playhead(frame: &mut Frame, area: Rect, column: u16, protect_origin: bool) {
+    let x = area.x + column.min(area.width - 1);
+    let top = if protect_origin && x == area.x {
+        area.top().saturating_add(1)
+    } else {
+        area.top()
+    };
+    let buffer = frame.buffer_mut();
+    for y in top..area.bottom() {
+        if let Some(cell) = buffer.cell_mut((x, y)) {
+            cell.set_symbol(" ")
+                .set_fg(Color::Reset)
+                .set_bg(Color::Reset)
+                .set_diff_option(CellDiffOption::AlwaysUpdate);
+        }
+    }
+}
+
 /// The same overview as straight RGBA, for the Kitty image path: `width × height` pixels, with the
-/// folded silhouette growing from the bottom and the playhead, loop and cues drawn into it.
+/// folded silhouette growing from the bottom and the loop and cues drawn into it. The playhead is
+/// an overlay (see [`draw_playhead`]), not part of the cached image.
 pub fn rgba(
     waveform: Option<&Waveform>,
     grid: Option<&BeatGrid>,
@@ -200,18 +271,6 @@ pub fn rgba(
             width,
             height,
             theme.dim,
-        );
-    }
-    // Playhead last, so it wins over the bars and the loop wash.
-    let playhead = (state.current_frame.min(state.total_frames) as f64 / state.total_frames as f64
-        * f64::from(width)) as u32;
-    for row in 0..height {
-        put(
-            &mut image,
-            width,
-            playhead.min(width - 1),
-            row,
-            [255, 40, 40, 255],
         );
     }
     for (slot, frame) in state.hot_cues.iter().enumerate() {

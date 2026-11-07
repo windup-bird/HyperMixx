@@ -461,6 +461,8 @@ pub struct App {
     pub waveform_view: WaveformView,
     /// The still images (cover, overview) each deck shows through the same image backend.
     pub deck_images: Vec<crate::tui::image_slot::DeckImages>,
+    /// The overview playhead column drawn last frame, so the image path can erase its old glyph.
+    pub overview_playhead: Vec<Option<u16>>,
 
     pub log: VecDeque<LogLine>,
     /// Lines scrolled up from the bottom (0 = following).
@@ -605,6 +607,7 @@ impl App {
             deck_images: (0..decks)
                 .map(|_| crate::tui::image_slot::DeckImages::new())
                 .collect(),
+            overview_playhead: vec![None; decks],
             waveform_view: WaveformView::new(WaveformSettings::default(), decks),
             log: VecDeque::new(),
             log_offset: 0,

@@ -673,6 +673,9 @@ fn render_overview(
             app.waveform.colors,
             &app.theme,
         );
+        // Braille repaints the old column with the waveform, so there is no stale glyph to clear.
+        let column = overview::draw_playhead(frame, area, &app.states[deck], Color::Red, None, false);
+        app.overview_playhead[deck] = column;
         return;
     }
     if suppress_images {
@@ -689,6 +692,10 @@ fn render_overview(
             app.waveform.colors,
             &app.theme,
         );
+        let previous = app.overview_playhead[deck].take();
+        let column =
+            overview::draw_playhead(frame, area, &app.states[deck], Color::Red, previous, false);
+        app.overview_playhead[deck] = column;
         return;
     };
     let state = app.states[deck].clone();
@@ -708,22 +715,27 @@ fn render_overview(
         color_key(theme.dim),
         grid.as_ref().map_or(0, |grid| grid.frame_at_beat(0)),
     ]);
-    let slot = &mut app.deck_images[deck].overview;
-    slot.draw(frame, area, key, || {
-        (
-            width_px.max(1),
-            height_px.max(1),
-            overview::rgba(
-                Some(waveform.as_ref()),
-                grid.as_ref(),
-                &state,
-                colors,
+    {
+        let slot = &mut app.deck_images[deck].overview;
+        slot.draw(frame, area, key, || {
+            (
                 width_px.max(1),
                 height_px.max(1),
-                &theme,
-            ),
-        )
-    });
+                overview::rgba(
+                    Some(waveform.as_ref()),
+                    grid.as_ref(),
+                    &state,
+                    colors,
+                    width_px.max(1),
+                    height_px.max(1),
+                    &theme,
+                ),
+            )
+        });
+    }
+    let previous = app.overview_playhead[deck].take();
+    let column = overview::draw_playhead(frame, area, &state, Color::Red, previous, true);
+    app.overview_playhead[deck] = column;
 }
 
 /// One colour as a number, for an image cache key. `Color` is not a field-less enum, so it cannot be
@@ -2522,6 +2534,49 @@ mod tests {
             reds.iter().any(|x| x.abs_diff(center) <= COVER_W + 2),
             "overview playhead not at half the track: {reds:?} (deck centre {center})"
         );
+    }
+
+    #[test]
+    fn the_overview_playhead_does_not_eat_the_kitty_placement_cell() {
+        let mut app = kitty_app();
+        app.states[0].current_frame = 0;
+        let buffer = render_at(&mut app, 120, 40);
+        let symbols = cell_symbols(&buffer);
+        assert!(
+            symbols.contains("a=t"),
+            "the overview's Kitty sequence must survive a playhead at column zero"
+        );
+        assert!(all_text(&buffer).contains('┃'));
+
+        app.states[0].current_frame = 50_000;
+        let buffer = render_at(&mut app, 120, 40);
+        assert!(
+            cell_symbols(&buffer).contains("a=p"),
+            "the cached overview must still be placed after the playhead moves"
+        );
+        assert!(all_text(&buffer).contains('┃'));
+    }
+
+    #[test]
+    fn the_overview_playhead_moves_with_the_frame() {
+        let mut app = test_app();
+        let red_x = |app: &mut App| {
+            let buffer = render_at(app, 120, 40);
+            let band = bands(buffer.area, app.decks);
+            let row = band.info.y + 2;
+            (0..band.info.width)
+                .find(|x| {
+                    buffer
+                        .cell((*x, row))
+                        .is_some_and(|cell| cell.fg == Color::Red)
+                })
+                .expect("overview playhead")
+        };
+        app.states[0].current_frame = 25_000;
+        let early = red_x(&mut app);
+        app.states[0].current_frame = 75_000;
+        let late = red_x(&mut app);
+        assert!(early < late, "playhead did not move: {early} → {late}");
     }
 
     /// The crossfader row, and the frame it lives in.
