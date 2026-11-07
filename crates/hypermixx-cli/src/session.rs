@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use crossbeam_channel::{Receiver, Sender};
 
 use hypermixx_audio::Command;
-use hypermixx_core::{Backend, LiveConfig};
+use hypermixx_core::LiveConfig;
+use hypermixx_library::analyser::Backends;
 use hypermixx_library::LibraryDb;
 use hypermixx_midi::{RouterCommand, RouterState};
 
@@ -19,7 +20,8 @@ use crate::response::LogLine;
 /// Everything a session needs that is not the engine itself.
 pub struct Session {
     pub command_tx: Sender<Command>,
-    pub backend: Backend,
+    /// Which backend runs which analysis path (`[preference.analysis]` in the config).
+    pub backends: Backends,
     /// How many decks the engine owns (asked of it, not assumed).
     pub decks: usize,
     pub notice_tx: NoticeTx,

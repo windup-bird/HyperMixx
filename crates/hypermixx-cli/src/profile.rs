@@ -16,7 +16,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use hypermixx_audio::{reference_toml, MixerConfig};
-use hypermixx_core::LiveConfig;
+use hypermixx_core::{Backend, LiveConfig};
 
 /// The shipped template. `--print-config` emits it and the first-start copy writes it verbatim.
 pub fn template() -> &'static str {
@@ -46,6 +46,47 @@ pub struct Controller {
     pub device: Option<String>,
 }
 
+/// The `[preference.analysis]` section: which backend runs which analysis path. Both keys are
+/// mandatory in spirit — an omitted key takes the timestretch default, and there is no `auto`:
+/// the config names its backends directly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnalysisBackends {
+    pub beats: Backend,
+    pub key: Backend,
+}
+
+impl Default for AnalysisBackends {
+    fn default() -> Self {
+        Self {
+            beats: Backend::default(),
+            key: Backend::default(),
+        }
+    }
+}
+
+fn analysis_section(value: &toml::Value) -> Result<AnalysisBackends, String> {
+    let table = value
+        .as_table()
+        .ok_or_else(|| "must be a table".to_owned())?;
+    let mut section = AnalysisBackends::default();
+    for (key, value) in table {
+        let text = value
+            .as_str()
+            .ok_or_else(|| format!("`{key}` must be a string"))?
+            .trim()
+            .to_owned();
+        let backend = Backend::parse(&text).ok_or_else(|| {
+            format!("`{key} = \"{text}\"` is not a backend (stratum | timestretch)")
+        })?;
+        match key.as_str() {
+            "beats" => section.beats = backend,
+            "key" => section.key = backend,
+            other => return Err(format!("unknown key `{other}` (beats | key)")),
+        }
+    }
+    Ok(section)
+}
+
 /// One parsed config, and the path it came from.
 #[derive(Debug)]
 pub struct Config {
@@ -53,6 +94,8 @@ pub struct Config {
     pub mixer: MixerConfig,
     pub live: LiveConfig,
     pub controller: Controller,
+    /// Which backend runs the beat and the key analysis path.
+    pub analysis: AnalysisBackends,
     /// Notes worth showing at startup (a first-start copy, clamped live values, ...).
     pub notes: Vec<String>,
 }
@@ -189,11 +232,21 @@ fn parse(path: &Path, text: &str, mut notes: Vec<String>) -> Result<Config, Stri
         device: section.device,
     };
 
+    let analysis = match value
+        .get("preference")
+        .and_then(|preference| preference.get("analysis"))
+    {
+        Some(section) => analysis_section(section)
+            .map_err(|err| format!("{}: [preference.analysis]: {err}", path.display()))?,
+        None => AnalysisBackends::default(),
+    };
+
     Ok(Config {
         path: path.to_path_buf(),
         mixer,
         live,
         controller,
+        analysis,
         notes,
     })
 }

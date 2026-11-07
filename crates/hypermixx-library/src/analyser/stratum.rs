@@ -47,6 +47,9 @@ pub fn analyze(mono: &[f32], sample_rate: u32) -> Result<RawAnalysis, AnalyserEr
         key: convert_key(result.key, result.key_confidence),
         bpm_hint: Some(result.bpm),
         duration_sec: result.metadata.duration_seconds as f64,
+        // stratum reports no dual-estimator phase verdict; the refit treats it as neutral.
+        phase_untrusted: false,
+        grid_confidence: None,
     })
 }
 

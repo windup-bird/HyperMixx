@@ -49,7 +49,7 @@ const METERS_EVERY: u64 = 6;
 pub fn run(pipeline: &AudioPipeline, session: Session) {
     let Session {
         command_tx,
-        backend,
+        backends,
         decks,
         notice_tx,
         notice_rx,
@@ -80,7 +80,7 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
     dispatcher.prime(decks, pipeline.response_rx());
     let mut app = App::new(
         decks,
-        backend,
+        backends,
         notice_rx,
         event_rx,
         dispatcher.slots(),

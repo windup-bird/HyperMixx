@@ -239,16 +239,34 @@ pub enum LoopOp {
     SetQuantum(LoopQuantum),
 }
 
-/// Which analyser backend to use for a track.
+/// Which analyser backend to use for a track. Configured directly (`[preference.analysis]` in
+/// config.toml) — there is no auto fallback: the user names the backend.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Backend {
-    /// Prefer stratum, fall back to timestretch.
+    /// timestretch's own analyser (tracker + kick-band corroboration). The default.
     #[default]
-    Auto,
+    Timestretch,
     /// stratum-dsp only.
     Stratum,
-    /// timestretch's own analyser only.
-    Timestretch,
+}
+
+impl Backend {
+    /// Parses a config/CLI token.
+    pub fn parse(token: &str) -> Option<Self> {
+        match token.to_ascii_lowercase().as_str() {
+            "timestretch" => Some(Backend::Timestretch),
+            "stratum" => Some(Backend::Stratum),
+            _ => None,
+        }
+    }
+
+    /// The config/CLI token for this backend.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Backend::Timestretch => "timestretch",
+            Backend::Stratum => "stratum",
+        }
+    }
 }
 
 /// How a phase correction closes the gap: the `sync phase` / `sync phaselock` argument.

@@ -72,10 +72,10 @@ crates/
 │       ├── track.rs         # TrackInfo:持 BeatSpec,惰性缓存编译结果
 │       ├── waveform.rs      # 立体声三频段 u8 峰值概览（2:1 mipmap）
 │       └── analyser/
-│           ├── mod.rs         # analyze(source) = backend → refine → compile
+│           ├── mod.rs         # analyze(source, Backends) = beats 路径 + key 路径 → refine → compile
 │           ├── stratum.rs     # stratum-dsp 适配(兜 panic,关静音裁剪)
-│           ├── timestretch.rs # 占位:上游未暴露离线分析,返回 Unsupported
-│           └── refine.rs      # fit_rigid:中位数周期 + 最小二乘 + 倍频归位
+│           ├── timestretch.rs # timestretch 0.16 包装:DP 跟踪器 + kick 相位互证 + key
+│           └── refine.rs      # fit_rigid v3:序列索引 + Tukey 稳健 LS;折叠带是输出后变换
 │
 ├── hypermixx-midi/       # MIDI 输入映射(core + midir + serde/toml)
 │   └── src/
@@ -142,7 +142,7 @@ crates/
 - FX 族:`AddFx { chain, kind }` / `RemoveFx { chain, index }` / `SetFxEnabled` /
   `SetFxParam { slot, name, value }` / `FxTrigger` / `PadPress` / `PadRelease` / `ListFx`;
   槽位寻址 `FxChainId::{Master, Deck(u8)}` + `FxSlotRef { chain, index }`
-- `Backend { Auto, Stratum, Timestretch }` — 分析后端选择
+- `Backend { Stratum, Timestretch }` — 分析后端,配置直选无 auto(`[preference.analysis]`)
 
 ---
 
@@ -401,12 +401,15 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 
 ## hypermixx-library
 
-分析管线:`Source → downmix_to_mono → backend → RawAnalysis → fit_rigid → BeatSpec
-→ GridCompiler → TrackAnalysis → SetAnalysis`
+分析管线:`Source → downmix_to_mono → beats 后端 → RawAnalysis → fit_rigid → BeatSpec
+→ GridCompiler → TrackAnalysis → SetAnalysis`(key 是独立路径,`Backends { beats, key }` 各自配置)
 
 - `BeatSpec` — 可编辑真源(段落化 BPM + 起点 + 拍数);刚性网格 = 单段
 - `GridCompiler` — 三段编译:起点前填至 frame 0 / 段内等距 / 接缝去重 + 末段外推到轨尾
-- `fit_rigid` — 中位数拍距 → 倍频归位(拉进 [60, 200] BPM)→ 整数拍号分配 + 最小二乘
+- `fit_rigid` v3 — 拍表是有序序列:顺序即拍号。去重(<3/4 拍的幽灵/子拍杂拍)
+  → 索引展开(+1/拍,丢拍 +round(gap/m))→ Tukey 稳健最小二乘(t = φ + k·P)
+  → DJ 折叠带是**输出后的显式 2^k 变换**(octave_shift 记录),不参与拟合。
+  倍频/3:2 归检测器(timestretch metrical check);不过门槛标记 degraded(尽力而为)
 - `TrackInfo` — 持 `BeatSpec` 与 key;`Mutex<Option<TrackAnalysis>>` 惰性编译,改 spec 即失效
 
 ---
@@ -415,7 +418,7 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 
 启动参数:默认启动 TUI(`--cli` 切行式 REPL)/ `--config <file>`(单文件多段落配置;
 不给则用平台默认路径,首次启动从内置模板复制)/`--print-config`(输出配置模板)/
-`--backend auto|stratum|timestretch` / `--controller <port>`(打开控制器输入;
+`--controller <port>`(打开控制器输入;
 映射文件由 config 的 `[controller].map` 指定;端口名或序号,`controller ports` 可列);
 `--guide [<file>]` 是 learn 模式编辑器(不启动引擎)。deck 数量启动时从引擎查询
 (`channel_count`,自定义拓扑可配任意通道)。

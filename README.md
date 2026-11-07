@@ -178,10 +178,10 @@ deck1> quit
 ```bash
 cargo run -p hypermixx-cli -- --cli                  # 纯 REPL（默认是 TUI）
 cargo run -p hypermixx-cli -- --guide                # controller-guide（不启动引擎）
-cargo run -p hypermixx-cli -- --backend auto        # 分析后端 auto | stratum | timestretch
 cargo run -p hypermixx-cli -- --config config.toml  # 指定配置文件；不给则用平台默认路径
 cargo run -p hypermixx-cli -- --print-config        # 打印配置模板后退出
 cargo run -p hypermixx-cli -- --controller 0       # 打开 0 号控制器输入
+#   分析后端在 config.toml 的 [preference.analysis]：beats/key = timestretch | stratum（无 auto）
 #   配置是单文件多段落：[mixer] / [live] / [preference] / [controller]
 #   不给 --config 时：Linux/Termux 读 $XDG_CONFIG_HOME/hypermixx/config.toml，
 #   Windows 读 %APPDATA%/Hypermixx/config.toml；首次启动从内置模板复制一份

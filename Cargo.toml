@@ -20,7 +20,9 @@ exclude = ["vendor/signalsmith-stretch"]
 charon-audio = { git = "https://github.com/windup-bird/charon-audio-cuda", branch = "feat/cuda-ep" }
 
 [workspace.package]
-version = "0.1.0"
+# Bumped past the v2 band-scan fitter: the `analysis` cache keys on this version, so tracks
+# re-analyse with the v3 sequence-indexed least-squares fit.
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 

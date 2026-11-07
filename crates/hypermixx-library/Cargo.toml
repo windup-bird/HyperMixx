@@ -10,6 +10,10 @@ hypermixx-core = { path = "../hypermixx-core" }
 hypermixx-media = { path = "../hypermixx-media" }
 crossbeam-channel = { workspace = true }
 stratum-dsp = { git = "https://github.com/HLLMR/stratum-dsp.git", rev = "758e0b6" }
+# Analysis only: the streaming/stretch side lives in `hypermixx-audio` (signalsmith). The
+# `analysis` feature gates the beat/key/rigid-grid modules; `accelerate` (the default) is a
+# macOS framework and is dropped for Linux builds.
+timestretch = { version = "0.16.0", default-features = false, features = ["analysis"] }
 serde = { version = "1", features = ["derive"] }
 symphonia = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }

@@ -1850,8 +1850,8 @@ fn render_load_target(
 mod tests {
     use super::*;
     use hypermixx_audio::{ChannelLevels, Meters};
-    use hypermixx_core::{Backend, BeatGrid};
-    use hypermixx_library::{BandPeaks, StereoPeaks, Waveform};
+    use hypermixx_core::BeatGrid;
+    use hypermixx_library::{analyser::Backends, BandPeaks, StereoPeaks, Waveform};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::sync::Arc;
@@ -1861,7 +1861,7 @@ mod tests {
         let (_event_tx, event_rx) = crossbeam_channel::unbounded();
         let mut app = App::new(
             2,
-            Backend::Auto,
+            Backends::default(),
             notice_rx,
             event_rx,
             Default::default(),

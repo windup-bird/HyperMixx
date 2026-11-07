@@ -12,11 +12,12 @@ use std::time::Instant;
 use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::{AudioPipeline, Meters};
 use hypermixx_core::{
-    Backend, BeatGrid, BrowserAction, Command, CommandResponse, DeckState, FxChainId, FxSlotStatus,
+    BeatGrid, BrowserAction, Command, CommandResponse, DeckState, FxChainId, FxSlotStatus,
     KeyFormat, KeylockMode, StemStatus,
 };
 use hypermixx_library::{
-    detect_source_kinds, ImportCalibration, LibraryDb, ScanProgress, ScanService, Source, SourceKind,
+    analyser::Backends, detect_source_kinds, ImportCalibration, LibraryDb, ScanProgress,
+    ScanService, Source, SourceKind,
 };
 
 use crate::command::{Slots, UiEvent};
@@ -308,7 +309,7 @@ impl Knob {
 /// A deck's transport, as the TUI sees it. Mirrors [`DeckState`] plus front-end-only data.
 pub struct App {
     pub version: &'static str,
-    pub backend: Backend,
+    pub backends: Backends,
     pub sample_rate: u32,
     /// Output ring capacity in frames, from the live config (the sliders can change it).
     pub ring_frames: usize,
@@ -428,7 +429,7 @@ pub struct App {
 impl App {
     pub fn new(
         decks: usize,
-        backend: Backend,
+        backends: Backends,
         notice_rx: Receiver<LogLine>,
         event_rx: Receiver<UiEvent>,
         fx_slots: Slots,
@@ -441,7 +442,7 @@ impl App {
         let browser = Browser::new();
         Self {
             version: crate::VERSION,
-            backend,
+            backends,
             sample_rate: hypermixx_core::SAMPLE_RATE,
             ring_frames: hypermixx_audio::OUTPUT_RING_CAPACITY,
             decks,
@@ -1260,7 +1261,6 @@ fn local_roots(kind: SourceKind) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use crate::preference::LibrarySettings;
-    use hypermixx_core::Backend;
     use hypermixx_library::SourceOrigin;
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -1360,7 +1360,7 @@ mod tests {
         let (_event_tx, event_rx) = crossbeam_channel::unbounded();
         let mut app = App::new(
             1,
-            Backend::Auto,
+            Backends::default(),
             notice_rx,
             event_rx,
             Default::default(),

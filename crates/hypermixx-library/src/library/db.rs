@@ -650,7 +650,28 @@ impl LibraryDb {
     }
 
     /// Stores the analyser result for a track, replacing an older result.
+    ///
+    /// Tracks whose only locations come from USB sources are **not** persisted: the media is
+    /// removable, so a cached grid outlives the device it was computed on (and the file may be
+    /// re-analysed on the device's own clock next time). The grid still reaches the deck for
+    /// this session; it just never enters the `analysis` table.
     pub fn save_analysis(&self, track_id: i64, analysis: &TrackAnalysis) -> Result<()> {
+        let from_usb: bool = {
+            let conn = self.lock()?;
+            conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM track_location tl
+                     JOIN source s ON s.id = tl.source_id
+                     WHERE tl.track_id = ?1 AND s.origin = 'usb'
+                 )",
+                params![track_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|exists| exists != 0)?
+        };
+        if from_usb {
+            return Ok(());
+        }
         let beat_frames_json = serde_json::to_string(&analysis.beatgrid.beat_frames)
             .map_err(|err| LibraryError::Invalid(format!("analysis JSON: {err}")))?;
         let (key_pc, key_mode, key_confidence) = match analysis.key {
@@ -1297,6 +1318,32 @@ mod tests {
         assert_eq!(loaded.beatgrid.beat_frames, analysis.beatgrid.beat_frames);
         assert_eq!(loaded.key.map(|key| key.camelot()), Some("8A".to_owned()));
         assert!((loaded.bpm.unwrap() - 124.0).abs() < 0.01);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_usb_tracks_analysis_is_not_persisted() {
+        let (db, dir) = temp_db("usb-analysis");
+        let root = dir.join("usb");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.wav"), wav_bytes(100, 400)).unwrap();
+        let source = db
+            .add_source_with_origin(SourceKind::Folder, SourceOrigin::Usb, &root, None)
+            .unwrap();
+        db.scan_source(source.id, &mut |_| {}).unwrap();
+        let playlist = db.root_playlists(source.id).unwrap().remove(0);
+        let track = db.tracks_in_playlist(playlist.id).unwrap().remove(0);
+
+        let analysis = TrackAnalysis {
+            beatgrid: BeatGrid::from_constant_bpm(124.0, 0, track.duration_frames, 44_100),
+            key: None,
+            bpm: Some(124.0),
+        };
+        db.save_analysis(track.track_id, &analysis).unwrap();
+        assert!(
+            db.load_analysis(track.track_id).unwrap().is_none(),
+            "usb-origin tracks must not enter the analysis cache"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

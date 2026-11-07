@@ -446,7 +446,7 @@ fn submit(app: &mut App, dispatcher: &Dispatcher, pipeline: &AudioPipeline) {
         &line,
         dispatcher,
         pipeline,
-        app.backend,
+        app.backends,
         app.decks,
         deck,
     );
@@ -801,7 +801,7 @@ fn analyse_browser_track(app: &mut App, dispatcher: &Dispatcher) {
         return;
     };
     match db.track_load(location_id) {
-        Ok(Some(load)) => command::spawn_analyse_track(load, db, app.backend, dispatcher),
+        Ok(Some(load)) => command::spawn_analyse_track(load, db, app.backends, dispatcher),
         Ok(None) => app.push_log(LogLine::error(format!(
             "library: no location {location_id}"
         ))),
@@ -1001,7 +1001,7 @@ mod tests {
         let (_event_tx, event_rx) = crossbeam_channel::unbounded();
         let app = App::new(
             2,
-            hypermixx_core::Backend::Auto,
+            hypermixx_library::analyser::Backends::default(),
             app_notice_rx,
             event_rx,
             Default::default(),

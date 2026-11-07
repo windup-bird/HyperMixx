@@ -17,10 +17,11 @@ use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::fx::FxKind;
 use hypermixx_audio::{AudioPipeline, Command};
 use hypermixx_core::{
-    Backend, BeatLen, CommandResponse, CueOp, FxChainId, FxSlotRef, HotCueOp, KeylockMode,
-    LiveConfig, LoopEditOp, LoopOp, LoopQuantum, NudgeOp, OutputOp, PhaseMode, Shared, Source,
-    Stem, StemOp, StemPreset, SyncOp, TrackAnalysis, VinylOp,
+    BeatLen, CommandResponse, CueOp, FxChainId, FxSlotRef, HotCueOp, KeylockMode, LiveConfig,
+    LoopEditOp, LoopOp, LoopQuantum, NudgeOp, OutputOp, PhaseMode, Shared, Source, Stem, StemOp,
+    StemPreset, SyncOp, TrackAnalysis, VinylOp,
 };
+use hypermixx_library::analyser::Backends;
 use hypermixx_library::{LibraryDb, ScanService};
 use hypermixx_media::ChunkedStreams;
 use hypermixx_midi::{RouterCommand, RouterState};
@@ -371,7 +372,7 @@ pub fn dispatch(
     line: &str,
     dispatcher: &Dispatcher,
     pipeline: &AudioPipeline,
-    backend: Backend,
+    backends: Backends,
     decks: usize,
     focused: Option<u8>,
 ) -> Action {
@@ -422,7 +423,7 @@ pub fn dispatch(
             let Some(source) = pipeline.deck_source(deck_id) else {
                 return Action::Failed(format!("deck {deck_id} holds no track to analyse"));
             };
-            spawn_analyse(deck_id, source, backend, dispatcher);
+            spawn_analyse(deck_id, source, backends, dispatcher);
             Action::Continue
         }
         "stem" => stem_family(&mut words, target, dispatcher, pipeline),
@@ -2497,14 +2498,14 @@ fn analysis_at_rate(mut analysis: TrackAnalysis, sample_rate: u32) -> TrackAnaly
 pub(crate) fn spawn_analyse_track(
     track: hypermixx_library::TrackLoad,
     db: Arc<LibraryDb>,
-    backend: Backend,
+    backends: Backends,
     dispatcher: &Dispatcher,
 ) {
     let notices_tx = dispatcher.notices.clone();
     let sample_rate = dispatcher.live().audio.sample_rate;
     notices::info(
         &notices_tx,
-        format!("[analyse] {}: running {backend:?}...", track.title),
+        format!("[analyse] {}: running {backends:?}...", track.title),
     );
     std::thread::Builder::new()
         .name("hypermixx-library-analyse".to_owned())
@@ -2518,7 +2519,7 @@ pub(crate) fn spawn_analyse_track(
                 }
             };
             let source: Shared = Arc::new(hypermixx_media::PcmPool::from_decoded(decoded));
-            match hypermixx_library::analyser::analyze(source, sample_rate, backend) {
+            match hypermixx_library::analyser::analyze(source, sample_rate, backends) {
                 Ok(analysis) => {
                     let bpm = analysis.bpm();
                     let key = analysis
@@ -2542,7 +2543,7 @@ pub(crate) fn spawn_analyse_track(
 }
 
 /// Runs the library analyser on a worker thread, then publishes a compiled grid.
-fn spawn_analyse(deck_id: u8, source: Shared, backend: Backend, dispatcher: &Dispatcher) {
+fn spawn_analyse(deck_id: u8, source: Shared, backends: Backends, dispatcher: &Dispatcher) {
     let command_tx = dispatcher.command_tx.clone();
     let notices_tx = dispatcher.notices.clone();
     let events = dispatcher.events.clone();
@@ -2555,11 +2556,11 @@ fn spawn_analyse(deck_id: u8, source: Shared, backend: Backend, dispatcher: &Dis
             notices::info(
                 &notices_tx,
                 format!(
-                    "[analyse] {}: running {backend:?}...",
+                    "[analyse] {}: running {backends:?}...",
                     hypermixx_core::deck_label(deck_id)
                 ),
             );
-            match hypermixx_library::analyser::analyze(source, sample_rate, backend) {
+            match hypermixx_library::analyser::analyze(source, sample_rate, backends) {
                 Ok(analysis) => {
                     let bpm = analysis.bpm();
                     let key = analysis
@@ -2960,7 +2961,7 @@ mod tests {
             };
             let full = format!("deck1 {line}");
             if let Action::Failed(message) =
-                dispatch(&full, &dispatcher, &pipeline, Backend::Auto, 2, Some(0))
+                dispatch(&full, &dispatcher, &pipeline, Backends::default(), 2, Some(0))
             {
                 panic!("`{full}` failed: {message}");
             }
@@ -2970,7 +2971,7 @@ mod tests {
             "deck1 keylock toggle",
             &dispatcher,
             &pipeline,
-            Backend::Auto,
+            Backends::default(),
             2,
             Some(0),
         ) {
@@ -2994,7 +2995,7 @@ mod tests {
         dispatcher.prime(1, pipeline.response_rx());
 
         for line in ["play", "cue", "fader flow -0.2", "fx list", "stem status"] {
-            match dispatch(line, &dispatcher, &pipeline, Backend::Auto, 2, None) {
+            match dispatch(line, &dispatcher, &pipeline, Backends::default(), 2, None) {
                 Action::Failed(message) => assert!(
                     message.contains("Tab"),
                     "`{line}` should point at `Tab`, got: {message}"
@@ -3004,7 +3005,7 @@ mod tests {
         }
         // An explicit target, and a verb that never needed a deck, still work.
         for line in ["deck1 play", "deck2 cue", "master fx list", "state"] {
-            let action = dispatch(line, &dispatcher, &pipeline, Backend::Auto, 2, None);
+            let action = dispatch(line, &dispatcher, &pipeline, Backends::default(), 2, None);
             assert!(
                 !matches!(action, Action::Failed(_)),
                 "`{line}` should work with no deck target, got {action:?}"
@@ -3012,7 +3013,7 @@ mod tests {
         }
         // The REPL passes a deck, and keeps its old fallback.
         assert!(!matches!(
-            dispatch("play", &dispatcher, &pipeline, Backend::Auto, 2, Some(1)),
+            dispatch("play", &dispatcher, &pipeline, Backends::default(), 2, Some(1)),
             Action::Failed(_)
         ));
     }
@@ -3034,7 +3035,7 @@ mod tests {
         // The reference channel is `[eq, filter]`.
         assert_eq!(dispatcher.slots().resolve("deck1", "filter"), Ok(1));
         for line in ["deck1 fx kind filter moog", "deck1 fx set filter value -0.3"] {
-            let action = dispatch(line, &dispatcher, &pipeline, Backend::Auto, 2, Some(0));
+            let action = dispatch(line, &dispatcher, &pipeline, Backends::default(), 2, Some(0));
             assert!(
                 !matches!(action, Action::Failed(_)),
                 "`{line}` failed: {action:?}"
@@ -3063,7 +3064,7 @@ mod tests {
             "deck1 fx flows filter none",
             "deck1 fx flows filter vocals,bass",
         ] {
-            let action = dispatch(line, &dispatcher, &pipeline, Backend::Auto, 2, Some(0));
+            let action = dispatch(line, &dispatcher, &pipeline, Backends::default(), 2, Some(0));
             assert!(
                 !matches!(action, Action::Failed(_)),
                 "`{line}`: {action:?}"
@@ -3073,7 +3074,7 @@ mod tests {
             "deck1 fx flows filter martian",
             &dispatcher,
             &pipeline,
-            Backend::Auto,
+            Backends::default(),
             2,
             Some(0),
         ) {

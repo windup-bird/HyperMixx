@@ -275,6 +275,9 @@ pub fn parse(text: &str) -> Result<(Preference, Vec<String>), String> {
                     .ok_or_else(|| "`theme` must be a table".to_owned())?;
                 parse_theme(table, &mut preference.theme, &mut notes);
             }
+            // `[preference.analysis]` is parsed by `profile.rs` (it configures the analyser
+            // backends, not a display preference) — known here only so it produces no note.
+            "analysis" => {}
             other => notes.push(format!("unknown preference section `[{other}]` ignored")),
         }
     }

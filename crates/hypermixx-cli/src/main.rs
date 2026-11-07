@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use crossbeam_channel::unbounded;
 use hypermixx_audio::{AudioPipeline, DECK_COUNT};
-use hypermixx_core::Backend;
 use hypermixx_library::LibraryDb;
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -52,7 +51,10 @@ fn main() {
     let controller = config.controller.clone();
     let live = config.live;
     let cfg = config.mixer;
-    let backend = args.backend;
+    let backends = hypermixx_library::analyser::Backends {
+        beats: config.analysis.beats,
+        key: config.analysis.key,
+    };
 
     // The guide is a self-contained editor: no audio engine, no mixer. It still reads the config,
     // so the rate it probes with and the file its `Output` pane edits are the ones a session uses.
@@ -148,7 +150,7 @@ fn main() {
             &pipeline,
             session::Session {
                 command_tx,
-                backend,
+                backends,
                 decks,
                 notice_tx,
                 notice_rx,
@@ -195,15 +197,17 @@ fn main() {
     let midi_state = midi_session.as_ref().map(|session| session.state());
     let config_note = format!(", config {config_path}");
     println!(
-        "hypermixx {VERSION} — {decks} decks, {}Hz stereo, backend {backend:?}{config_note}. \
+        "hypermixx {VERSION} — {decks} decks, {}Hz stereo, analysis beats {}/key {}{config_note}. \
          `help` for commands, `quit` to exit.",
-        live.audio.sample_rate
+        live.audio.sample_rate,
+        backends.beats.as_str(),
+        backends.key.as_str()
     );
     repl::run(
         &pipeline,
         session::Session {
             command_tx,
-            backend,
+            backends,
             decks,
             notice_tx,
             notice_rx,
@@ -221,7 +225,7 @@ fn main() {
 }
 
 /// Reads `--config <path>` (the one config file), `--print-config` (emit the template and exit),
-/// `--backend auto|stratum|timestretch` (default `auto`), `--cli` (line REPL instead of the TUI),
+/// `--cli` (line REPL instead of the TUI),
 /// `--controller <port>` (open a controller input onto the engine) and `--guide <file>` (the unit
 /// map guide, no engine). Without `--config` the platform default path is used and created on the
 /// first start. The terminal UI is the default front-end; `--cli` asks for the line REPL.
@@ -232,7 +236,6 @@ fn main() {
 struct CliArgs {
     config: Option<String>,
     print_config: bool,
-    backend: Backend,
     /// `--cli`: the line REPL instead of the terminal UI.
     cli: bool,
     /// `--controller <port>`: a port name or index, opened and mapped onto the engine. The map
@@ -252,19 +255,6 @@ impl CliArgs {
             match arg.as_str() {
                 "--print-config" => args.print_config = true,
                 "--cli" => args.cli = true,
-                "--backend" => {
-                    args.backend = match raw.next().as_deref() {
-                        Some("stratum") => Backend::Stratum,
-                        Some("timestretch") => Backend::Timestretch,
-                        Some("auto") | None => Backend::Auto,
-                        Some(other) => {
-                            eprintln!(
-                                "error: unknown backend `{other}` (auto|stratum|timestretch)"
-                            );
-                            std::process::exit(1);
-                        }
-                    };
-                }
                 "--config" => {
                     args.config = raw.next().or_else(|| {
                         eprintln!("error: --config needs a path");
@@ -306,7 +296,7 @@ impl CliArgs {
                 other => {
                     eprintln!(
                         "error: unknown argument `{other}`\n  flags: --config, --print-config, \
-                         --backend, --cli, --guide, --controller, --decks"
+                         --cli, --guide, --controller, --decks"
                     );
                     std::process::exit(1);
                 }

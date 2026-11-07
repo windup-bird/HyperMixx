@@ -103,6 +103,13 @@ vdj_offset_ms = 0.0
 [preference.display]
 key = "camelot"          # camelot (8A/8B) | classic (Am/C)
 
+# Analysis backends, named directly — there is no auto fallback.
+#   timestretch : tracked beat sequence + kick-band phase corroboration + key (default)
+#   stratum     : multi-method BPM + onset beat list
+[preference.analysis]
+beats = "timestretch"
+key = "timestretch"
+
 [controller]
 # `map` is a file pointer to a unit-map file, relative to this config's folder. Leaving it out
 # means no controller input. `device` overrides the map's `[meta].device`.

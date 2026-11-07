@@ -106,7 +106,9 @@ pub(crate) fn scan(
                     continue;
                 }
             };
-            // An unchanged file reuses its whole row, track and analysis included.
+            // An unchanged file reuses its whole row, track and analysis included. The row is
+            // reused, but the timing is not: the Full pass cleared it above, so it must be
+            // rebuilt here or the clear + short-circuit would leave the cache gridless forever.
             if let Some((location_id, _track_id)) =
                 unchanged_location(tx, source.id, &path, file_size, mtime_ns)?
             {
@@ -114,6 +116,16 @@ pub(crate) fn scan(
                 locations.insert(content.content_id, location_id);
                 stats.files_seen += 1;
                 stats.files_updated += 1;
+                import_analysis(
+                    tx,
+                    source.id,
+                    location_id,
+                    &root,
+                    content.analysis_path.as_deref(),
+                    &path,
+                    rb_mp3_offset_ms,
+                    &mut stats,
+                )?;
                 progress(ScanEvent {
                     index: stats.files_seen,
                     path,
@@ -260,7 +272,9 @@ fn scan_pdb(
                     continue;
                 }
             };
-            // An unchanged file reuses its whole row, track and analysis included.
+            // An unchanged file reuses its whole row, track and analysis included. The row is
+            // reused, but the timing is not: the Full pass cleared it above, so it must be
+            // rebuilt here or the clear + short-circuit would leave the cache gridless forever.
             if let Some((location_id, _track_id)) =
                 unchanged_location(tx, source.id, &path, file_size, mtime_ns)?
             {
@@ -268,6 +282,16 @@ fn scan_pdb(
                 locations.insert(track.id, location_id);
                 stats.files_seen += 1;
                 stats.files_updated += 1;
+                import_analysis(
+                    tx,
+                    source.id,
+                    location_id,
+                    &root,
+                    Some(track.analyze_path()),
+                    &path,
+                    rb_mp3_offset_ms,
+                    &mut stats,
+                )?;
                 progress(ScanEvent {
                     index: stats.files_seen,
                     path,

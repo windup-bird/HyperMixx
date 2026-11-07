@@ -19,7 +19,7 @@ use crate::session::Session;
 pub fn run(pipeline: &AudioPipeline, session: Session) {
     let Session {
         command_tx,
-        backend,
+        backends,
         decks,
         notice_tx,
         notice_rx,
@@ -59,7 +59,7 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
             if line.is_empty() {
                 continue;
             }
-            match command::dispatch(line, &dispatcher, pipeline, backend, decks, Some(0)) {
+            match command::dispatch(line, &dispatcher, pipeline, backends, decks, Some(0)) {
                 Action::Continue => {}
                 Action::Quit => break,
                 Action::Message(text) => println!("{text}"),

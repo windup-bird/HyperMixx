@@ -407,10 +407,12 @@ one the command follows the selected target (TUI: `Tab` cycles deck1 â†’ deck2 â
 browser is selected, name the deck in the line instead.
 startup flags: --config <file> (custom topology), --profile <name|file> (which files to use),
                --print-config (reference TOML), --live <file> (engine rate, ring, stem defaults),
-               --backend auto|stratum|timestretch, --cli (line REPL; the TUI is the default),
+               --cli (line REPL; the TUI is the default),
                --controller <port> [--controller-map <file>] (controller input; a map's
                [meta].device can supply the port),
-               --guide [<file>] [--controller <port>] [--decks <n>] (unit map guide)",
+               --guide [<file>] [--controller <port>] [--decks <n>] (unit map guide). Analysis
+               backends are `[preference.analysis]` in the config: beats/key = stratum|timestretch,
+               no auto.",
         decks - 1
     )
 }
