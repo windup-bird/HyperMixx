@@ -1,360 +1,212 @@
-# Hypermixx
+# HyperMixx
 
-基于Rust的跨平台混音软件，目前仅支持 cli/tui。直接运行进入 TUI，`--cli` 进入纯命令行，`--guide` 进入 controller-guide。
-旧的 `--tui` / `--midi` / `--midi-map` / `--midi-guide` 拼写已移除。
+> NO AIGC HERE
 
-## 架构
+基于Rust的跨平台DJ混音软件，豪情在天的终端界面(Ratatui)，灵活易用的映射编辑，高性能和低占用。
 
-分层单向依赖，下层不感知上层：
+未来计划扩展Flutter前端和Android支持。
 
+## 特性
+
+### 混音链路
+
+```text
+PCM -> flows(stems) -> stretch(keylock) -> prefader -> eq -> filter flowfx -> deckfx -> postfader -> limiter -> outputs
 ```
-cli ─┬─► audio ───┐
-     ├─► library ─┼─► media ──► core
-     ├─► stems ───┤
-     ├─► midi ────┤
-     └─► core ────┘
+
+可灵活配置cue监听/fader于fx的位置(pre/post)，fx可分stem应用并灵活映射到你的控制器，可选limiter和autogain。
+
+时间拉伸算法使用`SignalSmith`(MIT)。
+
+### 读取Rekordbox/Serato/VDJ曲库
+
+插上U盘，或者在配置里指一个文件夹，剩下的交给它。
+
+- **rekordbox**：优先读 `exportLibrary.db`（SQLCipher，口令是公开常量，需要时可用 `HYPERMIXX_REKORDBOX_KEY` 覆盖），没有就退回 `export.pdb`；ANLZ 里的 beatgrid 和 hot cue 一起带走。
+- **Serato**：读 `database V2` 和 `Subcrates/*.crate`，cue/grid 从音频文件的 ID3 `GEOB` 里取。
+- **VirtualDJ**：读 `database.xml` 和 `vdj-export/vdj-list.m3u`，有 ANLZ 也一起导入。
+- 普通文件夹也认，`~` 会展开成你的主目录。
+- 同一个音频按内容哈希合并，换路径、换块盘不会变成两首；U 盘只读，绝不写回。
+- 扫描在后台跑，界面先显示缓存，扫完自己刷新。缓存是一份可重建的 sqlite（`$HYPERMIXX_CACHE/library/`，默认 `.cache/library/`），删了最多重扫一次。
+
+加载时优先用导入的 grid，其次本地分析缓存，最后才看标签 BPM。导入时间会补偿解码器的 gapless 起点和各家的偏移（默认 Serato −16.5 ms），所以网格落点是对得上的。key 默认 Camelot（8A/8B），想换成 Am/C 改 `[preference.display] key = "classic"`。
+
+### 两分钟内驱动你的设备
+
+```text
+Midi-Message -> Slot -> Unit -> Command
 ```
 
-| crate | 职责 | 依赖 |
-|---|---|---|
-| `hypermixx-core` | 协议与类型：`Command`/`CommandResponse`、`DeckState`、`BeatGrid`、`Key`、`Source`、action 语法表、live 设置、输出状态 | serde |
-| `hypermixx-media` | 解码与内存池：`decode_file`（symphonia → 引擎率立体声）、`PcmPool`、`StreamConverter` 重采样 | core |
-| `hypermixx-audio` | 实时引擎：producer 线程 + cpal 输出、mixer/通道/FX 链、时间拉伸 | core, media |
-| `hypermixx-library` | 离线分析：beat 网格编译、stratum-dsp 适配、波形峰值 | core, media |
-| `hypermixx-stems` | 离线 stem 分离：HTDemucs 模型获取/校验、内容寻址缓存、ONNX 后端（CPU 默认；`cuda` 可选） | core, media, ort |
-| `hypermixx-midi` | MIDI 输入：字节解析、TOML 映射表、`Event → Command` 翻译（纯逻辑，可无硬件单测） | core, midir |
-| `hypermixx-cli` | 前端：默认 TUI（`--cli` 切行 REPL）、命令解析与补全 | 全部 |
+Slot是控制器上每个元件(按钮?旋钮?转盘?)的类型抽象，Unit是控制方式的抽象集合，每个Unit可定义映射组合(类似padmode/stemfx)并定义切换方式。
 
-外部依赖：`stratum-dsp`、`signalsmith-stretch`(vendored)、`midir`、`charon-audio-cuda`(forked from `charon-audio`)
+提供灵活易用的映射向导，每个Deck可定义多个Unit，并一键克隆到另一组Deck元件。
+
+映射不用从零写：内置了 `mixer`、`transport`、`jog`、`pad`、`browser` 这些常用 preset，插上控制器先跑起来，缺什么再进去学。所有东西最后都落在一个能读能改的 TOML 里，向导里够不着的细节（action 参数、曲线、值域）也可以手改。
+
+### 流式Stem分离
+
+基于`Charon`(MIT)，加载HTDemucs模型，滚动窗口分离并在完成后流式装载，完成高质量的实时分离。
+
+四路 stem（drums/bass/other/vocals）不是等整首分完才出现：装进 deck 的那一刻和原曲完全一样，之后模型每推进一个窗口就落地一块，播放中就能逐条推电平、静音、加效果。分离在后台跑，期间 play/loop/jump/sync 一切照旧。
+
+默认 CPU 分一首 3:39 约 87 秒；`[live.stems] provider = "cuda"` 后约 13 秒（RTX 4050）。结果按内容哈希缓存，同一首再跑 0 秒，一首约 300 MB，`stem cache prune` 清旧缓存。
+
+Provider可选cpu/cuda，启用cuda加速特性：
+```bash
+cargo run --release --features cuda
+```
 
 ## 安装
 
-Linux 已完整构建并通过测试；Windows（MSVC）可构建运行，依赖与踩坑见下面「Windows（MSVC）」（图形波形在 ConPTY 下自动回落 braille，见 `docs/WAVEFORM.md`）。
+在Linux开发，Linux/Windows完成测试。
 
-前置：Rust（2021 edition，1.70+）、音频输出设备。
+需要 Rust stable 和一块能出声的声卡。第一次构建会拉 ONNX Runtime 的预编译包（CPU 约 101 MB），之后只重建本仓库。
 
-Linux 还需 ALSA 开发库：
+### Linux
+
+除了 Rust，还要 ALSA 开发库：
 
 ```bash
 sudo apt install libasound2-dev   # Debian/Ubuntu
 
-git clone <repo> && cd HyperMixx
-cargo build --release
-cargo build --release --features cuda  # use cuda to separate stems
+git clone https://github.com/windup-bird/HyperMixx
+cd HyperMixx
+cargo build --release --workspace
+cargo run --release
 ```
 
-### Windows（MSVC）
+### Windows
 
-Windows 上除了 Rust，还需要三样原生依赖；缺任何一样都是**构建期直接失败**，不是运行期警告：
+需要三样原生依赖，缺任何一样都是**构建期直接失败**：
 
-| 依赖 | 谁需要 | 装法 |
+| 依赖 | 干什么 | 装法 |
 |---|---|---|
-| MSVC C++ 工具链 | 所有 native 依赖 + `signalsmith-stretch` 的 C++ 源 | VS「使用 C++ 的桌面开发」；`rustup show` 应显示 `…-pc-windows-msvc` |
-| OpenSSL（头文件 + `libcrypto.lib`） | `hypermixx-library` 的 `rusqlite/bundled-sqlcipher` | `winget install ShiningLight.OpenSSL.Dev` |
-| LLVM/libclang | vendored `signalsmith-stretch` 的 `build.rs`（bindgen 生成绑定） | `winget install LLVM.LLVM` |
+| MSVC C++ 工具链 | 所有 native 依赖 + vendored 的 `signalsmith-stretch` | VS Installer 勾选「使用 C++ 的桌面开发」 |
+| OpenSSL（头文件 + `libcrypto.lib`） | 曲库的 `rusqlite/bundled-sqlcipher` | `winget install ShiningLight.OpenSSL.Dev` |
+| LLVM / libclang | vendored 依赖的 bindgen | `winget install LLVM.LLVM` |
 
-两个 winget 包都装到默认位置（`C:\Program Files\OpenSSL-Win64`、`C:\Program Files\LLVM`）时，实测组合是
-OpenSSL 4.1.0 + LLVM 23.1.4 + Rust 1.98 msvc。
-
-```powershell
-winget install ShiningLight.OpenSSL.Dev LLVM.LLVM
-rustup show                      # 确认是 stable-x86_64-pc-windows-msvc
-```
-
-**构建期环境变量**：`libsqlite3-sys` 的 build.rs 在 Windows 上只认两种写法——`OPENSSL_LIB_DIR` +
-`OPENSSL_INCLUDE_DIR` 成对，或单个 `OPENSSL_DIR`。这里必须用前者：winget 版 OpenSSL 的导入库在
-`lib\VC\x64\MD` 而不是 `lib`，而 `OPENSSL_DIR` 只会让 cargo 去 `lib`/`lib64` 下找，链接期就找不到
-`libcrypto.lib`。
+装到默认位置后，在当前 PowerShell 会话里设好路径（`OPENSSL_LIB_DIR` 必须指到 `lib\VC\x64\MD`，不是 `lib`）：
 
 ```powershell
 $env:OPENSSL_LIB_DIR     = "C:\Program Files\OpenSSL-Win64\lib\VC\x64\MD"
 $env:OPENSSL_INCLUDE_DIR = "C:\Program Files\OpenSSL-Win64\include"
-$env:LIBCLANG_PATH       = "C:\Program Files\LLVM\bin"   # 装在默认位置时可省（clang-sys 自己会搜 C:\Program Files*\LLVM\lib）
-```
+$env:LIBCLANG_PATH       = "C:\Program Files\LLVM\bin"
 
-`$env:` 只在当前 PowerShell 会话有效。想只写一次就放进 `.cargo/config.toml`（与 `target/` 同级；该文件已在
-`.gitignore` 里，机器相关的绝对路径不会进仓库）：
-
-```toml
-[env]
-OPENSSL_LIB_DIR = "C:\\Program Files\\OpenSSL-Win64\\lib\\VC\\x64\\MD"
-OPENSSL_INCLUDE_DIR = "C:\\Program Files\\OpenSSL-Win64\\include"
-LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"
-```
-
-然后构建（首次要编译全部依赖，并下载 onnxruntime 预编译：CPU 约 101 MB、`cuda` 约 183 MB；之后只重建本仓库 ~40 秒）：
-
-```powershell
-git clone <repo>; cd HyperMixx
 cargo build --release
-cargo build --release --features cuda  # 可选：stem 分离走 GPU，需 CUDA 13 + cuDNN 9
+.\target\release\hypermixx-cli.exe
 ```
 
-产物是 `target\release\hypermixx-cli.exe`。它**运行期**还依赖两个动态库，构建成功不代表能直接双击：
+运行期还要让 `libcrypto-*-x64.dll` 找得到：把 `C:\Program Files\OpenSSL-Win64\bin` 留在 `PATH` 上，或者把 DLL 拷到 exe 旁边。完整的报错对照表和 CUDA 依赖见 [README.md](README.md) 的 Windows 一节。
 
-- `libcrypto-<major>-x64.dll`（OpenSSL 4 → `libcrypto-4-x64.dll`，3 → `libcrypto-3-x64.dll`）：
-  `bundled-sqlcipher` 是动态链接 `libcrypto` 的。把 `C:\Program Files\OpenSSL-Win64\bin` 留在 `PATH` 上，
-  或者把该 DLL 拷到 exe 旁边。
-- 只有 `--features cuda` 时才需要 `onnxruntime_providers_*.dll`：ORT 运行期按名字加载它，必须与 exe 同目录
-  （`cargo build` 会自动放进 `target\release\`，单独拷 exe 就要一起拷），并且 cuDNN 9 的 `bin` 要在 `PATH` 上。
+## 开始混音
 
-冒烟测试不需要声卡：
+第一次启动会自己在默认位置生成一份 `config.toml`（Linux 是 `~/.config/hypermixx/`，Windows 是 `%APPDATA%/Hypermixx/`），不用先写配置。默认进 TUI：方向键在曲库里走，`Enter` 打开/加载，`Tab` 把焦点交给 deck，`F9` 打开设置。
 
-```powershell
-.\target\release\hypermixx-cli.exe --print-config | Select-Object -First 3
-```
+### 载入曲库
 
-**常见构建错误**
+曲库来源都在 `config.toml` 的 `[preference.library]` 里，没列出来的类别不扫描、也不显示。
 
-| 报错（截断） | 原因 / 解法 |
-|---|---|
-| `failed to run custom build command for libsqlite3-sys` → `Missing environment variable OPENSSL_DIR or OPENSSL_DIR is not set` | 两个 OpenSSL 变量只设了一个（或都没设）。成对设，或设 `OPENSSL_DIR` |
-| `OpenSSL library directory does not exist: [...]` / `OpenSSL include directory does not exist` | 路径写错：导入库在 `lib\VC\x64\MD`，头是 `include\openssl\opensslv.h` |
-| `LINK : fatal error LNK1104: 无法打开文件“libcrypto.lib”` | `OPENSSL_LIB_DIR` 指到了 `…\OpenSSL-Win64\lib`（只有 `.def`/静态库），改成 `lib\VC\x64\MD` |
-| `Unable to generate bindings` / `couldn't find any valid shared libraries matching: ['libclang.dll']` | 没装 LLVM，或装在非默认目录又没设 `LIBCLANG_PATH`（指向**目录**，不是 `libclang.dll` 本身） |
-| `error: linker 'link.exe' not found` / `linking with link.exe failed` | 缺 MSVC：`rustup default stable-msvc` 并装 VS「使用 C++ 的桌面开发」 |
-| 启动即报缺 `libcrypto-4-x64.dll`（0xc0000135） | 见上：`PATH` 或把 DLL 拷到 exe 旁。版本号跟 OpenSSL 大版本走 |
-| `the CUDA execution provider could not run this model` | 见 `docs/STEM.md` §5：需要 `--features cuda`、CUDA 13 + cuDNN 9、provider DLL 在 exe 旁；或把 `[stems] provider` 改回 `cpu` |
-
-## 示例操作
-
-```bash
-cargo run -p hypermixx-cli                      # 默认就是 TUI
-cargo run -p hypermixx-cli -- --cli             # 纯命令行（REPL）
-```
-
-```text
-deck1> load test.mp3 122
-deck1 loaded: 18462369 frames (7:00.648)
-
-deck1> play                        # 切换播放/暂停（toggle）
-deck1> cue                         # smart：播放中回 cue 并暂停；暂停时把当前帧记为 cue 点
-deck1> cue set                     # 显式记 cue 点
-deck1> tempo 1.04                  # 设 tempo（1.0 = 原速）
-deck1> fader flow -0.2             # 通道/逐流电平（只衰减，顶端 0 dB）
-deck1> fader gain 1.0              # 通道 trim：0 = 0 dB，1 = +6 dB
-deck1> fader cross -1.0            # crossfader（共用；位置与曲线见 [crossfader]）
-deck1> tempofader 0.5              # 推子位置（tempo = 1 + pos × temporange）
-deck1> temporange 0.16             # 推子满量程 ±16%（缺省 0.1）
-deck1> keylock on                  # 变调引擎：on（默认）| off；窗口在 config.toml 的 [keylock]
-deck1> key 1                       # 变调半音（占位：只记录，暂不发声）
-deck1> beatjump 16
-deck1> fx list                    # 列出fx
-deck1> fx set eq low -0.5         # -1~1
-deck1> fx set filter value  0.5
-deck1> fx add echo                # 拍同步 echo：time 是拍数（无网格回落 120 BPM）
-deck1> fx set echo time 0.5       # 每半拍重复一次；feedback 0..0.95
-deck1> fx add reverb              # Freeverb：mix/size/damping/width
-deck1> fx set reverb size 0.6
-deck1> fx add flanger             # rate 是每拍周期数；rate/depth/feedback/mix
-deck1> fx add phaser              # 6 级全通级联，同样按拍扫
-deck1> fx add cut                 # 拍锁门限：div 拍、width 占空比、depth、edge(ms)
-deck1> fx set cut div 0.25
-deck1> master fx list
-
-# stems：离线分离 4 条轨，然后逐条控制（分离在后台跑，期间照常 play/loop/jump/sync）
-deck1> stem separate         # 分段分离：先装四路流（此刻仍听原曲），每 5.85s 一块落地即可用
-deck1> stem status           # 水位：`25% separated`（未装入部分是原曲回落）
-deck1> stem separate --model htdemucs-fp16   # 临时换模型（provider/overlap/shifts 在 config.toml）
-# CUDA：在 config.toml 设 `[stems] provider = "cuda"`，需 --features cuda 构建（13s，RTX 4050）
-# 更快：设 `[stems] overlap = 0.0` 后 `live reload`，分离时间少约 24%，窗口边缘权重更大
-deck1> stem acapella         # 只要人声（instrumental | drums | bass | full）
-deck1> vocals level -0.5     # 单条 stem 电平（-1 = 精确静音）
-deck1> vocals mute           # solo 仍然优先
-deck1> vocals fx add filter  # 只给人声加滤波（deck1 fx … 则是整 deck 共用）
-deck1> stem status           # 逐 stem 电平/静音/独奏
-
-# 拍同步：deck2 对 deck1
-deck1> deck2 sync phase pid        # 先对 BPM，再用 PI 追相位（pll 收敛后归零）
-deck1> deck2 sync tempolock        # 两边共享一个 tempo，任一边 fader 都带动对方
-deck1> sync set-leader       # 指定 master（target 即 leader，无参数）
-deck1> deck2 nudge 0.04 0.5        # 临时 +4% 挪相位，0.5s 后自己松开（tempo 不变）
-deck1> deck2 sync unlock           # 解锁：清 lock/align/nudgerate，tempo 保留
-deck1> quit
-```
-
-启动参数：
-
-```bash
-cargo run -p hypermixx-cli -- --cli                  # 纯 REPL（默认是 TUI）
-cargo run -p hypermixx-cli -- --guide                # controller-guide（不启动引擎）
-cargo run -p hypermixx-cli -- --config config.toml  # 指定配置文件；不给则用平台默认路径
-cargo run -p hypermixx-cli -- --print-config        # 打印配置模板后退出
-cargo run -p hypermixx-cli -- --controller 0       # 打开 0 号控制器输入
-#   分析后端在 config.toml 的 [preference.analysis]：beats/key = timestretch | stratum（无 auto）
-#   配置是单文件多段落：[mixer] / [live] / [preference] / [controller]
-#   不给 --config 时：Linux/Termux 读 $XDG_CONFIG_HOME/hypermixx/config.toml，
-#   Windows 读 %APPDATA%/Hypermixx/config.toml；首次启动从内置模板复制一份
-#   `config show` 看当前配置，`config reload` 重读；`HYPERMIXX_CONFIG` 可覆盖路径
-#   旧的 --profile / --live / --controller-map / --tui / --midi* 已移除
-```
-
-TUI 内尽量不用启动参数:`F9` 打开设置（控制器端口、映射文件、拓扑文件、输出设备都在这里选，取代了旧的 F2/F3）；
-`load` 不带路径则弹出文件浏览器；`--guide` 即使不跟路径也会在 TUI 里选端口与文件。波形左右声道上下镜像，三频段颜色、
-分频点（`low_hz`/`high_hz`，内置默认 200/4000Hz，随附文件用 250/4000Hz）、渲染 backend 与图像刷新率在 `config.toml` 配置：
-`auto` 按 kitty → braille 选择（tmux/screen 暂回 braille）；kitty 可用 60Hz。
-Windows 上经 ConPTY 时 kitty graphics 的 APC 序列会被丢掉（表现为选中 kitty 但波形区空白），
-原因与修法见 [`docs/WAVEFORM.md`](docs/WAVEFORM.md)。
-
-### TUI 布局
-
-```
-header（状态 + ⚙ settings）
-┌ Deck1 · 标题 ─────────────┐┌ Deck2 · 标题 ─────────────┐
-│ cover  状态行              ││ cover  状态行              │
-│        waveform-overview  ││        waveform-overview  │
-└───────────────────────────┘└───────────────────────────┘
-waveform（每 deck 2 行，高终端 ≥34 行时 3 行；无边框无背景）
- 1trans ┌ 1-pads/1-fx ─┐┌ 1-eq/1-beatctl ┐┌ faders ────────┐ 2trans ┌ 2-pads/2-fx ─┐┌ 2-eq/2-beatctl ┐
- sync  │ 2×4 pad      ││ 5 knobs        ││fader │meter│ f│ sync  │ 2×4 pad      ││ 5 knobs        │
- key   │ 每块 3 行    ││                ││                 │ key   │ 每块 3 行    ││                │
- cue   │ cue/loop/jump││                ││                 │ cue   │ cue/loop/jump││                │
- play  │ [pads][fx]   ││ [eq][beat]     ││crossfader ░░░░░│ play  │ [pads][fx]   ││ [eq][beat]     │
-       └──────────────┘└────────────────┘└────────────────┘       └──────────────┘└────────────────┘
-browser | command
-```
-
-- 控件带按字面顺序重复两组：`trans | pads/fx | eq/beatctl | faders | trans | pads/fx | eq/beatctl`。
-- `trans` 不设边框，`sync / key / cue / play` 纵向排列并留空行；不再占用 eq 面板。
-- `pads` 与 `fx` 共用一格，`eq` 与 `beatctl` 共用一格；各自底部有一行 `[pads][fx]` / `[eq][beat]`
-  切换按钮（样式同 padmode）。
-- `fx` 面板列出当前 deck 链里**所有**非 `eq`/`filter` 槽位（`flowfx1..`、`knobfx1..`、`padfx1..`
-  以及运行时 `fx add` 的槽）。上方显示前两个非节拍参数，若有节拍参数则显示 `- beats:N +`：
-  `-` 减半、`+` 加倍。节拍参数在协议里是整数编码：正数 = N 拍，负数 = 1/N 拍。
-- eq 的 5 个横条用 `▬`（居中矩形，不占满整行）画，空的部分也是 `▬`、只差颜色：这样每条上下
-  自带一点空隙，`filt` 不会贴住底部按钮，也不需要为间隙额外加整行。
-- pads 是 2 行 4 列，每块 3 行；pads/beatctl 底部模式行只放模式按钮（cue/loop/jump、bpm/loop/jump），
-  再下一行是分组切换；按钮内文字居中，没有别的文字。
-- 两个 deck 的 fader 和它们的电平条**同框**（中间那个 `faders` 框）：**左列是 deck1 的电平、右列是 deck2 的电平**
-  （不是 master/cue，那对数值仍在 header 的 `out`/`cue` 里）。crossfader 画在这个框的**最底下一行**，
-  与上面空一行；框内横向间隙统一 2 列，与那 1 行空白（约等于 2 列宽）视觉一致。
-- fader 的宽度是 **2 列**，正好等于 crossfader 那 1 行的像素厚度（字符格约 1:2），所以竖着的 deck fader
-  和横着的 crossfader 看起来是同一根推子。电平条各 1 列，分居框的中线两侧，让 crossfader 的中点落在中线上。
-- crossfader 用 fader 的样式（`█` 实心 / `░` 空格），但它是**双极**的：中间 0 位时两边都不填充，
-  向左/向右才从中点往外填。
-- 启动时焦点在 **browser**：方向键直接浏览曲库。browser 也是命令行的目标——此时**裸的 deck 命令会被拒绝**
-  （`play` 不会悄悄落到上次的 deck），按 `Tab` 选到 deck，或直接在行首写 `deck1 play`。
-- 宽度 < 112 或高度 < 26 时整条控件带隐藏，只留 header + deck 信息 + 波形 + browser/command；
-  eq 面板内部宽度不足 11 列时自动省掉数值，只留长条。
-- 控件全部可用鼠标点：pads 三档、beat 三档、分组切换、FX 槽/参数/节拍、fader/knob/crossfader 按位置取值。
-  键盘仍然只属于命令行（`Tab` 切目标，`F9` 设置）。
-- `[preference.display] follow = true`（默认）时，CLI/MIDI 命令和 MIDI 的 `mode_trigger` 会自动切到
-  对应面板：pad 命令切 pads/对应 padmode，beat/tempo 命令切 beatctl，eq/filter 命令切 eq，
-  其他 FX 命令切 fx 并选中对应槽位；关掉后 TUI 只响应鼠标/键盘。
-- 颜色集中在 `config.toml` 的 `[theme]`（`accent`/`dim`/`text`/`error`/`warn`/`pad`，`#rrggbb`）。
-- 封面与 overview 和波形共用渲染后端：kitty 下都走 graphics 协议（同一个 image/placement 生命周期，
-  弹层打开时不发送也不放置，关闭后重传重放，避免残留），其它终端下封面用半格真彩、overview 用 braille。
-
-配置是**一个文件**：`[mixer]`（拓扑，含 `[[mixer.output]]` 输出设备）、`[live]`（本机设置）、
-`[preference]`（主题/波形/曲库）、`[controller]`（映射文件指针 `map` 与可选 `device`）。
-不给 `--config` 时用平台默认路径，首次启动从内置模板复制一份；`--print-config` 打印模板。
-仓库里的 `profile/config.toml` 是模板本身，`profile/mapping.toml` 是 unit-map 样例。
-`[controller].map` 是文件指针，相对 config 所在目录。
-运行时改配置不必重启：`config reload` / `mixer reload` 重建拓扑（保留走带），`live reload` 重读本机设置
-（引擎率/ring 需重启，`[stems]` 立即生效）。
-
-终端内 `controller ports` 列出可用输入端口（`midi ports` 仍可）；映射表格式与全部 action 见
-`profile/mapping.toml` 注释与 [`docs/MIDI.md`](docs/MIDI.md)。
-
-`F9`（或 header 右侧的 settings 按钮）打开设置界面——**它不是 TOML 编辑器**，只有五项：
-
-```
-> controller   Numark Party Mix III · mapping.toml
-  output       2 output(s)
-  mixer        config.toml
-  live         config.toml
-  preference   config.toml
-```
-
-`→`/`Enter` 进下一层，`←` 退回上一层，`Esc` 关闭；每一层都是同一个**单栏平铺**列表（和 `--guide` 里的弹窗完全一样，
-没有树、没有双栏、没有第二个窗口）：
-
-- `controller`：先进 `controller › input`（MIDI 端口列表），选定后自动进入 `controller › map`（`.toml` 文件选择），
-  选定即重连。文件选择里 `→`/`Enter` 进入目录、`⌦` 上一级目录、`←` 退回上一层。
-- `mixer`：选**拓扑**文件（`.toml`），选定即把它交给引擎重载（等同 `mixer reload <file>`），
-  之后的 `mixer reload` 也以它为默认。
-- `output`：`output`（每条 `[[output]]` 一行，来自 `mixer` 选中的文件）→ `… › input`（hardware）→
-  `… › channels`（channel pair），选定即写该文件的 `device`/`channels` 并立即重载（不必重启）。
-  `●` 当前绑定、`◆` 本 controller 的声卡、`✓/✗ rate` 采样率。立体声设备没有 channel 这一层；
-  ALSA 的 `sysdefault`/`default`/`pipewire` 这类虚拟 PCM 会谎报 32 通道，列表只给前四对（0,1 / 2,3 / 4,5 / 6,7）。
-- `output` 排在 `mixer` 前面：设备绑定是演出前要动的，拓扑文件是设定。
-- `live`、`preference`：选新的 `.toml`；`live` 立即按 `live reload` 重新读取（引擎率/ring 需重启），
-  `preference` 立即换主题。
-- 其余按键：`↑↓` 移动、`r` 刷新（根层重读拓扑文件；`output` 里重读文件并**重新探测声卡**）。
-  设备列表是一张快照，所以**进入 `output` 时也会重探一次**：TUI 启动后才插上的控制器、或被声音服务器
-  刚放开的声卡，不用重启就能出现。探测会打开每个 PCM，ALSA 的抱怨进响应日志（不会糊到界面上）。
-- TUI 运行期间 **stderr 被接管**：引擎的 `[audio] …` 和 libasound 的 `ALSA lib …` 不再画到界面上，
-  而是进响应日志（可滚动）。所以换一次 `output` 只看得到日志里几行，不会把画面冲掉。
-
-`output` 绑定的设备若被别的客户端（通常是 PipeWire/PulseAudio）独占，引擎会把它报成 `missing` 而不是假装在放——
-此时选 `default`/`pipewire` 这类**走声音服务器**的目的地，或让出该声卡后 `output refresh`。该原因会打在 stderr 上。
-`config.toml` 的 `device_buffer_frames` 只是延迟偏好：ALSA 的 `dmix`/`plug`（`sysdefault`/`default`，USB 声卡常见路径）
-会拒绝固定 buffer，此时引擎自动退回后端默认值，不会因此变成静音输出。这种情况下设备一次回调可能要一整个 PCM buffer，
-而 `ring_frames` 只是下限：引擎会把该输出的 ring 自动长到装得下一次回调（日志里给出建议值），否则每次回调都会补静音——
-听起来就是“变慢 + 破碎”。
-
-弹窗出现时 deck 上的 kitty 图片会被立即删除（kitty 图片在文字层之下，只是不再绘制的话会从弹窗里透出来），
-关闭后自动重传。
-
-## 脚本
-
-`./scripts/phase_probe.sh`: 6次beatjump测试相位差
-`./scripts/sync_phase.sh`: 同曲先后播放sync测稳态相位差
-
-## 曲库
-
-`library` 读取本地文件夹和 rekordbox / VirtualDJ / Serato 的 USB 导出，缓存到
-`$HYPERMIXX_CACHE/library/library.sqlite3`（默认 `.cache/library/`）。U 盘只读，不写回。
+#### 本地曲库
 
 ```toml
-# config.toml
-[library]
-local = ["rkb", "serato", "vdj"]   # 本机用户目录里的库
-usb   = ["rkb", "serato", "vdj"]   # 插拔 U 盘时自动挂载并发现的库
-folders = ["~/Music"]              # 普通文件夹；`~` 展开为用户主目录源
+[preference.library]
+local   = ["rkb", "serato", "vdj"]   # 用户目录里的软件曲库
+folders = ["~/Music"]                # 普通文件夹，`~` 会展开
+```
+
+启动时 browser 优先打开 `~/Music`。想立刻重扫，命令行敲 `browser refresh`，或者用 `browser list` 看现在有哪些来源、上次什么时候扫的。
+
+#### USB曲库
+
+```toml
+[preference.library]
+usb = ["rkb", "serato", "vdj"]
+```
+
+插上就认。后台会轮询 `/sys/block` 找可移动盘，没挂载就调 `udisksctl mount --no-user-interaction` 挂上，然后只读地读一遍。同一块 U 盘上的 rekordbox / Serato / VirtualDJ 会作为三个不同的 library 出现，互不打架。
+
+### 使用命令行
+
+默认是 TUI；想用纯命令行加 `--cli`。两边是同一套语法，行首可以点名叫哪个 deck：
+
+```bash
+cargo run --release -- --cli
 ```
 
 ```text
-browser refresh                       # 增量重扫已配置来源
-browser list                          # 来源和 id
-browser tracks <list-id>              # list 内容
-browser show <location-id>            # 单曲详情
+deck1 load ~/Music/shelter.mp3 122
+deck1 play
+deck1 cue
+deck1 beatjump 16
+deck1 loop 8
+deck1 fx add echo
+deck1 stem separate
+
+deck2 load ~/Music/nepture.mp3
+deck2 sync phase pid      # 先对 BPM，再用 PI 追相位
+deck2 sync tempolock      # 两边共享一个 tempo
+deck1 sync set-leader     # 指定 master
+deck2 nudge 0.04 0.5      # 临时 +4%，半秒后自动松开
 ```
 
-启动时 browser 优先打开 `~/Music` 来源；没有这个来源时停在第一个已配置来源。
-扫描在后台进行，界面先显示缓存，完成后自动刷新。未出现在 `local` / `usb` / `folders`
-里的来源不会扫描，也不会显示。同一个 U 盘的
-rekordbox / VirtualDJ / Serato 会作为三个不同 library 出现。USB 插拔由后台 watcher
-轮询 `/sys/block`，未挂载时调用 `udisksctl mount --no-user-interaction`。
+裸命令（`play`、`loop 4`）作用于当前焦点 deck；只有 `master fx …` 走总线。`help` 看命令总表，`quit` 退出。常用动词不多：`load`、`play`、`cue`、`loop`、`beatjump`、`sync`、`fx`、`stem`，具体到每个参数看 [docs/COMMANDS.md](docs/COMMANDS.md)。
 
-- rekordbox：优先 `exportLibrary.db`（SQLCipher），没有时回退 `export.pdb`；ANLZ 的
-  `PQTZ`/`PCO2` 导入 beatgrid 和 hot cue。
-- VirtualDJ：`database.xml` + `vdj-export/vdj-list.m3u`，有 ANLZ 时一并导入。
-- Serato：`database V2` + `Subcrates/*.crate`，cue/grid 从 ID3 `GEOB` 读取。
-- 同一音频按内容哈希合并；路径只属于 location。
-- RB 的 ANLZ 时间保留原始值，并在 cue/grid 行记录 `offset_ms`。实测以 RB/VDJ 为 0 时，
-  Serato tag 晚约 16.5ms，因此默认 `serato_offset_ms = -16.5`。
-  加载时先减掉解码器 gapless 起点（MP3 样本 25.0567ms），再加可配置的微调，最后换算到帧。
-- 默认 RB 口令是公开常量；需要覆盖时设 `HYPERMIXX_REKORDBOX_KEY`。
-- `config.toml` 的 `[library] local|usb|folders` 决定启动时扫描/显示哪些来源。
-  `decoder_start_ms`、`grid_offset_ms` 以及 `rkb_mp3_offset_ms` / `serato_offset_ms` /
-  `vdj_offset_ms` 控制导入网格的时间补偿。`[display] key = "camelot"`（默认）可改为 `"classic"`。
+### 连接碟机
 
-TUI：`Tab` 到 browser 后，`↑/↓` 选择、`→/Enter` 打开（最低一级进入 tracks）、`←/Esc` 返回；
-track 上 `Enter`/`load [deck]` 加载，`analyse` 分析并缓存；鼠标双击 track 弹出 deck 选择框（1/2，
-默认停在第一个；`browser load 2` 这种显式指定的会预选对应行）。
-MIDI 可用 `browser.up/down/open/exit/load/refresh`，`hotcue set|trigger|clear <1..8>` 控制 hot cue。
+标准 MIDI 控制器插上就能用，不需要装驱动。
 
-## Stem Separate
+- `controller ports` 列出可用端口；`--controller 0` 启动时直接打开 0 号，或者进 TUI 按 `F9` 在设置里选。
+- 映射文件由 `config.toml` 的 `[controller] map = "mapping.toml"` 指定，路径相对配置文件所在目录。
+- 配置里写了端口但设备没插，不会拦着你启动；插上以后 `F9` 里再选一次就行。
+- 同一个映射文件可以给多台同型号控制器用，端口在设置里换，映射不用重写。
 
-`stem separate` 把当前曲目离线分离成[drums/bass/other/vocals]，pcm缓存在`./.cache/stems/...`（工作目录下的 `.cache`，可用 `HYPERMIXX_CACHE` 覆盖）。
+## 编辑映射
 
-## todo
+启动映射向导：
 
-1. midi control: nearly done
-2. better stem/stemfx
-3. network streamming
-4. better analysis
+```bash
+cargo run --release -- --guide
+```
+
+向导不启动音频引擎，改映射的时候不会突然出声。界面很直白：左边是 `deck | unit | slot` 三栏，右边是说明和 watch dog（看 MIDI raw、看报错），底部一排按钮。
+
+- `Enter` 往下钻；`new` 可以 `clone from deck1`，也可以从内置 preset 里挑一个新建 unit。
+- 到 slot 上按 `Enter` 进 Learn，动一下控制器上的实物，再 `Enter` 确认。14-bit 的旋钮会自动认出来，不用自己算 CC 号。
+- 一个 unit 可以有几套 mode，按模式键切换；`mode_trigger` 直达某一套，`mode_cycle` 按顺序轮。
+- 学完 `Save`，存成普通的 TOML。action 的参数就写在行内（`loop 1/4`、`nudge 0.15 0.06`），曲线和值域也能手改。
+- 仓库里的 `profile/mapping.toml` 是一份带注释的完整样例；schema 和全部 action 见 [docs/MIDI.md](docs/MIDI.md)。
+
+## 配置
+
+只有一个文件，分四段：
+
+```toml
+[mixer]        # 拓扑：通道、crossfader、master limiter、输出设备
+[live]         # 这台机器：采样率、ring、keylock、stem、autogain
+[preference]   # 界面口味：波形、主题、曲库、key 显示、分析后端
+[controller]   # 控制器：map 文件指针，可选 device
+```
+
+不给 `--config` 就用平台默认路径（Linux `$XDG_CONFIG_HOME/hypermixx/config.toml`，Windows `%APPDATA%/Hypermixx/config.toml`）；`HYPERMIXX_CONFIG` 可以覆盖，`--print-config` 打印内置模板。仓库里的 `profile/config.toml` 就是这份模板。
+
+改完不必重启：
+
+- `config reload` 重读整份配置。
+- `mixer reload [file]` 就地重建拓扑，正在放的歌不会停；文件里没写的键回到默认值，所以想保留的推子/trim 要一起写上。
+- `live reload` 重读本机设置。采样率和 ring 要重启才生效，`[live.stems]` 下一首分离立刻用新值。
+- 输出设备可以在 `F9` 里选，也可以 `output list` 看状态、`output refresh` 重试没插好的设备。
+
+段名或键名拼错会直接报错，不会偷偷按默认值跑——演出中途「看起来用了某套配置其实没有」比报错难查得多。
+
+## 计划中的功能
+
+1. 基于Flutter的GUI
+2. Android支持，包括ratadroid/flutter
+3. 网络/流媒体串流
+4. 更好的网格分析算法
+5. 脚本控制和SetMaker
+6. 基于LLM的自动混音
+7. 局域网互联和Sync
 
 ## 许可证
 
