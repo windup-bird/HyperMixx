@@ -623,7 +623,7 @@ fn fader_command<'a>(
         _ => return Action::Failed(format!("the position must be a number, got `{raw}`")),
     };
     let target_fader = match stage {
-        "cross" | "crossfader" => FaderTarget::Crossfader,
+        "cross" | "crossfader" => FaderTarget::default_crossfader(),
         "master" => FaderTarget::Master,
         "cue" => FaderTarget::Cue,
         // Everything else names a stage inside the target channel.
@@ -803,10 +803,6 @@ fn config_command<'a>(
                 Err(err) => return Action::Failed(format!("{path}: {err}")),
             };
             let _ = dispatcher.command_tx.send(Command::MixerReload { text });
-            let _ = dispatcher.command_tx.send(Command::SetAutogain {
-                enabled: live.autogain.enabled,
-                target_db: live.autogain.target_db,
-            });
             dispatcher.with_topology(Some(path.clone()));
             dispatcher.with_live(live, Some(path.clone()));
             let mut report = format!("config {path} reloaded");
@@ -887,12 +883,6 @@ fn live_command<'a>(words: &mut impl Iterator<Item = &'a str>, dispatcher: &Disp
                              (the engine's clock, rings and keylock window are set when it starts)",
                         );
                     }
-                    // Auto-gain is the one part of `live.toml` that applies to the running engine
-                    // immediately: the measurement is already on each deck.
-                    let _ = dispatcher.command_tx.send(Command::SetAutogain {
-                        enabled: live.autogain.enabled,
-                        target_db: live.autogain.target_db,
-                    });
                     dispatcher.with_live(live, Some(path));
                     Action::Message(text)
                 }
@@ -2698,7 +2688,7 @@ mod tests {
         expect(FaderTarget::CueSend(0), 0.9);
         // The shared stages ignore the target: they are one physical control.
         for (line, expected) in [
-            ("cross -1.0", FaderTarget::Crossfader),
+            ("cross -1.0", FaderTarget::default_crossfader()),
             ("master 0.1", FaderTarget::Master),
             ("cue -0.2", FaderTarget::Cue),
         ] {
@@ -2751,6 +2741,7 @@ mod tests {
         let (notice_tx, _notice_rx) = unbounded();
         let dispatcher = Dispatcher::new(command_tx, notice_tx);
         let state = Arc::new(Mutex::new(hypermixx_midi::RouterState {
+            mirrored: false,
             units: vec![hypermixx_midi::UnitModeState {
                 id: "deck0.pad".to_owned(),
                 deck: Some(0),
@@ -2843,7 +2834,7 @@ mod tests {
     fn a_config_without_a_live_section_uses_the_built_in_live_defaults() {
         // A one-file config that omits `[live]` must not have its `[mixer]` / `[preference]`
         // sections fed to `LiveConfig` (which would fail with "unknown field `mixer`").
-        let text = "[mixer]\n[[mixer.channel]]\nside = \"center\"\n[preference]\n";
+        let text = "[mixer]\n[[multideck.deck]]\nside = \"center\"\n[preference]\n";
         let (live, notes) = read_live_text(text).expect("a partial config parses");
         assert_eq!(live, LiveConfig::default());
         assert!(notes.is_empty(), "{notes:?}");
@@ -3101,13 +3092,14 @@ mod tests {
             &path,
             r#"
 [mixer]
-[[mixer.channel]]
+[mixer.autogain]
+enabled = true
+target_db = -9.0
+
+[[multideck.deck]]
 side = "center"
 
 [live]
-[live.autogain]
-enabled = true
-target_db = -9.0
 "#,
         )
         .unwrap();
@@ -3138,14 +3130,6 @@ target_db = -9.0
             Command::MixerReload { text } => assert!(text.contains("center"), "{text}"),
             other => panic!("expected MixerReload, got {other:?}"),
         }
-        match rx.recv().unwrap() {
-            Command::SetAutogain { enabled, target_db } => {
-                assert!(enabled);
-                assert_eq!(target_db, -9.0);
-            }
-            other => panic!("expected SetAutogain, got {other:?}"),
-        }
-        assert!(dispatcher.live().autogain.enabled);
         assert_eq!(dispatcher.topology_path(), path.to_string_lossy());
 
         // A missing file and a mistyped subcommand are failures.

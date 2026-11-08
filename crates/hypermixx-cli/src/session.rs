@@ -12,6 +12,7 @@ use hypermixx_audio::Command;
 use hypermixx_core::LiveConfig;
 use hypermixx_library::analyser::Backends;
 use hypermixx_library::LibraryDb;
+use hypermixx_midi::map::DeckRoutes;
 use hypermixx_midi::{RouterCommand, RouterState};
 
 use crate::notices::NoticeTx;
@@ -40,6 +41,11 @@ pub struct Session {
     /// REPL path). The TUI connects later and installs them on its own dispatcher.
     pub midi_control: Option<Sender<RouterCommand>>,
     pub midi_state: Option<Arc<Mutex<RouterState>>>,
+    /// Controller face → physical deck table, built from `[[multideck.deck]] source`. Both
+    /// front-ends need it to compile the normal and mirror unit maps.
+    pub deck_routes: DeckRoutes,
+    /// One entry per `[[controller]]` instance, each with its own port, map and face routes.
+    pub controller_sessions: Vec<crate::profile::ControllerSession>,
     /// The library cache, opened once by `main` and shared by both front-ends.
     pub library: Option<Arc<LibraryDb>>,
 }

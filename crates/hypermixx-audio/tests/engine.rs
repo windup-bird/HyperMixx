@@ -186,7 +186,7 @@ fn set_fader_reaches_the_mixer_through_the_command_channel() {
         FaderTarget::Flow(0),
         FaderTarget::Deck(1),
         FaderTarget::CueSend(0),
-        FaderTarget::Crossfader,
+        FaderTarget::default_crossfader(),
         FaderTarget::Master,
         FaderTarget::Cue,
     ] {

@@ -58,20 +58,6 @@ pub enum DeckSide {
     Center,
 }
 
-/// Where in the channel's path the crossfader's gain is applied. One physical control, but *where*
-/// it acts is a design parameter: before the flow inserts, after the flow faders, or at the very end.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CrossfaderPlace {
-    /// Per stream, right after the source gate and before the flow inserts.
-    Source,
-    /// On the channel's sum, after the flow faders and before the deck inserts.
-    Flow,
-    /// On the channel's sum, after the deck fader — the historical position.
-    #[default]
-    Deck,
-}
-
 /// Where the cue send taps the channel, relative to the channel fader.
 ///
 /// The tap is always a *point next to the fader* — never a free routing choice — because that is
@@ -136,6 +122,23 @@ impl CrossfaderCurve {
 }
 
 impl DeckSide {
+    /// Compact form for the runtime side an atomic can hold.
+    fn as_u8(self) -> u8 {
+        match self {
+            DeckSide::Left => 0,
+            DeckSide::Right => 1,
+            DeckSide::Center => 2,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => DeckSide::Left,
+            1 => DeckSide::Right,
+            _ => DeckSide::Center,
+        }
+    }
+
     /// This side's gain for a crossfader position of `-1.0` (hard left) .. `1.0` (hard right).
     pub fn gain_at(self, position: f32, curve: CrossfaderCurve, cut_width: f32) -> f32 {
         if self == DeckSide::Center {
@@ -202,6 +205,9 @@ pub struct Channel {
     /// monitor path instead of the mix.
     cue_send: Param,
     side: DeckSide,
+    /// The side the current crossfader pair assigns to this channel. Runtime state: a controller
+    /// mode can move a deck between left, right and outside the crossfade without a reload.
+    crossfader_side: AtomicU8,
     cross: CrossfaderConfig,
     /// Which side of the fader the cue send taps.
     cue_tap: CueTap,
@@ -247,8 +253,9 @@ impl Channel {
             gain: Param::new(clamp_pos(cfg.gain), FADER_TAU),
             cue_send: Param::new(cfg.cue_send.clamp(0.0, 1.0), FADER_TAU),
             side: cfg.side,
+            crossfader_side: AtomicU8::new(cfg.side.as_u8()),
             cross,
-            cue_tap: cfg.cue,
+            cue_tap: CueTap::default(),
         };
         // A channel can carry up to `Stem::COUNT` streams, and an `fx` command may address any of
         // them before the deck has grown — a stem chain is *configured*, not created, by being
@@ -508,6 +515,18 @@ impl Channel {
         self.crossfader.set(clamp_pos(position));
     }
 
+    /// The same position plus the side this channel currently occupies (chosen by the controller's
+    /// crossfader mode). A deck outside the pair is `Center` and stays at unity.
+    pub fn set_crossfader_for(&self, position: f32, side: DeckSide) {
+        self.crossfader_side.store(side.as_u8(), Ordering::Relaxed);
+        self.set_crossfader(position);
+    }
+
+    /// Which side of the channel fader the cue send taps (`[mixer.chain] fader-location`).
+    pub fn set_cue_tap(&mut self, tap: CueTap) {
+        self.cue_tap = tap;
+    }
+
     /// `0.0` (off) ..= `1.0` (full). Values outside that range are clamped, not wrapped.
     pub fn set_cue_send(&self, level: f32) {
         self.cue_send.set(if level.is_finite() { level.clamp(0.0, 1.0) } else { 0.0 });
@@ -559,9 +578,8 @@ impl Channel {
         // taken here and passed in.
         let cue_gain = self.cue_send.next_block(ctx.block_frames, ctx.sample_rate);
         let cross_position = self.crossfader.next_position(ctx);
-        let side_gain = self.side.gain_at(cross_position, self.cross.curve, self.cross.cut_width);
-        let cross_at_source = self.cross.place == CrossfaderPlace::Source;
-        let cross_at_flow = self.cross.place == CrossfaderPlace::Flow;
+        let side = DeckSide::from_u8(self.crossfader_side.load(Ordering::Relaxed));
+        let side_gain = side.gain_at(cross_position, self.cross.curve, self.cross.cut_width);
 
         let frames = ctx.block_frames;
         let live = streams.min(stream_buses.len());
@@ -593,9 +611,6 @@ impl Channel {
             if gate != 1.0 {
                 sb.scale(gate);
             }
-            if cross_at_source {
-                sb.scale(side_gain);
-            }
             sb.scale(self.flow_fader[stream].next_amp(ctx));
             if autogain_gain != 1.0 {
                 sb.scale(autogain_gain);
@@ -614,10 +629,6 @@ impl Channel {
             }
             bus.add_from(sb);
         }
-        // At the flow position the crossfader sits on the flow sum, after the tone controls.
-        if cross_at_flow {
-            bus.scale(side_gain);
-        }
 
         if !self.post_fx.is_empty() {
             self.post_fx.process(&mut bus, ctx);
@@ -633,11 +644,9 @@ impl Channel {
         if self.cue_tap == CueTap::Post {
             self.take_cue_into(&bus, cue_gain);
         }
-        // The historical position, and the default: last, so a crossfade is a routing decision taken
-        // after the tone controls and the levels rather than a level change that recolours them.
-        if self.cross.place == CrossfaderPlace::Deck {
-            bus.scale(side_gain);
-        }
+        // The crossfader is last, so a crossfade is a routing decision taken after the tone controls
+        // and the levels rather than a level change that recolours them.
+        bus.scale(side_gain);
 
         self.stream_buses = stream_buses;
         self.bus = bus;
@@ -841,9 +850,9 @@ mod tests {
         Channel::new(deck_at_zero(), &cfg, cross, flow, deck_chain)
     }
 
-    /// A crossfader config, for the tests that care where or how it acts.
-    fn cross(place: CrossfaderPlace, curve: CrossfaderCurve, start: f32) -> CrossfaderConfig {
-        CrossfaderConfig { place, curve, start, ..Default::default() }
+    /// A crossfader config, for the tests that care about its curve or starting position.
+    fn cross(curve: CrossfaderCurve, start: f32) -> CrossfaderConfig {
+        CrossfaderConfig { curve, start, ..Default::default() }
     }
 
     fn unity() -> ChannelConfig {
@@ -1000,7 +1009,7 @@ mod tests {
     fn a_crossfader_position_reaches_both_planes_of_a_stereo_signal() {
         let mut channel = channel_cross(
             ChannelConfig { side: DeckSide::Right, cue_send: 1.0, ..Default::default() },
-            cross(CrossfaderPlace::Deck, CrossfaderCurve::Classic, -1.0),
+            cross(CrossfaderCurve::Classic, -1.0),
             vec![FxChain::new()],
             FxChain::new(),
         );
@@ -1652,43 +1661,32 @@ mod tests {
         assert!(killed < 1e-6, "a closed trim leaked {killed}");
     }
 
-    /// The crossfader acts at the place the config names, and the cue tap sits just before the
-    /// fader: a crossfader downstream of that point is not in the monitor, one upstream is.
+    /// The crossfader is last and the cue tap sits just before the fader, so a hard crossfade does
+    /// not silence the monitor.
     #[test]
-    fn the_crossfader_acts_at_its_place_and_the_cue_tap_ignores_it_when_it_is_downstream() {
-        let run = |place: CrossfaderPlace| -> Channel {
-            let mut channel = channel_cross(
-                ChannelConfig {
-                    side: DeckSide::Right,
-                    cue_send: 1.0,
-                    ..Default::default()
-                },
-                cross(place, CrossfaderCurve::Classic, -1.0),
-                vec![FxChain::new()],
-                FxChain::new(),
-            );
-            channel.deck_mut().play();
-            for _ in 0..20 {
-                channel.process(&ctx());
-            }
-            channel
-        };
-        for (place, cue_ignores) in [
-            (CrossfaderPlace::Source, false),
-            (CrossfaderPlace::Flow, false),
-            (CrossfaderPlace::Deck, true),
-        ] {
-            let channel = run(place);
-            assert!(
-                channel.peak() < 1e-4,
-                "{place:?}: a right channel at hard left still sounded"
-            );
-            assert_eq!(
-                channel.cue().peak() > 0.0,
-                cue_ignores,
-                "{place:?}: the cue tap is just before the fader"
-            );
+    fn the_crossfader_is_last_and_the_cue_tap_ignores_it() {
+        let mut channel = channel_cross(
+            ChannelConfig {
+                side: DeckSide::Right,
+                cue_send: 1.0,
+                ..Default::default()
+            },
+            cross(CrossfaderCurve::Classic, -1.0),
+            vec![FxChain::new()],
+            FxChain::new(),
+        );
+        channel.deck_mut().play();
+        for _ in 0..20 {
+            channel.process(&ctx());
         }
+        assert!(
+            channel.peak() < 1e-4,
+            "a right channel at hard left still sounded"
+        );
+        assert!(
+            channel.cue().peak() > 0.0,
+            "the cue tap is just before the fader"
+        );
     }
 
     #[test]

@@ -516,8 +516,10 @@ pub enum FaderTarget {
     Gain(DeckId),
     /// One channel's cue send, linear `0.0..=1.0` (a send level, not a bipolar fader).
     CueSend(DeckId),
-    /// The single crossfader, broadcast to every channel (`-1.0` hard left .. `1.0` hard right).
-    Crossfader,
+    /// The shared crossfader (`-1.0` hard left .. `1.0` hard right). The pair it acts on is chosen
+    /// by the controller's mode at runtime, so it travels with every position rather than being a
+    /// fixed property of the channels.
+    Crossfader { left: DeckId, right: DeckId },
     /// The master bus fader.
     Master,
     /// The cue bus fader.
@@ -525,6 +527,12 @@ pub enum FaderTarget {
 }
 
 impl FaderTarget {
+    /// The pair a bare crossfader control acts on when no controller mode has named one. Keeping
+    /// the two-deck default in one place lets every front-end share it.
+    pub fn default_crossfader() -> Self {
+        Self::Crossfader { left: 0, right: 1 }
+    }
+
     /// Whether the target is a bipolar position (`-1.0..=1.0`, `0.0` = unity) rather than a
     /// linear level (`0.0..=1.0`). A mapping layer uses this to pick the default value range.
     pub fn is_bipolar(self) -> bool {
@@ -534,7 +542,7 @@ impl FaderTarget {
             | FaderTarget::Stem { .. }
             | FaderTarget::Deck(..)
             | FaderTarget::Gain(..)
-            | FaderTarget::Crossfader
+            | FaderTarget::Crossfader { .. }
             | FaderTarget::Master
             | FaderTarget::Cue => true,
         }

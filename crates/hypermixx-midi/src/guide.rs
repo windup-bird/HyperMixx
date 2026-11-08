@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::map::{
-    Encoding, EndpointRole, EventKind, Map, MapFile, RawControl, RawEndpoint, RawModeBind, RawUnit,
-    SlotKind, SlotRole,
+    Encoding, EndpointRole, EventKind, FaceRef, Map, MapFile, RawControl, RawEndpoint, RawModeBind,
+    RawUnit, SlotKind, SlotRole,
 };
 use crate::msg::Event;
 use crate::preset::{Preset, PresetRegistry, PresetScope};
@@ -445,7 +445,7 @@ impl Guide {
         let unit = RawUnit {
             id,
             preset: Some(preset.to_owned()),
-            deck: deck.map(|deck| deck as u8),
+            deck: deck.map(|deck| FaceRef::Deck(deck as u8)),
             start: None,
             mode_order: None,
             controls: Vec::new(),
@@ -533,7 +533,7 @@ impl Guide {
             .units
             .iter()
             .enumerate()
-            .filter(|(_, unit)| unit.deck.map(usize::from) == Some(source))
+            .filter(|(_, unit)| unit.deck.as_ref().and_then(FaceRef::deck_id).map(usize::from) == Some(source))
             .map(|(index, _)| index)
             .collect();
         if indexes.is_empty() {
@@ -814,7 +814,7 @@ impl Guide {
     fn deck_entries(&self) -> Vec<DeckEntry> {
         let mut decks: Vec<usize> = (0..self.decks).collect();
         for unit in &self.map.units {
-            if let Some(deck) = unit.deck {
+            if let Some(deck) = unit.deck.as_ref().and_then(FaceRef::deck_id) {
                 decks.push(usize::from(deck));
             }
         }
@@ -863,7 +863,7 @@ impl Guide {
             .units
             .iter()
             .enumerate()
-            .filter(|(_, unit)| unit.deck.map(usize::from) == deck)
+            .filter(|(_, unit)| unit.deck.as_ref().and_then(FaceRef::deck_id).map(usize::from) == deck)
             .map(|(index, unit)| UnitEntry {
                 row: Row {
                     label: unit.id.clone(),
@@ -1051,7 +1051,7 @@ impl Guide {
             .map
             .units
             .get(unit)
-            .and_then(|unit| unit.deck.map(usize::from));
+            .and_then(|unit| unit.deck.as_ref().and_then(FaceRef::deck_id).map(usize::from));
         let wanted = deck.map_or(DeckKind::Global, DeckKind::Deck);
         if let Some(index) = decks.iter().position(|entry| entry.kind == wanted) {
             self.nav.deck = index;
@@ -1176,7 +1176,7 @@ impl Guide {
                 .units
                 .iter()
                 .filter(|unit| {
-                    unit.deck.map(usize::from)
+                    unit.deck.as_ref().and_then(FaceRef::deck_id).map(usize::from)
                         == match entry.kind {
                             DeckKind::Deck(deck) => Some(deck),
                             DeckKind::Global => None,
@@ -1312,6 +1312,10 @@ impl Guide {
                 role: SlotRole::ModeCycle,
                 target: None,
             }),
+            SlotRole::DeckMirror => Some(SelectorCapture {
+                role: SlotRole::DeckMirror,
+                target: None,
+            }),
         };
         self.capture = Some(Capture {
             unit,
@@ -1327,9 +1331,9 @@ impl Guide {
             swept: false,
         });
         self.message = Some(match (slot.kind, slot.role) {
-            (_, SlotRole::ModeTrigger) | (_, SlotRole::ModeCycle) => {
-                "press the mode key now".to_owned()
-            }
+            (_, SlotRole::ModeTrigger)
+            | (_, SlotRole::ModeCycle)
+            | (_, SlotRole::DeckMirror) => "press the mode key now".to_owned(),
             (SlotKind::JogWheel, _) => "press the platter first".to_owned(),
             _ => format!("press or turn `{}` now", slot.name),
         });
@@ -1564,8 +1568,8 @@ fn copy_unit(
     target_deck: usize,
     channel_offset: i16,
 ) -> Result<crate::map::RawUnit, String> {
-    let Some(old_deck) = unit.deck else {
-        return Err("a global unit has no deck to clone to".to_owned());
+    let Some(old_deck) = unit.deck.as_ref().and_then(FaceRef::deck_id) else {
+        return Err("a face-named or global unit cannot be cloned by deck number".to_owned());
     };
     let target = target_deck as u8;
     if old_deck == target {
@@ -1577,7 +1581,7 @@ fn copy_unit(
     }
     let mut cloned = unit.clone();
     cloned.id = clone_id(&unit.id, old_deck, target);
-    cloned.deck = Some(target);
+    cloned.deck = Some(FaceRef::Deck(target));
     for control in &mut cloned.controls {
         let Some(one_or_many) = control.endpoint.as_mut() else {
             continue;
@@ -1707,6 +1711,7 @@ fn mode_key_hint(slot: &SlotInfo) -> String {
     match slot.role {
         SlotRole::ModeTrigger => format!("trigger → {}", slot.target.as_deref().unwrap_or("?")),
         SlotRole::ModeCycle => "cycle".to_owned(),
+        SlotRole::DeckMirror => "mirror toggle".to_owned(),
         SlotRole::Action => String::new(),
     }
 }
@@ -1995,7 +2000,7 @@ chain = "deck1"
         guide.clone_unit(1, 1).unwrap();
         let cloned = &guide.map.units[1];
         assert_eq!(cloned.id, "deck2.mixer");
-        assert_eq!(cloned.deck, Some(1));
+        assert_eq!(cloned.deck, Some(FaceRef::Deck(1)));
         assert_eq!(
             cloned.controls[0].endpoint.as_ref().unwrap().as_slice()[0].channel,
             1
@@ -2136,7 +2141,7 @@ chain = "deck1"
                 .map
                 .units
                 .iter()
-                .filter(|unit| unit.deck == Some(2))
+                .filter(|unit| unit.deck.as_ref().and_then(FaceRef::deck_id) == Some(2))
                 .count(),
             2
         );
@@ -2144,7 +2149,7 @@ chain = "deck1"
             .map
             .units
             .iter()
-            .find(|unit| unit.deck == Some(2) && unit.preset.as_deref() == Some("jog"))
+            .find(|unit| unit.deck.as_ref().and_then(FaceRef::deck_id) == Some(2) && unit.preset.as_deref() == Some("jog"))
             .expect("cloned jog");
         assert_eq!(jog.id, "deck3.jog");
         let turn = jog

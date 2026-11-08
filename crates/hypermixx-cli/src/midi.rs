@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use hypermixx_core::{BrowserAction, Command, CommandResponse, FxChainId};
-use hypermixx_midi::map::Action;
+use hypermixx_midi::map::{Action, DeckRoutes};
 use hypermixx_midi::{
     ports, Input, Map, MergeBuffer, ModeEvent, Received, Router, RouterCommand, RouterState,
 };
@@ -74,14 +74,19 @@ impl MidiSession {
     }
 }
 
-/// Reads and parses a map file. FX-name resolution is the caller's job (see [`resolve_with`]).
-pub fn read_map(map_path: &str) -> Result<Map, String> {
+/// Reads a map file and compiles it twice: once with every controller face resolved to its normal
+/// deck, once to its mirror deck. The router swaps between these when the mirror toggle fires.
+pub fn read_map_pair(map_path: &str, routes: &DeckRoutes) -> Result<(Map, Map), String> {
     let text = std::fs::read_to_string(map_path).map_err(|err| format!("{map_path}: {err}"))?;
     let base = Path::new(map_path)
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    Map::from_toml_str_at(&text, base).map_err(|err| format!("{map_path}: {err}"))
+    let normal = Map::from_toml_str_at_routes(&text, base, routes, false)
+        .map_err(|err| format!("{map_path}: {err}"))?;
+    let mirror = Map::from_toml_str_at_routes(&text, base, routes, true)
+        .map_err(|err| format!("{map_path}: {err}"))?;
+    Ok((normal, mirror))
 }
 
 /// Opens `port` and starts translating `map`.
@@ -94,13 +99,14 @@ pub fn read_map(map_path: &str) -> Result<Map, String> {
 pub fn attach(
     port: &str,
     map: Map,
+    mirror_map: Map,
     command_tx: Sender<Command>,
     browser_tx: Option<Sender<BrowserAction>>,
     mode_tx: Option<Sender<ModeEvent>>,
 ) -> Result<MidiSession, String> {
     let (received_tx, received_rx) = crossbeam_channel::unbounded();
     let (control_tx, control_rx) = crossbeam_channel::unbounded();
-    let router = Router::new(map);
+    let router = Router::new(map, mirror_map);
     let state = Arc::new(Mutex::new(router.snapshot()));
     let input = ports::open(port, received_tx).map_err(|err| format!("midi: {err}"))?;
     let translator_command_tx = command_tx.clone();
@@ -134,15 +140,18 @@ pub fn attach(
 pub fn attach_file(
     port: &str,
     map_path: &str,
+    routes: &DeckRoutes,
     decks: usize,
     command_tx: Sender<Command>,
     responses: &Receiver<CommandResponse>,
     notices: &NoticeTx,
 ) -> Result<MidiSession, String> {
-    let mut map = read_map(map_path)?;
+    let (mut map, mut mirror_map) = read_map_pair(map_path, routes)?;
     let unresolved = resolve_via_engine(&mut map, decks, &command_tx, responses);
     report_unresolved(notices, unresolved);
-    let session = attach(port, map, command_tx, None, None)?;
+    // The mirror map names the same FX slots as the normal one, so resolve them once and copy.
+    mirror_map.copy_fx_slots(&map);
+    let session = attach(port, map, mirror_map, command_tx, None, None)?;
     notices::info(
         notices,
         format!("[midi] listening on `{port}` (map {map_path})"),
@@ -192,6 +201,11 @@ fn pump(
                     }
                     if feed.state_changed {
                         publish(&state, &router);
+                    }
+                    if feed.mirror_changed {
+                        // A sweep coalesced for the old deck must not land on the new one.
+                        flush(&mut merge, &command_tx);
+                        last_flush = Instant::now();
                     }
                     if last_flush.elapsed() >= FLUSH_EVERY {
                         flush(&mut merge, &command_tx);
@@ -354,7 +368,7 @@ action = "play"
         let (received_tx, received_rx) = crossbeam_channel::unbounded();
         let (_control_tx, control_rx) = crossbeam_channel::unbounded();
         let (command_tx, command_rx) = crossbeam_channel::unbounded();
-        let router = Router::new(map);
+        let router = Router::new(map.clone(), map);
         let state = Arc::new(Mutex::new(router.snapshot()));
         let translator = std::thread::spawn(move || {
             pump(

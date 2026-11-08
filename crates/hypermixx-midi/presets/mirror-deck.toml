@@ -1,0 +1,14 @@
+# The mirror toggle: one button flips the whole controller between its normal and mirror deck
+# maps. The unit binds the note numbers; the deck list lives in `[[multideck.deck]] source`.
+[[preset]]
+name = "mirror-deck"
+scope = "global"
+start = "default"
+
+[[preset.slot]]
+slot = "toggle"
+type = "Button"
+role = "deck_mirror"
+
+[[preset.mode]]
+name = "default"

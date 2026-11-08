@@ -17,6 +17,8 @@ use crate::translate::{apply, relative_delta, BindState, REL_SCALE};
 /// A snapshot of every unit's active mode, for the TUI and the `midi mode` command.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RouterState {
+    /// Whether the controller's faces currently resolve to their mirror decks.
+    pub mirrored: bool,
     pub units: Vec<UnitModeState>,
 }
 
@@ -33,6 +35,8 @@ pub struct UnitModeState {
 pub enum RouterCommand {
     SetMode { unit: String, mode: String },
     NextMode { unit: String },
+    /// Flip every face to its mirror deck (the front-end can trigger the same toggle a button does).
+    MirrorToggle,
 }
 
 /// A selector press that chose a mode. Unlike [`RouterState`] this is an event, so a trigger that
@@ -55,6 +59,9 @@ pub struct Feed {
     /// A selector (or a command) changed the active mode, so the caller should republish
     /// [`Router::snapshot`].
     pub state_changed: bool,
+    /// The mirror toggle fired: the caller must flush its pending sweep buffer, because a value
+    /// coalesced for the old deck must not land on the new one.
+    pub mirror_changed: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -86,15 +93,23 @@ struct UnitRuntime {
     selectors: Vec<BindState>,
 }
 
-/// The live mapping. Owns the compiled [`Map`] plus the mode and per-endpoint state.
+/// The live mapping. Owns the two compiled [`Map`]s (normal faces and mirror faces) plus the mode
+/// and per-endpoint state. The mirror toggle swaps which map is current; every deck id in the
+/// compiled actions is already a physical deck, so no retargeting is needed at runtime.
 pub struct Router {
+    /// The map whose face resolution is in effect right now. Keeping it a *field* (not a method)
+    /// lets `control_event` borrow it disjointly from `units`; the toggle swaps it with the other
+    /// variant rather than recomputing deck ids.
     map: Map,
+    /// The other variant, swapped in by the mirror toggle.
+    mirror_map: Map,
+    mirrored: bool,
     units: Vec<UnitRuntime>,
     routes: HashMap<(EventKind, u8, u8), Route>,
 }
 
 impl Router {
-    pub fn new(map: Map) -> Self {
+    pub fn new(map: Map, mirror_map: Map) -> Self {
         let mut units = Vec::with_capacity(map.units.len());
         let mut routes = HashMap::new();
 
@@ -146,6 +161,8 @@ impl Router {
 
         Self {
             map,
+            mirror_map,
+            mirrored: false,
             units,
             routes,
         }
@@ -155,8 +172,20 @@ impl Router {
         &self.map
     }
 
+    /// Flips every controller face to its mirror deck. The caller flushes its pending sweep
+    /// buffer (see [`Feed::mirror_changed`]) and the unit's continuous controls re-arm their
+    /// pickup mirrors, exactly as a mode change does.
+    fn toggle_mirror(&mut self) {
+        std::mem::swap(&mut self.map, &mut self.mirror_map);
+        self.mirrored = !self.mirrored;
+        for unit in 0..self.units.len() {
+            self.rearm(unit);
+        }
+    }
+
     pub fn snapshot(&self) -> RouterState {
         RouterState {
+            mirrored: self.mirrored,
             units: self
                 .map
                 .units
@@ -221,6 +250,10 @@ impl Router {
                 let next = (self.units[unit_index].current + 1) % modes;
                 Ok(self.select(unit_index, next))
             }
+            RouterCommand::MirrorToggle => {
+                self.toggle_mirror();
+                Ok(true)
+            }
         }
     }
 
@@ -255,6 +288,12 @@ impl Router {
             SelectorBehavior::Cycle => {
                 let modes = self.map.units[unit].modes.len();
                 (self.units[unit].current + 1) % modes
+            }
+            SelectorBehavior::MirrorToggle => {
+                self.toggle_mirror();
+                out.state_changed = true;
+                out.mirror_changed = true;
+                return;
             }
         };
         // Report the selection before `select` decides whether it changed anything: a trigger that
@@ -514,7 +553,51 @@ mod tests {
 
     fn router(text: &str) -> Router {
         let map = Map::from_toml_str(text).expect("test map");
-        Router::new(map)
+        // No face routes in these tests: normal and mirror maps are identical.
+        Router::new(map.clone(), map)
+    }
+
+    #[test]
+    fn mirror_toggle_redirects_a_unit_to_its_mirror_deck() {
+        let text = r#"
+[[unit]]
+id = "u"
+deck = "A"
+
+[[unit.control]]
+slot = "play"
+type = "Button"
+endpoint = { midi = "note", channel = 0, id = 0 }
+
+[[unit.mode]]
+name = "default"
+[[unit.mode.bind]]
+slot = "play"
+action = "play"
+"#;
+        let mut routes = crate::map::DeckRoutes::default();
+        routes.insert("A", 0, Some(2));
+        let base = std::path::Path::new(".");
+        let normal = Map::from_toml_str_at_routes(text, base, &routes, false).expect("normal map");
+        let mirror = Map::from_toml_str_at_routes(text, base, &routes, true).expect("mirror map");
+        let mut router = Router::new(normal, mirror);
+
+        let feed = router.feed(&note(0, 0, true));
+        assert!(matches!(
+            feed.commands.as_slice(),
+            [Command::TogglePlay { deck_id: 0 }]
+        ));
+        assert!(!router.snapshot().mirrored);
+
+        // Release, toggle, press again: the same physical button now addresses deck 3.
+        let _ = router.feed(&note(0, 0, false));
+        assert!(router.command(RouterCommand::MirrorToggle).unwrap());
+        assert!(router.snapshot().mirrored);
+        let feed = router.feed(&note(0, 0, true));
+        assert!(matches!(
+            feed.commands.as_slice(),
+            [Command::TogglePlay { deck_id: 2 }]
+        ));
     }
 
     const TWO_MODES: &str = r#"
@@ -973,7 +1056,7 @@ turn = "nudge 0.15"
             map.resolve_fx(hypermixx_core::FxChainId::Deck(deck), "eq", 0);
             map.resolve_fx(hypermixx_core::FxChainId::Deck(deck), "filter", 1);
         }
-        let mut router = Router::new(map);
+        let mut router = Router::new(map.clone(), map);
 
         // Transport: deck1 play is note 0 on channel 0.
         let feed = router.feed(&note(0, 0, true));

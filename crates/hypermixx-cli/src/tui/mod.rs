@@ -63,6 +63,8 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         midi_map,
         midi_control,
         midi_state,
+        deck_routes,
+        controller_sessions,
         library,
     } = session;
     let preference_path = preference_path(topology.as_deref());
@@ -91,6 +93,8 @@ pub fn run(pipeline: &AudioPipeline, session: Session) {
         dispatcher.slots(),
         dispatcher.scan(),
     );
+    app.deck_routes = deck_routes;
+    app.controller_sessions = controller_sessions;
     // Start the fan-out before `prime` so its `ListFx` requests reach the engine.
     spawn_command_fanout(command_rx, engine_tx, dispatcher.slots(), app.intent_slot());
     // Prime every chain's slot list so `fx remove <name>` works from the first command.

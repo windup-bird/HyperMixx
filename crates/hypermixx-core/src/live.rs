@@ -209,8 +209,6 @@ pub struct LiveConfig {
     /// Keylock STFT window (read at startup; changing it requires a restart).
     pub keylock: KeylockSettings,
     pub stems: StemSettings,
-    /// Auto-gain (applied immediately, unlike the audio/keylock settings).
-    pub autogain: AutogainSettings,
 }
 
 impl LiveConfig {
@@ -258,7 +256,6 @@ impl LiveConfig {
         if stems.provider.trim().is_empty() {
             stems.provider = StemSettings::default().provider;
         }
-        self.autogain = self.autogain.sanitised();
         self
     }
 
@@ -281,12 +278,6 @@ impl LiveConfig {
                 self.keylock.interval,
                 self.keylock.block as f64 * 1000.0 / f64::from(self.audio.sample_rate),
                 self.audio.sample_rate
-            ),
-            format!(
-                "autogain {}  target {:.1} dBFS  (max gain ±{:.0} dB)",
-                if self.autogain.enabled { "on" } else { "off" },
-                self.autogain.target_db,
-                AutogainSettings::RANGE_DB,
             ),
             format!(
                 "stems  model {}  provider {}  overlap {:.2}  shifts {}  threads {}  memory {}  {}",
@@ -328,11 +319,10 @@ mod tests {
         assert_eq!(live.keylock, KeylockSettings::default());
         assert_eq!(live.stems.provider, "cpu", "a machine without a GPU never needs a flag");
 
-        assert_eq!(live.report().len(), 4);
+        assert_eq!(live.report().len(), 3);
         assert!(live.report()[0].contains("44100Hz"));
         assert!(live.report()[0].contains("device buffer backend default"));
         assert!(live.report()[1].contains("keylock block 2048 interval 512"));
-        assert!(live.report()[2].contains("autogain off  target -12.0 dBFS"));
     }
 
     #[test]
@@ -354,10 +344,6 @@ mod tests {
                 model: "  ".to_owned(),
                 ..Default::default()
             },
-            autogain: AutogainSettings {
-                enabled: true,
-                target_db: f32::NAN,
-            },
         }
         .sanitised();
         assert_eq!(live.audio.sample_rate, DEFAULT_SAMPLE_RATE, "an impossible rate is replaced");
@@ -367,11 +353,6 @@ mod tests {
             live.audio.device_buffer_frames,
             Some(MIN_DEVICE_BUFFER_FRAMES),
             "a one-frame device buffer is clamped up"
-        );
-        assert_eq!(
-            live.autogain.target_db,
-            AutogainSettings::default().target_db,
-            "a NaN target is replaced, not trusted"
         );
         assert_eq!(live.stems.overlap, 0.5, "clamped to the useful range");
         assert_eq!(live.stems.shifts, 2, "two passes is the most worth offering");

@@ -25,7 +25,7 @@ pub(crate) mod output;
 
 pub use bus::Bus;
 pub use channel::{
-    Channel, CrossfaderCurve, CrossfaderPlace, CueTap, DeckSide, SlotChain, DEFAULT_CUT_WIDTH,
+    Channel, CrossfaderCurve, CueTap, DeckSide, SlotChain, DEFAULT_CUT_WIDTH,
 };
 pub use config::{
     build_chain, build_chain_with_roles, build_slot, build_slots, reference_toml, simple_dj,
@@ -132,6 +132,7 @@ impl Mixer {
             return Err(MixerError::Empty);
         }
         let block_frames = BLOCK_SIZE;
+        let autogain = cfg.autogain;
         let chains = cfg.build_chains()?;
         let mut channels = Vec::with_capacity(cfg.channels.len());
         for (channel_cfg, (flow_chains, post_fx)) in cfg.channels.iter().zip(chains) {
@@ -147,6 +148,7 @@ impl Mixer {
             channel.set_block_seconds(block_seconds_of(sample_rate));
             // Time-based effects size their buffers from the engine's rate, before the first block.
             channel.prepare_fx(sample_rate);
+            channel.set_cue_tap(cfg.fader_location);
             channels.push(channel);
         }
 
@@ -189,7 +191,7 @@ impl Mixer {
             tuning,
             ring_capped: false,
             keylock: KeylockSettings::default(),
-            autogain: AutogainSettings::default(),
+            autogain,
         })
     }
 
@@ -318,7 +320,8 @@ impl Mixer {
             );
             channel.set_block_seconds(block_seconds_of(self.sample_rate));
             channel.prepare_fx(self.sample_rate);
-            channel.set_autogain(self.autogain);
+            channel.set_cue_tap(cfg.fader_location);
+            channel.set_autogain(cfg.autogain);
             // Whatever was playing on this index keeps playing: a deck is not a config value.
             if let Some(previous) = old.get_mut(channels.len()) {
                 channel.replace_deck(previous.take_deck());
@@ -338,15 +341,17 @@ impl Mixer {
         self.cue.blend = cfg.cue.blend;
         self.cue.curve = cfg.cue.curve;
         self.cue.cut_width = cfg.cue.cut_width;
+        self.autogain = cfg.autogain;
         self.config = cfg;
         // Destinations are the part that most often *needs* a reload (a device that appeared), so
         // they are rebuilt last and reported.
         Ok(self.refresh_outputs())
     }
 
-    /// Applies the auto-gain preference (from `live.toml`) to every channel. The gain is derived
-    /// per block from the deck's measured loudness, so this takes effect on the next block for
-    /// whatever is already loaded — no reload, no re-measure.
+    /// Overrides the session's auto-gain preference (the config value comes from `[mixer.autogain]`
+    /// at construction and on `mixer reload`). The gain is derived per block from the deck's
+    /// measured loudness, so this takes effect on the next block for whatever is already loaded —
+    /// no reload, no re-measure.
     pub fn set_autogain(&mut self, settings: AutogainSettings) {
         self.autogain = settings.sanitised();
         for channel in &mut self.channels {
@@ -411,11 +416,19 @@ impl Mixer {
             FaderTarget::Deck(deck_id) => self.fader_channel(deck_id)?.set_fader(value),
             FaderTarget::Gain(deck_id) => self.fader_channel(deck_id)?.set_gain(value),
             FaderTarget::CueSend(deck_id) => self.fader_channel(deck_id)?.set_cue_send(value),
-            FaderTarget::Crossfader => {
-                // One physical fader: every channel is written the same position; the pan law is
-                // the channel's business, not the command's.
-                for channel in &self.channels {
-                    channel.set_crossfader(value);
+            FaderTarget::Crossfader { left, right } => {
+                // One physical fader, but the controller's mode decides which two decks it spans.
+                // Every channel hears the same position; only the pair is attenuated, everyone
+                // else is Centre and stays at unity.
+                for (index, channel) in self.channels.iter().enumerate() {
+                    let side = if index == left as usize {
+                        DeckSide::Left
+                    } else if index == right as usize {
+                        DeckSide::Right
+                    } else {
+                        DeckSide::Center
+                    };
+                    channel.set_crossfader_for(value, side);
                 }
             }
             FaderTarget::Master => self.master.set_fader(value),
@@ -1265,7 +1278,7 @@ mod tests {
         assert_eq!(mixer.channel(1).unwrap().levels().3, 0.25);
 
         // The crossfader is one physical fader broadcast to every channel.
-        mixer.set_fader(FaderTarget::Crossfader, -1.0).unwrap();
+        mixer.set_fader(FaderTarget::default_crossfader(), -1.0).unwrap();
         assert_eq!(mixer.channel(0).unwrap().levels().2, -1.0);
         assert_eq!(mixer.channel(1).unwrap().levels().2, -1.0);
 
@@ -1530,9 +1543,9 @@ mod tests {
     fn the_deck_listing_is_the_flow_chain_then_the_post_banks() {
         use hypermixx_core::Command;
         let mut cfg = simple_dj();
-        cfg.channels[0].flow_fx = vec![crate::mixer::config::FlowSlotConfig::all("echo")];
-        cfg.channels[0].knob_fx = vec!["filter".into()];
-        cfg.channels[0].pad_fx = vec!["reverb".into()];
+        cfg.flow_fx = vec![crate::mixer::config::FlowSlotConfig::all("echo")];
+        cfg.knob_fx = vec!["filter".into()];
+        cfg.pad_fx = vec!["reverb".into()];
         let mut mixer = loaded(cfg, 1);
         let slots = match mixer.handle_fx_command(Command::ListFx {
             chain: FxChainId::Deck(0),
@@ -1617,7 +1630,7 @@ mod tests {
     fn removal_is_tail_only_and_none_empties_in_place() {
         use hypermixx_core::Command;
         let mut cfg = simple_dj();
-        cfg.channels[0].knob_fx = vec!["echo".into(), "reverb".into()];
+        cfg.knob_fx = vec!["echo".into(), "reverb".into()];
         let mut mixer = loaded(cfg, 1);
         let flow_len = mixer.channel(0).unwrap().flow_len();
         // Removing a slot that is not last would renumber the ones after it.
@@ -1668,7 +1681,7 @@ mod tests {
     fn set_fx_flows_routes_a_group_and_reports_it() {
         use hypermixx_core::Command;
         let mut cfg = simple_dj();
-        cfg.channels[0].flow_fx = vec![config::FlowSlotConfig::only("echo", [Stem::Vocals])];
+        cfg.flow_fx = vec![config::FlowSlotConfig::only("echo", [Stem::Vocals])];
         let mut mixer = loaded(cfg, 1);
         let target = FxTarget {
             chain: FxChainId::Deck(0),
@@ -1937,10 +1950,8 @@ mod tests {
     #[test]
     fn a_bad_config_is_refused_before_any_device_is_touched() {
         let cfg = MixerConfig {
-            channels: vec![ChannelConfig {
-                knob_fx: vec!["chorus".into()],
-                ..Default::default()
-            }],
+            channels: vec![ChannelConfig::default()],
+            knob_fx: vec!["chorus".into()],
             outputs: vec![],
             ..Default::default()
         };
@@ -2097,14 +2108,15 @@ mod tests {
         let playing = mixer.deck(0).unwrap().current_frame();
         assert!(playing > 0, "the deck should be running");
 
-        // A file that names one channel, gives it a different chain and a different trim, and no
+        // A file that names one deck, gives the mix a different chain and a different trim, and no
         // outputs.
         let statuses = mixer
             .reload(
                 r#"
-                [[channel]]
-                side = "center"
+                [chain]
                 knob_fx = ["gain"]
+                [[multideck.deck]]
+                side = "center"
                 gain = 1.0
                 [[output]]
                 name = "only"
@@ -2131,7 +2143,9 @@ mod tests {
         );
 
         // A bad file changes nothing: an unknown effect is refused before any live state is touched.
-        let err = mixer.reload("[[channel]]\nknob_fx = [\"shimmer\"]\n").unwrap_err();
+        let err = mixer
+            .reload("[chain]\nknob_fx = [\"shimmer\"]\n[[multideck.deck]]\n")
+            .unwrap_err();
         assert!(matches!(err, MixerError::UnknownFx(_)), "{err:?}");
         assert_eq!(mixer.channel_count(), 1);
         assert_eq!(

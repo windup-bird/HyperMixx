@@ -9,38 +9,68 @@
 # Every section is optional: a missing key takes its built-in default. Paths inside the config are
 # relative to this file's folder.
 
-[mixer]
-# The stage order is fixed; a config only chooses what sits in each bank. `eq` and `filter` are
-# always the tone prefix of every flow.
-
-[[mixer.channel]]
+[multideck]
+# The deck list: one [[multideck.deck]] per deck, in deck-id order (deck1, deck2, ...). Each entry
+# carries its controller mapping and the parameters a DJ sets per deck; everything that is the
+# same on every deck lives in `[mixer.chain]`.
+# `source` names the controller surface that drives a deck: <controller-id>.<face>[.mirror].
+# Omit `.mirror` for the normal variant; omit `source` for a deck no controller owns. A two-deck
+# controller driving four decks adds two more entries, e.g.
+#   source = "ctl1.A.mirror"   (deck3)
+#   source = "ctl1.B.mirror"   (deck4)
+[[multideck.deck]]
+source = "ctl1.A"
 side = "left"
-filter = "linear"        # linear | moog — the fixed sweep stage's kind
-cue = "pre"              # pre | post — which side of the fader the cue send taps
 cue_send = 1.0
-# knob_fx = ["echo"]     # post-merge knob bank
-# pad_fx = ["reverb"]    # post-merge pad bank
-# [[mixer.channel.flow_fx]]
+
+[[multideck.deck]]
+source = "ctl1.B"
+side = "right"
+cue_send = 1.0
+
+# One MIDI session per controller. Each entry opens its own port and unit map; the `source` labels
+# above decide which face each deck belongs to, so two devices never address the same deck unless
+# their sources say so. Omit the section for a rig with no controller.
+# [[controller]]
+# id = "ctl1"
+# device = "Controller-A"
+# map = "mapping.toml"
+#
+# [[controller]]
+# id = "ctl2"
+# device = "Controller-B"
+# map = "mapping2.toml"
+
+[mixer]
+# The mixer's own sections. The stage order is fixed; a config only chooses what sits in each bank.
+# `eq` and `filter` are always the tone prefix of every flow.
+
+[mixer.crossfader]
+curve = "classic"        # classic | constant_power | cut
+
+[mixer.chain]
+# One table for the whole mix: every effect, the master bus, and the settings every deck shares.
+master_fx = []           # master-bus effects, before the limiter (alias: fx)
+flow_fx = []             # per-flow inserts (template: one chain per flow)
+knob_fx = []             # post-merge knob bank
+pad_fx = []              # post-merge pad bank
+limiter = true            # the safety stage; on unless explicitly turned off
+ceiling_db = -1.0         # dBFS, −40 .. +12; the limiter's ceiling
+fader = 0.0               # master trim
+filter = "linear"         # linear | moog — the fixed sweep stage's kind, every channel
+fader-location = "pre"    # pre | post — which side of the channel fader the cue send taps
+cue-blend = -1.0          # -1 = cue only (default), 0 = both, +1 = master only
+# [[mixer.chain.flow_fx]]
 # kind = "filter"
 # flows = ["vocals"]     # omitted = every flow, [] = none
 
-[[mixer.channel]]
-side = "right"
-filter = "linear"
-cue = "pre"
-cue_send = 1.0
-
-[mixer.crossfader]
-place = "deck"           # source | flow | deck
-curve = "classic"        # classic | constant_power | cut
-
-[mixer.master]
-limiter = true            # the safety stage; on unless explicitly turned off
-ceiling_db = -1.0         # dBFS, −40 .. +12; the limiter's ceiling
-# fx = []
+[mixer.chain.autogain]
+enabled = false          # off by default: a mixer that silently changes level is a surprise
+target_db = -12.0        # dBFS for the loudest ~3 s of a track
 
 [mixer.cue]
-# blend = -1.0           # -1 = cue only (default), 0 = both, +1 = master only
+# fader = 0.0             # cue-bus trim
+# curve = "classic"
 
 [[mixer.output]]
 name = "main"
@@ -61,9 +91,6 @@ channels = [2, 3]
 # block = 2048
 # [live.stems]
 # provider = "cpu"
-# [live.autogain]
-# enabled = false
-# target_db = -12.0
 
 [preference]
 # TUI tastes. Omitted keys take the built-in defaults.

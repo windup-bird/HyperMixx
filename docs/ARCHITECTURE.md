@@ -242,8 +242,9 @@ kind:`linear`/`moog`),`flowfx` 在合并前逐流跑,`knobfx`/`padfx` 在合并�
 影响;分叉在它之后则跟着它(把 crossfader 放早的代价,文档写明)。
 
 **autogain**:响度是**曲目属性**(装载时对 PCM 做一次滑窗 RMS,取最响的 3 s 的平均值,存在
-`Deck` 上),增益是**机器偏好**(`config.toml` 的 `[autogain] enabled/target_db`)。所以 `live reload`
-改目标或开关会立刻对已装载的曲子重新推导,不需要重测;`Command::SetAutogain` 把它推进引擎。
+`Deck` 上),增益是 **mixer 配置**(`config.toml` 的 `[mixer.autogain] enabled/target_db`)。
+`Mixer::new` / `mixer reload` 从 cfg 应用它,所以改目标或开关会立刻对已装载的曲子重新推导,
+不需要重测;`Command::SetAutogain` 仍可作会话内覆盖,下一次 `mixer reload` 会回到配置值。
 
 `MasterBus::render`:`sum → master_fx → master_fader → limiter(安全级)`。
 `CueBus`:`sum → cue_fader → blend_with(master.sum)` —— 耳机是 cue 与 master 的混合,
@@ -259,10 +260,10 @@ kind:`linear`/`moog`),`flowfx` 在合并前逐流跑,`knobfx`/`padfx` 在合并�
 
 其余由 `MixerConfig` 纯数据描述(`config.rs`):每通道的 `filter`(linear|moog)、
 `flow_fx`(`Vec<FlowSlotConfig>`,每项带 `kind` 与 `flows`)/`knob_fx`/`pad_fx` 名单
-(经 `FxKind` 注册表解析,未知名 → `MixerError::UnknownFx` 构造失败)、`cue`(pre|post),
-`[crossfader]`(place/curve/cut_width/start)、`[cue]`(fader/blend/curve/cut_width)、
-cue_send/side、master fx/limiter/fader、
-输出列表(name/role(`master`|`cue`)/channels/gain)。
+(经 `FxKind` 注册表解析,未知名 → `MixerError::UnknownFx` 构造失败)、`cue-tap`(pre|post,
+旧键 `cue` 仍可读)、`[crossfader]`(place/curve/cut_width/start)、`[cue]`
+(fader/cue-blend/curve/cut_width)、cue_send/side、`[chain]` 的 master fx/limiter/fader、
+`[autogain]`(enabled/target_db)、输出列表(name/role(`master`|`cue`)/channels/gain)。
 `flow_fx` 是**模板**:每条 flow 各建一条独立的链(4 stems = 4 条,各自状态);逐流差异用每个槽的
 **白名单**(`[[channel.flow_fx]] flows = ["vocals"]`)——一个控件、N 份实例,`flows` 决定哪条 flow
 真正处理。mask 收窄时那条 flow 上的尾巴被硬切(不是淡出);放宽时新进入的实例先 `reset()`。
@@ -295,10 +296,9 @@ cue_send/side、master fx/limiter/fader、
   graph 里把两条流直接相加——main 有 limiter(≤−1 dBFS)但 cue 总线没有(cue_send 1.0
   时电平可达 2.0),DAC 实收 ~2.9 → 硬削波。Mixer 检测设备名重复,第二条降级 sink 不路由
   (设备选择 `[[output]] device` 字段是后续工作)
-- `simple_dj()` — 参考拓扑:2 通道(eq/filter 固定前缀、空 bank、cue_send 1.0)+
-  master limiter + master/cue 输出;`reference_toml()` 是配置模板的 TOML 文本 —— 直接
-  `include_str!("profile/config.toml")`,所以模板、`--print-config` 与内置构造只有一个真源
-  (`MixerConfig::from_toml_str` 只读 `[mixer]` 段,测试钉死解析回 `simple_dj()`)
+- `simple_dj()` — 参考拓扑的薄别名:直接解析 `reference_toml()`。配置模板(`profile/config.toml`)
+  是唯一真源,`--print-config` 与首次启动复制都是同一份字节;deck 列表来自模板的
+  `[[multideck.deck]]`,总线来自 `[mixer]`(测试钉死"模板解析 == simple_dj()")
 
 **热加载**:`Command::MixerReload { text }`(文本而非路径 —— 文件 IO 属于前端)在 producer 线程上
 `Mixer::reload(&text)`:先解析+`build_chains` 全量校验,通过后才就地换掉 channels/chains/faders/
@@ -308,8 +308,11 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 
 **TOML 配置**(`MixerConfig::from_toml_str`):文件 schema 由 `MixerFile`/`MasterFile`
 镜像结构定义(`deny_unknown_fields`,坏键报行号),Rust 类型与文件格式各自保有适合的
-命名。每 `[[channel]]` 一 deck,`[master]` 一表,`[[output]]` 任意个;除 `side`/`name`/
-`role` 外全部有默认。解析与构造分层:未知 FX 名在 `build_chains`(注册表查询)而非解析层。
+命名。deck 列表来自与 `[mixer]` 同级的 `[[multideck.deck]]`(数组顺序即 deck 编号,
+`source` 把 controller 逻辑面映射到物理 deck);`[mixer.chain]` 一表(`[mixer.master]`
+为旧别名),`[[mixer.output]]` 任意个;除 `source`/`name`/`role` 外全部有默认。旧
+`[[mixer.channel]]` 被按名拒绝,root-level `[[channel]]` 裸拓扑文件仍可读。解析与构造分层:
+未知 FX 名在 `build_chains`(注册表查询)而非解析层。
 
 ### `fx/` — 效果子系统
 
@@ -419,7 +422,7 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 启动参数:默认启动 TUI(`--cli` 切行式 REPL)/ `--config <file>`(单文件多段落配置;
 不给则用平台默认路径,首次启动从内置模板复制)/`--print-config`(输出配置模板)/
 `--controller <port>`(打开控制器输入;
-映射文件由 config 的 `[controller].map` 指定;端口名或序号,`controller ports` 可列);
+映射文件由 config 的 `[[controller]].map` 指定,可声明多个独立会话;端口名或序号,`controller ports` 可列);
 `--guide [<file>]` 是 learn 模式编辑器(不启动引擎)。deck 数量启动时从引擎查询
 (`channel_count`,自定义拓扑可配任意通道)。
 

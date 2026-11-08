@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use hypermixx_audio::{reference_toml, MixerConfig};
 use hypermixx_core::{Backend, LiveConfig};
+use hypermixx_midi::map::DeckRoutes;
 
 /// The shipped template. `--print-config` emits it and the first-start copy writes it verbatim.
 pub fn template() -> &'static str {
@@ -35,15 +36,38 @@ pub const MAP_TEMPLATE: &str = include_str!(concat!(
 /// Parsed by hand because this crate does not depend on serde; two keys do not warrant one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ControllerSection {
+    id: Option<String>,
     map: Option<String>,
     device: Option<String>,
 }
 
-/// What the session needs from `[controller]`, with `map` already resolved to a usable path.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// One controller instance. `id` is the label a `[[multideck.deck]] source` refers to; `map` is
+/// already resolved to a usable path. `[[controller]]` may declare any number of these.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Controller {
+    pub id: String,
     pub map: Option<String>,
     pub device: Option<String>,
+}
+
+impl Default for Controller {
+    fn default() -> Self {
+        Self {
+            id: "default".to_owned(),
+            map: None,
+            device: None,
+        }
+    }
+}
+
+/// One controller ready to attach: its resolved port, unit map and its own slice of the face →
+/// deck table. Both front-ends attach these as separate MIDI sessions.
+#[derive(Clone, Debug)]
+pub struct ControllerSession {
+    pub id: String,
+    pub port: Option<String>,
+    pub map: String,
+    pub routes: DeckRoutes,
 }
 
 /// The `[preference.analysis]` section: which backend runs which analysis path. Both keys are
@@ -93,11 +117,69 @@ pub struct Config {
     pub path: PathBuf,
     pub mixer: MixerConfig,
     pub live: LiveConfig,
+    /// The first (or only) controller, kept for the front-ends' single-input paths.
     pub controller: Controller,
+    /// Every declared controller. `[[controller]]` instances each own a port, a unit map and their
+    /// own slice of the face → deck table.
+    pub controllers: Vec<Controller>,
     /// Which backend runs the beat and the key analysis path.
     pub analysis: AnalysisBackends,
     /// Notes worth showing at startup (a first-start copy, clamped live values, ...).
     pub notes: Vec<String>,
+}
+
+/// Builds the controller-face → physical-deck table from `[[multideck.deck]] source`.
+///
+/// `source` is `<controller-id>.<face>[.mirror]` (an `Am` spelling also means the mirror). Passing
+/// a `controller` id keeps only that controller's sources, so each `[[controller]]` instance gets
+/// its own table and two devices cannot address the same deck unless their sources say so.
+pub fn deck_routes(mixer: &MixerConfig, controller: Option<&str>) -> DeckRoutes {
+    let mut routes = DeckRoutes::default();
+    let mut faces: std::collections::HashMap<String, (Option<u8>, Option<u8>)> =
+        std::collections::HashMap::new();
+    for (index, channel) in mixer.channels.iter().enumerate() {
+        let Some(source) = channel.source.as_deref() else {
+            continue;
+        };
+        let Some((owner, face, mirror)) = parse_source(source) else {
+            continue;
+        };
+        if let Some(want) = controller {
+            if owner.as_deref().is_some_and(|owner| owner != want) {
+                continue;
+            }
+        }
+        let entry = faces.entry(face).or_insert((None, None));
+        if mirror {
+            entry.1 = Some(index as u8);
+        } else {
+            entry.0 = Some(index as u8);
+        }
+    }
+    for (face, (normal, mirror)) in faces {
+        if let Some(normal) = normal {
+            routes.insert(&face, normal, mirror);
+        }
+    }
+    routes
+}
+
+/// `<controller>.<face>[.mirror]` — an `Am` spelling also means the mirror variant. The owner is
+/// optional so a bare `A` still works on a single-controller rig.
+fn parse_source(source: &str) -> Option<(Option<String>, String, bool)> {
+    let mut parts: Vec<&str> = source.split('.').filter(|part| !part.is_empty()).collect();
+    let explicit = parts.last() == Some(&"mirror");
+    if explicit {
+        parts.pop();
+    }
+    let face = parts.pop()?;
+    let owner = (!parts.is_empty()).then(|| parts.join("."));
+    let (face, mirror) = if let Some(base) = face.strip_suffix('m') {
+        (!base.is_empty()).then(|| (base.to_owned(), true))?
+    } else {
+        (face.to_owned(), explicit)
+    };
+    Some((owner, face, mirror))
 }
 
 /// The platform's config path. `HYPERMIXX_CONFIG` wins when set, which is also how a test or a
@@ -196,41 +278,59 @@ fn parse(path: &Path, text: &str, mut notes: Vec<String>) -> Result<Config, Stri
         None => LiveConfig::default(),
     };
 
-    let section = match value.get("controller") {
-        Some(section) => controller_section(section)
-            .map_err(|err| format!("{}: [controller]: {err}", path.display()))?,
-        None => ControllerSection::default(),
+    let controller_sections: Vec<ControllerSection> = match value.get("controller") {
+        Some(toml::Value::Array(entries)) => entries
+            .iter()
+            .map(controller_section)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("{}: [[controller]]: {err}", path.display()))?,
+        Some(section) => vec![controller_section(section)
+            .map_err(|err| format!("{}: [controller]: {err}", path.display()))?],
+        None => vec![ControllerSection::default()],
     };
     let dir = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let map = section.map.map(|map| resolve_against(dir, &map));
-    // A configured but unreadable map is a silent "no controller" otherwise; say exactly why.
-    if let Some(map) = &map {
-        match std::fs::read_to_string(map) {
-            Ok(text) => {
-                let base = Path::new(map)
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."));
-                if let Err(err) = hypermixx_midi::Map::from_toml_str_at(&text, base) {
-                    notes.push(format!(
-                        "{}: [controller].map `{map}` does not parse: {err}",
-                        path.display()
-                    ));
-                }
+    let mut controllers = Vec::with_capacity(controller_sections.len());
+    let count = controller_sections.len();
+    for (index, section) in controller_sections.into_iter().enumerate() {
+        let label = section.id.clone().unwrap_or_else(|| {
+            if count == 1 {
+                "default".to_owned()
+            } else {
+                format!("controller{}", index + 1)
             }
-            Err(err) => notes.push(format!(
-                "{}: [controller].map `{map}` cannot be read: {err}",
-                path.display()
-            )),
+        });
+        let map = section.map.map(|map| resolve_against(dir, &map));
+        // A configured but unreadable map is a silent "no controller" otherwise; say exactly why.
+        if let Some(map) = &map {
+            match std::fs::read_to_string(map) {
+                Ok(text) => {
+                    let base = Path::new(map)
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .unwrap_or_else(|| Path::new("."));
+                    if let Err(err) = hypermixx_midi::Map::from_toml_str_at(&text, base) {
+                        notes.push(format!(
+                            "{}: controller `{label}`.map `{map}` does not parse: {err}",
+                            path.display()
+                        ));
+                    }
+                }
+                Err(err) => notes.push(format!(
+                    "{}: controller `{label}`.map `{map}` cannot be read: {err}",
+                    path.display()
+                )),
+            }
         }
+        controllers.push(Controller {
+            id: section.id.unwrap_or(label),
+            map,
+            device: section.device,
+        });
     }
-    let controller = Controller {
-        map,
-        device: section.device,
-    };
+    let controller = controllers.first().cloned().unwrap_or_default();
 
     let analysis = match value
         .get("preference")
@@ -246,6 +346,7 @@ fn parse(path: &Path, text: &str, mut notes: Vec<String>) -> Result<Config, Stri
         mixer,
         live,
         controller,
+        controllers,
         analysis,
         notes,
     })
@@ -314,9 +415,10 @@ fn controller_section(value: &toml::Value) -> Result<ControllerSection, String> 
             .trim()
             .to_owned();
         match key.as_str() {
+            "id" => section.id = Some(text),
             "map" => section.map = Some(text),
             "device" => section.device = Some(text),
-            other => return Err(format!("unknown key `{other}` (map | device)")),
+            other => return Err(format!("unknown key `{other}` (id | map | device)")),
         }
     }
     Ok(section)
@@ -344,7 +446,7 @@ mod tests {
         let cfg = parse(Path::new("config.toml"), template(), Vec::new()).expect("parses");
         assert_eq!(cfg.mixer.channels.len(), 2, "the reference topology has two decks");
         assert_eq!(cfg.mixer.outputs.len(), 2);
-        assert!(!cfg.live.autogain.enabled, "auto-gain is off in the template");
+        assert!(!cfg.mixer.autogain.enabled, "auto-gain is off in the template");
         assert_eq!(cfg.controller, Controller::default());
     }
 
@@ -354,13 +456,14 @@ mod tests {
         let path = dir.join("config.toml");
         let text = r#"
 [mixer]
-[[mixer.channel]]
+[mixer.autogain]
+enabled = true
+target_db = -9.0
+
+[[multideck.deck]]
 side = "center"
 
 [live]
-[live.autogain]
-enabled = true
-target_db = -9.0
 
 [preference]
 [preference.waveform]
@@ -372,8 +475,8 @@ device = "DDJ-400"
 "#;
         let cfg = parse(&path, text, Vec::new()).expect("parses");
         assert_eq!(cfg.mixer.channels.len(), 1);
-        assert!(cfg.live.autogain.enabled);
-        assert_eq!(cfg.live.autogain.target_db, -9.0);
+        assert!(cfg.mixer.autogain.enabled);
+        assert_eq!(cfg.mixer.autogain.target_db, -9.0);
         assert_eq!(
             cfg.controller.map,
             Some(dir.join("mapping.toml").to_string_lossy().into_owned())
@@ -384,12 +487,12 @@ device = "DDJ-400"
     #[test]
     fn an_existing_file_is_read_not_overwritten() {
         let path = temp("existing.toml");
-        std::fs::write(&path, "[mixer]\n[[mixer.channel]]\nside = \"center\"\n").unwrap();
+        std::fs::write(&path, "[mixer]\n[[multideck.deck]]\nside = \"center\"\n").unwrap();
         let cfg = load_or_create(Some(path.to_string_lossy().as_ref())).expect("reads");
         assert_eq!(cfg.mixer.channels.len(), 1);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "[mixer]\n[[mixer.channel]]\nside = \"center\"\n",
+            "[mixer]\n[[multideck.deck]]\nside = \"center\"\n",
             "loading must not rewrite the user's file"
         );
         std::fs::remove_file(&path).ok();
@@ -422,7 +525,7 @@ device = "DDJ-400"
         assert_eq!(cfg.path, path);
         assert!(cfg.notes.iter().any(|note| note.contains("created")));
 
-        let edited = "[mixer]\n[[mixer.channel]]\nside = \"center\"\n";
+        let edited = "[mixer]\n[[multideck.deck]]\nside = \"center\"\n";
         std::fs::write(&path, edited).unwrap();
         let again = load_or_create_at(&path, true).expect("reads the edited config");
         assert_eq!(again.mixer.channels.len(), 1);
@@ -438,14 +541,14 @@ device = "DDJ-400"
         let path = dir.join("config.toml");
         std::fs::write(
             &path,
-            "[mixer]\n[[mixer.channel]]\nside = \"center\"\n[controller]\nmap = \"missing.toml\"\n",
+            "[mixer]\n[[multideck.deck]]\nside = \"center\"\n[controller]\nmap = \"missing.toml\"\n",
         )
         .unwrap();
         let cfg = load_or_create(Some(path.to_string_lossy().as_ref())).expect("parses");
         assert!(
             cfg.notes
                 .iter()
-                .any(|note| note.contains("[controller].map") && note.contains("cannot be read")),
+                .any(|note| note.contains("controller") && note.contains("cannot be read")),
             "a missing map must be named: {:?}",
             cfg.notes
         );

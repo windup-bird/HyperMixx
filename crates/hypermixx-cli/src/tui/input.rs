@@ -446,7 +446,7 @@ fn apply_hit(app: &mut App, hit: Hit, dispatcher: &Dispatcher) {
             value: value.clamp(-1.0, 1.0),
         }),
         Hit::Crossfader { value } => send(Command::SetFader {
-            target: FaderTarget::Crossfader,
+            target: FaderTarget::default_crossfader(),
             value: value.clamp(-1.0, 1.0),
         }),
     }

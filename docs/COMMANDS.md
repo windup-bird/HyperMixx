@@ -18,7 +18,7 @@ cargo run -p hypermixx-cli -- [flags]
 | `--config <file>` | 指定配置文件（单文件多段落）；不给则用平台默认路径，首次启动从内置模板复制一份。`HYPERMIXX_CONFIG` 可覆盖路径 |
 | `--print-config` | 打印配置模板后退出（不启动引擎） |
 | `--backend auto\|stratum\|timestretch` | 离线分析后端，缺省 `auto`（stratum 优先，失败回落） |
-| `--controller <port>` | 启动时打开控制器输入（端口号或名字，`controller ports` 可列；`midi ports` 别名仍可）。映射文件由 config 的 `[controller].map` 指定 |
+| `--controller <port>` | 启动时打开控制器输入（端口号或名字，`controller ports` 可列；`midi ports` 别名仍可）。映射文件由 config 的 `[[controller]].map` 指定 |
 | `--guide [<file>]` | learn 模式地图编辑器（**不启动音频引擎**）；缺省编辑 config 同目录的 `mapping.toml`，不存在则从内置模板创建 |
 | `--decks <n>` | 仅作用于 `--guide` 的 deck 栏宽度，缺省 1 |
 
@@ -327,10 +327,11 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 
 ### 3.8 Auto-gain
 
-`config.toml` 的 `[autogain] enabled/target_db` 决定是否把每首曲子的最响 3 s 归一化到目标电平。
+`config.toml` 的 `[mixer.autogain] enabled/target_db` 决定是否把每首曲子的最响 3 s 归一化到目标电平。
 响度在**装载时**从 PCM 测一次（存在 deck 上），增益在引擎里按当前设置推导（±12 dB 钳制），
-所以 `live reload` 改开关/目标对**已经装载**的曲子立即生效，不需要重测。它在逐 flow 的
-`flow fader` 之后、channel trim 之前。
+所以 `mixer reload` 改开关/目标对**已经装载**的曲子立即生效，不需要重测（`Command::SetAutogain`
+仍可作会话内覆盖，下一次 `mixer reload` 回到配置值）。它在逐 flow 的 `flow fader` 之后、
+channel trim 之前。
 
 `provider = "cuda"` 是**要求而不是建议**：CUDA 不能接管整张图时会直接报错，而不是悄悄在 CPU 上跑
 （那样只是慢 9 倍，看起来却像成功了）。窗口长度不可调 —— 导出把它钉在 343,980 采样（7.8 s）。
@@ -515,18 +516,50 @@ live reload [<file>]  重读 config 的 [live] 段（缺省当前 config 路径�
 配置是**一个文件**，四个段落：
 
 ```toml
-[mixer]        # 拓扑：[[mixer.channel]] / [mixer.crossfader] / [[mixer.output]] …
-[[mixer.channel]]
-side = "left"
-[mixer.master]
+[multideck]    # 唯一 deck 列表，数组顺序即 deck 编号（deck1, deck2, …）
+[[multideck.deck]]
+source = "ctl1.A"         # <controller>.<face>[.mirror]；省略 = 该 deck 无控制器
+side = "left"             # crossfader 左/右；center = 不参与
+cue_send = 1.0            # 送 cue 总线 0..1
+# flow_fader = 0.0        # 逐 flow 电平
+# deck_fader = 0.0        # channel fader 起点
+# gain = 0.0              # trim
+
+[mixer]        # 总线：[mixer.chain] / [mixer.crossfader] / [[mixer.output]] …
+[mixer.chain]              # 整条混音链的效果都在这一个表里，所有 deck 共享
+master_fx = []            # master 效果（别名 fx），limiter 之前
+flow_fx = []              # 逐 flow insert（模板：每 flow 一条独立链）
+knob_fx = []              # 合并后 knob bank
+pad_fx = []               # 合并后 pad bank
 limiter = true            # 安全限幅，默认开启；写 false 才关
 ceiling_db = -1.0         # 限幅门限 dBFS（−40 .. +12），省略 = −1
-[live]         # 本机设置：[audio] / [keylock] / [stems] / [autogain]
+fader = 0.0               # master trim
+filter = "linear"         # linear | moog — 固定 sweep 的种类
+fader-location = "pre"    # pre | post — cue 送在 fader 哪一侧（取代旧的 per-deck `cue`）
+cue-blend = -1.0          # -1 只听 cue，0 各半，+1 只听 master
+[mixer.chain.autogain]
+enabled = false
+target_db = -12.0
+[mixer.crossfader]
+curve = "classic"         # classic | constant_power | cut
+[live]         # 本机设置：[audio] / [keylock] / [stems]
 [preference]   # 前端设置：波形、主题、曲库
-[controller]
-map = "mapping.toml"   # unit-map 文件指针，相对本文件所在目录
-# device = "..."       # 可选，覆盖映射文件的 [meta].device
+
+[[controller]] # 每个控制器一个会话
+id = "ctl1"
+map = "mapping.toml"      # unit-map 文件指针，相对本文件所在目录
+# device = "..."          # 可选，覆盖映射文件的 [meta].device
 ```
+
+- deck 编号分两层：audio 侧是 `deck1..deckN`（`[[multideck.deck]]` 的顺序），controller 侧是
+  逻辑面 `A`/`B`/`C`/`D`（mapping 里 `deck = "A"`）。`source` 表把逻辑面映射到物理 deck。
+- mirror：`source = "ctl1.A"` 与 `source = "ctl1.A.mirror"` 分别占两个 deck；mapping 里的
+  `mirror-deck` preset 提供 toggle 按钮，按下整台控制器切到 mirror 面。
+- crossfader 的左右组合由 controller 侧定义：mapping 的 `global.crossfader` 用多个 mode
+  （`fader cross A B` / `fader cross Am Bm`）指定 deck 对；`[mixer.crossfader]` 只剩
+  `curve` / `cut_width` / `start`（`place` 已固定为通道末端）。
+- 旧的 `[[mixer.channel]]` 已移除：deck 的字段写进 `[[multideck.deck]]`，效果写进
+  `[mixer.chain]`。root 级 `[[channel]]` 裸拓扑文件仍可读。
 
 - 不给 `--config`：Linux/Termux 用 `$XDG_CONFIG_HOME/hypermixx/config.toml`
   （缺省 `~/.config/hypermixx/config.toml`），Windows 用 `%APPDATA%/Hypermixx/config.toml`；

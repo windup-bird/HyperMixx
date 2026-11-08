@@ -48,7 +48,7 @@ fn main() {
         .map
         .clone()
         .unwrap_or_else(|| profile::map_path_for(&config.path));
-    let controller = config.controller.clone();
+    let controllers = config.controllers.clone();
     let live = config.live;
     let cfg = config.mixer;
     let backends = hypermixx_library::analyser::Backends {
@@ -91,14 +91,31 @@ fn main() {
         }
         return;
     }
-    // MIDI: `[controller].map` is the file pointer; `device` (or the map's `[meta].device`) names
-    // the port. An explicit `--controller` wins. A config that names no map opens no input.
-    let midi_port = args.midi.clone().or_else(|| {
-        controller.device.clone().or_else(|| {
-            controller.map.as_ref()?;
-            map_device(&map_path)
+    // Each `[[controller]]` becomes its own session: own port, own unit map, and its own slice of
+    // the face → deck table (so two devices cannot address the same deck by accident). An explicit
+    // `--controller` overrides the first instance's port.
+    let controller_sessions: Vec<profile::ControllerSession> = controllers
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let map = entry.map.clone().unwrap_or_else(|| map_path.clone());
+            let port = (index == 0)
+                .then(|| args.midi.clone())
+                .flatten()
+                .or_else(|| entry.device.clone())
+                .or_else(|| entry.map.as_ref().and_then(|_| map_device(&map)));
+            let routes = profile::deck_routes(&cfg, Some(&entry.id));
+            profile::ControllerSession {
+                id: entry.id.clone(),
+                port,
+                map,
+                routes,
+            }
         })
-    });
+        .collect();
+    let midi_port = controller_sessions.first().and_then(|entry| entry.port.clone());
+    // The unfiltered table is the fallback for a front-end that has no explicit controller list.
+    let deck_routes = profile::deck_routes(&cfg, None);
     // `start` builds the mixer on the producer thread (cpal streams are !Send) and reports a bad
     // config back synchronously, so a failure here is a clean exit, not a half-alive engine.
     let pipeline = match AudioPipeline::start_with(
@@ -118,12 +135,6 @@ fn main() {
         }
     };
     let command_tx = pipeline.command_tx();
-    // Auto-gain is a live preference pushed to the engine (the per-track measurement is part of the
-    // load); the mixer starts disabled until this arrives.
-    let _ = command_tx.send(hypermixx_core::Command::SetAutogain {
-        enabled: live.autogain.enabled,
-        target_db: live.autogain.target_db,
-    });
     // A custom topology may name any number of channels, so the deck-id range comes from the
     // engine rather than the built-in constant.
     let decks = pipeline.channel_count().unwrap_or(DECK_COUNT).max(1);
@@ -161,6 +172,8 @@ fn main() {
                 midi_map: map_path.clone(),
                 midi_control: None,
                 midi_state: None,
+                deck_routes: deck_routes.clone(),
+                controller_sessions: controller_sessions.clone(),
                 library: library.clone(),
             },
         );
@@ -171,30 +184,33 @@ fn main() {
     // came from the profile is "what this rig usually is", and a controller that is not plugged in
     // yet should not stop the session — say so and carry on (F9 can still pick one).
     let explicit_midi = args.midi.is_some();
-    let midi_session = match midi_port.as_deref() {
-        Some(port) => match midi::attach_file(
+    let mut midi_sessions: Vec<midi::MidiSession> = Vec::new();
+    for entry in &controller_sessions {
+        let Some(port) = entry.port.as_deref() else {
+            continue;
+        };
+        match midi::attach_file(
             port,
-            &map_path,
+            &entry.map,
+            &entry.routes,
             decks,
             command_tx.clone(),
             pipeline.response_rx(),
             &notice_tx,
         ) {
-            Ok(session) => Some(session),
+            Ok(session) => midi_sessions.push(session),
             Err(err) if explicit_midi => {
-                eprintln!("error: controller: {err}");
+                eprintln!("error: controller `{}`: {err}", entry.id);
                 std::process::exit(1);
             }
             Err(err) => {
-                eprintln!("warning: controller: {err}; continuing without it");
-                None
+                eprintln!("warning: controller `{}`: {err}; continuing without it", entry.id);
             }
-        },
-        None => None,
-    };
+        }
+    }
 
-    let midi_control = midi_session.as_ref().map(|session| session.control());
-    let midi_state = midi_session.as_ref().map(|session| session.state());
+    let midi_control = midi_sessions.first().map(|session| session.control());
+    let midi_state = midi_sessions.first().map(|session| session.state());
     let config_note = format!(", config {config_path}");
     println!(
         "hypermixx {VERSION} — {decks} decks, {}Hz stereo, analysis beats {}/key {}{config_note}. \
@@ -218,10 +234,12 @@ fn main() {
             midi_map: map_path,
             midi_control,
             midi_state,
+            deck_routes,
+            controller_sessions,
             library,
         },
     );
-    drop(midi_session);
+    drop(midi_sessions);
 }
 
 /// Reads `--config <path>` (the one config file), `--print-config` (emit the template and exit),

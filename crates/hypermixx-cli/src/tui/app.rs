@@ -493,12 +493,17 @@ pub struct App {
     pub screen: ratatui::layout::Rect,
     /// A modal picker, if one is open.
     pub overlay: Option<Overlay>,
-    /// The live MIDI input, when connected; dropping the app closes the port.
-    pub midi: Option<crate::midi::MidiSession>,
+    /// The live MIDI inputs, one per `[[controller]]`; dropping the app closes their ports.
+    pub midi: Vec<crate::midi::MidiSession>,
     /// The chosen (or flag-supplied) port, remembered across reconnects.
     pub midi_port: Option<String>,
     /// The chosen (or flag-supplied) map path.
     pub midi_map: Option<String>,
+    /// Controller face → physical deck table, used to compile a controller's normal and mirror
+    /// unit maps when it connects.
+    pub deck_routes: hypermixx_midi::map::DeckRoutes,
+    /// One entry per `[[controller]]` instance; `attach_midi` connects all of them.
+    pub controller_sessions: Vec<crate::profile::ControllerSession>,
 
     notice_rx: Receiver<LogLine>,
     event_rx: Receiver<UiEvent>,
@@ -626,9 +631,11 @@ impl App {
             quit: false,
             screen: ratatui::layout::Rect::default(),
             overlay: None,
-            midi: None,
+            midi: Vec::new(),
             midi_port: None,
             midi_map: None,
+            deck_routes: Default::default(),
+            controller_sessions: Vec::new(),
             notice_rx,
             event_rx,
             mode_tx,
@@ -654,54 +661,79 @@ impl App {
         notices: &NoticeTx,
         dispatcher: &crate::command::Dispatcher,
     ) {
-        let Some(port) = self.midi_port.clone() else {
-            return;
-        };
-        let map_path = self
-            .midi_map
-            .clone()
-            .unwrap_or_else(|| crate::profile::default_map_path().to_owned());
-        let mut map = match crate::midi::read_map(&map_path) {
-            Ok(map) => map,
-            Err(err) => {
-                self.push_log(LogLine::error(format!("controller: {err}")));
-                self.overlay = Some(Overlay::Files {
-                    picker: FilePicker::new(
-                        Some(std::path::Path::new(&map_path)),
-                        &["toml"],
-                        "controller map",
-                    ),
-                    purpose: FilePurpose::MidiMap,
-                });
+        let specs: Vec<crate::profile::ControllerSession> = if self.controller_sessions.is_empty() {
+            // No explicit controller list: the F9-style single connection.
+            let Some(port) = self.midi_port.clone() else {
                 return;
-            }
+            };
+            vec![crate::profile::ControllerSession {
+                id: "default".to_owned(),
+                port: Some(port),
+                map: self
+                    .midi_map
+                    .clone()
+                    .unwrap_or_else(|| crate::profile::default_map_path().to_owned()),
+                routes: self.deck_routes.clone(),
+            }]
+        } else {
+            self.controller_sessions.clone()
         };
+        // Dropping the old sessions closes their ports before the new ones open.
+        self.midi.clear();
         let slots = self.fx_slots.clone();
-        let unresolved =
-            crate::midi::resolve_with(&mut map, |chain, fx| slots.resolve(&chain.label(), fx).ok());
-        crate::midi::report_unresolved(notices, unresolved);
         let mode_tx = self.mode_sender();
-        match crate::midi::attach(
-            &port,
-            map,
-            command_tx,
-            Some(self.browser_tx.clone()),
-            Some(mode_tx),
-        ) {
-            Ok(session) => {
-                // The dispatcher is what `midi mode` talks through; install the new router's
-                // channels before replacing the old session (whose drop closes its port).
-                dispatcher.set_midi(session.control(), session.state());
-                self.midi = Some(session);
-                self.push_log(LogLine::info(format!(
-                    "[controller] connected `{port}` ({map_path})"
-                )));
-            }
-            Err(err) => {
-                self.push_log(LogLine::error(format!("controller: {err}")));
-                self.overlay = Some(Overlay::Ports {
-                    list: PortList::refresh(),
-                });
+        let mut first = true;
+        for spec in specs {
+            let Some(port) = spec.port.clone() else {
+                continue;
+            };
+            let (mut map, mut mirror_map) =
+                match crate::midi::read_map_pair(&spec.map, &spec.routes) {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        self.push_log(LogLine::error(format!("controller `{}`: {err}", spec.id)));
+                        self.overlay = Some(Overlay::Files {
+                            picker: FilePicker::new(
+                                Some(std::path::Path::new(&spec.map)),
+                                &["toml"],
+                                "controller map",
+                            ),
+                            purpose: FilePurpose::MidiMap,
+                        });
+                        continue;
+                    }
+                };
+            let unresolved = crate::midi::resolve_with(&mut map, |chain, fx| {
+                slots.resolve(&chain.label(), fx).ok()
+            });
+            crate::midi::report_unresolved(notices, unresolved);
+            mirror_map.copy_fx_slots(&map);
+            match crate::midi::attach(
+                &port,
+                map,
+                mirror_map,
+                command_tx.clone(),
+                Some(self.browser_tx.clone()),
+                Some(mode_tx.clone()),
+            ) {
+                Ok(session) => {
+                    // The dispatcher's single control/state pair follows the first controller.
+                    if first {
+                        dispatcher.set_midi(session.control(), session.state());
+                        first = false;
+                    }
+                    self.push_log(LogLine::info(format!(
+                        "[controller] `{}` connected `{port}` ({})",
+                        spec.id, spec.map
+                    )));
+                    self.midi.push(session);
+                }
+                Err(err) => {
+                    self.push_log(LogLine::error(format!("controller `{}`: {err}", spec.id)));
+                    self.overlay = Some(Overlay::Ports {
+                        list: PortList::refresh(),
+                    });
+                }
             }
         }
     }

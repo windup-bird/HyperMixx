@@ -2,6 +2,23 @@
 [meta]
 # device = "..."   # a port name or index; config.toml's [controller] device overrides it
 
+# Press the mirror toggle to make every deck-scoped unit below drive its mirror deck. Which
+# physical deck that is comes from `[[multideck.deck]] source = "<controller>.<face>.mirror"`.
+[[unit]]
+id = "global.mirror"
+preset = "mirror-deck"
+mode = []
+
+[[unit.control]]
+slot = "toggle"
+type = "Button"
+role = "deck_mirror"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 15
+id = 60
+
 [[unit]]
 id = "global.browser"
 preset = "browser"
@@ -44,10 +61,14 @@ midi = "note"
 channel = 15
 id = 3
 
+# The crossfader is a controller-internal concept: each mode names the pair of physical decks it
+# spans. `AB` uses the normal faces, `AmBm` their mirror decks. `mode-next` cycles between them;
+# the same `fader cross <left> <right>` also accepts literal deck numbers.
 [[unit]]
 id = "global.crossfader"
 preset = "crossfader"
-mode = []
+start = "AB"
+mode_order = ["AB", "AmBm"]
 
 [[unit.control]]
 slot = "fader"
@@ -57,6 +78,28 @@ type = "BipolKnob"
 midi = "cc"
 channel = 15
 id = 8
+
+[[unit.control]]
+slot = "mode-next"
+type = "Button"
+role = "mode_cycle"
+
+[unit.control.endpoint]
+midi = "note"
+channel = 15
+id = 61
+
+[[unit.mode]]
+name = "AB"
+[[unit.mode.bind]]
+slot = "fader"
+action = "fader cross A B"
+
+[[unit.mode]]
+name = "AmBm"
+[[unit.mode.bind]]
+slot = "fader"
+action = "fader cross Am Bm"
 
 [[unit]]
 id = "global.outputfader"
@@ -84,7 +127,7 @@ id = 12
 [[unit]]
 id = "deck1.jog"
 preset = "jog"
-deck = 1
+deck = "A"
 mode = []
 
 [[unit.control]]
@@ -107,7 +150,7 @@ id = 6
 [[unit]]
 id = "deck1.mixer"
 preset = "mixer"
-deck = 1
+deck = "A"
 mode = []
 
 [[unit.control]]
@@ -167,7 +210,7 @@ id = 26
 [[unit]]
 id = "deck1.manualjump"
 preset = "manualjump"
-deck = 1
+deck = "A"
 mode = []
 
 [[unit.control]]
@@ -191,7 +234,7 @@ id = 72
 [[unit]]
 id = "deck1.tempofader"
 preset = "tempofader"
-deck = 1
+deck = "A"
 mode = []
 
 [[unit.control]]
@@ -207,7 +250,7 @@ id = 9
 [[unit]]
 id = "deck1.pad"
 preset = "pad"
-deck = 1
+deck = "A"
 mode = []
 
 [[unit.control]]
@@ -295,7 +338,7 @@ id = 0
 [[unit]]
 id = "deck1.transport"
 preset = "transport"
-deck = 1
+deck = "A"
 mode = []
 
 [[unit.control]]
@@ -328,7 +371,7 @@ id = 2
 [[unit]]
 id = "deck2.jog"
 preset = "jog"
-deck = 2
+deck = "B"
 mode = []
 
 [[unit.control]]
@@ -351,7 +394,7 @@ id = 6
 [[unit]]
 id = "deck2.mixer"
 preset = "mixer"
-deck = 2
+deck = "B"
 mode = []
 
 [[unit.control]]
@@ -411,7 +454,7 @@ id = 26
 [[unit]]
 id = "deck2.manualjump"
 preset = "manualjump"
-deck = 2
+deck = "B"
 mode = []
 
 [[unit.control]]
@@ -435,7 +478,7 @@ id = 72
 [[unit]]
 id = "deck2.tempofader"
 preset = "tempofader"
-deck = 2
+deck = "B"
 mode = []
 
 [[unit.control]]
@@ -451,7 +494,7 @@ id = 9
 [[unit]]
 id = "deck2.pad"
 preset = "pad"
-deck = 2
+deck = "B"
 mode = []
 
 [[unit.control]]
@@ -539,7 +582,7 @@ id = 0
 [[unit]]
 id = "deck2.transport"
 preset = "transport"
-deck = 2
+deck = "B"
 mode = []
 
 [[unit.control]]

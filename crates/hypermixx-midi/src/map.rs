@@ -113,6 +113,110 @@ mod deck_number {
     }
 }
 
+/// A `[[unit]]`'s `deck`: a controller face (`A`, `Am`, `A.mirror`, …) or a literal 1-based deck
+/// number. Faces are resolved against [`DeckRoutes`] at compile time, so a map never needs to know
+/// which physical deck its controller drives; numbers keep the old files working.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FaceRef {
+    Face(String),
+    Deck(DeckId),
+}
+
+impl<'de> serde::Deserialize<'de> for FaceRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Name(String),
+            Number(u8),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Name(name) => Ok(FaceRef::Face(name)),
+            Raw::Number(0) => Err(serde::de::Error::custom("deck numbers start at 1")),
+            Raw::Number(number) => Ok(FaceRef::Deck(number - 1)),
+        }
+    }
+}
+
+impl serde::Serialize for FaceRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            FaceRef::Face(name) => serializer.serialize_str(name),
+            FaceRef::Deck(id) => serializer.serialize_u8(id + 1),
+        }
+    }
+}
+
+impl FaceRef {
+    fn resolve(&self, routes: &DeckRoutes, mirror: bool) -> Result<DeckId, String> {
+        match self {
+            FaceRef::Deck(id) => Ok(*id),
+            FaceRef::Face(name) => routes.resolve(name, mirror),
+        }
+    }
+
+    /// The literal deck number, when this is the numeric spelling. The guide lists units by deck
+    /// number, so face-named units are simply outside its numbered columns.
+    pub fn deck_id(&self) -> Option<DeckId> {
+        match self {
+            FaceRef::Deck(id) => Some(*id),
+            FaceRef::Face(_) => None,
+        }
+    }
+}
+
+/// Which physical deck each controller face drives, in its normal and mirror variants. Built by
+/// the front-end from `[[multideck.deck]] source`. Compiling a map with `mirror = false` resolves
+/// every face to its normal deck, `mirror = true` to its mirror deck; the router swaps between the
+/// two compiled maps when the mirror toggle fires.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeckRoutes {
+    faces: HashMap<String, (DeckId, Option<DeckId>)>,
+}
+
+impl DeckRoutes {
+    /// Registers a face. `mirror` is the deck the face drives when mirrored (or after an explicit
+    /// `Am` / `A.mirror` reference); `None` means the face has no mirror deck.
+    pub fn insert(&mut self, face: &str, normal: DeckId, mirror: Option<DeckId>) {
+        self.faces.insert(face.to_owned(), (normal, mirror));
+    }
+
+    pub fn resolve(&self, name: &str, mirror: bool) -> Result<DeckId, String> {
+        let (base, forced) = if let Some(base) = name.strip_suffix(".mirror") {
+            (base, true)
+        } else if let Some(base) = name.strip_suffix('m') {
+            (base, true)
+        } else {
+            (name, false)
+        };
+        // Without an explicit `source` table (a bare map, the guide, `--print-config`) a single
+        // uppercase letter falls back to its alphabetical deck index: A → deck1, B → deck2, …
+        let fallback = if base.len() == 1 && base.as_bytes()[0].is_ascii_uppercase() {
+            Some((base.as_bytes()[0] - b'A') as DeckId)
+        } else {
+            None
+        };
+        let Some((normal, mirrored)) = self.faces.get(base).copied().or_else(|| {
+            fallback.map(|id| (id, None))
+        }) else {
+            return Err(format!("unknown controller face `{base}`"));
+        };
+        if mirror || forced {
+            // A face with no mirror deck simply keeps driving its normal deck when toggled. That
+            // makes the two-deck default start cleanly; adding the mirror `source` later enables it.
+            Ok(mirrored.unwrap_or(normal))
+        } else {
+            Ok(normal)
+        }
+    }
+}
+
 /// Which MIDI message an endpoint listens for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -202,6 +306,8 @@ pub enum SlotRole {
     ModeTrigger,
     /// Pressing advances to the next mode in the unit's order.
     ModeCycle,
+    /// Pressing flips the controller between its normal and mirror deck maps.
+    DeckMirror,
 }
 
 /// The part of a compound slot an endpoint belongs to.
@@ -357,9 +463,10 @@ pub struct RawUnit {
     /// A built-in or user preset that supplies slot kinds and default modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
-    /// The deck this unit targets by default, written 1-based in TOML. Omit for a global unit.
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "deck_number")]
-    pub deck: Option<DeckId>,
+    /// The controller face (or literal 1-based deck number) this unit targets by default. Omit
+    /// for a global unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deck: Option<FaceRef>,
     /// The mode the unit starts in. Defaults to the preset's `start`, then the first mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<String>,
@@ -456,6 +563,8 @@ impl Control {
 pub enum SelectorBehavior {
     Trigger { mode: usize },
     Cycle,
+    /// Flips every face to its mirror deck (the router swaps its compiled map).
+    MirrorToggle,
 }
 
 /// A slot that switches the unit's mode. Compiled from a control's `role`, never written directly.
@@ -900,6 +1009,22 @@ impl Map {
 
     /// Parses text with a base folder for `[meta] presets`.
     pub fn from_toml_str_at(text: &str, base: &Path) -> Result<Self, MapError> {
+        Self::parse(text, base, &DeckRoutes::default(), false)
+    }
+
+    /// The same parse, with controller faces resolved through `routes`. Compiling once with
+    /// `mirror = false` and once with `mirror = true` gives the router the two maps it swaps between
+    /// when the mirror toggle fires.
+    pub fn from_toml_str_at_routes(
+        text: &str,
+        base: &Path,
+        routes: &DeckRoutes,
+        mirror: bool,
+    ) -> Result<Self, MapError> {
+        Self::parse(text, base, routes, mirror)
+    }
+
+    fn parse(text: &str, base: &Path, routes: &DeckRoutes, mirror: bool) -> Result<Self, MapError> {
         let file = MapFile::from_toml_str(text)?;
         let presets =
             crate::preset::PresetRegistry::load(file.meta.as_ref(), base).map_err(MapError::new)?;
@@ -913,7 +1038,7 @@ impl Map {
                     raw.id
                 )));
             }
-            let unit = compile_unit(raw, &presets)
+            let unit = compile_unit(raw, &presets, routes, mirror)
                 .map_err(|message| MapError::new(format!("unit `{}`: {message}", raw.id)))?;
             units.push(unit);
         }
@@ -944,6 +1069,12 @@ impl Map {
     /// Records that `name` is slot `index` in `chain`. Called by the CLI after `ListFx`.
     pub fn resolve_fx(&mut self, chain: FxChainId, name: impl Into<String>, index: usize) {
         self.fx_slots.insert((chain, name.into()), index);
+    }
+
+    /// Copies the resolved FX slot book from another map compiled from the same text. The mirror
+    /// variant names the same FX slots, so a front-end only needs to resolve them once.
+    pub fn copy_fx_slots(&mut self, other: &Map) {
+        self.fx_slots = other.fx_slots.clone();
     }
 
     /// The slot index for a named effect, if it has been resolved.
@@ -998,7 +1129,17 @@ fn check_name(what: &str, value: &str) -> Result<(), String> {
 }
 
 /// Merges a unit with its preset and compiles every layer.
-fn compile_unit(raw: &RawUnit, presets: &crate::preset::PresetRegistry) -> Result<Unit, String> {
+fn compile_unit(
+    raw: &RawUnit,
+    presets: &crate::preset::PresetRegistry,
+    routes: &DeckRoutes,
+    mirror: bool,
+) -> Result<Unit, String> {
+    let unit_deck = raw
+        .deck
+        .as_ref()
+        .map(|face| face.resolve(routes, mirror))
+        .transpose()?;
     let preset = match raw.preset.as_deref() {
         Some(name) => Some(
             presets
@@ -1114,7 +1255,8 @@ fn compile_unit(raw: &RawUnit, presets: &crate::preset::PresetRegistry) -> Resul
                     raw_mode.name, raw_bind.slot
                 ));
             }
-            let binding = compile_mode_binding(raw_bind, &controls[control], raw.deck)?;
+            let binding =
+                compile_mode_binding(raw_bind, &controls[control], unit_deck, routes, mirror)?;
             validate_binding(&controls[control], &binding, &endpoints)?;
             binds[control] = Some(binding);
         }
@@ -1146,6 +1288,7 @@ fn compile_unit(raw: &RawUnit, presets: &crate::preset::PresetRegistry) -> Resul
                 SelectorBehavior::Trigger { mode }
             }
             SlotRole::ModeCycle => SelectorBehavior::Cycle,
+            SlotRole::DeckMirror => SelectorBehavior::MirrorToggle,
         };
         // A mode slot with no endpoint yet is simply not wired: the guide learns it later.
         let Some(endpoint) = control.endpoint_index(&endpoints, EndpointRole::Main) else {
@@ -1172,7 +1315,7 @@ fn compile_unit(raw: &RawUnit, presets: &crate::preset::PresetRegistry) -> Resul
 
     Ok(Unit {
         id: raw.id.clone(),
-        deck: raw.deck,
+        deck: unit_deck,
         start,
         controls,
         endpoints,
@@ -1357,12 +1500,31 @@ struct ActionCtx<'a> {
     deck: Option<DeckId>,
     chain: Option<&'a str>,
     fx: Option<&'a str>,
+    routes: &'a DeckRoutes,
+    mirror: bool,
+}
+
+impl ActionCtx<'_> {
+    /// A crossfader side: a controller face (`A`, `Am`, `A.mirror`) or a literal 1-based deck
+    /// number. A face is resolved through the routes at compile time, so each mode names a pair of
+    /// *physical* decks without knowing which controller drives them.
+    fn face(&self, token: &str) -> Result<DeckId, String> {
+        if let Ok(number) = token.parse::<u8>() {
+            return match number {
+                0 => Err("deck numbers start at 1".to_owned()),
+                n => Ok(n - 1),
+            };
+        }
+        self.routes.resolve(token, self.mirror)
+    }
 }
 
 fn compile_mode_binding(
     raw: &RawModeBind,
     control: &Control,
     unit_deck: Option<DeckId>,
+    routes: &DeckRoutes,
+    mirror: bool,
 ) -> Result<ModeBinding, String> {
     if control.role != SlotRole::Action {
         return Err(format!(
@@ -1374,6 +1536,8 @@ fn compile_mode_binding(
         deck: raw.deck.or(unit_deck),
         chain: raw.chain.as_deref(),
         fx: raw.fx.as_deref(),
+        routes,
+        mirror,
     };
     let parse = |line: Option<&str>| -> Result<Option<Action>, String> {
         line.map(|line| {
@@ -1783,7 +1947,11 @@ fn parse_action(line: &str, ctx: &ActionCtx<'_>) -> Result<Action, String> {
         ["fader", "deck"] => Ok(Action::Fader(FaderTarget::Deck(deck("fader deck")?))),
         ["fader", "gain"] => Ok(Action::Fader(FaderTarget::Gain(deck("fader gain")?))),
         ["fader", "cuesend"] => Ok(Action::Fader(FaderTarget::CueSend(deck("fader cuesend")?))),
-        ["fader", "cross"] => Ok(Action::Fader(FaderTarget::Crossfader)),
+        ["fader", "cross"] => Ok(Action::Fader(FaderTarget::default_crossfader())),
+        ["fader", "cross", left, right] => Ok(Action::Fader(FaderTarget::Crossfader {
+            left: ctx.face(left)?,
+            right: ctx.face(right)?,
+        })),
         ["fader", "master"] => Ok(Action::Fader(FaderTarget::Master)),
         ["fader", "cue"] => Ok(Action::Fader(FaderTarget::Cue)),
         [stem_name, what @ ("fader" | "mute" | "solo")] => {

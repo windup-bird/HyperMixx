@@ -741,7 +741,7 @@ mod tests {
     #[test]
     fn a_config_without_a_preference_section_uses_the_built_in_defaults() {
         // The other sections are not preferences; they must not be reported as unknown sections.
-        let text = "[mixer]\n[[mixer.channel]]\nside = \"center\"\n[live]\n[controller]\n";
+        let text = "[mixer]\n[[multideck.deck]]\nside = \"center\"\n[live]\n[controller]\n";
         let (preference, notes) = parse(text).expect("a partial config parses");
         assert_eq!(preference, Preference::default());
         assert!(notes.is_empty(), "{notes:?}");
