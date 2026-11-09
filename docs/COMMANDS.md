@@ -16,17 +16,16 @@ cargo run -p hypermixx-cli -- [flags]
 |---|---|
 | `--cli` | 行式 REPL；不给则启动 TUI（默认） |
 | `--config <file>` | 指定配置文件（单文件多段落）；不给则用平台默认路径，首次启动从内置模板复制一份。`HYPERMIXX_CONFIG` 可覆盖路径 |
-| `--print-config` | 打印配置模板后退出（不启动引擎） |
 | `--backend auto\|stratum\|timestretch` | 离线分析后端，缺省 `auto`（stratum 优先，失败回落） |
-| `--controller <port>` | 启动时打开控制器输入（端口号或名字，`controller ports` 可列；`midi ports` 别名仍可）。映射文件由 config 的 `[[controller]].map` 指定 |
 | `--guide [<file>]` | learn 模式地图编辑器（**不启动音频引擎**）；缺省编辑 config 同目录的 `mapping.toml`，不存在则从内置模板创建 |
-| `--decks <n>` | 仅作用于 `--guide` 的 deck 栏宽度，缺省 1 |
+| `--4-decks` | 四碟界面：引擎起四条 deck，TUI 的 deck 区按页纵向堆叠，控制带每列各自翻页。不给就是双碟 |
 
 - 未知参数是硬错误（`error: unknown argument …`），不会静默忽略；
   `--profile` / `--live` / `--controller-map` / `--tui` / `--midi*` 已移除。
-- `--guide` 即使不跟端口也能在 TUI 里选端口/文件；给了路径/端口时启动即尝试打开，
-  失败会留在 watch dog 里等待 `File` / `Connect`。
-- deck 数量启动时从引擎查询（自定义拓扑可配任意通道数），不是固定常量。
+- 控制器只由配置文件描述（`[[controller]]` 的 `device`/`map`），没有命令行参数；`--guide` 打开
+  地图后按 `Connect` 选端口，失败会留在 watch dog 里等下一次。
+- deck 数量由 `--4-decks` 决定（缺省 2）；配置里的 `[[multideck.deck]]` 只提供
+  `<controller>.<face>[.mirror]` 映射，不决定有几个 deck。
 
 ---
 
@@ -483,7 +482,8 @@ controller ports    列出可用控制器输入端口（`midi ports` / `list` �
 controller mode     查看/切换已接入映射的 unit 模式
 ```
 
-只有查询与模式切换走会话命令：打开端口在启动时（`--controller`）或 TUI 的 `F9` 设置界面完成——
+只有查询与模式切换走会话命令：打开端口在启动时（`[[controller]].device`/映射文件里的 device）
+或 TUI 的 `F9` 设置界面完成——
 映射是对运行中引擎接线一次，会话中途不重新打开输入。映射表格式与全部 action 见
 [`MIDI.md`](MIDI.md)。
 
@@ -522,7 +522,7 @@ live reload [<file>]  重读 config 的 [live] 段（缺省当前 config 路径�
 配置是**一个文件**，四个段落：
 
 ```toml
-[multideck]    # 唯一 deck 列表，数组顺序即 deck 编号（deck1, deck2, …）
+[multideck]    # controller 映射 + per-deck 参数；第 N 行即 deckN，数量由 --4-decks 决定
 [[multideck.deck]]
 source = "ctl1.A"         # <controller>.<face>[.mirror]；省略 = 该 deck 无控制器
 side = "left"             # crossfader 左/右；center = 不参与
@@ -572,8 +572,10 @@ map = "mapping.toml"      # unit-map 文件指针，相对本文件所在目录
 # device = "..."          # 可选，覆盖映射文件的 [meta].device
 ```
 
-- deck 编号分两层：audio 侧是 `deck1..deckN`（`[[multideck.deck]]` 的顺序），controller 侧是
-  逻辑面 `A`/`B`/`C`/`D`（mapping 里 `deck = "A"`）。`source` 表把逻辑面映射到物理 deck。
+- deck 编号分两层：audio 侧是 `deck1..deckN`，数量由 `--4-decks` 决定（2 或 4，缺省 2）；
+  配置里的第 N 行 `[[multideck.deck]]` 只描述 deckN——`source` 把 controller 逻辑面映射到物理
+  deck，行数不足时多出来的 deck 没有 controller。controller 侧是逻辑面 `A`/`B`/`C`/`D`
+  （mapping 里 `deck = "A"`）。
 - mirror：`source = "ctl1.A"` 与 `source = "ctl1.A.mirror"` 分别占两个 deck；`mirror-deck`
   preset 是 **deck unit**，每个 deck strip 装一个 toggle，按下只切这一组控件到它的 mirror 面，
   两条 deck strip 可以各自独立镜像。

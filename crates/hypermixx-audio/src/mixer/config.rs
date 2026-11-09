@@ -200,6 +200,29 @@ impl EqConfig {
 }
 
 impl MixerConfig {
+    /// Resizes the deck list to `count`, keeping what the config already describes and appending
+    /// defaults for the rest.
+    ///
+    /// The front-end owns the deck count (`--4-decks`); a config's `[[multideck.deck]]` rows only say
+    /// which controller face drives which deck. A file that maps two faces therefore still runs four
+    /// decks: the extra two keep unity faders and a full cue send, take crossing sides of the
+    /// crossfader, and simply have no controller.
+    pub fn set_channel_count(&mut self, count: usize) {
+        while self.channels.len() < count {
+            let index = self.channels.len();
+            self.channels.push(ChannelConfig {
+                cue_send: 1.0,
+                side: if index % 2 == 0 {
+                    DeckSide::Left
+                } else {
+                    DeckSide::Right
+                },
+                ..ChannelConfig::default()
+            });
+        }
+        self.channels.truncate(count);
+    }
+
     /// Every FX name the chain names — every bank — for validation and `fx help`.
     pub fn all_fx(&self) -> impl Iterator<Item = &String> {
         self.flow_fx
@@ -667,13 +690,13 @@ pub fn simple_dj() -> MixerConfig {
         .expect("the shipped template must parse into the reference topology")
 }
 
-/// The shipped config as TOML — the starting point for a hand-written config (`--print-config`
-/// emits it, and the first-start copy writes it). Parsing this text must yield exactly [`simple_dj`]
+/// The shipped config as TOML — the starting point for a hand-written config (the first-start
+/// copy writes it verbatim). Parsing this text must yield exactly [`simple_dj`]
 /// for the mixer, which is the test that keeps the schema and the constructor honest with each
 /// other. The other sections are the front-end's and are ignored here.
 pub fn reference_toml() -> &'static str {
-    // One file is the single source of truth: the built-in topology, `--print-config` and the
-    // first-start copy are the same bytes. `from_toml_str` reads `[mixer]` and merges the
+    // One file is the single source of truth: the built-in topology and the first-start copy are
+    // the same bytes. `from_toml_str` reads `[mixer]` and merges the
     // top-level `[[multideck.deck]]` mapping into it; the other sections are the front-end's.
     include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -817,6 +840,30 @@ mod tests {
     }
 
     #[test]
+    fn the_frontend_deck_count_pads_the_config_and_keeps_its_mapping() {
+        let mut cfg = simple_dj();
+        assert_eq!(cfg.channels.len(), 2);
+        cfg.set_channel_count(4);
+        assert_eq!(cfg.channels.len(), 4, "--4-decks adds two decks");
+        // The decks the config maps keep their controller faces; the appended ones have none.
+        assert_eq!(cfg.channels[0].source.as_deref(), Some("ctl1.A"));
+        assert_eq!(cfg.channels[1].source.as_deref(), Some("ctl1.B"));
+        assert_eq!(cfg.channels[2].source, None);
+        assert_eq!(cfg.channels[3].source, None);
+        // A new deck is audible in the headphones and sits on one side of the crossfader, with its
+        // partner on the other.
+        assert_eq!(cfg.channels[2].cue_send, 1.0);
+        assert_eq!(cfg.channels[2].flow_fader, 0.0);
+        assert_ne!(
+            cfg.channels[2].side, cfg.channels[3].side,
+            "the appended pair crosses the crossfader"
+        );
+        // Shrinking drops the tail rather than leaving a channel the front-end cannot address.
+        cfg.set_channel_count(2);
+        assert_eq!(cfg.channels.len(), 2);
+    }
+
+    #[test]
     fn every_named_fx_resolves() {
         let cfg = simple_dj();
         for name in cfg.all_fx() {
@@ -826,7 +873,7 @@ mod tests {
 
     #[test]
     fn the_reference_toml_parses_into_simple_dj() {
-        // The contract `--print-config` → edit → `--config` depends on: the emitted text and the
+        // The contract the shipped template → edit → `--config` path depends on: that text and the
         // built-in constructor describe the same mixer. Ids are positional (the mixer renumbers),
         // so they are normalised before the comparison.
         let mut parsed = MixerConfig::from_toml_str(reference_toml())

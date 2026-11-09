@@ -42,14 +42,10 @@ pub struct Outputs {
     pub controller: Option<String>,
 }
 
-/// Runs the controller guide.
-pub fn run(
-    map_path: &str,
-    port: Option<&str>,
-    decks: usize,
-    outputs: Outputs,
-) -> Result<(), String> {
-    let mut session = Session::new(map_path, port, decks, outputs)?;
+/// Runs the controller guide. The controller is the one the map names (`[meta].device`): there is no
+/// command-line override any more, and the guide's own Connect menu picks a port at runtime.
+pub fn run(map_path: &str, decks: usize, outputs: Outputs) -> Result<(), String> {
+    let mut session = Session::new(map_path, None, decks, outputs)?;
     let mut terminal = ratatui::try_init().map_err(|err| format!("terminal: {err}"))?;
     let outcome = event_loop(&mut terminal, &mut session);
     ratatui::restore();

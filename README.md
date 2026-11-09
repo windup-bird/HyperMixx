@@ -155,7 +155,7 @@ deck2 nudge 0.04 0.5      # 临时 +4%，半秒后自动松开
 
 标准 MIDI 控制器插上就能用，不需要装驱动。
 
-- `controller ports` 列出可用端口；`--controller 0` 启动时直接打开 0 号，或者进 TUI 按 `F9` 在设置里选。
+- `controller ports` 列出可用端口；想开机就连上，就在 config 的 `[[controller]]` 里写好 `device`，否则进 TUI 按 `F9` 在设置里选。
 - 映射文件由 `config.toml` 的 `[controller] map = "mapping.toml"` 指定，路径相对配置文件所在目录。
 - 配置里写了端口但设备没插，不会拦着你启动；插上以后 `F9` 里再选一次就行。
 - 同一个映射文件可以给多台同型号控制器用，端口在设置里换，映射不用重写。
@@ -187,7 +187,9 @@ cargo run --release -- --guide
 [controller]   # 控制器：map 文件指针，可选 device
 ```
 
-不给 `--config` 就用平台默认路径（Linux `$XDG_CONFIG_HOME/hypermixx/config.toml`，Windows `%APPDATA%/Hypermixx/config.toml`）；`HYPERMIXX_CONFIG` 可以覆盖，`--print-config` 打印内置模板。仓库里的 `profile/config.toml` 就是这份模板。
+不给 `--config` 就用平台默认路径（Linux `$XDG_CONFIG_HOME/hypermixx/config.toml`，Windows `%APPDATA%/Hypermixx/config.toml`）；`HYPERMIXX_CONFIG` 可以覆盖。仓库里的 `profile/config.toml` 就是首次启动复制的那份模板。
+
+启动参数只有四个：`--config <file>`、`--4-decks`（四碟界面）、`--cli`（行式 REPL）、`--guide [<file>]`（映射向导）。deck 数量由 `--4-decks` 决定，配置里的 `[[multideck.deck]]` 只负责“哪个控制器面驱动哪个 deck”。
 
 改完不必重启：
 

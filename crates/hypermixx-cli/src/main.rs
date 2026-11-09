@@ -26,13 +26,9 @@ pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
     let args = CliArgs::parse();
-    if args.print_config {
-        print!("{}", profile::template());
-        return;
-    }
     // One config for the whole run: `--config` names it, otherwise the platform default is used
     // and created from the shipped template on the first start.
-    let config = match profile::load_or_create(args.config.as_deref()) {
+    let mut config = match profile::load_or_create(args.config.as_deref()) {
         Ok(config) => config,
         Err(err) => {
             eprintln!("error: {err}");
@@ -42,6 +38,10 @@ fn main() {
     for note in &config.notes {
         eprintln!("warning: {note}");
     }
+    // The deck count is the front-end's (`--4-decks`), not the config's: a config only maps decks to
+    // controller faces, so the same file runs a two- or a four-deck rig.
+    let deck_count = if args.four_decks { 4 } else { DECK_COUNT };
+    config.mixer.set_channel_count(deck_count);
     let config_path = config.path.to_string_lossy().into_owned();
     let map_path = config
         .controller
@@ -76,36 +76,34 @@ fn main() {
                 eprintln!("warning: {path}: {err}");
             }
         }
-        let decks = args.decks.unwrap_or(1);
-        let guide_port = args.midi.clone();
+        let decks = if args.four_decks { 4 } else { 1 };
         let rate = live.audio.sample_rate;
         let outputs = tui::guide::Outputs {
             preference: config_path.clone(),
             mixer_path: config_path.clone(),
             devices: hypermixx_audio::output_devices(Some(rate)),
             engine_rate: rate,
-            controller: guide_port.clone(),
+            // The map names the controller; the guide marks its device in the list once it opens.
+            controller: None,
         };
-        if let Err(err) = tui::guide::run(path, guide_port.as_deref(), decks, outputs) {
+        if let Err(err) = tui::guide::run(path, decks, outputs) {
             eprintln!("error: {err}");
             std::process::exit(1);
         }
         return;
     }
     // Each `[[controller]]` becomes its own session: own port, own unit map, and its own slice of
-    // the face → deck table (so two devices cannot address the same deck by accident). An explicit
-    // `--controller` overrides the first instance's port.
+    // the face → deck table (so two devices cannot address the same deck by accident). The port is
+    // the entry's `device`, or the one the map names; there is no command-line override.
     // The unfiltered table is the fallback for a front-end that has no explicit controller list.
     let deck_routes = profile::deck_routes(&cfg, None);
-    let mut controller_sessions: Vec<profile::ControllerSession> = controllers
+    let controller_sessions: Vec<profile::ControllerSession> = controllers
         .iter()
-        .enumerate()
-        .map(|(index, entry)| {
+        .map(|entry| {
             let map = entry.map.clone().unwrap_or_else(|| map_path.clone());
-            let port = (index == 0)
-                .then(|| args.midi.clone())
-                .flatten()
-                .or_else(|| entry.device.clone())
+            let port = entry
+                .device
+                .clone()
                 .or_else(|| entry.map.as_ref().and_then(|_| map_device(&map)));
             let routes = profile::deck_routes(&cfg, Some(&entry.id));
             profile::ControllerSession {
@@ -116,18 +114,6 @@ fn main() {
             }
         })
         .collect();
-    // `--controller` works even when the config declares no `[[controller]]`: it is explicitly
-    // asking for one input, with the config's map (or the conventional one next to it).
-    if controller_sessions.is_empty() {
-        if let Some(port) = args.midi.clone() {
-            controller_sessions.push(profile::ControllerSession {
-                id: "default".to_owned(),
-                port: Some(port),
-                map: map_path.clone(),
-                routes: deck_routes.clone(),
-            });
-        }
-    }
     let midi_port = controller_sessions.first().and_then(|entry| entry.port.clone());
     // `start` builds the mixer on the producer thread (cpal streams are !Send) and reports a bad
     // config back synchronously, so a failure here is a clean exit, not a half-alive engine.
@@ -194,10 +180,8 @@ fn main() {
         return;
     }
 
-    // A port the *user* named on the command line must open, or the run is a mistake; a port that
-    // came from the profile is "what this rig usually is", and a controller that is not plugged in
-    // yet should not stop the session — say so and carry on (F9 can still pick one).
-    let explicit_midi = args.midi.is_some();
+    // A controller the config names but that is not plugged in yet should not stop the session —
+    // say so and carry on (F9 can still pick one).
     let mut midi_sessions: Vec<midi::MidiSession> = Vec::new();
     for entry in &controller_sessions {
         let Some(port) = entry.port.as_deref() else {
@@ -213,10 +197,6 @@ fn main() {
             &notice_tx,
         ) {
             Ok(session) => midi_sessions.push(session),
-            Err(err) if explicit_midi => {
-                eprintln!("error: controller `{}`: {err}", entry.id);
-                std::process::exit(1);
-            }
             Err(err) => {
                 eprintln!("warning: controller `{}`: {err}; continuing without it", entry.id);
             }
@@ -257,27 +237,22 @@ fn main() {
     drop(midi_sessions);
 }
 
-/// Reads `--config <path>` (the one config file), `--print-config` (emit the template and exit),
-/// `--cli` (line REPL instead of the TUI),
-/// `--controller <port>` (open a controller input onto the engine) and `--guide <file>` (the unit
-/// map guide, no engine). Without `--config` the platform default path is used and created on the
-/// first start. The terminal UI is the default front-end; `--cli` asks for the line REPL.
-/// Unknown flags are errors rather than silently ignored:
-/// a typo'd `--conifg` that launches the default topology instead is the kind of surprise nobody
-/// wants mid-set.
+/// Reads `--config <path>` (the one config file), `--4-decks` (a four-deck rig), `--cli` (line REPL
+/// instead of the TUI) and `--guide [<file>]` (the unit map guide, no engine). Without `--config`
+/// the platform default path is used and created on the first start. The terminal UI is the default
+/// front-end; `--cli` asks for the line REPL. Controllers are only ever described by the config
+/// (`[[controller]]`), never by a flag. Unknown flags are errors rather than silently ignored: a
+/// typo'd `--conifg` that launches the default rig instead is the kind of surprise nobody wants
+/// mid-set.
 #[derive(Debug, Default)]
 struct CliArgs {
     config: Option<String>,
-    print_config: bool,
+    /// `--4-decks`: run four decks instead of the default two.
+    four_decks: bool,
     /// `--cli`: the line REPL instead of the terminal UI.
     cli: bool,
-    /// `--controller <port>`: a port name or index, opened and mapped onto the engine. The map
-    /// itself is `[controller].map` in the config.
-    midi: Option<String>,
     /// `--guide [<file>]`: run the unit map guide instead of the engine.
     midi_guide: Option<String>,
-    /// `--decks <n>`: how many deck groups the guide shows; `new` allocates beyond them.
-    decks: Option<usize>,
 }
 
 impl CliArgs {
@@ -286,23 +261,11 @@ impl CliArgs {
         let mut raw = std::env::args().skip(1).peekable();
         while let Some(arg) = raw.next() {
             match arg.as_str() {
-                "--print-config" => args.print_config = true,
+                "--4-decks" => args.four_decks = true,
                 "--cli" => args.cli = true,
                 "--config" => {
                     args.config = raw.next().or_else(|| {
                         eprintln!("error: --config needs a path");
-                        std::process::exit(1);
-                    });
-                }
-                // `--controller*` is the current spelling; `--midi*` stays as an alias so existing
-                // scripts and profiles keep working. The engine still speaks MIDI — only the
-                // user-facing name of the thing that sends it changed.
-                "--controller" => {
-                    args.midi = raw.next().or_else(|| {
-                        eprintln!(
-                            "error: --controller needs a port name or index \
-                             (`controller ports` lists them)"
-                        );
                         std::process::exit(1);
                     });
                 }
@@ -316,20 +279,10 @@ impl CliArgs {
                             .unwrap_or_else(|| "mapping.toml".to_owned()),
                     });
                 }
-                "--decks" => {
-                    args.decks = Some(
-                        raw.next()
-                            .and_then(|value| value.parse().ok())
-                            .unwrap_or_else(|| {
-                                eprintln!("error: --decks needs a number");
-                                std::process::exit(1);
-                            }),
-                    );
-                }
                 other => {
                     eprintln!(
-                        "error: unknown argument `{other}`\n  flags: --config, --print-config, \
-                         --cli, --guide, --controller, --decks"
+                        "error: unknown argument `{other}`\n  flags: --config, --4-decks, \
+                         --cli, --guide"
                     );
                     std::process::exit(1);
                 }

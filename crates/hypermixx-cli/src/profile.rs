@@ -6,7 +6,7 @@
 //! and a read-only config directory does not stop the engine: the built-in template runs instead.
 //!
 //! All file IO stays in this front-end crate — the audio engine only ever reads text. In particular
-//! the template is the single source of truth for `--print-config`, the first-start copy and the
+//! the template is the single source of truth for the first-start copy and the
 //! engine's built-in topology (`reference_toml()` embeds the same bytes).
 //!
 //! `[controller].map` is a **file pointer** to a unit map, resolved relative to this config's
@@ -19,7 +19,7 @@ use hypermixx_audio::{reference_toml, MixerConfig};
 use hypermixx_core::{Backend, LiveConfig};
 use hypermixx_midi::map::DeckRoutes;
 
-/// The shipped template. `--print-config` emits it and the first-start copy writes it verbatim.
+/// The shipped template. The first-start copy writes it verbatim.
 pub fn template() -> &'static str {
     reference_toml()
 }

@@ -195,7 +195,7 @@ impl DeckRoutes {
         } else {
             (name, false)
         };
-        // Without an explicit `source` table (a bare map, the guide, `--print-config`) a single
+        // Without an explicit `source` table (a bare map, the guide) a single
         // uppercase letter falls back to its alphabetical deck index: A → deck1, B → deck2, …
         let fallback = if base.len() == 1 && base.as_bytes()[0].is_ascii_uppercase() {
             Some((base.as_bytes()[0] - b'A') as DeckId)

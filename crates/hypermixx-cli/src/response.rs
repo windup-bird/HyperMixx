@@ -409,14 +409,12 @@ target: a bare deck verb is refused while it is selected, so a stray `play` cann
 A leading `deck1` / `1` selects a deck (numbers are 1-based), `master` the summed output. Without
 one the command follows the selected target (TUI: `Tab` cycles deck1 → deck2 → browser); while
 browser is selected, name the deck in the line instead.
-startup flags: --config <file> (custom topology), --profile <name|file> (which files to use),
-               --print-config (reference TOML), --live <file> (engine rate, ring, stem defaults),
-               --cli (line REPL; the TUI is the default),
-               --controller <port> [--controller-map <file>] (controller input; a map's
-               [meta].device can supply the port),
-               --guide [<file>] [--controller <port>] [--decks <n>] (unit map guide). Analysis
-               backends are `[preference.analysis]` in the config: beats/key = stratum|timestretch,
-               no auto.",
+startup flags: --config <file> (the one config file), --4-decks (four decks instead of two),
+               --cli (line REPL; the TUI is the default), --guide [<file>] (unit map guide, no
+               engine). Controllers come from the config's [[controller]] (device/map), never from a
+               flag. The deck count is the flag's, not the config's: [[multideck.deck]] only maps
+               decks to controller faces. Analysis backends are `[preference.analysis]` in the
+               config: beats/key = stratum|timestretch, no auto.",
         decks - 1
     )
 }

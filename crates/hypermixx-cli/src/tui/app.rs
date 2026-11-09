@@ -43,6 +43,10 @@ pub const DEFAULT_FRAMES_PER_CELL: f64 = 2_048.0;
 const LOG_CAP: usize = 500;
 /// Candidates shown in the completion popup.
 pub const COMPLETION_ROWS: usize = 8;
+/// How many decks one page of the control band drives, and how many deck rows the deck area stacks.
+/// Two decks per page is what the trans/pads/eq columns were designed around; four decks then read
+/// as two stacked pages, and the toggle in each trans column says which deck that column drives.
+pub const DECKS_PER_PAGE: usize = 2;
 
 /// Which prefix the command line currently speaks for.
 ///
@@ -337,6 +341,12 @@ pub enum Hit {
     },
     /// The header button that opens the settings screen.
     Settings,
+    /// Cycle the deck one control column drives (`column` 0 = left, 1 = right). `delta` is the
+    /// direction; the toggle button always sends `+1`.
+    DeckSlot {
+        column: usize,
+        delta: i8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -388,6 +398,10 @@ pub struct App {
     pub ring_frames: usize,
     pub decks: usize,
     pub focused: usize,
+    /// Which deck each control column (trans/pads/fx/eq/fader) drives, left then right. Defaults to
+    /// the first page; a column only ever shows decks of its own parity (`deck3` on the left,
+    /// `deck4` on the right), so the two halves of a four-deck rig pair up without colliding.
+    pub slots: [usize; DECKS_PER_PAGE],
     /// The command-line target: one deck, or the (still prefix-less) browser.
     pub target: Target,
     /// The browser pane: Miller columns plus the current list's tracks.
@@ -580,6 +594,7 @@ impl App {
             ring_frames: hypermixx_audio::OUTPUT_RING_CAPACITY,
             decks,
             focused: 0,
+            slots: std::array::from_fn(|column| column.min(decks - 1)),
             // A session starts in the library. The browser takes the arrow keys *and* the command
             // line: a bare deck verb is refused until `Tab` picks a deck (or the line names one).
             target: Target::Browser,
@@ -1288,8 +1303,49 @@ impl App {
         };
         if let Target::Deck(index) = self.target {
             self.focused = index;
+            self.show_deck(index);
         }
         self.refresh_completion();
+    }
+
+    /// The decks the control band draws, in column order (one per column, never more, never twice).
+    pub fn page_decks(&self) -> impl Iterator<Item = usize> + '_ {
+        self.slots
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(column, deck)| *deck < self.decks && (*column == 0 || *deck != self.slots[0]))
+            .map(|(_, deck)| deck)
+    }
+
+    /// Brings `deck` under the control band: what `Tab` does when it picks a deck, so the columns
+    /// below always describe a deck the command line can reach. A deck always lands on its own
+    /// column (index 0 is the left half, 1 the right), which is the column its toggle cycles.
+    pub fn show_deck(&mut self, deck: usize) {
+        if deck < self.decks {
+            self.slots[deck % DECKS_PER_PAGE] = deck;
+        }
+    }
+
+    /// The decks one column toggles through: deck1 ⇄ deck3 on the left, deck2 ⇄ deck4 on the right
+    /// for a four-deck rig. One column per parity keeps the two halves off the same deck.
+    pub fn column_decks(&self, column: usize) -> impl Iterator<Item = usize> + '_ {
+        (column % DECKS_PER_PAGE..self.decks).step_by(DECKS_PER_PAGE)
+    }
+
+    /// Cycles one column's deck, wrapping. It touches that column only: the other half keeps the
+    /// deck it was driving, which is what makes "flip the left side to deck 3" a single click.
+    pub fn cycle_slot(&mut self, column: usize, delta: isize) {
+        let column = column % DECKS_PER_PAGE;
+        let decks: Vec<usize> = self.column_decks(column).collect();
+        if decks.is_empty() {
+            return;
+        }
+        let at = decks
+            .iter()
+            .position(|deck| *deck == self.slots[column])
+            .unwrap_or(0) as isize;
+        self.slots[column] = decks[(at + delta).rem_euclid(decks.len() as isize) as usize];
     }
 
     pub fn zoom_in(&mut self) {

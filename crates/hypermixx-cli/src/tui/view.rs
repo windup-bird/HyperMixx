@@ -4,11 +4,18 @@
 //!
 //! ```text
 //! header                                                    (1 row)
-//! deck info: title · status · track overview                (4 rows)
-//! waveform, one per deck                                    (2 rows each)
+//! deck row 1: deck info for decks 1..=2 · track overview     (4 or 5 rows)
+//!             waveform, one per deck on that page            (2 or 3 rows each)
+//! deck row 2: the same for decks 3..=4 (only when there are more than two decks)
 //! 1trans | 1pads/1fx | 1eq/1beatctl | faders | 2trans | 2pads/2fx | 2eq/2beatctl
 //! browser : command                                         (fills the rest)
 //! ```
+//!
+//! The deck area always stacks *every* page of decks, so four decks show four waveforms; only the
+//! control band below it picks its pair, and each trans column's toggle picks its own: the left
+//! column cycles deck1 ⇄ deck3, the right one deck2 ⇄ deck4. That keeps the tracks in view — a DJ
+//! reads all four — while the pads, knobs and transport, which need a wide column each, stay at
+//! their designed size.
 //!
 //! The control band is the part that needs room, so it is drawn only when the terminal is large
 //! enough to keep the browser usable; on a small screen the whole band disappears and the interface
@@ -32,7 +39,7 @@ use crate::preference::Theme;
 use crate::response::{bpm_label, loop_length, sync_label, time, Level, LogLine};
 use crate::tui::app::{
     App, BeatMode, EqPanel, Hit, Knob, LoopHit, Overlay, PadMode, PadPanel, Target, TransportHit,
-    COMPLETION_ROWS,
+    COMPLETION_ROWS, DECKS_PER_PAGE,
 };
 use crate::tui::text::{center_to_width, pad_to_width, truncate_to_width, width};
 use crate::tui::{browser, overview, popup, settings, text};
@@ -41,9 +48,16 @@ use crate::tui::{browser, overview, popup, settings, text};
 const HEADER_H: u16 = 1;
 /// Deck info: a border, the status row, and a two-row overview.
 const INFO_H: u16 = 5;
+/// Deck info when the deck area is stacked (more than one page): a border, the status row and a
+/// single overview row. The stacked pages pay for the info row twice, so each one gives up its
+/// second overview row rather than pushing the browser off the screen.
+const INFO_H_STACK: u16 = 4;
 /// Height of the control band, borders included: the panel content plus the mode row, the group
 /// switch row, and the borders.
 const CONTROL_H: u16 = 10;
+/// The control band when the deck area is stacked: the two pads rows keep their labels but lose the
+/// third row of each pad, which pays for the second info row above.
+const CONTROL_H_STACK: u16 = 8;
 /// The borderless transport column. Four buttons stacked vertically, with air between them.
 const TRANS_W: u16 = 8;
 /// The fader / volume-bar / crossfader box in the middle of the band: two channel faders and the
@@ -72,58 +86,79 @@ const MIN_CONTROL_HEIGHT: u16 = 26;
 /// cell aspect (a square in pixels), so a taller cell simply gets a wider cover.
 const COVER_W: u16 = 10;
 
+/// One page of decks: the info row above the waveforms of the decks it holds.
+struct PageBand {
+    info: Rect,
+    wave: Rect,
+}
+
 /// The vertical bands of one frame.
 struct Bands {
     header: Rect,
-    info: Rect,
-    wave: Rect,
+    /// Top to bottom: the first page's info row and waveforms, then the second page's, … one page
+    /// per [`DECKS_PER_PAGE`] decks.
+    pages: Vec<PageBand>,
     controls: Option<Rect>,
     bottom: Rect,
 }
 
 fn bands(area: Rect, decks: usize) -> Bands {
+    let decks = decks.max(1);
+    // More than one page means the deck area is stacked: every page is drawn, one under the other.
+    let stacked = decks > DECKS_PER_PAGE;
+    let pages = decks.div_ceil(DECKS_PER_PAGE);
+    // Waveform rows per deck: three on a tall terminal (the waveform is what a DJ actually reads),
+    // two when height is tight. A stacked deck area starts a row lower on the budget, so it only
+    // takes the third row when there is real room for it.
+    let per_deck = match (stacked, area.height) {
+        (false, height) if height >= 34 => 3,
+        (true, height) if height >= 40 => 3,
+        _ => 2,
+    };
+    let info_h = if stacked { INFO_H_STACK } else { INFO_H };
+    let want_control = if stacked { CONTROL_H_STACK } else { CONTROL_H };
+
     let mut y = area.top();
     let header = Rect::new(area.x, y, area.width, HEADER_H.min(area.height));
     y += header.height;
 
-    // Waveform rows: three per deck on a tall terminal (the waveform is what a DJ actually reads),
-    // two when height is tight, one when four decks have to fit.
-    let tall = area.height >= 34;
-    let per_deck = match (decks, tall) {
-        (1..=2, true) => 3,
-        (1..=2, false) => 2,
-        (_, true) => 2,
-        _ => 1,
-    };
-    let want_wave = per_deck * decks as u16;
-    let want_controls = if area.width >= MIN_CONTROL_WIDTH && area.height >= MIN_CONTROL_HEIGHT {
-        CONTROL_H
-    } else {
-        0
-    };
+    // Waveforms first (they are what a DJ actually reads), then the info rows, then the control
+    // band; the browser keeps its floor. Each page then takes its share in that order, so a short
+    // terminal loses the later pages before it loses the first one.
     let mut available = area.bottom().saturating_sub(y).saturating_sub(MIN_BOTTOM_H);
-    let wave_h = want_wave.min(available);
-    available -= wave_h;
-    let info_h = INFO_H.min(available);
-    available -= info_h;
+    let mut wave_budget = (per_deck * decks as u16).min(available);
+    available -= wave_budget;
+    let mut info_budget = (info_h * pages as u16).min(available);
+    available -= info_budget;
     // All or nothing: half a control band is worse than none.
-    let controls_h = if want_controls > 0 && available >= want_controls {
-        want_controls
+    let controls_h = if area.width >= MIN_CONTROL_WIDTH
+        && area.height >= MIN_CONTROL_HEIGHT
+        && available >= want_control
+    {
+        want_control
     } else {
         0
     };
 
-    let info = Rect::new(area.x, y, area.width, info_h);
-    y += info_h;
-    let wave = Rect::new(area.x, y, area.width, wave_h);
-    y += wave_h;
-    let controls = (controls_h > 0).then(|| Rect::new(area.x, y, area.width, CONTROL_H));
+    let mut page_bands = Vec::with_capacity(pages);
+    for page in 0..pages {
+        let on_page = (decks - page * DECKS_PER_PAGE).min(DECKS_PER_PAGE) as u16;
+        let info = info_h.min(info_budget);
+        info_budget -= info;
+        let wave = (per_deck * on_page).min(wave_budget);
+        wave_budget -= wave;
+        page_bands.push(PageBand {
+            info: Rect::new(area.x, y, area.width, info),
+            wave: Rect::new(area.x, y + info, area.width, wave),
+        });
+        y += info + wave;
+    }
+    let controls = (controls_h > 0).then(|| Rect::new(area.x, y, area.width, controls_h));
     y += controls_h;
     let bottom = Rect::new(area.x, y, area.width, area.bottom().saturating_sub(y));
     Bands {
         header,
-        info,
-        wave,
+        pages: page_bands,
         controls,
         bottom,
     }
@@ -148,16 +183,21 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     render_top(frame, bands.header, app, &mut hits);
-    if bands.info.height > 0 {
-        let columns = Layout::horizontal(vec![Constraint::Fill(1); app.decks]).split(bands.info);
-        for (index, column) in columns.iter().enumerate() {
-            render_deck_info(frame, *column, app, index, suppress_images);
+    for (page, deck_band) in bands.pages.iter().enumerate() {
+        let first = page * DECKS_PER_PAGE;
+        let count = (app.decks - first).min(DECKS_PER_PAGE);
+        if deck_band.info.height > 0 {
+            let columns =
+                Layout::horizontal(vec![Constraint::Fill(1); count]).split(deck_band.info);
+            for (slot, column) in columns.iter().enumerate() {
+                render_deck_info(frame, *column, app, first + slot, suppress_images);
+            }
         }
-    }
-    if bands.wave.height > 0 {
-        let rows = Layout::vertical(vec![Constraint::Fill(1); app.decks]).split(bands.wave);
-        for (index, row) in rows.iter().enumerate() {
-            render_waveform(frame, *row, app, index, suppress_images);
+        if deck_band.wave.height > 0 {
+            let rows = Layout::vertical(vec![Constraint::Fill(1); count]).split(deck_band.wave);
+            for (slot, row) in rows.iter().enumerate() {
+                render_waveform(frame, *row, app, first + slot, suppress_images);
+            }
         }
     }
     if let Some(controls) = bands.controls {
@@ -349,8 +389,18 @@ fn render_deck_info(
     }
     let theme = app.theme;
     let focused = app.target == Target::Deck(deck);
+    // With stacked pages the command target can sit on the other page, so the decks the control
+    // band below drives keep a white border: the screen always shows which pair the pads and
+    // transport belong to, even while the command line speaks for a deck on the other page.
+    let border = if focused {
+        theme.accent
+    } else if app.decks > DECKS_PER_PAGE && app.slots.contains(&deck) {
+        theme.text
+    } else {
+        theme.dim
+    };
     let block = Block::bordered()
-        .border_style(Style::default().fg(if focused { theme.accent } else { theme.dim }))
+        .border_style(Style::default().fg(border))
         .title(Span::styled(
             format!(
                 " Deck{} · {} ",
@@ -800,7 +850,8 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App, hits: &mut Vec<(Rec
     if app.decks == 0 {
         return;
     }
-    // Literal order, repeated for deck 2: trans | pads/fx | eq/beatctl | faders | the same again.
+    // Literal order, repeated for the page's second deck: trans | pads/fx | eq/beatctl | faders |
+    // the same again. Which decks those are is `App::page` — the header of each trans column says.
     let columns = Layout::horizontal([
         Constraint::Length(TRANS_W),
         Constraint::Fill(1),
@@ -812,14 +863,18 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App, hits: &mut Vec<(Rec
     ])
     .split(area);
 
-    render_trans(frame, columns[0], app, 0, hits);
-    render_pad_group(frame, columns[1], app, 0, hits);
-    render_eq_group(frame, columns[2], app, 0, hits);
+    // The two columns' decks are independent: each trans toggle cycles its own half only.
+    let mut columns_decks = app.page_decks();
+    let first = columns_decks.next().unwrap_or(0);
+    let second = columns_decks.next();
+    render_trans(frame, columns[0], app, first, 0, hits);
+    render_pad_group(frame, columns[1], app, first, hits);
+    render_eq_group(frame, columns[2], app, first, hits);
     render_center(frame, columns[3], app, hits);
-    if app.decks >= 2 {
-        render_trans(frame, columns[4], app, 1, hits);
-        render_pad_group(frame, columns[5], app, 1, hits);
-        render_eq_group(frame, columns[6], app, 1, hits);
+    if let Some(second) = second {
+        render_trans(frame, columns[4], app, second, 1, hits);
+        render_pad_group(frame, columns[5], app, second, hits);
+        render_eq_group(frame, columns[6], app, second, hits);
     }
 }
 
@@ -852,12 +907,15 @@ fn render_eq_group(
 }
 
 /// The borderless transport column. Four buttons, vertically centred with a blank row between
-/// them; no box, because the deck group already reads as one instrument.
+/// them; no box, because the deck group already reads as one instrument. When there is more than one
+/// page of decks it grows a fifth row on top — the deck toggle, which names the deck this column
+/// drives and cycles only this column to the next one.
 fn render_trans(
     frame: &mut Frame,
     area: Rect,
     app: &App,
     deck: usize,
+    column: usize,
     hits: &mut Vec<(Rect, Hit)>,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -871,11 +929,29 @@ fn render_trans(
         (TransportHit::Cue, "cue"),
         (TransportHit::Play, "play"),
     ];
-    let step = (area.height / rows.len() as u16).max(1);
-    let used = (rows.len() as u16 - 1) * step + 1;
+    let paged = app.decks > DECKS_PER_PAGE;
+    let slots = rows.len() as u16 + u16::from(paged);
+    let step = (area.height / slots).max(1);
+    let used = (slots - 1) * step + 1;
     let top = area.y + area.height.saturating_sub(used) / 2;
+    if paged {
+        // `deck3` rather than an arrow: the button answers "which deck am I editing?" before it is
+        // clicked, and the two columns answer for themselves.
+        let rect = Rect::new(area.x, top, area.width, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                center_to_width(
+                    &format!("deck{}", deck + 1),
+                    rect.width as usize,
+                ),
+                mode_style(app, true),
+            ))),
+            rect,
+        );
+        hit(hits, rect, Hit::DeckSlot { column, delta: 1 });
+    }
     for (index, (action, text)) in rows.iter().enumerate() {
-        let y = top + index as u16 * step;
+        let y = top + (index as u16 + u16::from(paged)) * step;
         if y >= area.bottom() {
             break;
         }
@@ -913,12 +989,12 @@ fn render_trans(
     }
 }
 
-/// The fader / volume-bar / crossfader box: one fader and one level column per deck, with the
-/// crossfader (drawn exactly like a fader, but horizontal) in the bottom row of the same frame.
+/// The fader / volume-bar / crossfader box: one fader and one level column per control column, with
+/// the crossfader (drawn exactly like a fader, but horizontal) in the bottom row of the same frame.
 ///
-/// The two level columns are the *decks'* levels — left for deck 1, right for deck 2 — and they sit
-/// on their own side of the middle, which leaves the centre of the frame empty so the crossfader's
-/// halfway point lands on it.
+/// The two level columns are the *decks'* levels — left for the deck the left columns drive, right
+/// for the deck the right ones drive — and they sit on their own side of the middle, which leaves
+/// the centre of the frame empty so the crossfader's halfway point lands on it.
 fn render_center(frame: &mut Frame, area: Rect, app: &App, hits: &mut Vec<(Rect, Hit)>) {
     if area.width < 10 || area.height < 5 {
         return;
@@ -960,11 +1036,14 @@ fn render_center(frame: &mut Frame, area: Rect, app: &App, hits: &mut Vec<(Rect,
         Constraint::Length(fader_w),
     ])
     .split(top);
-    render_gauge(frame, columns[0], app, 0, hits);
-    render_meter(frame, columns[2], app, 0);
-    if app.decks >= 2 {
-        render_meter(frame, columns[4], app, 1);
-        render_gauge(frame, columns[6], app, 1, hits);
+    let mut columns_decks = app.page_decks();
+    let first = columns_decks.next().unwrap_or(0);
+    let second = columns_decks.next();
+    render_gauge(frame, columns[0], app, first, hits);
+    render_meter(frame, columns[2], app, first);
+    if let Some(second) = second {
+        render_meter(frame, columns[4], app, second);
+        render_gauge(frame, columns[6], app, second, hits);
     }
     render_crossfader(
         frame,
@@ -1201,13 +1280,16 @@ fn render_fx(frame: &mut Frame, area: Rect, app: &App, deck: usize, hits: &mut V
             );
             return;
         }
-        // The first two non-beat parameters, in declaration order.
+        // The first two non-beat parameters, in declaration order. The last content row belongs to
+        // the beat division, so the stacked band (three content rows) shows one parameter rather
+        // than drawing the second one under the beats row.
         let params: Vec<(usize, &hypermixx_core::FxParamStatus)> = slot
             .params
             .iter()
             .enumerate()
             .filter(|(_, param)| param.beats == 0)
             .take(2)
+            .take(content_rows.saturating_sub(2) as usize)
             .collect();
         for (row, (param_index, param)) in params.iter().enumerate() {
             if row as u16 + 1 >= content_rows {
@@ -1232,7 +1314,9 @@ fn render_fx(frame: &mut Frame, area: Rect, app: &App, deck: usize, hits: &mut V
             .enumerate()
             .find(|(_, param)| param.beats != 0)
         {
-            let row = (1 + params.len() as u16).min(content_rows.saturating_sub(1));
+            let row = (1 + params.len() as u16)
+                .min(content_rows.saturating_sub(1))
+                .max(1);
             let rect = line(inner, row, 0, inner.width);
             let half = Rect::new(rect.x, rect.y, rect.width / 2, 1);
             let double = Rect::new(
@@ -2323,6 +2407,43 @@ mod tests {
         app
     }
 
+    /// Four decks: the deck area stacks a page per pair and the control band drives one pair.
+    fn stacked_app() -> App {
+        let (_notice_tx, notice_rx) = crossbeam_channel::unbounded();
+        let (_event_tx, event_rx) = crossbeam_channel::unbounded();
+        let mut app = App::new(
+            4,
+            Backends::default(),
+            notice_rx,
+            event_rx,
+            Default::default(),
+            Default::default(),
+        );
+        app.meters = Some(Meters {
+            master_peak: 0.1,
+            cue_peak: 0.05,
+            master_reduction_db: 0.0,
+            overruns: 0,
+            deck_peaks: vec![0.2, 0.1, 0.1, 0.2],
+            channels: vec![
+                ChannelLevels {
+                    flow: 0.0,
+                    deck: 0.0,
+                    crossfader: 0.0,
+                    cue_send: 1.0,
+                    gain: 0.0,
+                };
+                4
+            ],
+        });
+        for deck in 0..4 {
+            app.titles[deck] = Some(format!("deck{}.mp3", deck + 1));
+            app.states[deck].total_frames = 100_000;
+            app.states[deck].bpm = 120.0;
+        }
+        app
+    }
+
     fn render_at(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2410,6 +2531,175 @@ mod tests {
         assert!(
             !all_text(&narrow).contains("pads"),
             "a narrow terminal drops the whole control band"
+        );
+    }
+
+    #[test]
+    fn four_decks_stack_two_pages_of_bands() {
+        let tall = bands(Rect::new(0, 0, 120, 40), 4);
+        assert_eq!(tall.pages.len(), 2, "one page per pair of decks");
+        assert_eq!(
+            tall.pages[0].info.height, INFO_H_STACK,
+            "a stacked info row gives up its second overview row"
+        );
+        assert_eq!(
+            tall.pages[0].wave.height, 6,
+            "three rows for each of the page's two decks"
+        );
+        assert_eq!(tall.pages[1].info.y, tall.pages[0].wave.bottom());
+        assert_eq!(
+            tall.controls.map(|rect| rect.height),
+            Some(CONTROL_H_STACK),
+            "two-row pads instead of three"
+        );
+        assert!(tall.bottom.height >= MIN_BOTTOM_H, "{:?}", tall.bottom);
+
+        // A short terminal keeps both pages and drops to two waveform rows per deck.
+        let short = bands(Rect::new(0, 0, 120, 32), 4);
+        assert_eq!(short.pages.len(), 2);
+        assert_eq!(short.pages[0].wave.height, 4);
+        assert!(short.controls.is_some());
+        assert!(short.bottom.height >= MIN_BOTTOM_H, "{:?}", short.bottom);
+
+        // Three decks: the last page holds one deck and still gets its own bands.
+        let three = bands(Rect::new(0, 0, 120, 40), 3);
+        assert_eq!(three.pages.len(), 2);
+        assert_eq!(
+            three.pages[1].wave.height, 3,
+            "one deck keeps all three rows"
+        );
+    }
+
+    #[test]
+    fn four_decks_show_every_waveform_but_one_pair_of_controls() {
+        let mut app = stacked_app();
+        let buffer = render_at(&mut app, 120, 40);
+        let text = all_text(&buffer);
+        for deck in 1..=4 {
+            assert!(text.contains(&format!("Deck{deck}")), "Deck{deck}: {text}");
+            assert!(
+                text.contains(&format!("deck{deck}.mp3")),
+                "deck{deck}.mp3: {text}"
+            );
+        }
+        // The columns start on the first pair; the other two decks have no pads or knobs.
+        for title in ["1-pads", "2-pads", "1-eq", "2-eq"] {
+            assert!(text.contains(title), "{title}: {text}");
+        }
+        for title in ["3-pads", "4-pads", "3-eq", "4-eq"] {
+            assert!(!text.contains(title), "{title} is not in a column: {text}");
+        }
+        assert_eq!(text.matches("sync").count(), 2, "{text}");
+
+        // Each column's toggle names the deck that column drives.
+        let toggles: Vec<(Rect, usize)> = app
+            .hits
+            .iter()
+            .filter_map(|(rect, hit)| match hit {
+                Hit::DeckSlot { column, .. } => Some((*rect, *column)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(toggles.len(), 2, "one toggle per trans column");
+        for (rect, column) in &toggles {
+            let row = row_text(&buffer, rect.y);
+            assert!(
+                row.contains(&format!("deck{}", column + 1)),
+                "column {column} names its deck: {row}"
+            );
+        }
+
+        // Flipping the left column alone brings deck 3 under the pads and leaves the right column
+        // (deck 2) exactly where it was.
+        app.target = Target::Deck(0);
+        app.cycle_slot(0, 1);
+        assert_eq!(app.slots, [2, 1]);
+        let buffer = render_at(&mut app, 120, 40);
+        let text = all_text(&buffer);
+        for title in ["3-pads", "2-pads", "3-eq", "2-eq"] {
+            assert!(text.contains(title), "{title}: {text}");
+        }
+        for title in ["1-pads", "1-eq", "4-pads", "4-eq"] {
+            assert!(!text.contains(title), "{title} is out: {text}");
+        }
+        // Every deck keeps its info and waveform; only the columns change.
+        for deck in 1..=4 {
+            assert!(text.contains(&format!("Deck{deck}")), "Deck{deck}: {text}");
+        }
+        let labels: Vec<String> = toggles
+            .iter()
+            .map(|(rect, _)| row_text(&buffer, rect.y))
+            .collect();
+        assert!(
+            labels.iter().any(|row| row.contains("deck3")),
+            "the left toggle follows its column: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|row| row.contains("deck2")),
+            "the right toggle stays on deck 2: {labels:?}"
+        );
+        // The pad hits reach the decks the columns now drive.
+        let pads: Vec<usize> = app
+            .hits
+            .iter()
+            .filter_map(|(_, hit)| match hit {
+                Hit::Pad { deck, .. } => Some(*deck),
+                _ => None,
+            })
+            .collect();
+        assert!(pads.contains(&2) && pads.contains(&1), "{pads:?}");
+    }
+
+    #[test]
+    fn four_decks_survive_small_terminals_and_two_decks_have_no_toggle() {
+        let mut app = stacked_app();
+        for (width, height) in [(120, 26), (120, 30), (120, 32), (100, 40), (150, 60)] {
+            let buffer = render_at(&mut app, width, height);
+            assert!(
+                all_text(&buffer).contains("browser"),
+                "{width}x{height} keeps the browser"
+            );
+        }
+        // With a single page there is nothing to flip, so the trans column stays four buttons.
+        let mut app = test_app();
+        let buffer = render_at(&mut app, 120, 40);
+        assert!(
+            !app.hits
+                .iter()
+                .any(|(_, hit)| matches!(hit, Hit::DeckSlot { .. })),
+            "two decks need no deck toggle"
+        );
+        assert_eq!(all_text(&buffer).matches("play").count(), 2);
+    }
+
+    #[test]
+    fn the_decks_under_the_control_band_keep_a_white_border() {
+        let mut app = stacked_app();
+        // The command line speaks for deck 1 while the columns drive decks 3-4: no panel is
+        // accented, but the two decks under the pads keep a white border so the pairing is on screen.
+        app.target = Target::Deck(0);
+        app.cycle_slot(0, 1);
+        app.cycle_slot(1, 1);
+        let buffer = render_at(&mut app, 120, 40);
+        let pages = bands(buffer.area, 4).pages;
+        let under = pages[1].info;
+        let column = under.width / 2;
+        assert_eq!(
+            buffer.cell((under.x, under.y)).map(|cell| cell.fg),
+            Some(app.theme.text),
+            "the deck under the pads is white"
+        );
+        assert_eq!(
+            buffer.cell((under.x + column, under.y)).map(|cell| cell.fg),
+            Some(app.theme.text),
+            "both of its decks are white"
+        );
+        assert_eq!(
+            buffer
+                .cell((pages[0].info.x, pages[0].info.y))
+                .map(|cell| cell.fg),
+            Some(app.theme.accent),
+            "the command target keeps the accent on the other page"
         );
     }
 
@@ -2516,9 +2806,9 @@ mod tests {
         let buffer = render_at(&mut app, 120, 40);
         // The overview sits in the deck info band, below the status row.
         let band = bands(buffer.area, app.decks);
-        assert!(band.info.height >= 3);
-        let overview_row = band.info.y + 2;
-        let reds: Vec<u16> = (0..band.info.width)
+        assert!(band.pages[0].info.height >= 3);
+        let overview_row = band.pages[0].info.y + 2;
+        let reds: Vec<u16> = (0..band.pages[0].info.width)
             .filter(|x| {
                 buffer
                     .cell((*x, overview_row))
@@ -2528,7 +2818,7 @@ mod tests {
         assert!(!reds.is_empty(), "no playhead in the overview");
         // Halfway through the track, measured across the deck's own column (the cover takes the
         // first few cells of the band).
-        let deck_column = band.info.width / app.decks as u16;
+        let deck_column = band.pages[0].info.width / app.decks as u16;
         let center = deck_column / 2;
         assert!(
             reds.iter().any(|x| x.abs_diff(center) <= COVER_W + 2),
@@ -2563,8 +2853,8 @@ mod tests {
         let red_x = |app: &mut App| {
             let buffer = render_at(app, 120, 40);
             let band = bands(buffer.area, app.decks);
-            let row = band.info.y + 2;
-            (0..band.info.width)
+            let row = band.pages[0].info.y + 2;
+            (0..band.pages[0].info.width)
                 .find(|x| {
                     buffer
                         .cell((*x, row))
@@ -2822,9 +3112,12 @@ mod tests {
         let mut app = test_app();
         let tall = bands(Rect::new(0, 0, 120, 40), app.decks);
         let short = bands(Rect::new(0, 0, 120, 32), app.decks);
-        assert_eq!(tall.wave.height, 6, "three rows per deck at 40 rows");
         assert_eq!(
-            short.wave.height, 4,
+            tall.pages[0].wave.height, 6,
+            "three rows per deck at 40 rows"
+        );
+        assert_eq!(
+            short.pages[0].wave.height, 4,
             "two rows per deck when height is tight"
         );
         assert!(short.controls.is_some(), "the band still fits at 32 rows");
@@ -2933,12 +3226,12 @@ mod tests {
         // Inside the deck-info border: a square (6 columns for 3 rows at the default cell size),
         // filled with chrome and nothing written over it.
         let cell = buffer
-            .cell((band.info.x + 1, band.info.y + 1))
+            .cell((band.pages[0].info.x + 1, band.pages[0].info.y + 1))
             .expect("cover cell");
         assert_eq!(cell.bg, app.theme.dim, "no cover means a dim block");
         assert_eq!(cell.symbol(), " ", "no letter over the artwork slot");
         let beside = buffer
-            .cell((band.info.x + 7, band.info.y + 1))
+            .cell((band.pages[0].info.x + 7, band.pages[0].info.y + 1))
             .expect("after the square");
         assert_ne!(beside.bg, app.theme.dim, "the square ends before the text");
     }
@@ -2967,8 +3260,8 @@ mod tests {
         }));
         let buffer = render_at(&mut app, 120, 40);
         let band = bands(buffer.area, app.decks);
-        let (left, top) = (band.info.x + 1, band.info.y + 1);
-        let rows = band.info.height.saturating_sub(2);
+        let (left, top) = (band.pages[0].info.x + 1, band.pages[0].info.y + 1);
+        let rows = band.pages[0].info.height.saturating_sub(2);
         let cell = app.waveform_view.cell_px();
         // The same rule the renderer uses: a square in pixels.
         let square_w = (u32::from(rows) * u32::from(cell.height) / u32::from(cell.width)) as u16;
