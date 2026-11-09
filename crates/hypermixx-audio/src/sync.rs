@@ -22,14 +22,25 @@
 //!   into the shared speed.
 //! * **`phase` includes `tempo`, `phaselock` includes `tempolock`.** Both locks are built the same
 //!   way; `phaselock` just stops the leader from being driven by the group.
+//! * **The leader is automatic until the DJ names one.** The first deck that starts playing leads;
+//!   while it plays nothing steals the lead, and when it stops the loudest deck still playing takes
+//!   over. A lock freezes that choice, and `sync set-leader` overrides it outright.
+
+use std::cmp::Ordering;
 
 use hypermixx_core::{DeckId, NudgeOp, PhaseMode, SyncOp};
 
-use crate::deck::{LeaderSample, PhaseAlign, SyncCtx, MAX_RATE, MAX_TEMPO_RANGE, MIN_RATE};
+use crate::deck::{
+    LeaderSample, PhaseAlign, SyncCtx, BLOCK_SECONDS, MAX_RATE, MAX_TEMPO_RANGE, MIN_RATE,
+};
 use crate::mixer::Mixer;
 
 /// Why sync needs a grid the deck does not have.
 const NO_GRID: &str = "sync needs a beat grid — `analyse` the track, or load it with a bpm";
+/// Time constant of the output-level average the automatic leader compares when it has to move
+/// after the current leader stops. Long enough to ignore a kick drum, short enough to follow a
+/// crossfader move within a beat or two.
+const LEADER_LEVEL_TAU_SECONDS: f64 = 0.2;
 
 /// What a sync group is doing to a pair of decks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -72,6 +83,16 @@ pub struct SyncGroup {
     pub group_bpm: f64,
     /// This block's positions, one slot per channel, filled by [`SyncGroup::prepare`].
     samples: Vec<Option<LeaderSample>>,
+    /// The order in which each deck most recently *started* playing, or `None` while it is paused.
+    /// The earliest start wins when an automatic leader has to be elected for the first time.
+    started: Vec<Option<u64>>,
+    /// Monotonic counter for [`started`](Self::started).
+    next_start: u64,
+    /// Whether each deck was playing on the previous block, for start-edge detection.
+    last_playing: Vec<bool>,
+    /// Smoothed `Channel::peak()` per deck: the current output level an automatic leader switch
+    /// compares. Peak alone is too twitchy, and fader position alone ignores a quiet track.
+    level: Vec<f32>,
 }
 
 impl SyncGroup {
@@ -85,18 +106,40 @@ impl SyncGroup {
     /// nothing flows back up), then hand each deck the view it needs for this block.
     pub fn prepare(&mut self, mixer: &mut Mixer) {
         let count = mixer.channel_count();
+        self.resize(count);
+        // The output level is a peak; a short exponential average keeps a kick drum from deciding
+        // who leads while still following a crossfader move.
+        let dt = {
+            let dt = mixer.block_seconds();
+            if dt.is_finite() && dt > 0.0 {
+                dt
+            } else {
+                BLOCK_SECONDS
+            }
+        };
+        let alpha = (1.0 - (-dt / LEADER_LEVEL_TAU_SECONDS).exp()) as f32;
         self.samples.clear();
         for index in 0..count {
-            let sample = mixer.deck(index).and_then(|deck| {
-                deck.beat_phase().map(|phase| LeaderSample {
-                    deck_id: index as DeckId,
-                    phase: Some(phase),
-                    bpm: deck.bpm_at_frame(),
-                    tempo: deck.tempo(),
-                })
-            });
+            let (sample, playing, peak) = match mixer.channel(index) {
+                Some(channel) => {
+                    let deck = channel.deck();
+                    (
+                        deck.beat_phase().map(|phase| LeaderSample {
+                            deck_id: index as DeckId,
+                            phase: Some(phase),
+                            bpm: deck.bpm_at_frame(),
+                            tempo: deck.tempo(),
+                        }),
+                        deck.is_playing(),
+                        channel.peak(),
+                    )
+                }
+                None => (None, false, 0.0),
+            };
             self.samples.push(sample);
+            self.observe(index, playing, peak, alpha);
         }
+        self.auto_leader_step(mixer);
         if self.mode == SyncMode::Phaselock {
             if let Some(leader) = self.leader_sample() {
                 if leader.bpm > 0.0 {
@@ -110,6 +153,166 @@ impl SyncGroup {
                 deck.set_sync(Some(ctx));
             }
         }
+    }
+
+    /// Makes the automatic leader follow the DJ's transport and levels.
+    ///
+    /// The rule is deliberately event-like, not a continuous popularity contest:
+    ///
+    /// * no leader yet -> the first deck that started playing (with a usable grid) leads;
+    /// * the leader is still playing -> nothing moves, even if another deck is louder;
+    /// * the leader stopped -> the loudest deck that is still playing takes over, with the earlier
+    ///   start breaking a level tie.
+    ///
+    /// A locked pair keeps its leader: reversing a running phaselock during a set is never what the
+    /// DJ meant. An explicit `sync set-leader` wins over all of this.
+    fn auto_leader_step(&mut self, mixer: &Mixer) {
+        if self.explicit || self.mode != SyncMode::Free {
+            return;
+        }
+        let count = mixer.channel_count();
+        if count == 0 {
+            self.leader = None;
+            self.follower = None;
+            return;
+        }
+        let Some(leader) = self.leader else {
+            if let Some(first) = self.first_playing(mixer, count, None) {
+                self.leader = Some(first);
+                self.follower = None;
+            }
+            return;
+        };
+        if mixer
+            .deck(leader as usize)
+            .is_some_and(crate::deck::Deck::is_playing)
+        {
+            return;
+        }
+        if let Some(next) = self.loudest_playing(mixer, count, None) {
+            if next != leader {
+                self.leader = Some(next);
+                self.follower = None;
+            }
+        }
+    }
+
+    /// Grows/trims the per-channel bookkeeping after a mixer reload changed the deck count.
+    fn resize(&mut self, count: usize) {
+        self.started.resize(count, None);
+        self.last_playing.resize(count, false);
+        self.level.resize(count, 0.0);
+        if self.follower.is_some_and(|deck| deck as usize >= count) {
+            self.follower = None;
+        }
+        if self.leader.is_some_and(|deck| deck as usize >= count) {
+            self.leader = None;
+            self.follower = None;
+            self.explicit = false;
+        }
+    }
+
+    /// One block of play-edge and output-level bookkeeping for `index`.
+    fn observe(&mut self, index: usize, playing: bool, peak: f32, alpha: f32) {
+        let was_playing = self.last_playing[index];
+        if playing && !was_playing {
+            self.started[index] = Some(self.next_start);
+            self.next_start = self.next_start.wrapping_add(1);
+        } else if !playing {
+            self.started[index] = None;
+        }
+        self.last_playing[index] = playing;
+
+        let peak = if peak.is_finite() { peak.max(0.0) } else { 0.0 };
+        let level = &mut self.level[index];
+        *level += (peak - *level) * alpha;
+        if *level < 1e-6 {
+            *level = 0.0;
+        }
+    }
+
+    /// The deck that started playing first among the current playing set.
+    fn first_playing(
+        &self,
+        mixer: &Mixer,
+        count: usize,
+        exclude: Option<DeckId>,
+    ) -> Option<DeckId> {
+        (0..count as DeckId)
+            .filter(|&deck| Some(deck) != exclude)
+            .filter(|&deck| Self::usable_leader(mixer, deck))
+            .filter(|&deck| {
+                mixer
+                    .deck(deck as usize)
+                    .is_some_and(crate::deck::Deck::is_playing)
+            })
+            .min_by_key(|&deck| (self.start_order(deck), deck))
+    }
+
+    /// The playing deck with the highest smoothed output level.
+    fn loudest_playing(
+        &self,
+        mixer: &Mixer,
+        count: usize,
+        exclude: Option<DeckId>,
+    ) -> Option<DeckId> {
+        self.loudest(mixer, count, exclude, true)
+    }
+
+    /// The loaded, grid-bearing deck with the highest smoothed output level.
+    fn loudest(
+        &self,
+        mixer: &Mixer,
+        count: usize,
+        exclude: Option<DeckId>,
+        playing_only: bool,
+    ) -> Option<DeckId> {
+        let mut best = None;
+        for deck in 0..count as DeckId {
+            if Some(deck) == exclude || !Self::usable_leader(mixer, deck) {
+                continue;
+            }
+            if playing_only
+                && !mixer
+                    .deck(deck as usize)
+                    .is_some_and(crate::deck::Deck::is_playing)
+            {
+                continue;
+            }
+            best = Some(match best {
+                None => deck,
+                Some(current) if self.leads_over(deck, current) => deck,
+                Some(current) => current,
+            });
+        }
+        best
+    }
+
+    /// Whether `a` should lead over `b`: louder first, then the earlier start, then the lower id.
+    fn leads_over(&self, a: DeckId, b: DeckId) -> bool {
+        let a_level = self.level.get(a as usize).copied().unwrap_or(0.0);
+        let b_level = self.level.get(b as usize).copied().unwrap_or(0.0);
+        match a_level.partial_cmp(&b_level) {
+            Some(Ordering::Greater) => true,
+            Some(Ordering::Less) => false,
+            _ => (self.start_order(a), a) < (self.start_order(b), b),
+        }
+    }
+
+    fn start_order(&self, deck: DeckId) -> u64 {
+        self.started
+            .get(deck as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(u64::MAX)
+    }
+
+    /// A leader must have a track and a grid; a deck that cannot be compared would only turn the
+    /// `sync` command into a later error.
+    fn usable_leader(mixer: &Mixer, deck: DeckId) -> bool {
+        mixer
+            .deck(deck as usize)
+            .is_some_and(|deck| deck.total_frames() > 0 && deck.bpm_at_frame() > 0.0)
     }
 
     /// This block's view for `deck_id`: the shared BPM plus whoever it tracks.
@@ -169,38 +372,49 @@ impl SyncGroup {
                 ));
             }
         }
+        // Syncing a deck *to* an explicit leader restates the same lead; it must not quietly turn
+        // that leader back into an automatic one.
+        let stays_explicit = self.explicit && self.leader == Some(leader);
         self.leader = Some(leader);
-        self.explicit = false;
+        self.explicit = stays_explicit;
         self.follower = Some(target);
         Ok(())
     }
 
-    /// The deck `target` follows: the recorded leader, else the only other deck there is.
+    /// The deck `target` follows.
     ///
-    /// With more than two decks and no explicit leader the answer is genuinely ambiguous, and a
-    /// guess that happens to be wrong puts both tracks at the wrong tempo — so it is refused and
-    /// the user is told which command settles it.
+    /// An explicit or already-recorded leader wins. Otherwise the first deck that started playing
+    /// leads; with nobody playing, the loudest loaded deck with a grid is the fallback. A two-deck
+    /// mixer keeps the old diagnostic (the other deck is returned even without a grid) so a missing
+    /// analysis still says *which* deck lacks the grid.
     fn resolve_leader(&self, mixer: &Mixer, target: DeckId) -> Result<DeckId, String> {
-        match self.leader {
-            Some(leader) if leader != target => Ok(leader),
-            Some(leader) if self.explicit => Err(format!(
-                "{} is the leader ({}) — sync another deck to it, or move the lead with \
-                 `deckN sync set-leader`",
-                hypermixx_core::deck_label(target),
-                hypermixx_core::deck_label(leader)
-            )),
-            _ => {
-                let mut others = (0..mixer.channel_count() as DeckId).filter(|&id| id != target);
-                match (others.next(), others.next()) {
-                    (Some(only), None) => Ok(only),
-                    _ => Err(format!(
-                        "no leader for {} — with this many decks pick one with \
-                         `deckN sync set-leader`",
-                        hypermixx_core::deck_label(target)
-                    )),
-                }
+        if let Some(leader) = self.leader {
+            if leader != target {
+                return Ok(leader);
             }
+            return Err(format!(
+                "{} is the leader — sync another deck to it, or move the lead with \
+                 `deckN sync set-leader`",
+                hypermixx_core::deck_label(target)
+            ));
         }
+        let count = mixer.channel_count();
+        if count <= 2 {
+            return (0..count as DeckId)
+                .find(|&id| id != target)
+                .ok_or_else(|| "sync needs another deck".to_owned());
+        }
+        if let Some(first) = self.first_playing(mixer, count, Some(target)) {
+            return Ok(first);
+        }
+        self.loudest(mixer, count, Some(target), false)
+            .ok_or_else(|| {
+                format!(
+                    "no leader for {} — no other deck has a beat grid; load/analyse one or \
+                     `deckN sync set-leader`",
+                    hypermixx_core::deck_label(target)
+                )
+            })
     }
 
     /// Both BPMs a tempo match needs, read at the positions the two decks are actually at.
@@ -331,6 +545,9 @@ impl SyncGroup {
     /// does not drag the other deck with it.
     fn sync_tempo(&mut self, mixer: &mut Mixer, deck_id: DeckId) -> Result<(), String> {
         Self::require_track(mixer, deck_id)?;
+        // A pause and the next sync can land in the same block; the per-block `prepare` step has
+        // not necessarily seen the leader stop yet.
+        self.auto_leader_step(mixer);
         let leader = self.resolve_leader(mixer, deck_id)?;
         let (leader_bpm, own_bpm) = Self::match_bpm(mixer, leader, deck_id)?;
         self.track(leader, deck_id)?;
@@ -345,6 +562,7 @@ impl SyncGroup {
     /// block, so whichever fader moves, the other deck follows on the next block.
     fn sync_tempolock(&mut self, mixer: &mut Mixer, deck_id: DeckId) -> Result<(), String> {
         Self::require_track(mixer, deck_id)?;
+        self.auto_leader_step(mixer);
         let leader = self.resolve_leader(mixer, deck_id)?;
         let (leader_bpm, own_bpm) = Self::match_bpm(mixer, leader, deck_id)?;
         self.track(leader, deck_id)?;
@@ -373,6 +591,7 @@ impl SyncGroup {
         align: PhaseAlign,
     ) -> Result<(), String> {
         Self::require_track(mixer, deck_id)?;
+        self.auto_leader_step(mixer);
         let leader = self.resolve_leader(mixer, deck_id)?;
         let (leader_bpm, own_bpm) = Self::match_bpm(mixer, leader, deck_id)?;
         self.track(leader, deck_id)?;

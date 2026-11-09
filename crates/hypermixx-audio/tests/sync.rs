@@ -6,13 +6,15 @@
 mod common;
 
 use common::{
-    ack, ask, constant_grid, decode_wav, expect_error, load_both, session, sleep, state, states,
+    ack, ask, constant_grid, decode_wav, expect_error, load, load_both, session, session_with,
+    sleep, state, states,
 };
 use crossbeam_channel::{Receiver, Sender};
 use hypermixx_audio::deck::wrap_phase;
 use hypermixx_audio::{
     BeatGrid, Command, CommandResponse, DeckId, NudgeOp, PhaseMode, SyncOp, SAMPLE_RATE,
 };
+use hypermixx_core::FaderTarget;
 
 const BPM: f32 = 122.0;
 /// How long a flow switch needs before its landing is readable.
@@ -38,6 +40,24 @@ fn seed(
 /// leader phase − follower phase, folded into `[-0.5, 0.5]`.
 fn phase_gap(grid: &BeatGrid, leader: u64, follower: u64) -> f64 {
     wrap_phase(f64::from(grid.phase(leader)) - f64::from(grid.phase(follower)))
+}
+
+/// Four loaded, analysed decks, all playing the same generated source.
+fn four_decks(
+    name: &str,
+    bpm: [f32; 4],
+) -> (
+    Sender<Command>,
+    Receiver<CommandResponse>,
+    hypermixx_audio::AudioPipeline,
+) {
+    let (tx, rx, pipeline) = session_with(4);
+    let source = decode_wav(name, 20);
+    for deck_id in 0..4u8 {
+        let total = load(&tx, &rx, deck_id, source.clone());
+        seed(&tx, &rx, deck_id, bpm[deck_id as usize], total);
+    }
+    (tx, rx, pipeline)
 }
 
 // ---------------------------------------------------------------- sync tempo
@@ -82,6 +102,146 @@ fn sync_tempo_puts_both_decks_on_one_beat_rate() {
     assert!(
         (leader_beats - follower_beats).abs() < 1e-3,
         "beat rates must match: {leader_beats} vs {follower_beats}"
+    );
+
+    ask(&tx, Command::Quit);
+    ack(&rx);
+}
+
+#[test]
+fn a_four_deck_rig_uses_the_first_deck_that_plays_as_leader() {
+    let (tx, rx, _pipeline) = four_decks("sync-four-first-play.wav", [122.0, 128.0, 124.0, 130.0]);
+
+    // The first deck to play owns the lead; a later deck starting does not take it just because it
+    // is playing too.
+    ask(&tx, Command::Play { deck_id: 0 });
+    ack(&rx);
+    sleep(150);
+    ask(&tx, Command::Play { deck_id: 1 });
+    ack(&rx);
+    sleep(150);
+
+    ask(
+        &tx,
+        Command::Sync {
+            deck_id: 3,
+            op: SyncOp::Tempo,
+        },
+    );
+    ack(&rx);
+
+    let follower = state(&tx, &rx, 3);
+    assert_eq!(
+        follower.sync_leader,
+        Some(0),
+        "deck4 should follow the first deck that played"
+    );
+    let expected = 122.0f64 / 130.0;
+    assert!(
+        (f64::from(follower.tempo) - expected).abs() < 1e-3,
+        "follower tempo {} must be 122/130",
+        follower.tempo
+    );
+
+    ask(&tx, Command::Quit);
+    ack(&rx);
+}
+
+#[test]
+fn a_stopped_leader_hands_over_to_the_loudest_playing_deck() {
+    let (tx, rx, _pipeline) = four_decks("sync-four-handover.wav", [122.0; 4]);
+
+    ask(&tx, Command::Play { deck_id: 0 });
+    ack(&rx);
+    sleep(150);
+    ask(&tx, Command::Play { deck_id: 1 });
+    ack(&rx);
+    ask(&tx, Command::Play { deck_id: 2 });
+    ack(&rx);
+    sleep(300);
+
+    // While the first-played leader is running, a louder deck does not steal the lead.
+    ask(
+        &tx,
+        Command::SetFader {
+            target: FaderTarget::Deck(1),
+            value: -0.8,
+        },
+    );
+    ack(&rx);
+    sleep(350);
+    ask(
+        &tx,
+        Command::Sync {
+            deck_id: 3,
+            op: SyncOp::Tempo,
+        },
+    );
+    ack(&rx);
+    assert_eq!(
+        state(&tx, &rx, 3).sync_leader,
+        Some(0),
+        "a playing leader keeps the lead even when another deck is louder"
+    );
+
+    // Once it stops, the loudest deck still playing takes over: deck2 has the louder fader.
+    ask(&tx, Command::Pause { deck_id: 0 });
+    ack(&rx);
+    sleep(400);
+    ask(
+        &tx,
+        Command::Sync {
+            deck_id: 3,
+            op: SyncOp::Tempo,
+        },
+    );
+    ack(&rx);
+    assert_eq!(
+        state(&tx, &rx, 3).sync_leader,
+        Some(2),
+        "the loudest playing deck should lead after the old leader stops"
+    );
+
+    ask(&tx, Command::Quit);
+    ack(&rx);
+}
+
+#[test]
+fn an_explicit_leader_does_not_hand_over_when_it_stops() {
+    let (tx, rx, _pipeline) = four_decks("sync-four-explicit.wav", [122.0; 4]);
+
+    ask(
+        &tx,
+        Command::Sync {
+            deck_id: 0,
+            op: SyncOp::SetLeader,
+        },
+    );
+    ack(&rx);
+    ask(&tx, Command::Play { deck_id: 0 });
+    ack(&rx);
+    sleep(150);
+    ask(&tx, Command::Play { deck_id: 1 });
+    ack(&rx);
+    ask(&tx, Command::Play { deck_id: 2 });
+    ack(&rx);
+    sleep(250);
+
+    ask(&tx, Command::Pause { deck_id: 0 });
+    ack(&rx);
+    sleep(350);
+    ask(
+        &tx,
+        Command::Sync {
+            deck_id: 3,
+            op: SyncOp::Tempo,
+        },
+    );
+    ack(&rx);
+    assert_eq!(
+        state(&tx, &rx, 3).sync_leader,
+        Some(0),
+        "an explicit set-leader survives the leader stopping and another deck being louder"
     );
 
     ask(&tx, Command::Quit);
@@ -316,9 +476,12 @@ fn phase_pid_closes_a_staggered_start_and_parks() {
         "a converged controller must park at zero, still {}",
         finished[1].nudgerate
     );
+    // Phaselock re-derives the follower's tempo from the leader's grid every block, and a
+    // constant grid's beat widths alternate by one frame. Allow that rounding; a phase
+    // correction that actually moved the tempo would be orders of magnitude larger.
     assert!(
-        (f64::from(finished[1].tempo) - synced_tempo).abs() < 1e-6,
-        "phase correction must never touch the tempo: {} vs {synced_tempo}",
+        (f64::from(finished[1].tempo) - synced_tempo).abs() < 1e-3,
+        "phase correction must not move the tempo beyond grid rounding: {} vs {synced_tempo}",
         finished[1].tempo
     );
     assert_eq!(finished[1].align.as_deref(), Some("pid"));
@@ -582,7 +745,7 @@ fn two_decks_may_not_sync_to_each_other() {
         },
     );
     let message = expect_error(&rx, "two_decks_may_not_sync_to_each_other");
-    assert!(message.contains("follow each other"), "unhelpful refusal: {message}");
+    assert!(message.contains("is the leader"), "unhelpful refusal: {message}");
 
     // An explicitly named leader also refuses to sync to itself.
     ask(

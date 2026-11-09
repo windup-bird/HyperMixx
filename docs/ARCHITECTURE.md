@@ -180,11 +180,14 @@ mixer 只负责把 deck 变成采样;谁跟谁、共享 BPM 是什么,是**关�
 
 - `SyncGroup` — `leader` / `follower` / `mode`(`Free|Tempolock|Phaselock`)/ `group_bpm`
   + 每块位置快照
+  - **自动 leader**:`prepare` 每块记录起播顺序和 `Channel::peak()` 的 200ms EMA;没有显式
+    leader 时先播且有网格的 deck 先领,leader 播放期间不因音量换人,停播后才在仍播放的 deck 里
+    按电平换人(平局看起播顺序);锁定期间冻结,显式 `set-leader` 优先且不会被同步降级
   - `prepare(&mut Mixer)` — 每块渲染前:取样全 deck(phase / `bpm_at_frame` / `tempo`)、
     phaselock 下用 `leader.tempo × bpm` 重算 `group_bpm`、给每个 deck 塞 `SyncCtx`(`Copy`)
   - `handle_sync` / `set_tempo` / `nudge` — 命令入口。**fader 三分支**:
     phaselock+follower → 忽略(单向)/ tempolock → 写 `group_bpm`(双向)/ 其余 → 写自己 `tempo`
-  - **单向规则**:`track()` 拒绝反向——两 deck 互相同步拒绝第二条;显式 leader 拒绝自同步
+  - **单向规则**:`track()` 拒绝反向——两 deck 互相同步拒绝第二条;leader(显式或自动)拒绝自同步
   - **锁下不再接受一次性匹配**:`sync tempo` 在 `Tempolock`/`Phaselock` 下直接拒绝——它只会写
     `tempo`,而下一块就会被 `group_bpm` 重算盖回,回 `Ok` 却什么也没发生,比报错更糟。
     `sync phase` 是 instant-only;锁定时再按 sync 直接解锁整组。持续相位控制器只属于

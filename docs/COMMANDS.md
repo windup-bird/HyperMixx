@@ -198,7 +198,11 @@ state                       打印全部 deck 的状态行
 
 规则与拒绝（引擎回 `Error`）：
 
-- 两 deck 互相同步会拒绝第二条；显式 leader 拒绝自同步；**leader 必须有网格**。
+- 两 deck 互相同步会拒绝第二条；leader（显式或自动）拒绝自同步；**leader 必须有网格**。
+- **自动 leader**：没有 `set-leader` 时，先开始播放且有网格的 deck 自动成为 leader；leader
+  播放期间不会因为别的 deck 更响而换人；leader 停播后，在仍在播放且有网格的 deck 里选当前
+  输出电平（`Channel::peak()` 的 200ms 平滑）最高的，平局按起播顺序。锁定期间 leader 冻结；
+  显式 `set-leader` 永远优先，同步别的 deck 到它也不会把显式降级成自动。
 - `sync tempo` 在 `tempolock`/`phaselock` 锁下直接拒绝（写了也会被 `group_bpm` 盖回）；
   `sync phase` 在锁下不重复对拍，而是**解锁整组**；`sync phaselock` 才是持续相位控制器。
 - `sync unlock` 解的是**整组**（`[deck_id, leader, follower]` 一起清），但 `tempo` 与

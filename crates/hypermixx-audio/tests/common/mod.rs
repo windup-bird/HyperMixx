@@ -84,7 +84,16 @@ fn headless_dj() -> MixerConfig {
 }
 
 pub fn session() -> (Sender<Command>, Receiver<CommandResponse>, AudioPipeline) {
-    let pipeline = AudioPipeline::start(headless_dj()).expect("engine should start headless");
+    session_with(2)
+}
+
+/// The same headless engine, with an explicit channel count (the four-deck sync tests).
+pub fn session_with(
+    channels: usize,
+) -> (Sender<Command>, Receiver<CommandResponse>, AudioPipeline) {
+    let mut config = headless_dj();
+    config.set_channel_count(channels);
+    let pipeline = AudioPipeline::start(config).expect("engine should start headless");
     let command_tx = pipeline.command_tx();
     // The response channel belongs to the pipeline; a clone keeps the printer fed while the caller
     // still owns the pipeline (whose `Drop` is what ends the stream).
