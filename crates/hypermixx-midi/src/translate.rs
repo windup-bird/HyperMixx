@@ -301,10 +301,10 @@ impl<'a> BindingOut<'a> {
                     let Some(deck_id) = self.spec.deck else {
                         return;
                     };
-                    // `Bend`, not `Start`: each message *adds* to the bend (so turning faster bends
-                    // harder, up to the engine's clamp) instead of re-stating it (which would only
-                    // make it last longer). The magnitude is the tick count, so an encoder that
-                    // reports ±3 per detent counts three times.
+                    // `Bend`: each message re-states the offset and restarts the release, so a
+                    // continuous turn stays bent instead of stacking into a runaway rate. The
+                    // magnitude is the tick count, so an encoder that reports ±3 per detent still
+                    // bends three times as far in one message.
                     self.out.push(Command::Nudge {
                         deck_id,
                         op: NudgeOp::Bend {

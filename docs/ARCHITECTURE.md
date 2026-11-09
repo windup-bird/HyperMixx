@@ -391,7 +391,8 @@ master/cue trim 是运行时值,reload 保留。**配置值取"默认 ← 文件
   控制器,否则会自己去追那次跳转);`Linear` 定斜率 `err_sec/t`;`Pid` 是 PI(`kp`1.0 / `ki`0.2,
   积分抗饱和,输出 ±5% 限幅 = 收敛超时的兜底)。**相位差先包裹到 [-0.5, 0.5]、再换算成秒**
   (`err_beats × 60/bpm`):秒÷秒才是无量纲比率,增益与限幅才量纲自洽
-  - **`nudgerate` 总限幅 ±15%** = PLL ±5%(收敛兜底)+ nudge ±10%(DJ 手掰),两者同向叠满也不越界
+  - **nudge 没有独立上限**:`nudgerate = 相位修正 + nudge`;只有相位控制器自己保留 ±5% 收敛兜底。
+    最终播放率仍有引擎的 `MIN_RATE..MAX_RATE` 安全范围。
 ### `flow/`
 - `Playing` — 一个独立播放声部：引擎 + 时钟 + `LoopRangeCell`。`playing` 是主/滑时钟，
   `shadow` 是 loop/roll/slip 的第二声部；切换都是块边界硬切，无 crossfade。

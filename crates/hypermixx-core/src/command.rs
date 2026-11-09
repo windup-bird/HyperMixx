@@ -394,9 +394,9 @@ pub enum NudgeOp {
     ///
     /// Absolute: the bend becomes `delta`, whatever it was. What a *button* wants.
     Start { delta: f32, seconds: Option<f64> },
-    /// Add `delta` to the running bend (clamped to the engine's limit) and release it `seconds`
-    /// after the last message. What a **wheel** wants: turning faster bends harder instead of
-    /// bending for longer, and the two directions subtract from each other.
+    /// Set the bend to `delta` and release it `seconds` after the last message. What a **wheel**
+    /// wants: each message re-states the offset and restarts the release, so turning faster keeps
+    /// the bend alive instead of stacking it into a runaway rate.
     Bend { delta: f32, seconds: f64 },
     /// Release the bend (ramps back to zero, it is not cut off).
     Stop,

@@ -747,7 +747,7 @@ impl Deck {
         self.push_rate();
     }
 
-    /// Adds to the running bend (a wheel tick); see [`Nudge::bend`](crate::deck::sync::Nudge).
+    /// Re-states the wheel bend; see [`Nudge::bend`](crate::deck::sync::Nudge).
     pub fn bend_nudge(&mut self, delta: f64, seconds: f64) {
         self.playhead.bend_nudge(delta, seconds);
         self.push_rate();
@@ -867,10 +867,7 @@ impl Deck {
             // into a signed rate; when they stop, the target is zero and the rate decays instead
             // of cutting to silence on the next block.
             let target = if self.vinyl_moved {
-                (self.vinyl_delta / crate::BLOCK_SIZE as f64).clamp(
-                    -super::scratch::MAX_SCRATCH_RATE,
-                    super::scratch::MAX_SCRATCH_RATE,
-                )
+                self.vinyl_delta / crate::BLOCK_SIZE as f64
             } else {
                 0.0
             };
@@ -1867,7 +1864,7 @@ mod tests {
 
     /// A deck that was already paused can be scratched too (and stays paused afterwards); an
     /// explicit transport command always lets go of the platter, so a missed note-off cannot leave a
-    /// deck that never resumes; and a turn with nobody on the plate is a bend that *accumulates*.
+    /// deck that never resumes; and a turn with nobody on the plate is a re-stated pitch bend.
     #[test]
     fn slip_vinyl_uses_a_signed_tape_reader_and_keeps_playing() {
         let mut deck = Deck::new(pool(100_000));
@@ -1946,9 +1943,9 @@ mod tests {
         deck.play();
         assert!(deck.is_playing(), "the deck is not stuck");
 
-        // Nobody on the platter: the wheel bends, and turning harder bends harder (the accumulation)
-        // rather than longer. The waits are short on purpose — a bend now releases itself 60 ms after
-        // the last message, so sampling after ~120 ms would read a bend that has already let go.
+        // Nobody on the platter: the wheel bends. Each message re-states the offset and restarts
+        // the release, so a continuous turn stays bent without accumulating into a runaway rate.
+        // The waits are short on purpose — the bend releases itself after the last message.
         let before = deck.current_frame();
         deck.apply_vinyl(VinylOp::Turn {
             ticks: 1,
@@ -1960,7 +1957,7 @@ mod tests {
         let first = deck.nudge_rate();
         assert!(first > 0.0, "it bent forward");
         assert!(deck.current_frame() > before, "and the deck kept playing");
-        // Two ticks the other way cancel the one that was added.
+        // A tick the other way reverses the bend.
         deck.apply_vinyl(VinylOp::Turn {
             ticks: -1,
             frames_per_tick: 441.0,
@@ -1969,11 +1966,11 @@ mod tests {
             deck.process_block(&mut out);
         }
         assert!(
-            deck.nudge_rate().abs() < 0.01,
-            "opposite turns cancel: {}",
+            deck.nudge_rate() < -0.01,
+            "opposite turns reverse the bend: {}",
             deck.nudge_rate()
         );
-        // Two messages the same way: stronger, and the engine's clamp is what stops it.
+        // Two messages the same way: same offset (the last message wins), not a stack.
         deck.apply_vinyl(VinylOp::Turn {
             ticks: 1,
             frames_per_tick: 441.0,
@@ -1986,13 +1983,9 @@ mod tests {
             deck.process_block(&mut out);
         }
         assert!(
-            deck.nudge_rate() > first + 0.01,
-            "a second turn is stronger, not longer: {first} then {}",
+            (deck.nudge_rate() - first).abs() < 0.02,
+            "a repeated turn re-states the bend instead of stacking: {first} then {}",
             deck.nudge_rate()
-        );
-        assert!(
-            deck.nudge_rate() <= crate::deck::sync::NUDGE_LIMIT + 1e-3,
-            "and clamped"
         );
         let _ = park;
     }

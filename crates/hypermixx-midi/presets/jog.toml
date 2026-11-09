@@ -12,17 +12,19 @@ type = "JogWheel"
 name = "vinyl"
 [[preset.mode.bind]]
 slot = "jog"
-action = "vinyl"
+# frames_per_tick = 1.8 s of audio / ticks per revolution at the engine rate.
+# 234 assumes a 340-tick wheel at 44.1 kHz; change this when calibrating a controller.
+action = "vinyl 234"
 
 [[preset.mode]]
 name = "slip"
 [[preset.mode.bind]]
 slot = "jog"
 press = "vinyl slip"
-turn = "vinyl"
+turn = "vinyl 234"
 
 [[preset.mode]]
 name = "nudge"
 [[preset.mode.bind]]
 slot = "jog"
-turn = "nudge 0.01"
+turn = "nudge 0.002 0.005"

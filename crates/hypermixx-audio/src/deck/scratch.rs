@@ -10,9 +10,6 @@ use crate::mixer::Bus;
 use crate::CHANNELS;
 use hypermixx_core::Source;
 
-/// Largest scratch speed, in source frames per output frame.
-pub const MAX_SCRATCH_RATE: f64 = 4.0;
-
 pub struct Scratch {
     sources: Vec<Arc<dyn Source>>,
     /// Source position (fractional) of the next output frame.
@@ -51,11 +48,9 @@ impl Scratch {
     }
 
     pub fn set_rate(&mut self, rate: f64) {
-        self.rate = if rate.is_finite() {
-            rate.clamp(-MAX_SCRATCH_RATE, MAX_SCRATCH_RATE)
-        } else {
-            0.0
-        };
+        // No musical ceiling: the DJ's hand is the limit. A non-finite value is still refused,
+        // because it would poison the reader's position permanently.
+        self.rate = if rate.is_finite() { rate } else { 0.0 };
     }
 
     pub fn process_streams(&mut self, outs: &mut [Bus], frames: usize) -> usize {

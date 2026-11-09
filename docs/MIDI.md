@@ -154,8 +154,8 @@ turn = "vinyl"
 ```toml
 action = "loop 1/4"        # 分数拍长
 action = "beatjump -8"
-action = "nudge 0.15 0.06"
-action = "vinyl 1323"
+action = "nudge 0.01 0.02"
+action = "vinyl 234"       # frames/tick = 1.8s × 引擎采样率 / 轮子每圈 tick 数
 action = "fx param value"  # 参数名在行内，槽位名在 fx 字段
 ```
 

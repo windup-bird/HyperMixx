@@ -27,20 +27,8 @@
 
 use hypermixx_core::{DeckId, PhaseMode};
 
-/// Total ceiling on `nudgerate`: the phase controller's ±5% plus a single nudge's ±10%.
-///
-/// The controller is the backstop that stops a stuck correction from running away; the nudge is
-/// the DJ's hand. Stacking them but bounding the sum keeps the engine inside a tempo change a
-/// listener reads as "bent" rather than "broken".
-pub const NUDGERATE_LIMIT: f64 = 0.15;
 /// Ceiling on the phase controller alone — the ±5% convergence backstop.
 pub const PLL_LIMIT: f64 = 0.05;
-/// Ceiling on a single nudge bend.
-/// How hard a bend may get, as a rate. The ceiling is what decides how *far* one wheel flick can move
-/// the phase — a per-message step that already sits near the limit makes every extra message useless,
-/// which reads as "not responsive" no matter how short the bend is. ±30 % is a wheel-sized bend and
-/// still well inside [`MIN_RATE`]/[`MAX_RATE`], so a bend can never push playback out of range.
-pub const NUDGE_LIMIT: f64 = 0.30;
 /// Engine tempo bounds, mirroring the stretch backend's clamp.
 pub const MIN_RATE: f64 = 0.25;
 pub const MAX_RATE: f64 = 4.0;
@@ -192,20 +180,24 @@ impl Nudge {
     /// ramp, which is inaudible as a transient and still snappy under the hand.
     const TAU_SECONDS: f64 = 0.004;
 
-    /// Starts bending by `delta` (clamped), optionally releasing itself after `seconds`.
+    /// Starts bending by `delta`, optionally releasing itself after `seconds`.
     pub fn start(&mut self, delta: f64, seconds: Option<f64>) {
-        self.target = delta.clamp(-NUDGE_LIMIT, NUDGE_LIMIT);
+        if delta.is_finite() {
+            self.target = delta;
+        }
         self.arm_release(seconds);
     }
 
-    /// **Adds** `delta` to the running bend, clamped to the limit, and re-arms the release.
+    /// Sets the wheel's bend to `delta` and re-arms the release.
     ///
-    /// This is what a wheel does: each tick makes the bend stronger (up to the clamp), a tick the
-    /// other way weakens it, and the bend lets go `seconds` after the messages stop. Re-arming
-    /// matters — a turn that keeps going must not release mid-turn — but the *strength* is what
-    /// accumulates, not the duration.
+    /// A wheel message is a direction, not an accumulator: turning faster re-states the same
+    /// offset more often instead of stacking it into an ever-larger rate. A single message that
+    /// reports a larger magnitude (some encoders send ±3 per detent) still bends proportionally.
+    /// The bend lets go `seconds` after the last message.
     pub fn bend(&mut self, delta: f64, seconds: f64) {
-        self.target = (self.target + delta).clamp(-NUDGE_LIMIT, NUDGE_LIMIT);
+        if delta.is_finite() {
+            self.target = delta;
+        }
         self.arm_release(Some(seconds));
     }
 
@@ -363,7 +355,7 @@ impl Playhead {
         self.nudge.start(delta, seconds);
     }
 
-    /// Adds to the running bend; see [`Nudge::bend`].
+    /// Re-states the wheel bend; see [`Nudge::bend`].
     pub fn bend_nudge(&mut self, delta: f64, seconds: f64) {
         self.nudge.bend(delta, seconds);
     }
@@ -438,7 +430,7 @@ impl Playhead {
         // 3. The bend, then both halves stacked and bounded.
         self.nudge.tick();
         let nudge_rate = self.nudge.rate();
-        self.nudgerate = (correction + nudge_rate).clamp(-NUDGERATE_LIMIT, NUDGERATE_LIMIT);
+        self.nudgerate = correction + nudge_rate;
     }
 }
 
@@ -560,13 +552,13 @@ mod tests {
     }
 
     #[test]
-    fn a_nudge_is_clamped() {
+    fn a_nudge_has_no_musical_ceiling() {
         let mut nudge = Nudge::default();
         nudge.start(9.0, None);
-        for _ in 0..60 {
+        for _ in 0..240 {
             nudge.tick();
         }
-        assert!((nudge.rate() - NUDGE_LIMIT).abs() < 1e-3);
+        assert!(nudge.rate() > 1.0, "the bend keeps its requested strength");
     }
 
     #[test]
