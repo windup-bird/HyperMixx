@@ -130,8 +130,8 @@ crates/
   由 deck 按 `1 + position×tempo_range` 算 rate,再走 `SyncGroup::set_tempo` 的三分支
 - sync 族:`Sync { deck_id, op }`,op = `Tempo` / `Phase{mode,t}` / `TempoLock` /
   `PhaseLock{mode,t}` / `SetLeader` / `Unlock`;`PhaseMode = Instant | Linear | Pid`。
-  **`phase` 包含 `tempo`,`phaselock` 包含 `tempolock`**;`SetLeader` 不带参数(target-first
-  语法下 `deck0 sync set-leader` 即“deck0 是 leader”)
+  **`phase` 是 instant-only(锁定时再触发 = 解锁),`phaselock` 才装 linear|pid 控制器**;
+  `SetLeader` 不带参数(target-first 语法下 `deck0 sync set-leader` 即“deck0 是 leader”)
 - `Nudge { deck_id, op }`,`op = Start{delta, seconds} | Stop` — 临时速率弯折,
   只动 `nudgerate`,结束时 `tempo` 原封不动(CLI 秒数必填,MIDI `seconds=None` 为按住)
 - `DeckState` 除 transport 外还报 `bpm` / `bpm_at_frame` / `tempo` / `tempo_fader` / `tempo_range` / `nudgerate` / `playing_rate` / `lock` / `align` /
@@ -142,7 +142,8 @@ crates/
 - FX 族:`AddFx { chain, kind }` / `RemoveFx { chain, index }` / `SetFxEnabled` /
   `SetFxParam { slot, name, value }` / `FxTrigger` / `PadPress` / `PadRelease` / `ListFx`;
   槽位寻址 `FxChainId::{Master, Deck(u8)}` + `FxSlotRef { chain, index }`
-- `Backend { Stratum, Timestretch }` — 分析后端,配置直选无 auto(`[preference.analysis]`)
+- `Backend { Stratum, Timestretch }` — 分析后端,配置直选无 auto(`[preference.analysis]`);
+  `auto_analyse = true` 时 browser 载入会跳过已有导入/缓存,对空白曲目后台分析并写缓存
 
 ---
 
@@ -186,7 +187,8 @@ mixer 只负责把 deck 变成采样;谁跟谁、共享 BPM 是什么,是**关�
   - **单向规则**:`track()` 拒绝反向——两 deck 互相同步拒绝第二条;显式 leader 拒绝自同步
   - **锁下不再接受一次性匹配**:`sync tempo` 在 `Tempolock`/`Phaselock` 下直接拒绝——它只会写
     `tempo`,而下一块就会被 `group_bpm` 重算盖回,回 `Ok` 却什么也没发生,比报错更糟。
-    `sync phase` 在锁下则**跳过对拍那一步、只装 align**(组已经管着 tempo,方向照样校验),
+    `sync phase` 是 instant-only;锁定时再按 sync 直接解锁整组。持续相位控制器只属于
+    `sync phaselock`(linear|pid),
     所以“锁定期间改相位模式”是合法操作。对照:**phaselock 下 follower 的 fader 是故意忽略**的
     ——那是连续控制,演出中途不能抛错
   - **`tempo` 与 `nudgerate` 永不混**:`group_bpm` 只由 `tempo` 派生,所以 nudge 与相位修正
@@ -246,9 +248,9 @@ kind:`linear`/`moog`),`flowfx` 在合并前逐流跑,`knobfx`/`padfx` 在合并�
 `Mixer::new` / `mixer reload` 从 cfg 应用它,所以改目标或开关会立刻对已装载的曲子重新推导,
 不需要重测;`Command::SetAutogain` 仍可作会话内覆盖,下一次 `mixer reload` 会回到配置值。
 
-`MasterBus::render`:`sum → master_fx → master_fader → limiter(安全级)`。
-`CueBus`:`sum → cue_fader → blend_with(master.sum)` —— 耳机是 cue 与 master 的混合,
-`[cue] blend` `-1`(缺省,= 只听 cue)/`0`/`+1`,三条曲线与 crossfader 共用。
+`MasterBus::render`:`sum → master_fx → master trim → limiter(安全级)`。
+`CueBus`:`sum → cue trim → blend_with(master.sum)` —— 耳机是 cue 与 master 的混合,
+`[mixer.fader] cue_blend` `-1`(缺省,= 只听 cue)/`0`/`+1`,三条曲线与 crossfader 共用。
 
 四样东西**永远不可配置**:
 
@@ -258,14 +260,16 @@ kind:`linear`/`moog`),`flowfx` 在合并前逐流跑,`knobfx`/`padfx` 在合并�
 3. **fader 只衰减**:`fader_amp` 的上半段恒为 1.0;headroom 只在 `gain`(`trim_amp`,+6 dB 封顶)
 4. 阶段顺序本身
 
-其余由 `MixerConfig` 纯数据描述(`config.rs`):每通道的 `filter`(linear|moog)、
-`flow_fx`(`Vec<FlowSlotConfig>`,每项带 `kind` 与 `flows`)/`knob_fx`/`pad_fx` 名单
-(经 `FxKind` 注册表解析,未知名 → `MixerError::UnknownFx` 构造失败)、`cue-tap`(pre|post,
-旧键 `cue` 仍可读)、`[crossfader]`(place/curve/cut_width/start)、`[cue]`
-(fader/cue-blend/curve/cut_width)、cue_send/side、`[chain]` 的 master fx/limiter/fader、
-`[autogain]`(enabled/target_db)、输出列表(name/role(`master`|`cue`)/channels/gain)。
+其余由 `MixerConfig` 纯数据描述(`config.rs`):`[mixer.fx]` 的 `filter`(linear|moog)、
+`flow_fx`(`Vec<FlowSlotConfig>`,每项带 `kind` 与 `flows`)/`knob_fx`/`pad_fx`/`master_fx` 名单
+(经 `FxKind` 注册表解析,未知名 → `MixerError::UnknownFx` 构造失败)、`[mixer.eq]` 的
+`lower_hz`(low/mid 分界)/`higher_hz`(mid/high 分界)、`[mixer.limiter]` 的 `limiter`/`ceiling_db`、`[mixer.fader]` 的
+`position`(pre|post)/`crossfader_curve`(cue/master 混合)/`cue_blend`、`[mixer.crossfader]`
+(curve/cut_width/start)、`[mixer.cue]`(curve/cut_width)、cue_send/side、
+`[mixer.autogain]`(enabled/target_db)、输出列表(name/role(`master`|`cue`)/channels/gain)。
+master/cue trim 是运行时推子,不是配置值;`mixer reload` 保留它们。
 `flow_fx` 是**模板**:每条 flow 各建一条独立的链(4 stems = 4 条,各自状态);逐流差异用每个槽的
-**白名单**(`[[channel.flow_fx]] flows = ["vocals"]`)——一个控件、N 份实例,`flows` 决定哪条 flow
+**白名单**(`[[mixer.fx.flow_fx]] flows = ["vocals"]`)——一个控件、N 份实例,`flows` 决定哪条 flow
 真正处理。mask 收窄时那条 flow 上的尾巴被硬切(不是淡出);放宽时新进入的实例先 `reset()`。
 每条链每块都被驱动(即使全部 bypass/mask 掉):跳过整条链会漏掉 bypass/mask 的边沿,让重新接上
 的效果带着它没听到的音频复活。
@@ -301,17 +305,18 @@ kind:`linear`/`moog`),`flowfx` 在合并前逐流跑,`knobfx`/`padfx` 在合并�
   `[[multideck.deck]]`,总线来自 `[mixer]`(测试钉死"模板解析 == simple_dj()")
 
 **热加载**:`Command::MixerReload { text }`(文本而非路径 —— 文件 IO 属于前端)在 producer 线程上
-`Mixer::reload(&text)`:先解析+`build_chains` 全量校验,通过后才就地换掉 channels/chains/faders/
-master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默认),不是补丁**;保留的只有不属于配置的东西
+`Mixer::reload(&text)`:先解析+`build_chains` 全量校验,通过后才就地换掉 channels/chains 并重建输出;
+master/cue trim 是运行时值,reload 保留。**配置值取"默认 ← 文件"(未定义即默认),不是补丁**;保留的只有不属于配置的东西
 —— 每个 channel 的 deck 与走带(`Channel::take_deck`)、计量计数。文件里少掉的 channel 连同曲目一起丢,
 多出来的建空 deck。任一错误整份拒绝,旧链照常工作到验证通过为止。
 
-**TOML 配置**(`MixerConfig::from_toml_str`):文件 schema 由 `MixerFile`/`MasterFile`
-镜像结构定义(`deny_unknown_fields`,坏键报行号),Rust 类型与文件格式各自保有适合的
+**TOML 配置**(`MixerConfig::from_toml_str`):文件 schema 由 `MixerFile`
+及分表结构定义(`deny_unknown_fields`,坏键报行号),Rust 类型与文件格式各自保有适合的
 命名。deck 列表来自与 `[mixer]` 同级的 `[[multideck.deck]]`(数组顺序即 deck 编号,
-`source` 把 controller 逻辑面映射到物理 deck);`[mixer.chain]` 一表(`[mixer.master]`
-为旧别名),`[[mixer.output]]` 任意个;除 `source`/`name`/`role` 外全部有默认。旧
-`[[mixer.channel]]` 被按名拒绝,root-level `[[channel]]` 裸拓扑文件仍可读。解析与构造分层:
+`source` 把 controller 逻辑面映射到物理 deck);`[mixer.fx]`/`[mixer.eq]`/`[mixer.limiter]`/
+`[mixer.fader]`/`[mixer.cue]`/`[mixer.autogain]` 分表,`[[mixer.output]]` 任意个;
+除 `source`/`name`/`role` 外全部有默认。旧
+`[[mixer.channel]]` 与 root-level `[[channel]]`/`[chain]`/`[master]` 都按名拒绝。解析与构造分层:
 未知 FX 名在 `build_chains`(注册表查询)而非解析层。
 
 ### `fx/` — 效果子系统
@@ -335,7 +340,7 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   `OnePole`(反馈阻尼)、`SineLfo`(flanger/phaser 调制);容量在 `prepare` 里按引擎率定,
   之后 `process` 不再分配
 - `sample/` 十一个内置效果:
-  - `Eq` — 三段 ISO:low shelf 320Hz / bell 1.2kHz / high shelf 3.6kHz,±26 dB 线性 dB
+  - `Eq` — 三段 ISO:low/mid 分界 `lower_hz`、mid/high 分界 `higher_hz`,中频 bell 在两者几何中心;缺省 250Hz / 2kHz,±26 dB 线性 dB
     律;系数仅在控制移动时重算,平坦时整段跳过
   - `Filter`/`Moog` — 同一套 TPT 状态变量核(`filter` 两极点 12dB/oct,`moog` 四极点级联 24dB/oct):
     LP/HP 两条支路**始终并行**、各自 cutoff 连续,中间用逐样本平滑的权重交叉淡化 —— 换的是权重不是拓扑,
@@ -357,7 +362,7 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   - `Cut` — 拍锁梯形门:`div` 拍、`width` 占空比、`depth` 关断深度、`edge` ms 过渡;
     相位由 `beat_position` 推导,loop/jump 后仍落在拍上
   - `Empty`(`none`) — 空槽:挂载、可寻址、不处理任何样本。固定 bank 里"去掉一个效果"就是
-    `fx kind <槽> none`(序号和 role 不变),所以 map 不需要重绑
+    `fx select <槽> none`(序号和 role 不变),所以 map 不需要重绑
 - `registry.rs` — `FxKind` 封闭枚举(eq/filter/gain/limiter/echo/reverb/flanger/
   phaser/cut)+ 别名解析;加效果 = 一个 variant + 一个 `build` arm + 一行 `ALL`,无插件面
 
@@ -437,8 +442,8 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   ÷2/×2、域 1/32..64 拍,循环中编辑原地原子 store,exit 无缝续播越过 out)
 - `fx` 族:`fx add|remove|list|set|on|off|trigger|pad press|release`,chain 地址
   `master`/`m`/`deck0`/`d0`/`0`;`fx help` 从注册表生成 kind/参数清单(永不与引擎脱节)
-- `sync` 族:`sync tempo | phase <instant|linear [秒]|pid> | tempolock |
-  phaselock <mode> [秒] | set-leader | unlock`;`nudge <delta> <秒> | nudge off`。
+- `sync` 族:`sync tempo | phase [instant] | tempolock |
+  phaselock [linear [秒]|pid] | set-leader | unlock`;`nudge <delta> <秒> | nudge off`。
   解析错误(`linear 0`、非数字秒数)前端直接 `Failed`;引擎拒绝(无网格、反向同步)后到为 `Error`
 - TUI deck 信息行多一枚黄色徽标:`sync phaselock 122.0 BPM ← deck0 phase pid locked`,
   与 CLI 的 `deck_line` 共用 `response::sync_badge`(所以测它就同时覆盖两边)

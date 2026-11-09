@@ -71,7 +71,7 @@ pub fn format_response(response: &CommandResponse, sample_rate: u32) -> Vec<LogL
             for slot in slots {
                 let state = if slot.enabled { "on" } else { "off" };
                 // The role is what a map binds; the kind is what is in it right now. They only
-                // differ after `fx kind`, and then the difference is worth showing.
+                // differ after `fx select`, and then the difference is worth showing.
                 let what = if slot.role == slot.kind {
                     slot.role.clone()
                 } else {
@@ -349,10 +349,11 @@ pub fn help_text(decks: usize) -> String {
   [deck] tempofader <-1..1>    pitch fader position (tempo = 1 + position × range)
   [deck] temporange <range>    fader range (default 0.1 = ±10%)
   [deck] sync tempo            match the other deck's BPM once
-  [deck] sync phase <mode>     match tempo, then close the beat phase
-                               mode: instant | linear [seconds] | pid
+  [deck] sync phase [instant]  match tempo, then jump onto the leader's phase
+                               pressing sync while locked drops the lock
   [deck] sync tempolock        both decks share one tempo — either fader moves both
-  [deck] sync phaselock <mode> follower tracks the leader exactly (its own fader is ignored)
+  [deck] sync phaselock [linear [seconds]|pid]
+                               follower tracks the leader exactly (its own fader is ignored)
   [deck] sync set-leader       name *this* deck as the one the others follow
   [deck] sync unlock           drop the lock and the correction, keeping the tempo
   [deck] fader <stage> <pos>   levels: flow (per-stem) |deck (the channel fader) |gain|cuesend,
@@ -458,7 +459,7 @@ pub fn fx_help_text() -> String {
         "fx commands (the chain is the line's target: the focused deck by default,\n`master` for the summed output, e.g. `master fx list`):
   fx add <kind>                    append an effect to the end of the chain
   fx remove <slot>                 drop a slot (later slots shift down)
-  fx kind <slot> <kind>            swap the effect in a slot (same index, same role)
+  fx select <slot> <kind>          swap the effect in a slot (same index, same role)
   fx flows <slot> all|none|a,b     route a flowfx slot to some of the flows
   fx list                          show every slot with its index, kind and parameters
   fx set <slot> <param> <value>    set one parameter (value is smoothed, no clicks)

@@ -180,9 +180,10 @@ state                       打印全部 deck 的状态行
 
 ```
 [deck] sync tempo                        一次性对 BPM（写自己的 tempo）
-[deck] sync phase <mode> [seconds]       先对 BPM，再追相位（phase ⊃ tempo）
+[deck] sync phase [instant]               一次性：先对 BPM，再直接落到 leader 相位；锁定时再触发 = 解锁
 [deck] sync tempolock                    双向共享一个 tempo，任一边 fader 都带动对方（别名 lock）
-[deck] sync phaselock <mode> [seconds]   单向：follower 精确跟随 leader（其 fader 被忽略）
+[deck] sync phaselock [linear [seconds]|pid]
+                                          单向持续：follower 精确跟随 leader（其 fader 被忽略），缺省 pid
 [deck] sync set-leader                   宣布“本 deck 是 leader”，无参数（别名 leader）
 [deck] sync unlock                       解锁：清 lock/align/nudgerate，tempo 保留（别名 off）
 ```
@@ -199,7 +200,7 @@ state                       打印全部 deck 的状态行
 
 - 两 deck 互相同步会拒绝第二条；显式 leader 拒绝自同步；**leader 必须有网格**。
 - `sync tempo` 在 `tempolock`/`phaselock` 锁下直接拒绝（写了也会被 `group_bpm` 盖回）；
-  `sync phase` 在锁下跳过对拍那步、只装 align（锁定期间改相位模式是合法操作）。
+  `sync phase` 在锁下不重复对拍，而是**解锁整组**；`sync phaselock` 才是持续相位控制器。
 - `sync unlock` 解的是**整组**（`[deck_id, leader, follower]` 一起清），但 `tempo` 与
   `leader` 都保留。
 - 实测收敛特性见 README 的 `sync_phase.sh` 表格。
@@ -220,7 +221,7 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 ```
 [deck] loop in                    武装 in 点（按拍量化），后台准备 looper
 [deck] loop out                   按量化后的 out 点硬切入
-[deck] loop <beats>               N 拍循环；同时更新 loop_beats
+[deck] loop <beats>               N 拍循环；正在循环且长度相同 = 退出，不同 = 改成该长度
 [deck] loop toggle                用 loop_beats 开/关循环
 [deck] loopbeats double|halve     改 loop_beats（1/32..64）；循环中同步重设
 [deck] loop slip in               武装 slip loop：playing 继续跑，shadow 出声
@@ -249,7 +250,7 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 ```
 [deck|master] fx add <kind>                追加到 bank 末尾（eq|filter|moog|gain|limiter|echo|reverb|flanger|phaser|cut|none，含别名）
 [deck|master] fx remove|rm <slot>          只允许删 bank 的最后一个槽（删中间会重编号）
-[deck|master] fx kind <slot> <kind>        换掉槽里的效果（序号、role、开关状态都不变）
+[deck|master] fx select <slot> <kind>        换掉槽里的效果（序号、role、开关状态都不变）
 [deck] fx flows <slot> all|none|a,b        flowfx 槽只作用于哪些 flow（stem 名，逗号分隔）
 [deck|master] fx toggle <slot>             翻转槽位（引擎持有状态，前端不留镜像）
 [deck|master] fx list|ls                   列出槽位：索引、kind、开关、参数
@@ -261,7 +262,7 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 ```
 
 - `<slot>` 可以是**索引**、**role** 或**效果名**（启动时已 `ListFx` 预载，无需先 `list`）。
-  **role 优先**：槽位有一个与内容无关的固定身份（`eq`、`filter`、`echo`…），`fx kind` 换掉效果后
+  **role 优先**：槽位有一个与内容无关的固定身份（`eq`、`filter`、`echo`…），`fx select` 换掉效果后
   role 不变，所以 `fx set filter value -0.3` 在槽里换成 `moog` 之后仍然指同一个槽
   （`fx list` 会显示成 `filter (moog)`）。效果名按链内第一个同名槽解析。
 - MIDI map 的 `fx param` 可以写参数名，也可以写 1-based 序号（`fx param 1`）；序号按效果
@@ -270,7 +271,7 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 
 | kind | 别名 | 参数 |
 |---|---|---|
-| `eq` | equalizer, tone | `low` `mid` `high` `low_hz` `mid_hz` `high_hz`（增益 −26..+26 dB；分频 320Hz / 1.2kHz / 3.6kHz） |
+| `eq` | equalizer, tone | `low` `mid` `high` `low_hz` `mid_hz` `high_hz`（增益 −26..+26 dB；分频来自 `[mixer.eq]`，缺省 250Hz / 几何中心 / 2kHz） |
 | `filter` | lp, hp, sweep, linear | `value`（−1 = LP 20Hz .. 0 = 全开 .. +1 = HP 18kHz）、`resonance`（0..1 → Q 0.3..18）；2 极点 |
 | `moog` | ladder | 同上（同一个 `value`/`resonance` 语义）；4 极点级联，24 dB/oct |
 | `gain` | volume, amp | `gain` |
@@ -280,7 +281,7 @@ MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` �
 | `flanger` | flange | `mix` `depth` `rate`（每拍周期数，1/16..4）`feedback`（−0.95..0.95） |
 | `phaser` | phase | `mix` `depth` `rate` `feedback`（6 级全通级联，系数查表） |
 | `cut` | gate, trans | `depth` `div`（拍，1/16..4）`width`（占空比 0.05..0.95）`edge`（ms，0..20）；按拍锁相的梯形门 |
-| `none` | empty | 无参数：槽位留着当占位，不处理任何样本（`fx kind <槽> none` 用来原地清空、保住序号） |
+| `none` | empty | 无参数：槽位留着当占位，不处理任何样本（`fx select <槽> none` 用来原地清空、保住序号） |
 
 - 时间类效果（`echo` / `reverb` / `flanger` / `phaser` / `cut`）的节拍参数走
   `FxContext` 的拍网格；曲目还没分析时回落到 120 BPM，不会静音。
@@ -343,15 +344,17 @@ CPU 与 CUDA 的结果 Σ 残差一致（实测都是 −32.9 dB 量级），但
 **每 stem 的链也可以在配置文件里给**（`--config`）：
 
 ```toml
-[[channel]]
-filter = "linear"              # linear | moog：固定 filter 级的 kind（`fx kind filter moog` 可运行时换）
-cue = "pre"                    # pre | post：cue send 抽在 fader 的哪一侧（post 时推子连耳机一起关）
+[mixer.fx]
+filter = "linear"              # linear | moog：固定 filter 级的 kind（`fx select filter moog` 可运行时换）
 knob_fx = ["echo"]             # 合并后 knob bank
 pad_fx = ["reverb"]            # 合并后 pad bank（在 knob 之后）
 
-[[channel.flow_fx]]            # 合并前、逐 flow 的插入
+[[mixer.fx.flow_fx]]           # 合并前、逐 flow 的插入
 kind = "filter"
 flows = ["vocals"]             # 只作用于人声；省略 = 全部 flow；[] = 哪条都不作用
+
+[mixer.fader]
+position = "pre"               # pre | post：cue send 抽在 fader 的哪一侧
 ```
 
 `flow_fx` 是**模板而不是一条链**：每条 flow 都有同一组槽位、各自独立的实例（状态互不串味），
@@ -434,10 +437,11 @@ mixer reload [<file>]   重读拓扑并就地重建；不带路径则读 --confi
 ```
 
 - **语义 = 内置默认 ← 文件**：文件里没写的键取**默认值**，而不是保留运行中的值。所以演出中途 reload
-  要把想保留的推子/trim 一起写上。
-- **保留的只有"不是配置值"的东西**：每个 channel 的 deck 与走带（reload 不会停音乐）与计量计数。
-  文件里没再出现的 channel 会被丢弃（连同它装载的曲目），并打印一行说明。
-- **要么整份生效，要么整份拒绝**：未知效果名 / 没有 `[[channel]]` 都在动任何状态之前失败 ——
+  要把想保留的 channel fader / gain 一起写上。
+- **保留的只有"不是配置值"的东西**：每个 channel 的 deck 与走带（reload 不会停音乐）、计量计数，
+  以及 master/cue trim（它们是运行时推子，不是配置值）。文件里没再出现的 channel 会被丢弃
+  （连同它装载的曲目），并打印一行说明。
+- **要么整份生效，要么整份拒绝**：未知效果名 / 没有 `[[multideck.deck]]` 都在动任何状态之前失败 ——
   半套拓扑会让引擎停在一个没有任何配置文件能描述的状态里。旧链在验证通过之前一直照常工作。
 - 设备绑定也在 reload 里重建并重新列出（见 3.9），所以"插上耳机 → `mixer reload`"一步到位。
 
@@ -468,7 +472,7 @@ output refresh   （别名 reload/reopen）重试所有不可用的目的地，�
 ### 3.10 MIDI
 
 映射文件里的 `action` 就是**一条去掉目标的会话命令**（`"beatjump 4"`、`"vocals mute"`、
-`"sync phase pid"`），目标取 binding 的 `deck` 字段。语法表只有一份
+`"sync phase"`），目标取 binding 的 `deck` 字段。语法表只有一份
 （`hypermixx-core::action::ACTIONS`），`docs/MIDI.md` 的 action 表由它维护；
 CLI 侧有一个测试逐一断言每个 action 都有对应的会话动词。
 
@@ -525,23 +529,38 @@ cue_send = 1.0            # 送 cue 总线 0..1
 # deck_fader = 0.0        # channel fader 起点
 # gain = 0.0              # trim
 
-[mixer]        # 总线：[mixer.chain] / [mixer.crossfader] / [[mixer.output]] …
-[mixer.chain]              # 整条混音链的效果都在这一个表里，所有 deck 共享
-master_fx = []            # master 效果（别名 fx），limiter 之前
+[mixer]        # 总线：[mixer.fx] / [mixer.eq] / [mixer.limiter] / [mixer.fader] / [[mixer.output]]
+[mixer.crossfader]
+curve = "classic"         # classic | constant_power | cut
+# cut_width / start 仍可写；省略 = 内置默认
+
+[mixer.fx]                # 四个 FX bank + 固定 sweep；所有 deck 共享
+master_fx = []            # master 效果，limiter 之前
 flow_fx = []              # 逐 flow insert（模板：每 flow 一条独立链）
 knob_fx = []              # 合并后 knob bank
 pad_fx = []               # 合并后 pad bank
+filter = "linear"         # linear | moog — 固定 sweep 的种类
+# 逐 flow 白名单用 [[mixer.fx.flow_fx]]：
+# [[mixer.fx.flow_fx]]
+# kind = "filter"
+# flows = ["vocals"]      # 省略 = 全部 flow，[] = 哪条都不作用
+
+[mixer.eq]
+lower_hz = 250            # low/mid 分界
+higher_hz = 2000          # mid/high 分界；中频 bell 在两者的几何中心
+
+[mixer.limiter]
 limiter = true            # 安全限幅，默认开启；写 false 才关
 ceiling_db = -1.0         # 限幅门限 dBFS（−40 .. +12），省略 = −1
-fader = 0.0               # master trim
-filter = "linear"         # linear | moog — 固定 sweep 的种类
-fader-location = "pre"    # pre | post — cue 送在 fader 哪一侧（取代旧的 per-deck `cue`）
-cue-blend = -1.0          # -1 只听 cue，0 各半，+1 只听 master
-[mixer.chain.autogain]
+
+[mixer.fader]
+position = "pre"          # pre | post — cue 送在 fader 哪一侧
+crossfader_curve = "classic"  # cue/master 混合曲线；等价于 [mixer.cue].curve，新分组优先
+cue_blend = -1.0          # -1 只听 cue，0 各半，+1 只听 master
+
+[mixer.autogain]
 enabled = false
 target_db = -12.0
-[mixer.crossfader]
-curve = "classic"         # classic | constant_power | cut
 [live]         # 本机设置：[audio] / [keylock] / [stems]
 [preference]   # 前端设置：波形、主题、曲库
 
@@ -558,8 +577,12 @@ map = "mapping.toml"      # unit-map 文件指针，相对本文件所在目录
 - crossfader 的左右组合由 controller 侧定义：mapping 的 `global.crossfader` 用多个 mode
   （`fader cross A B` / `fader cross Am Bm`）指定 deck 对；`[mixer.crossfader]` 只剩
   `curve` / `cut_width` / `start`（`place` 已固定为通道末端）。
-- 旧的 `[[mixer.channel]]` 已移除：deck 的字段写进 `[[multideck.deck]]`，效果写进
-  `[mixer.chain]`。root 级 `[[channel]]` 裸拓扑文件仍可读。
+- 旧的 `[[mixer.channel]]` / root 级 `[[channel]]` / `[mixer.chain]` / `[mixer.master]` 都不再兼容：
+  deck 的字段写进 `[[multideck.deck]]`，效果写进 `[mixer.fx]`。
+- FX 槽位的身份是 **role + index**，不是当前效果名：配置里的列表只决定启动时的初始效果和槽位
+  数量；运行时用 `fx select <slot> <kind>` 换效果，role、序号、开关、pad latch、flow 白名单都保留，
+  同名参数（如 `filter`/`moog` 的 `value`/`resonance`）按名继承。映射应绑 `fx param 1` 或 role，
+  不要绑效果名。想预留一个空槽就写 `"none"`，不要用 `fx remove` 删中间槽。
 
 - 不给 `--config`：Linux/Termux 用 `$XDG_CONFIG_HOME/hypermixx/config.toml`
   （缺省 `~/.config/hypermixx/config.toml`），Windows 用 `%APPDATA%/Hypermixx/config.toml`；
@@ -571,6 +594,9 @@ map = "mapping.toml"      # unit-map 文件指针，相对本文件所在目录
 - 段名拼错（`[mixr]`）是错误，不是静默回落 —— 否则看起来用了某套配置其实没有。
 - `[preference]` 是空段也合法（= 什么都没设）；波形、主题、曲库见
   `[preference.waveform]` / `[preference.theme]` / `[preference.library]`。
+- `[preference.analysis] auto_analyse = true`：browser 载入时，如果既没有外部曲库网格
+  （Rekordbox/Serato/VDJ）也没有分析缓存，就在后台自动跑一次分析并写回缓存；播放不会等它。
+  缺省 `false`。
 
 ### 3.13 帮助与退出
 
@@ -651,7 +677,7 @@ hypermixx> fx set filter value 0.5
 hypermixx> master fx list
 
 # deck1 同步到 deck0：先对 BPM 再用 PI 追相位
-hypermixx> deck1 sync phase pid
+hypermixx> deck1 sync phaselock pid
 hypermixx> deck1 sync tempolock
 hypermixx> deck0 sync set-leader
 hypermixx> deck1 nudge 0.04 0.5     # 临时 +4%，0.5s 后自动松开

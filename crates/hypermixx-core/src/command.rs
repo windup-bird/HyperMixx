@@ -278,8 +278,8 @@ pub enum LoopOp {
     Cancel,
     /// Leave the active loop; a slip loop drops its shadow and resumes `playing`.
     Exit,
-    /// Beat loop: with no loop engaged, open an N-beat loop at the quantized current beat; while
-    /// looping, re-time the current loop's `out` to `in + N` beats (halve/double), in place.
+    /// Beat loop: with no loop engaged, open an N-beat loop at the quantized current beat. While
+    /// looping, the same N closes the loop, a different N re-times it in place.
     Beats(BeatLen),
     /// Toggle a loop using the deck's `loop_beats`: no loop opens one, an active loop exits.
     Toggle,
@@ -327,7 +327,7 @@ impl Backend {
     }
 }
 
-/// How a phase correction closes the gap: the `sync phase` / `sync phaselock` argument.
+/// How a phase correction closes the gap: `sync phase` is instant only; `sync phaselock` takes a controller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PhaseMode {
     /// One flow switch that lands the follower on the leader's phase. Nothing keeps it there —
@@ -365,14 +365,16 @@ impl PhaseMode {
 pub enum SyncOp {
     /// One-shot tempo match: the target's rate becomes `leader_bpm / own_bpm`.
     Tempo,
-    /// `Tempo`, then a phase correction (`t_seconds` belongs to [`PhaseMode::Linear`]).
+    /// `Tempo`, then an instant jump onto the leader's phase. The one-shot command is
+    /// instant-only; when a lock is already running, this same op drops the lock.
     Phase {
         mode: PhaseMode,
         t_seconds: Option<f64>,
     },
     /// Bidirectional shared tempo: one `group_bpm` both decks derive their rate from.
     TempoLock,
-    /// One-way shared tempo — the follower tracks the leader — plus a phase correction.
+    /// One-way shared tempo — the follower tracks the leader — plus a continuous phase
+    /// correction (`linear` | `pid`).
     PhaseLock {
         mode: PhaseMode,
         t_seconds: Option<f64>,

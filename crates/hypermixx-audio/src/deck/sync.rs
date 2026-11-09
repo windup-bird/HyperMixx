@@ -4,7 +4,7 @@
 //!
 //! * **`tempo`** — the *stable* rate. The DJ's tempo fader, a one-shot `sync tempo` and a lock's
 //!   group recompute all write here. It is what `sync unlock` deliberately keeps.
-//! * **`nudgerate`** — the *temporary* rate. Phase tracking (`sync phase` / `sync phaselock`) and
+//! * **`nudgerate`** — the *temporary* rate. Phase tracking (`sync phaselock`) and
 //!   `nudge` both land here, so a correction never contaminates the tempo it is correcting. It
 //!   returns to zero as soon as the error converges or the bend is released.
 //!
@@ -90,7 +90,7 @@ impl PhaseAlign {
                 let t = t_seconds.unwrap_or(2.0);
                 if !t.is_finite() || t <= 0.0 {
                     return Err(
-                        "`sync phase linear` needs a positive duration, e.g. `sync phase linear 2.0`"
+                        "`sync phaselock linear` needs a positive duration, e.g. `sync phaselock linear 2.0`"
                             .into(),
                     );
                 }

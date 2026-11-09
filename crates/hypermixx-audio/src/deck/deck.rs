@@ -1291,6 +1291,11 @@ impl Deck {
         }
         let analysis = self.require_grid()?;
         if let Some(range) = self.loop_range() {
+            // A loop pad is a toggle when it names the loop that is already running: pressing the
+            // lit pad again closes it. A different length still re-times the current loop in place.
+            if self.loop_beats == beats {
+                return self.loop_exit();
+            }
             let out = beats_after(&analysis.beatgrid, range.in_frame, beats)
                 .ok_or_else(|| LOOP_NO_GRID.to_owned())?
                 .min(self.total_frames())
@@ -2739,6 +2744,36 @@ mod tests {
             out[CHANNELS],
             out[2 * CHANNELS]
         );
+    }
+
+    /// A loop pad is a toggle for its own length: a 4-beat pad closes a running 4-beat loop, but
+    /// an 8-beat pad changes the length in place instead.
+    #[test]
+    fn the_same_beat_loop_length_toggles_and_a_different_length_retimes() {
+        let total = crate::SAMPLE_RATE as u64 * 60;
+        let mut deck = loop_deck(total);
+        let four = BeatLen::beats(4);
+        let eight = BeatLen::beats(8);
+
+        deck.apply_loop(LoopOp::Beats(four)).expect("open");
+        let range = deck.loop_range().expect("engaged");
+        deck.apply_loop(LoopOp::Beats(four)).expect("toggle off");
+        assert!(deck.loop_range().is_none(), "the lit pad closes its loop");
+
+        deck.apply_loop(LoopOp::Beats(four)).expect("reopen");
+        let opened = deck.loop_range().expect("engaged");
+        deck.apply_loop(LoopOp::Beats(eight)).expect("retime");
+        let retimed = deck.loop_range().expect("still looping");
+        assert_eq!(retimed.in_frame, opened.in_frame, "a retime keeps the in point");
+        let grid = deck.analysis().expect("grid").beatgrid.clone();
+        let b = grid.floor_beat(opened.in_frame);
+        assert_eq!(
+            retimed.out_frame - retimed.in_frame,
+            grid.frame_at_beat(b + 8) - grid.frame_at_beat(b),
+            "the different pad changes the length"
+        );
+        assert_eq!(deck.loop_beats_value(), eight);
+        let _ = range;
     }
 
     #[test]

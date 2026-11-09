@@ -275,7 +275,7 @@ fn phase_pid_closes_a_staggered_start_and_parks() {
         &tx,
         Command::Sync {
             deck_id: 1,
-            op: SyncOp::Phase {
+            op: SyncOp::PhaseLock {
                 mode: PhaseMode::Pid,
                 t_seconds: None,
             },
@@ -636,13 +636,12 @@ fn a_one_shot_tempo_match_is_refused_once_the_pair_is_locked() {
     );
     assert_eq!(unchanged[1].sync_mode, "tempolock");
 
-    // Changing the phase mode *while* locked stays legal: the group owns the tempo already, so
-    // only the correction is installed — and the lock must survive it.
+    // A phase controller upgrades the relation to phaselock; the group still owns the tempo.
     ask(
         &tx,
         Command::Sync {
             deck_id: 1,
-            op: SyncOp::Phase {
+            op: SyncOp::PhaseLock {
                 mode: PhaseMode::Pid,
                 t_seconds: None,
             },
@@ -652,12 +651,35 @@ fn a_one_shot_tempo_match_is_refused_once_the_pair_is_locked() {
     sleep(250);
     let corrected = states(&tx, &rx);
     assert_eq!(corrected[1].align.as_deref(), Some("pid"));
-    assert!(corrected[1].lock, "adding a correction must not drop the lock");
-    assert_eq!(corrected[1].sync_mode, "tempolock");
+    assert!(corrected[1].lock, "the follower is still group-driven");
+    assert_eq!(corrected[1].sync_mode, "phaselock");
     assert!(
         (f64::from(corrected[1].tempo) - locked_tempo).abs() < 1e-6,
         "the group still owns the tempo: {} vs {locked_tempo}",
         corrected[1].tempo
+    );
+
+    // The sync control is a toggle while a lock runs: pressing it again unlocks.
+    ask(
+        &tx,
+        Command::Sync {
+            deck_id: 1,
+            op: SyncOp::Phase {
+                mode: PhaseMode::Instant,
+                t_seconds: None,
+            },
+        },
+    );
+    ack(&rx);
+    sleep(250);
+    let unlocked = states(&tx, &rx);
+    assert_eq!(unlocked[1].sync_mode, "free");
+    assert!(!unlocked[1].lock);
+    assert_eq!(unlocked[1].align, None);
+    assert!(
+        (f64::from(unlocked[1].tempo) - locked_tempo).abs() < 1e-6,
+        "unlocking keeps the tempo: {} vs {locked_tempo}",
+        unlocked[1].tempo
     );
 
     ask(&tx, Command::Quit);
@@ -675,7 +697,7 @@ fn a_linear_phase_sync_rejects_a_nonsense_duration() {
         &tx,
         Command::Sync {
             deck_id: 1,
-            op: SyncOp::Phase {
+            op: SyncOp::PhaseLock {
                 mode: PhaseMode::Linear,
                 t_seconds: Some(0.0),
             },
@@ -684,12 +706,12 @@ fn a_linear_phase_sync_rejects_a_nonsense_duration() {
     let message = expect_error(&rx, "a_linear_phase_sync_rejects_a_nonsense_duration");
     assert!(message.contains("positive duration"), "unhelpful refusal: {message}");
 
-    // …and a good one applies: tempo matched, controller installed, still free of any lock.
+    // …and a good one applies: tempo matched, controller installed, follower locked.
     ask(
         &tx,
         Command::Sync {
             deck_id: 1,
-            op: SyncOp::Phase {
+            op: SyncOp::PhaseLock {
                 mode: PhaseMode::Linear,
                 t_seconds: Some(2.0),
             },
@@ -698,8 +720,8 @@ fn a_linear_phase_sync_rejects_a_nonsense_duration() {
     ack(&rx);
     let applied = state(&tx, &rx, 1);
     assert_eq!(applied.align.as_deref(), Some("linear"));
-    assert_eq!(applied.sync_mode, "free");
-    assert!(!applied.lock);
+    assert_eq!(applied.sync_mode, "phaselock");
+    assert!(applied.lock);
 
     ask(&tx, Command::Quit);
     ack(&rx);

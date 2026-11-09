@@ -159,6 +159,46 @@ impl FlowSlotConfig {
     }
 }
 
+/// The channel EQ's two crossovers. The middle bell sits at their geometric centre, so the three
+/// bands stay log-evenly spaced when a rig moves the shelf frequencies.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EqConfig {
+    pub lower_hz: f32,
+    pub higher_hz: f32,
+}
+
+impl Default for EqConfig {
+    fn default() -> Self {
+        Self {
+            lower_hz: 250.0,
+            higher_hz: 2_000.0,
+        }
+    }
+}
+
+impl EqConfig {
+    /// `(low shelf, middle bell, high shelf)` in Hz. Nonsense or an inverted pair falls back to the
+    /// shipped frequencies rather than asking the filter designer to solve an impossible equation.
+    pub fn frequencies(&self) -> (f32, f32, f32) {
+        let sane = |value: f32, fallback: f32| {
+            if value.is_finite() && value > 0.0 {
+                value.clamp(20.0, 20_000.0)
+            } else {
+                fallback
+            }
+        };
+        let mut low = sane(self.lower_hz, 250.0);
+        let mut high = sane(self.higher_hz, 2_000.0);
+        if high <= low * 1.01 {
+            low = 250.0;
+            high = 2_000.0;
+        }
+        let mid = (low * high).sqrt();
+        (low, mid, high)
+    }
+}
+
 impl MixerConfig {
     /// Every FX name the chain names — every bank — for validation and `fx help`.
     pub fn all_fx(&self) -> impl Iterator<Item = &String> {
@@ -243,11 +283,8 @@ impl Default for CrossfaderConfig {
 #[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CueMixConfig {
-    /// Cue trim.
-    pub fader: f32,
-    /// `-1.0` = cue only, `0.0` = both at the curve's centre, `1.0` = master only. Spelled
-    /// `cue-blend` in the file; the shorter `blend` still loads.
-    #[serde(alias = "cue-blend")]
+    /// `-1.0` = cue only, `0.0` = both at the curve's centre, `1.0` = master only. The file
+    /// spells this `[mixer.fader] cue_blend`.
     pub blend: f32,
     pub curve: CrossfaderCurve,
     /// Fraction of the blend the `cut` curve drops over, at each end.
@@ -257,7 +294,6 @@ pub struct CueMixConfig {
 impl Default for CueMixConfig {
     fn default() -> Self {
         Self {
-            fader: 0.0,
             blend: -1.0,
             curve: CrossfaderCurve::Classic,
             cut_width: super::DEFAULT_CUT_WIDTH,
@@ -354,22 +390,19 @@ pub struct MixerConfig {
     /// The limiter's ceiling, dBFS. Converted to a linear amplitude when the slot is built; the
     /// limiter clamps it into its own useful range (−40 dBFS .. +12 dBFS).
     pub master_limiter_ceiling_db: f32,
-    /// Master trim, `-1.0 ..= 1.0` (0 dB at the top).
-    pub master_fader: f32,
-    /// Cue trim, `-1.0 ..= 1.0`.
-    pub cue_fader: f32,
     /// How a `cue` output blends the cue sends with the master mix.
     pub cue: CueMixConfig,
     pub outputs: Vec<OutputConfig>,
     /// Auto-gain: match each loaded track's measured loudness to a target. A mixer setting, so
     /// `mixer reload` re-applies it while `live reload` leaves it alone.
     pub autogain: AutogainSettings,
-    /// Which sweep the fixed `filter` stage builds, for every channel (a `[mixer.chain]` setting).
+    /// Which sweep the fixed `filter` stage builds, for every channel (`[mixer.fx] filter`).
     pub filter: FilterMode,
-    /// Which side of the channel fader the cue send taps, for every channel (a `[mixer.chain]`
-    /// setting). `pre` (default) keeps a channel cueable with its fader down; `post` makes the
+    /// Which side of the channel fader the cue send taps, for every channel (`[mixer.fader]`). `pre` (default) keeps a channel cueable with its fader down; `post` makes the
     /// fader silence the monitor too.
     pub fader_location: CueTap,
+    /// The fixed three-band tone stage's crossovers (`[mixer.eq]`).
+    pub eq: EqConfig,
 }
 
 impl Default for MixerConfig {
@@ -381,17 +414,16 @@ impl Default for MixerConfig {
             knob_fx: Vec::new(),
             pad_fx: Vec::new(),
             master_fx: Vec::new(),
-            // The safety stage is on by default everywhere: in a parsed config (`MasterFile`),
-            // in the reference topology (`simple_dj`) and in this constructor.
+            // The safety stage is on by default everywhere: in a parsed config, in the
+            // reference topology (`simple_dj`) and in this constructor.
             master_limiter: true,
             master_limiter_ceiling_db: -1.0,
-            master_fader: 0.0,
-            cue_fader: 0.0,
             cue: CueMixConfig::default(),
             outputs: Vec::new(),
             autogain: AutogainSettings::default(),
             filter: FilterMode::Linear,
             fader_location: CueTap::default(),
+            eq: EqConfig::default(),
         }
     }
 }
@@ -414,31 +446,22 @@ impl MixerConfig {
     ///
     /// This is the parser half of the "config is plain data" rule: the file schema is spelled out
     /// by [`MixerFile`] right below — a small mirror of [`MixerConfig`] whose only job is naming
-    /// (`[[channel]]` singular, a `[master]` table), so the Rust type and the file format can each
-    /// keep the names that suit them. File IO stays with the caller — a front-end decides where
+    /// (`[[mixer.fx]]`, `[[multideck.deck]]`), so the Rust type and the file format can each keep
+    /// the names that suit them. File IO stays with the caller — a front-end decides where
     /// topologies come from, the engine only reads the text.
     ///
     /// A config that parses but names an unknown effect still succeeds here; that is a
     /// *construction* error ([`MixerError::UnknownFx`] from `build_chains`), surfaced when a mixer
     /// is built rather than when the text is read, because that is where the registry is consulted.
     pub fn from_toml_str(text: &str) -> Result<Self, MixerError> {
-        // A single-file config keeps the topology under `[mixer]`; a standalone topology file (the
-        // historical `--config` shape, and `reference_toml()`) has the same keys at the root. Both
-        // are accepted, so one whole config can be emitted by `--print-config` while an old file
-        // still loads. Parsing to a Value first keeps syntax errors pointing at their line.
         let value: toml::Value =
             toml::from_str(text).map_err(|err| MixerError::Parse(err.to_string()))?;
-        // The two top-level sections have different jobs: `[mixer]` owns the audio topology and the
-        // bus shape, `[multideck]` only maps each deck to a controller face. Parsing to a Value
-        // first keeps syntax errors pointing at their line and lets us read both in one pass.
         let mixer_section = value.get("mixer").cloned();
         let deck_section = value
             .get("multideck")
             .and_then(|table| table.get("deck"))
             .cloned();
 
-        // `[[mixer.channel]]` is gone: each deck's fields live in `[[multideck.deck]]`. Only the
-        // historical bare-topology file (no `[mixer]` section) still reads root-level `[[channel]]`s.
         if mixer_section
             .as_ref()
             .and_then(|section| section.get("channel"))
@@ -460,47 +483,43 @@ impl MixerConfig {
             return Ok(simple_dj());
         }
 
-        // A bare topology file (the historical `--config` shape) still reads its `[[channel]]`s at
-        // the root. A one-file config reads `[mixer]`, whose `[[channel]]` rows are the audio
-        // topology; `[[multideck.deck]]` only carries the mapping, matched by index.
-        let section = match &mixer_section {
-            Some(section) => section.clone(),
-            None => {
-                let mut root = value.clone();
-                if let Some(table) = root.as_table_mut() {
-                    table.remove("multideck");
-                }
-                root
+        // The old root-level topology (`[[channel]]`, `[chain]`, `[master]`) is gone. Say so
+        // instead of silently building an empty mixer from a file that has no `[mixer]` table.
+        if mixer_section.is_none() && deck_section.is_none() {
+            if let Some(key) = ["channel", "chain", "master", "autogain", "output"]
+                .into_iter()
+                .find(|key| value.get(*key).is_some())
+            {
+                return Err(MixerError::Parse(format!(
+                    "root-level `{key}` was removed; put the mixer tables under `[mixer]`"
+                )));
             }
-        };
-        let mut file: MixerFile = section
+        }
+
+        let section = mixer_section.unwrap_or_else(|| toml::Value::Table(Default::default()));
+        let file: MixerFile = section
             .try_into()
             .map_err(|err| MixerError::Parse(err.to_string()))?;
+        let mut cfg: MixerConfig = file.into();
         if let Some(decks) = deck_section {
-            if !file.channel.is_empty() {
-                return Err(MixerError::Parse(
-                    "[[mixer.channel]] was removed; put each deck's fields in [[multideck.deck]]"
-                        .to_owned(),
-                ));
-            }
             let decks: Vec<DeckFile> = decks
                 .try_into()
                 .map_err(|err| MixerError::Parse(format!("[multideck]: {err}")))?;
-            file.channel = decks.into_iter().map(ChannelConfig::from).collect();
+            cfg.channels = decks.into_iter().map(ChannelConfig::from).collect();
         }
-        Ok(file.into())
+        Ok(cfg)
     }
 }
 
-/// One `[[multideck.deck]]`: routing metadata only. It is matched to `[[mixer.channel]]` by index;
-/// the audio topology (side, filter, fx, cue tap, …) lives under `[mixer]`.
+/// One `[[multideck.deck]]`: the controller routing plus the per-deck audio parameters. Everything
+/// shared by every deck lives under `[mixer]`.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct DeckFile {
     /// `<controller>.<face>[.mirror]`. Omit for a deck no controller owns.
     source: Option<String>,
     /// Per-deck audio parameters. Everything that is the *same* on every deck lives in
-    /// `[mixer.chain]`; these are the ones a DJ sets per deck.
+    /// `[mixer.fx]` / `[mixer.fader]`; these are the ones a DJ sets per deck.
     side: DeckSide,
     cue_send: f32,
     flow_fader: f32,
@@ -521,131 +540,120 @@ impl From<DeckFile> for ChannelConfig {
     }
 }
 
-/// The TOML schema for the `[mixer]` section: the audio topology — one `[[channel]]` per deck —
-/// plus the bus shape (`[crossfader]`, `[chain]`, `[cue]`, `[autogain]`) and any number of
-/// `[[output]]`s. The controller mapping lives in the sibling `[[multideck.deck]]` array. Every
-/// field defaults, so the smallest legal file is a single `[[channel]]`.
+/// The TOML schema for the `[mixer]` section: the bus shape (`[crossfader]`, `[fx]`, `[eq]`,
+/// `[limiter]`, `[fader]`, `[cue]`, `[autogain]`) and any number of `[[mixer.output]]`s. The deck list
+/// lives in the sibling `[[multideck.deck]]` array. Every field defaults.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct MixerFile {
-    channel: Vec<ChannelConfig>,
     crossfader: CrossfaderConfig,
-    /// `[mixer.chain]`: the master bus plus the settings every channel shares. Documented
-    /// spelling; `[mixer.master]` / `[mixer.autogain]` remain readable as the old aliases.
-    chain: Option<ChainFile>,
-    master: MasterFile,
-    cue: CueMixConfig,
+    /// `[mixer.fx]`: the four banks and the fixed sweep's kind.
+    fx: FxFile,
+    /// `[mixer.eq]`: the fixed tone stage's two crossovers.
+    eq: EqConfig,
+    /// `[mixer.limiter]`: the safety stage.
+    limiter: LimiterFile,
+    /// `[mixer.fader]`: cue tap side, cue blend and the cue blend curve.
+    fader: FaderFile,
+    /// `[mixer.cue]`: the cue bus shape. The trim is a runtime value, not a config value.
+    cue: CueFile,
     output: Vec<OutputConfig>,
-    /// `[mixer.autogain]`. Every field defaults, so the section is optional.
+    /// `[mixer.autogain]`.
     autogain: AutogainSettings,
 }
 
-/// The `[mixer.chain]` table. One table for the whole mix: the master bus (`fx`, `limiter`,
-/// `ceiling_db`, `fader`), the settings every channel shares (`filter`, `fader-location`), the cue
-/// bus blend and auto-gain. Per-deck differences stay in `[[mixer.channel]]`.
-#[derive(Debug, serde::Deserialize)]
+/// The `[mixer.fx]` table: the four banks plus the fixed sweep's kind. Their order is fixed by the
+/// signal path; the lists choose what sits in each stage.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
-struct ChainFile {
-    /// Master-bus effects, before the safety limiter (alias `fx`).
-    #[serde(alias = "fx")]
+struct FxFile {
     master_fx: Vec<String>,
-    /// Per-flow inserts shared by every channel. A template: every flow gets its own chain.
     flow_fx: Vec<FlowSlotConfig>,
-    /// Post-merge knob bank shared by every channel.
     knob_fx: Vec<String>,
-    /// Post-merge pad bank shared by every channel.
     pad_fx: Vec<String>,
-    /// The safety stage. On by default — a config has to say `limiter = false` to turn it off.
-    limiter: bool,
-    /// Limiter ceiling in dBFS.
-    ceiling_db: f32,
-    /// Master trim, `-1.0 ..= 1.0`.
-    fader: f32,
-    /// Which sweep the fixed `filter` stage builds (`linear` | `moog`), for every channel.
     filter: FilterMode,
-    /// `pre` | `post` — which side of the channel fader the cue send taps, for every channel.
-    #[serde(rename = "fader-location")]
-    fader_location: CueTap,
-    /// `-1.0` = cue only, `0.0` = both, `1.0` = master only.
-    #[serde(rename = "cue-blend")]
-    cue_blend: f32,
-    autogain: AutogainSettings,
 }
 
-impl Default for ChainFile {
+impl Default for FxFile {
     fn default() -> Self {
         Self {
             master_fx: Vec::new(),
             flow_fx: Vec::new(),
             knob_fx: Vec::new(),
             pad_fx: Vec::new(),
-            limiter: true,
-            ceiling_db: -1.0,
-            fader: 0.0,
             filter: FilterMode::Linear,
-            fader_location: CueTap::default(),
-            cue_blend: -1.0,
-            autogain: AutogainSettings::default(),
         }
     }
 }
 
-/// The old `[mixer.master]` table: the subset of [`ChainFile`] that spelling used to carry.
-#[derive(Debug, serde::Deserialize)]
+/// The `[mixer.limiter]` table. `limiter` is also accepted as `enabled`, because a section named
+/// "limiter" repeating the word is easy to get wrong.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
-struct MasterFile {
-    fx: Vec<String>,
+struct LimiterFile {
+    #[serde(alias = "enabled")]
     limiter: bool,
     ceiling_db: f32,
-    fader: f32,
 }
 
-impl Default for MasterFile {
+impl Default for LimiterFile {
     fn default() -> Self {
         Self {
-            fx: Vec::new(),
             limiter: true,
             ceiling_db: -1.0,
-            fader: 0.0,
         }
     }
+}
+
+/// The `[mixer.fader]` table. The cue/master trims are runtime values, so they are not here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct FaderFile {
+    /// `pre` | `post` — which side of the channel fader the cue send taps.
+    position: Option<CueTap>,
+    /// The cue/master **blend** curve (the headphones' crossfader), grouped here with
+    /// `cue_blend`.
+    crossfader_curve: Option<CrossfaderCurve>,
+    /// `-1.0` = cue only, `0.0` = both, `1.0` = master only.
+    cue_blend: Option<f32>,
+}
+
+/// The `[mixer.cue]` table: shape only. Its trim is a runtime fader.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct CueFile {
+    curve: Option<CrossfaderCurve>,
+    cut_width: Option<f32>,
 }
 
 impl From<MixerFile> for MixerConfig {
     fn from(file: MixerFile) -> Self {
-        // `[mixer.chain]` is the documented spelling; without it the old `[master]` /
-        // `[autogain]` / `[cue] blend` keys still describe the same fields.
-        let chain = file.chain.unwrap_or_else(|| ChainFile {
-            master_fx: file.master.fx,
-            flow_fx: Vec::new(),
-            knob_fx: Vec::new(),
-            pad_fx: Vec::new(),
-            limiter: file.master.limiter,
-            ceiling_db: file.master.ceiling_db,
-            fader: file.master.fader,
-            filter: FilterMode::Linear,
-            fader_location: CueTap::default(),
-            cue_blend: file.cue.blend,
-            autogain: file.autogain,
-        });
-        let mut cue = file.cue;
-        cue.blend = chain.cue_blend;
+        let fx = file.fx;
+        let mut cue = CueMixConfig::default();
+        cue.blend = file.fader.cue_blend.unwrap_or(-1.0);
+        // The new grouping puts the blend curve in `[mixer.fader]`; `[mixer.cue] curve` remains
+        // the direct spelling for the same field.
+        cue.curve = file
+            .fader
+            .crossfader_curve
+            .or(file.cue.curve)
+            .unwrap_or_default();
+        cue.cut_width = file.cue.cut_width.unwrap_or(super::DEFAULT_CUT_WIDTH);
         Self {
-            channels: file.channel,
+            channels: Vec::new(),
             crossfader: file.crossfader,
-            flow_fx: chain.flow_fx,
-            knob_fx: chain.knob_fx,
-            pad_fx: chain.pad_fx,
-            master_fx: chain.master_fx,
-            master_limiter: chain.limiter,
-            master_limiter_ceiling_db: chain.ceiling_db,
-            master_fader: chain.fader,
-            cue_fader: cue.fader,
+            flow_fx: fx.flow_fx,
+            knob_fx: fx.knob_fx,
+            pad_fx: fx.pad_fx,
+            master_fx: fx.master_fx,
+            master_limiter: file.limiter.limiter,
+            master_limiter_ceiling_db: file.limiter.ceiling_db,
             cue,
             outputs: file.output,
-            autogain: chain.autogain,
-            filter: chain.filter,
-            fader_location: chain.fader_location,
+            autogain: file.autogain,
+            filter: fx.filter,
+            fader_location: file.fader.position.unwrap_or_default(),
+            eq: file.eq,
         }
     }
 }
@@ -694,13 +702,12 @@ pub fn silent_test_channel() -> MixerConfig {
         master_fx: vec![],
         master_limiter: false,
         master_limiter_ceiling_db: -1.0,
-        master_fader: 0.0,
-        cue_fader: 0.0,
         cue: CueMixConfig::default(),
         outputs: vec![],
         autogain: AutogainSettings::default(),
         filter: FilterMode::Linear,
         fader_location: CueTap::default(),
+        eq: EqConfig::default(),
     }
 }
 
@@ -730,11 +737,15 @@ fn build_channel_chains(
     mixer: &MixerConfig,
     _cfg: &ChannelConfig,
 ) -> Result<BuiltChains, MixerError> {
+    let (low_hz, mid_hz, high_hz) = mixer.eq.frequencies();
     let flow = (0..Stem::COUNT)
         .map(|_| {
-            // `eq` first, then the sweep — part of the path, not of any bank.
+            // `eq` first, then the sweep — part of the path, not of any bank. The EQ gets its
+            // crossovers from `[mixer.eq]`; its role stays `eq` so a mapped knob survives a
+            // runtime `fx select eq …` swap.
+            let eq = crate::fx::sample::Eq::with_frequencies(low_hz, mid_hz, high_hz);
             let mut slots = vec![
-                slot_with_role("eq", Some("eq"))?,
+                FxSlot::with_role(Box::new(eq), "eq", "eq"),
                 slot_with_role(mixer.filter.name(), Some("filter"))?,
             ];
             for (index, slot_cfg) in mixer.flow_fx.iter().enumerate() {
@@ -896,7 +907,7 @@ mod tests {
     #[test]
     fn the_struct_default_agrees_with_the_parsed_default() {
         let cfg = MixerConfig::default();
-        let parsed = MixerConfig::from_toml_str("[[channel]]\nside = \"center\"\n").unwrap();
+        let parsed = MixerConfig::from_toml_str("[mixer]\n[[multideck.deck]]\nside = \"center\"\n").unwrap();
         assert!(cfg.master_limiter, "the safety stage is on everywhere");
         assert_eq!(cfg.master_limiter_ceiling_db, -1.0);
         assert_eq!(cfg.master_limiter, parsed.master_limiter);
@@ -905,19 +916,19 @@ mod tests {
 
     #[test]
     fn the_master_limiter_is_on_by_default_and_its_ceiling_is_configurable() {
-        let on = MixerConfig::from_toml_str("[[channel]]\nside = \"center\"\n").unwrap();
-        assert!(on.master_limiter, "omitting [master] must not drop the safety stage");
+        let on = MixerConfig::from_toml_str("[mixer]\n[[multideck.deck]]\nside = \"center\"\n").unwrap();
+        assert!(on.master_limiter, "omitting [mixer.limiter] must not drop the safety stage");
         assert_eq!(on.master_limiter_ceiling_db, -1.0);
 
         let cfg = MixerConfig::from_toml_str(
-            "[master]\nlimiter = true\nceiling_db = -6.0\n[[channel]]\nside = \"center\"\n",
+            "[mixer.limiter]\nlimiter = true\nceiling_db = -6.0\n[[multideck.deck]]\nside = \"center\"\n",
         )
         .unwrap();
         assert!(cfg.master_limiter);
         assert_eq!(cfg.master_limiter_ceiling_db, -6.0);
 
         let off = MixerConfig::from_toml_str(
-            "[master]\nlimiter = false\n[[channel]]\nside = \"center\"\n",
+            "[mixer.limiter]\nlimiter = false\n[[multideck.deck]]\nside = \"center\"\n",
         )
         .unwrap();
         assert!(!off.master_limiter, "a config can still turn it off");
@@ -928,9 +939,10 @@ mod tests {
         // A minimal channel: everything optional takes the defaults the comments promise.
         let cfg = MixerConfig::from_toml_str(
             r#"
-            [[channel]]
+            [mixer]
+            [[multideck.deck]]
             side = "center"
-            [[output]]
+            [[mixer.output]]
             name = "only"
             role = "master"
             "#,
@@ -960,13 +972,11 @@ mod tests {
         );
         assert_eq!(cfg.outputs[0].channels, (0, 1));
         assert_eq!(cfg.outputs[0].gain, 1.0);
-        assert_eq!(cfg.cue_fader, 0.0);
         assert!(
             cfg.master_limiter,
             "the safety stage is on by default; a config has to turn it off"
         );
         assert_eq!(cfg.master_limiter_ceiling_db, -1.0);
-        assert_eq!(cfg.master_fader, 0.0);
         // The struct default agrees with the parsed channel above.
         let default = ChannelConfig::default();
         assert_eq!(
@@ -980,14 +990,15 @@ mod tests {
     fn toml_errors_name_their_location_and_refuse_unknown_keys() {
         // A syntax error carries the line; a typo'd key is refused rather than ignored.
         let err = MixerConfig::from_toml_str(
-            "[[channel]]
+            "[mixer]
+[[multideck.deck]]
 side = \"spinward\"",
         )
         .unwrap_err();
         assert!(matches!(err, MixerError::Parse(_)));
         assert!(err.message().contains("spinward"), "got: {}", err.message());
 
-        let err = MixerConfig::from_toml_str("[[channel]]\nside = \"left\"\nbass_boost = 12.0\n")
+        let err = MixerConfig::from_toml_str("[mixer]\n[[multideck.deck]]\nside = \"left\"\nbass_boost = 12.0\n")
             .unwrap_err();
         assert!(
             err.message().contains("bass_boost"),
@@ -998,7 +1009,7 @@ side = \"spinward\"",
         // The pre-bank spelling is gone: `stem_fx` and `chain` are refused by name rather than
         // silently ignored, so an old topology file cannot half-load.
         for gone in ["stem_fx", "chain"] {
-            let text = format!("[[channel]]\n{gone} = [\"eq\"]\n");
+            let text = format!("[mixer]\n[[multideck.deck]]\n{gone} = [\"eq\"]\n");
             let err = MixerConfig::from_toml_str(&text).unwrap_err();
             assert!(
                 err.message().contains(gone),
@@ -1008,7 +1019,7 @@ side = \"spinward\"",
         }
 
         // An output without a name has nothing to log against.
-        assert!(MixerConfig::from_toml_str("[[output]]\nrole = \"main\"").is_err());
+        assert!(MixerConfig::from_toml_str("[mixer]\n[[mixer.output]]\nrole = \"main\"").is_err());
         // Every error variant is displayable.
         for err in [
             MixerError::UnknownFx("x".into()),
@@ -1076,15 +1087,95 @@ side = \"spinward\"",
         );
     }
 
+    /// The split `[mixer.fx]` / `[mixer.eq]` / `[mixer.limiter]` / `[mixer.fader]` shape is the
+    /// documented file layout.
+    #[test]
+    fn the_split_mixer_tables_parse() {
+        let cfg = MixerConfig::from_toml_str(
+            r#"
+            [mixer]
+
+            [mixer.crossfader]
+            curve = "cut"
+
+            [mixer.fx]
+            master_fx = ["echo"]
+            knob_fx = ["filter"]
+            pad_fx = ["reverb"]
+            filter = "moog"
+
+            [mixer.eq]
+            lower_hz = 180
+            higher_hz = 3_200
+
+            [mixer.limiter]
+            limiter = false
+            ceiling_db = -6.0
+
+            [mixer.fader]
+            position = "post"
+            crossfader_curve = "constant_power"
+            cue_blend = 1.0
+
+            [[multideck.deck]]
+            side = "center"
+            "#,
+        )
+        .expect("the split tables parse");
+        assert_eq!(cfg.master_fx, vec!["echo"]);
+        assert_eq!(cfg.knob_fx, vec!["filter"]);
+        assert_eq!(cfg.pad_fx, vec!["reverb"]);
+        assert_eq!(cfg.filter, FilterMode::Moog);
+        assert_eq!(cfg.eq.lower_hz, 180.0);
+        assert_eq!(cfg.eq.higher_hz, 3_200.0);
+        assert!(!cfg.master_limiter);
+        assert_eq!(cfg.master_limiter_ceiling_db, -6.0);
+        assert_eq!(cfg.fader_location, CueTap::Post);
+        assert_eq!(
+            cfg.crossfader.curve,
+            CrossfaderCurve::Cut,
+            "the deck crossfader keeps [mixer.crossfader].curve"
+        );
+        assert_eq!(
+            cfg.cue.curve,
+            CrossfaderCurve::ConstantPower,
+            "[mixer.fader].crossfader_curve shapes the cue/master blend"
+        );
+        assert_eq!(cfg.cue.blend, 1.0);
+    }
+
+    /// The EQ stage is built with `[mixer.eq]`'s crossovers; the middle bell is their log centre.
+    #[test]
+    fn the_eq_stage_uses_the_configured_crossovers() {
+        let cfg = MixerConfig::from_toml_str(
+            r#"
+            [mixer]
+            [mixer.eq]
+            lower_hz = 250
+            higher_hz = 2_000
+            [[multideck.deck]]
+            side = "center"
+            "#,
+        )
+        .expect("parses");
+        let chains = cfg.build_chains().unwrap();
+        let eq = &chains[0].0[0].slots()[0];
+        assert_eq!(eq.role(), "eq");
+        assert_eq!(eq.fx().get_param("low_hz"), Some(250.0));
+        assert_eq!(eq.fx().get_param("high_hz"), Some(2_000.0));
+        let mid = eq.fx().get_param("mid_hz").unwrap();
+        assert!((mid - 707.106_8).abs() < 0.01, "geometric centre, got {mid}");
+    }
+
     /// `filter` chooses the kind of the fixed stage; the slot's role stays `filter`, which is what a
-    /// mapped knob and `fx kind` rely on.
+    /// mapped knob and `fx select` rely on.
     #[test]
     fn the_filter_kind_configures_the_fixed_stage() {
         let cfg = MixerConfig::from_toml_str(
             r#"
-            [chain]
+            [mixer.fx]
             filter = "moog"
-            [[channel]]
+            [[multideck.deck]]
             "#,
         )
         .expect("parses");
@@ -1099,18 +1190,18 @@ side = \"spinward\"",
     #[test]
     fn a_flowfx_slot_exists_once_per_flow_but_is_one_control() {
         let text = r#"
-            [chain]
+            [mixer.fx]
             knob_fx = ["filter"]
             pad_fx = []
 
-            [[chain.flow_fx]]
+            [[mixer.fx.flow_fx]]
             kind = "filter"
 
-            [[chain.flow_fx]]
+            [[mixer.fx.flow_fx]]
             kind = "echo"
             flows = ["vocals", "drums"]
 
-            [[channel]]
+            [[multideck.deck]]
         "#;
         let cfg = MixerConfig::from_toml_str(text).expect("parses");
         let chains = cfg.build_chains().unwrap();
@@ -1131,12 +1222,12 @@ side = \"spinward\"",
         // An explicit empty whitelist is a mounted slot that processes nothing.
         let cfg = MixerConfig::from_toml_str(
             r#"
-            [chain]
-            [[chain.flow_fx]]
+            [mixer.fx]
+            [[mixer.fx.flow_fx]]
             kind = "echo"
             flows = []
 
-            [[channel]]
+            [[multideck.deck]]
         "#,
         )
         .expect("parses");

@@ -1,6 +1,6 @@
 //! [`Empty`]: a slot that is mounted, addressable and processes nothing.
 //!
-//! Fixed slot banks mean a slot's *position* has to survive a change of mind. `fx kind <slot> none`
+//! Fixed slot banks mean a slot's *position* has to survive a change of mind. `fx select <slot> none`
 //! empties the slot in place — the index and role stay, so a controller map keeps pointing at it —
 //! which is what "remove this effect" means in a mixer whose banks are declared in the config.
 

@@ -1,7 +1,7 @@
 //! The action vocabulary, shared by every front-end that can drive the engine.
 //!
 //! There is **one** table, and its names *are* the session grammar: a MIDI binding's `action` is a
-//! command line without the target (`"play"`, `"beatjump 4"`, `"sync phase pid"`, `"vocals mute"`),
+//! command line without the target (`"play"`, `"beatjump 4"`, `"sync phase"`, `"vocals mute"`),
 //! and the binding's `deck` supplies the target it leaves out. A line that starts with its own
 //! target word (`master fx toggle filter`) addresses that instead.
 //!
@@ -276,11 +276,8 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "sync phase",
         deck: true,
         momentary: false,
-        args: &[
-            arg("instant|linear|pid", false, "the correction mode"),
-            arg("seconds", false, "duration, for linear"),
-        ],
-        doc: "match BPM, then close the phase",
+        args: &[arg("instant", false, "the one-shot correction mode")],
+        doc: "match BPM, then jump onto the leader's phase (toggle off a running lock)",
     },
     ActionSpec {
         name: "sync tempolock",
@@ -294,7 +291,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         deck: true,
         momentary: false,
         args: &[
-            arg("instant|linear|pid", false, "the correction mode"),
+            arg("linear|pid", false, "the continuous correction mode"),
             arg("seconds", false, "duration, for linear"),
         ],
         doc: "follow the leader exactly",
@@ -409,7 +406,7 @@ pub fn canonical(name: &str) -> Option<String> {
     if ACTIONS.iter().any(|spec| spec.name == name) {
         return Some(name.to_owned());
     }
-    // A line with arguments whose verb is in the registry (`loop 8`, `sync phase pid`,
+    // A line with arguments whose verb is in the registry (`loop 8`, `sync phase`,
     // `beatjump -4`, `vinyl 1323`): the verb is what has to be known, the words are the parser's
     // business.
     if ACTIONS.iter().any(|spec| {

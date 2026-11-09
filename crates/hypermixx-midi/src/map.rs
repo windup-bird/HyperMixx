@@ -1782,7 +1782,7 @@ fn stem_of(token: &str) -> Result<Stem, String> {
 /// Resolves an action line into its parameterised [`Action`].
 ///
 /// The line is **a session command line without the target**: `"play"`, `"beatjump 4"`,
-/// `"sync phase pid"`, `"vocals mute"`, `"fader flow"`, `"loop 1/4"`. Every value the action needs
+/// `"sync phase"`, `"vocals mute"`, `"fader flow"`, `"loop 1/4"`. Every value the action needs
 /// is in the line; the row only supplies the deck, and the FX chain address. Legacy dot-spelled
 /// names are still accepted — see [`hypermixx_core::action::canonical`].
 fn parse_action(line: &str, ctx: &ActionCtx<'_>) -> Result<Action, String> {
@@ -2014,34 +2014,39 @@ fn parse_action(line: &str, ctx: &ActionCtx<'_>) -> Result<Action, String> {
                 _ => SyncAction::Unlock,
             }))
         }
-        ["sync", phase @ ("phase" | "phaselock")] => {
+        ["sync", "phase"] => {
             deck("sync")?;
-            let (mode, seconds) = phase_args(&[])?;
-            Ok(Action::Sync(if *phase == "phase" {
-                SyncAction::Phase {
-                    mode,
-                    t_seconds: seconds,
-                }
-            } else {
-                SyncAction::PhaseLock {
-                    mode,
-                    t_seconds: seconds,
-                }
+            Ok(Action::Sync(SyncAction::Phase {
+                mode: PhaseMode::Instant,
+                t_seconds: None,
             }))
         }
-        ["sync", phase @ ("phase" | "phaselock"), rest @ ..] => {
+        ["sync", "phase", "instant" | "jump"] => {
             deck("sync")?;
-            let (mode, seconds) = phase_args(rest)?;
-            Ok(Action::Sync(if *phase == "phase" {
-                SyncAction::Phase {
-                    mode,
-                    t_seconds: seconds,
-                }
-            } else {
-                SyncAction::PhaseLock {
-                    mode,
-                    t_seconds: seconds,
-                }
+            Ok(Action::Sync(SyncAction::Phase {
+                mode: PhaseMode::Instant,
+                t_seconds: None,
+            }))
+        }
+        ["sync", "phase", mode, ..] => {
+            deck("sync")?;
+            Err(format!(
+                "`sync phase` only supports instant; use `sync phaselock {mode}` for a controller"
+            ))
+        }
+        ["sync", "phaselock"] => {
+            deck("sync")?;
+            Ok(Action::Sync(SyncAction::PhaseLock {
+                mode: PhaseMode::Pid,
+                t_seconds: None,
+            }))
+        }
+        ["sync", "phaselock", rest @ ..] => {
+            deck("sync")?;
+            let (mode, seconds) = phaselock_args(rest)?;
+            Ok(Action::Sync(SyncAction::PhaseLock {
+                mode,
+                t_seconds: seconds,
             }))
         }
         ["fx", what @ ("on" | "off" | "toggle" | "pad" | "trigger")] => {
@@ -2062,13 +2067,19 @@ fn parse_action(line: &str, ctx: &ActionCtx<'_>) -> Result<Action, String> {
     }
 }
 
-/// The `<mode> [seconds]` tail of a `sync phase` line. Defaults to the PI controller, which is what
-/// a button wants: press it, and the decks converge.
-fn phase_args(rest: &[&str]) -> Result<(PhaseMode, Option<f64>), String> {
+/// The `<linear [seconds] | pid>` tail of a `sync phaselock` line. The default is the PI
+/// controller, which is what a button wants: press it, and the decks converge.
+fn phaselock_args(rest: &[&str]) -> Result<(PhaseMode, Option<f64>), String> {
     let mut mode = PhaseMode::Pid;
     let mut seconds = None;
     for word in rest {
         if let Some(parsed) = PhaseMode::parse(word) {
+            if parsed == PhaseMode::Instant {
+                return Err(
+                    "`sync phaselock` needs linear|pid — use `sync phase` for an instant jump"
+                        .to_owned(),
+                );
+            }
             mode = parsed;
             continue;
         }
@@ -2081,7 +2092,7 @@ fn phase_args(rest: &[&str]) -> Result<(PhaseMode, Option<f64>), String> {
         seconds = Some(value);
     }
     if mode == PhaseMode::Linear && seconds.is_none() {
-        return Err("`sync phase linear` needs a duration".to_owned());
+        return Err("`sync phaselock linear` needs a duration".to_owned());
     }
     Ok((mode, seconds))
 }

@@ -12,7 +12,7 @@
 [multideck]
 # The deck list: one [[multideck.deck]] per deck, in deck-id order (deck1, deck2, ...). Each entry
 # carries its controller mapping and the parameters a DJ sets per deck; everything that is the
-# same on every deck lives in `[mixer.chain]`.
+# same on every deck lives in `[mixer.fx]` / `[mixer.fader]`.
 # `source` names the controller surface that drives a deck: <controller-id>.<face>[.mirror].
 # Omit `.mirror` for the normal variant; omit `source` for a deck no controller owns. A two-deck
 # controller driving four decks adds two more entries, e.g.
@@ -48,29 +48,38 @@ cue_send = 1.0
 [mixer.crossfader]
 curve = "classic"        # classic | constant_power | cut
 
-[mixer.chain]
-# One table for the whole mix: every effect, the master bus, and the settings every deck shares.
-master_fx = []           # master-bus effects, before the limiter (alias: fx)
+[mixer.fx]
+master_fx = []           # master-bus effects, before the limiter
 flow_fx = []             # per-flow inserts (template: one chain per flow)
 knob_fx = []             # post-merge knob bank
 pad_fx = []              # post-merge pad bank
-limiter = true            # the safety stage; on unless explicitly turned off
-ceiling_db = -1.0         # dBFS, −40 .. +12; the limiter's ceiling
-fader = 0.0               # master trim
-filter = "linear"         # linear | moog — the fixed sweep stage's kind, every channel
-fader-location = "pre"    # pre | post — which side of the channel fader the cue send taps
-cue-blend = -1.0          # -1 = cue only (default), 0 = both, +1 = master only
-# [[mixer.chain.flow_fx]]
+filter = "linear"        # linear | moog — the fixed sweep stage's kind, every channel
+
+# Per-flow routing still uses tables, now under `[mixer.fx]`:
+# [[mixer.fx.flow_fx]]
 # kind = "filter"
 # flows = ["vocals"]     # omitted = every flow, [] = none
 
-[mixer.chain.autogain]
+[mixer.eq]
+lower_hz = 250           # low/mid boundary
+higher_hz = 2000         # mid/high boundary; the mid bell sits at their geometric centre
+
+[mixer.limiter]
+limiter = true            # the safety stage; on unless explicitly turned off
+ceiling_db = -1.0         # dBFS, −40 .. +12; the limiter's ceiling
+
+[mixer.fader]
+position = "pre"         # pre | post — which side of the channel fader the cue send taps
+crossfader_curve = "classic"  # cue/master blend curve: classic | constant_power | cut
+cue_blend = -1.0         # -1 = cue only (default), 0 = both, +1 = master only
+
+[mixer.autogain]
 enabled = false          # off by default: a mixer that silently changes level is a surprise
 target_db = -12.0        # dBFS for the loudest ~3 s of a track
 
 [mixer.cue]
-# fader = 0.0             # cue-bus trim
-# curve = "classic"
+# curve = "classic"       # cue/master blend curve (same as [mixer.fader].crossfader_curve)
+# cut_width = 0.05        # the cut curve's fade width at each end
 
 [[mixer.output]]
 name = "main"
@@ -131,12 +140,14 @@ vdj_offset_ms = 0.0
 key = "camelot"          # camelot (8A/8B) | classic (Am/C)
 follow = true            # CLI/MIDI 命令与 modetrigger 自动切到对应面板
 
-# Analysis backends, named directly — there is no auto fallback.
+# Analysis backends, named directly — there is no automatic backend fallback.
+# auto_analyse only decides whether a browser load with no grid analyses in the background.
 #   timestretch : tracked beat sequence + kick-band phase corroboration + key (default)
 #   stratum     : multi-method BPM + onset beat list
 [preference.analysis]
 beats = "timestretch"
 key = "timestretch"
+auto_analyse = false        # analyse a browser load when no imported/cached grid exists
 
 [controller]
 # `map` is a file pointer to a unit-map file, relative to this config's folder. Leaving it out

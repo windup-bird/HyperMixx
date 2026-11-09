@@ -52,7 +52,7 @@ pub enum UiEvent {
 }
 
 /// One slot as the front-end remembers it: the stable **role** of the position, and what is in it
-/// now. They differ after `fx kind` swaps the effect, and every lookup prefers the role — that is
+/// now. They differ after `fx select` swaps the effect, and every lookup prefers the role — that is
 /// what keeps a mapped knob on its slot when `filter` becomes `moog`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotEntry {
@@ -63,7 +63,7 @@ pub struct SlotEntry {
 /// The slots of every chain.
 ///
 /// The front-end owns all chain mutations, so it can keep this accurate without asking the engine:
-/// `FxAdded` appends, a dispatched `fx remove` drops locally, `fx kind` replaces the kind, and
+/// `FxAdded` appends, a dispatched `fx remove` drops locally, `fx select` replaces the kind, and
 /// `fx list` replaces the whole chain. It is filled once at startup (see [`Dispatcher::prime`]) so
 /// a slot can be named from the very first command.
 pub struct SlotBook {
@@ -148,7 +148,7 @@ impl SlotBook {
         book.get(chain)?.get(index).map(|entry| entry.role.clone())
     }
 
-    /// Records a `fx kind` this front-end sent. The engine validated the name, so no round-trip.
+    /// Records a `fx select` this front-end sent. The engine validated the name, so no round-trip.
     pub fn set_kind(&self, chain: &str, index: usize, kind: &str) {
         if let Ok(mut book) = self.slots.lock() {
             if let Some(entries) = book.get_mut(chain) {
@@ -1052,22 +1052,29 @@ fn sync_command<'a>(
     deck_id: u8,
     command_tx: &Sender<Command>,
 ) -> Action {
-    let usage = "usage: [deck] sync tempo | phase <mode> [seconds] | tempolock | phaselock <mode> [seconds] | set-leader | unlock";
+    let usage = "usage: [deck] sync tempo | phase [instant] | tempolock | phaselock [linear [seconds]|pid] | set-leader | unlock";
     let Some(sub) = words.next() else {
         return Action::Message(usage.into());
     };
     let op = match sub {
         "tempo" => SyncOp::Tempo,
         "phase" => {
-            let (mode, t_seconds) = match phase_mode(words, "phase") {
-                Ok(parsed) => parsed,
-                Err(message) => return Action::Failed(message),
-            };
-            SyncOp::Phase { mode, t_seconds }
+            // One-shot phase is only the jump; a controller belongs to `phaselock`.
+            if let Some(mode) = words.next() {
+                if PhaseMode::parse(mode) != Some(PhaseMode::Instant) {
+                    return Action::Failed(format!(
+                        "`sync phase` only supports instant; use `sync phaselock {mode}` for a controller"
+                    ));
+                }
+            }
+            SyncOp::Phase {
+                mode: PhaseMode::Instant,
+                t_seconds: None,
+            }
         }
         "tempolock" | "lock" => SyncOp::TempoLock,
         "phaselock" => {
-            let (mode, t_seconds) = match phase_mode(words, "phaselock") {
+            let (mode, t_seconds) = match phaselock_mode(words, "phaselock") {
                 Ok(parsed) => parsed,
                 Err(message) => return Action::Failed(message),
             };
@@ -1085,21 +1092,24 @@ fn sync_command<'a>(
     send(command_tx, Command::Sync { deck_id, op })
 }
 
-/// `<mode> [seconds]` for `sync phase` / `sync phaselock`. Only `linear` takes a duration — a
-/// duration on `pid` would be a typo the user should see rather than an argument silently ignored.
-fn phase_mode<'a>(
+/// `<linear [seconds] | pid>` for `sync phaselock`. The default is `pid`; only `linear` takes a
+/// duration, and `instant` belongs to the one-shot `sync phase`.
+fn phaselock_mode<'a>(
     words: &mut impl Iterator<Item = &'a str>,
     what: &str,
 ) -> Result<(PhaseMode, Option<f64>), String> {
-    let usage = format!("usage: [deck] sync {what} <instant|linear [seconds]|pid>");
+    let usage = format!("usage: [deck] sync {what} [linear [seconds]|pid]");
     let Some(token) = words.next() else {
-        return Err(usage);
+        return Ok((PhaseMode::Pid, None));
     };
     let Some(mode) = PhaseMode::parse(token) else {
         return Err(format!(
-            "unknown phase mode `{token}` — instant|linear|pid\n{usage}"
+            "unknown phaselock mode `{token}` — linear|pid\n{usage}"
         ));
     };
+    if mode == PhaseMode::Instant {
+        return Err("`sync phaselock` needs linear|pid — use `sync phase` for an instant jump".into());
+    }
     let t_seconds = match words.next() {
         Some(raw) => match raw.parse::<f64>() {
             Ok(seconds) => {
@@ -1407,13 +1417,13 @@ fn fx<'a>(
         }
         // Swap the effect *in* a slot: same index, same role, same on/off state. The kind is
         // validated here, so the local slot book can be updated without a round-trip.
-        "kind" => {
+        "select" => {
             let index = match resolve_slot(words.next(), chain, dispatcher) {
                 Ok(index) => index,
                 Err(e) => return Action::Failed(e),
             };
             let Some(kind) = words.next() else {
-                return Action::Failed("usage: [deck|master] fx kind <slot> <kind>".into());
+                return Action::Failed("usage: [deck|master] fx select <slot> <kind>".into());
             };
             let parsed = match FxKind::parse(kind) {
                 Ok(parsed) => parsed,
@@ -2389,24 +2399,41 @@ fn browser_command(words: &mut std::str::SplitWhitespace<'_>, dispatcher: &Dispa
     }
 }
 
+/// What to do when a load has no imported or cached analysis and auto-analysis is enabled.
+#[derive(Clone)]
+pub(crate) struct AutoAnalysis {
+    pub backends: Backends,
+    /// `(cache, track_id)` so a successful automatic run is reusable next time. `None` for a load
+    /// that did not come from the library browser.
+    pub cache: Option<(Arc<LibraryDb>, i64)>,
+}
+
 /// Decodes on a worker thread, then hands the pipeline a ready source (+ optional constant grid).
 pub(crate) fn spawn_load(deck_id: u8, path: String, bpm: Option<f32>, dispatcher: &Dispatcher) {
-    spawn_load_with(deck_id, path, bpm, None, None, dispatcher);
+    spawn_load_with(deck_id, path, bpm, None, None, None, dispatcher);
 }
 
 /// As [`spawn_load`], but with an analysis already read from the library cache. The grid is scaled
 /// to the engine rate if the cached analysis was produced under another live setting.
+///
+/// `auto_analyse` runs only when the caller found neither an imported grid nor a cached analysis.
+/// Playback starts first; the analyser reads the PCM already resident in the just-decoded source,
+/// then publishes a real grid and (when a library id is known) caches it.
 pub(crate) fn spawn_load_with(
     deck_id: u8,
     path: String,
     bpm: Option<f32>,
     analysis: Option<TrackAnalysis>,
     cues: Option<hypermixx_library::LoadedCues>,
+    auto_analyse: Option<AutoAnalysis>,
     dispatcher: &Dispatcher,
 ) {
     let command_tx = dispatcher.command_tx.clone();
     let notices_tx = dispatcher.notices.clone();
     let events = dispatcher.events.clone();
+    // A tag BPM produces a constant grid below, but that is a hint, not an analysis: auto-analysis
+    // still runs in that case.
+    let auto_analyse = auto_analyse.filter(|_| analysis.is_none());
     // The decoder resamples to the engine's rate, which is a live setting rather than a constant:
     // after this call nothing downstream has a sample-rate concept left.
     let sample_rate = dispatcher.live().audio.sample_rate;
@@ -2459,7 +2486,7 @@ pub(crate) fn spawn_load_with(
                     let source: Shared = Arc::new(hypermixx_media::PcmPool::from_decoded(decoded));
                     let _ = command_tx.send(Command::Load {
                         deck_id,
-                        source,
+                        source: source.clone(),
                         analysis,
                         loudness_db,
                     });
@@ -2469,6 +2496,61 @@ pub(crate) fn spawn_load_with(
                             memory: cues.memory,
                             hot: cues.hot,
                         });
+                    }
+                    if let Some(auto) = auto_analyse {
+                        notices::info(
+                            &notices_tx,
+                            format!(
+                                "[analyse] {}: auto-load, running {:?}...",
+                                hypermixx_core::deck_label(deck_id),
+                                auto.backends
+                            ),
+                        );
+                        match hypermixx_library::analyser::analyze(
+                            source,
+                            sample_rate,
+                            auto.backends,
+                        ) {
+                            Ok(analysis) => {
+                                let bpm = analysis.bpm();
+                                let key = analysis
+                                    .key
+                                    .map(|key| key.traditional())
+                                    .unwrap_or_else(|| "--".into());
+                                if let Some((db, track_id)) = auto.cache {
+                                    if let Err(err) = db.save_analysis(track_id, &analysis) {
+                                        notices::error(
+                                            &notices_tx,
+                                            format!("[analyse] cache: {err}"),
+                                        );
+                                    }
+                                }
+                                notices::info(
+                                    &notices_tx,
+                                    format!(
+                                        "[analyse] {}: {bpm:.1} BPM, {key}",
+                                        hypermixx_core::deck_label(deck_id)
+                                    ),
+                                );
+                                if let Some(tap) = &events {
+                                    let _ = tap.send(UiEvent::Grid {
+                                        deck_id,
+                                        analysis: analysis.clone(),
+                                    });
+                                }
+                                let _ = command_tx.send(Command::SetAnalysis {
+                                    deck_id,
+                                    analysis,
+                                });
+                            }
+                            Err(err) => notices::error(
+                                &notices_tx,
+                                format!(
+                                    "[analyse] {}: {err}",
+                                    hypermixx_core::deck_label(deck_id)
+                                ),
+                            ),
+                        }
                     }
                 }
                 Err(err) => notices::error(&notices_tx, format!("deck {deck_id}, {path}: {err}")),
@@ -2916,7 +2998,7 @@ mod tests {
                 "loop double" => "loop double",
                 "loop" => "loop 4",
                 "sync tempo" => "sync tempo",
-                "sync phase" => "sync phase pid",
+                "sync phase" => "sync phase",
                 "sync tempolock" => "sync tempolock",
                 "sync phaselock" => "sync phaselock pid",
                 "sync set-leader" => "sync set-leader",
@@ -3015,7 +3097,7 @@ mod tests {
         ));
     }
 
-    /// `fx kind` swaps the effect in a slot and the slot book follows it: the role keeps resolving
+    /// `fx select` swaps the effect in a slot and the slot book follows it: the role keeps resolving
     /// (`filter`), the new kind resolves too, and a parameter set through the role still lands.
     #[test]
     fn fx_kind_swaps_the_effect_but_keeps_the_role_addressable() {
@@ -3031,7 +3113,7 @@ mod tests {
 
         // The reference channel is `[eq, filter]`.
         assert_eq!(dispatcher.slots().resolve("deck1", "filter"), Ok(1));
-        for line in ["deck1 fx kind filter moog", "deck1 fx set filter value -0.3"] {
+        for line in ["deck1 fx select filter moog", "deck1 fx set filter value -0.3"] {
             let action = dispatch(line, &dispatcher, &pipeline, Backends::default(), 2, Some(0));
             assert!(
                 !matches!(action, Action::Failed(_)),
@@ -3172,7 +3254,7 @@ side = "center"
         ));
         // And the file's text travels as-is.
         let path = std::env::temp_dir().join("hypermixx-cli-reload-test.toml");
-        std::fs::write(&path, "[[channel]]\nside = \"left\"\n").unwrap();
+        std::fs::write(&path, "[mixer]\n[[multideck.deck]]\nside = \"left\"\n").unwrap();
         let (tx, rx) = unbounded();
         let dispatcher = Dispatcher::new(tx, crossbeam_channel::unbounded().0);
         let line = format!("reload {}", path.display());

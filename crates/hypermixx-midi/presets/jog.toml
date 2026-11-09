@@ -25,4 +25,4 @@ turn = "vinyl"
 name = "nudge"
 [[preset.mode.bind]]
 slot = "jog"
-turn = "nudge 0.15"
+turn = "nudge 0.01"

@@ -27,7 +27,7 @@ pub use flow::{Direction, Playing, PitchShiftEngine};
 pub use fx::{Fx, FxChain, FxContext, FxError, FxKind, FxSlot, FxTarget, Param};
 pub use mixer::{
     output_devices, reference_toml, silent_test_channel, simple_dj, Bus, Channel, ChannelConfig,
-    CrossfaderConfig, CrossfaderCurve, CueMixConfig, CueTap, DeviceInfo,
+    CrossfaderConfig, CrossfaderCurve, CueMixConfig, CueTap, DeviceInfo, EqConfig,
     MasterBus, Mixer, MixerConfig, MixerError, Output, OutputConfig, OutputError, OutputId,
     OutputRole, OutputState, OutputStatus, Outputs,
 };

@@ -51,6 +51,7 @@ fn main() {
     let controllers = config.controllers.clone();
     let live = config.live;
     let cfg = config.mixer;
+    let auto_analyse = config.analysis.auto_analyse;
     let backends = hypermixx_library::analyser::Backends {
         beats: config.analysis.beats,
         key: config.analysis.key,
@@ -94,7 +95,9 @@ fn main() {
     // Each `[[controller]]` becomes its own session: own port, own unit map, and its own slice of
     // the face → deck table (so two devices cannot address the same deck by accident). An explicit
     // `--controller` overrides the first instance's port.
-    let controller_sessions: Vec<profile::ControllerSession> = controllers
+    // The unfiltered table is the fallback for a front-end that has no explicit controller list.
+    let deck_routes = profile::deck_routes(&cfg, None);
+    let mut controller_sessions: Vec<profile::ControllerSession> = controllers
         .iter()
         .enumerate()
         .map(|(index, entry)| {
@@ -113,9 +116,19 @@ fn main() {
             }
         })
         .collect();
+    // `--controller` works even when the config declares no `[[controller]]`: it is explicitly
+    // asking for one input, with the config's map (or the conventional one next to it).
+    if controller_sessions.is_empty() {
+        if let Some(port) = args.midi.clone() {
+            controller_sessions.push(profile::ControllerSession {
+                id: "default".to_owned(),
+                port: Some(port),
+                map: map_path.clone(),
+                routes: deck_routes.clone(),
+            });
+        }
+    }
     let midi_port = controller_sessions.first().and_then(|entry| entry.port.clone());
-    // The unfiltered table is the fallback for a front-end that has no explicit controller list.
-    let deck_routes = profile::deck_routes(&cfg, None);
     // `start` builds the mixer on the producer thread (cpal streams are !Send) and reports a bad
     // config back synchronously, so a failure here is a clean exit, not a half-alive engine.
     let pipeline = match AudioPipeline::start_with(
@@ -174,6 +187,7 @@ fn main() {
                 midi_state: None,
                 deck_routes: deck_routes.clone(),
                 controller_sessions: controller_sessions.clone(),
+                auto_analyse,
                 library: library.clone(),
             },
         );
@@ -236,6 +250,7 @@ fn main() {
             midi_state,
             deck_routes,
             controller_sessions,
+            auto_analyse,
             library,
         },
     );

@@ -439,6 +439,8 @@ pub struct App {
     pub fx_slot: Vec<usize>,
     /// Whether CLI/MIDI commands and mode triggers may switch panels on their own.
     pub follow_commands: bool,
+    /// Whether a browser load should analyse a track that has no imported or cached grid.
+    pub auto_analyse: bool,
     /// The latest intent produced by the command fan-out.
     pub intent: Arc<Mutex<Option<UiIntent>>>,
     /// Live FX slot state per deck, polled with [`Command::GetFxState`] so the knobs show the
@@ -517,6 +519,42 @@ pub struct App {
     waveform_rx: Receiver<(usize, Arc<hypermixx_library::Waveform>)>,
     cover_tx: Sender<(usize, Option<Arc<hypermixx_media::Cover>>)>,
     cover_rx: Receiver<(usize, Option<Arc<hypermixx_media::Cover>>)>,
+}
+
+/// The sessions [`App::connect_midi`] should open.
+///
+/// The configured `[[controller]]` list is the normal source, but the F9 picker is a *runtime*
+/// choice: when it names a port, that port (and the picked map) must win over the first entry even
+/// if the config left every controller key commented out. Without this, the template's empty
+/// `[controller]` section would look like a configured-but-portless controller and silently swallow
+/// the user's pick.
+fn connection_specs(
+    sessions: &[crate::profile::ControllerSession],
+    midi_port: Option<&str>,
+    midi_map: Option<&str>,
+    routes: &hypermixx_midi::map::DeckRoutes,
+) -> Vec<crate::profile::ControllerSession> {
+    let mut specs = sessions.to_vec();
+    let Some(port) = midi_port else {
+        return specs;
+    };
+    match specs.first_mut() {
+        Some(first) => {
+            first.port = Some(port.to_owned());
+            if let Some(map) = midi_map {
+                first.map = map.to_owned();
+            }
+        }
+        None => specs.push(crate::profile::ControllerSession {
+            id: "default".to_owned(),
+            port: Some(port.to_owned()),
+            map: midi_map
+                .map(str::to_owned)
+                .unwrap_or_else(|| crate::profile::default_map_path().to_owned()),
+            routes: routes.clone(),
+        }),
+    }
+    specs
 }
 
 impl App {
@@ -600,6 +638,7 @@ impl App {
             eq_panel: vec![EqPanel::default(); decks],
             fx_slot: vec![0; decks],
             follow_commands: true,
+            auto_analyse: false,
             intent,
             deck_fx: vec![Vec::new(); decks],
             fx_pending: 0,
@@ -661,23 +700,15 @@ impl App {
         notices: &NoticeTx,
         dispatcher: &crate::command::Dispatcher,
     ) {
-        let specs: Vec<crate::profile::ControllerSession> = if self.controller_sessions.is_empty() {
-            // No explicit controller list: the F9-style single connection.
-            let Some(port) = self.midi_port.clone() else {
-                return;
-            };
-            vec![crate::profile::ControllerSession {
-                id: "default".to_owned(),
-                port: Some(port),
-                map: self
-                    .midi_map
-                    .clone()
-                    .unwrap_or_else(|| crate::profile::default_map_path().to_owned()),
-                routes: self.deck_routes.clone(),
-            }]
-        } else {
-            self.controller_sessions.clone()
-        };
+        let specs = connection_specs(
+            &self.controller_sessions,
+            self.midi_port.as_deref(),
+            self.midi_map.as_deref(),
+            &self.deck_routes,
+        );
+        if specs.is_empty() {
+            return;
+        }
         // Dropping the old sessions closes their ports before the new ones open.
         self.midi.clear();
         let slots = self.fx_slots.clone();
@@ -1514,6 +1545,55 @@ mod tests {
     use super::*;
     use crate::preference::LibrarySettings;
     use hypermixx_library::SourceOrigin;
+
+    fn session(id: &str, port: Option<&str>, map: &str) -> crate::profile::ControllerSession {
+        crate::profile::ControllerSession {
+            id: id.to_owned(),
+            port: port.map(str::to_owned),
+            map: map.to_owned(),
+            routes: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_runtime_midi_pick_connects_even_with_no_configured_controller() {
+        let specs = connection_specs(
+            &[],
+            Some("Party Mix III MIDI 1"),
+            Some("/tmp/mapping.toml"),
+            &Default::default(),
+        );
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].port.as_deref(), Some("Party Mix III MIDI 1"));
+        assert_eq!(specs[0].map, "/tmp/mapping.toml");
+    }
+
+    #[test]
+    fn a_runtime_midi_pick_overrides_a_portless_configured_entry() {
+        let configured = [session("default", None, "/old/mapping.toml")];
+        let specs = connection_specs(
+            &configured,
+            Some("Party Mix III MIDI 1"),
+            Some("/new/mapping.toml"),
+            &Default::default(),
+        );
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].port.as_deref(), Some("Party Mix III MIDI 1"));
+        assert_eq!(specs[0].map, "/new/mapping.toml");
+    }
+
+    #[test]
+    fn configured_controllers_are_untouched_without_a_runtime_pick() {
+        let configured = [
+            session("ctl1", Some("port-a"), "/a.toml"),
+            session("ctl2", Some("port-b"), "/b.toml"),
+        ];
+        let specs = connection_specs(&configured, None, None, &Default::default());
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[1].id, "ctl2");
+        assert_eq!(specs[1].port.as_deref(), Some("port-b"));
+        assert_eq!(specs[1].map, "/b.toml");
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

@@ -522,7 +522,7 @@ impl Channel {
         self.set_crossfader(position);
     }
 
-    /// Which side of the channel fader the cue send taps (`[mixer.chain] fader-location`).
+    /// Which side of the channel fader the cue send taps (`[mixer.fader] position`).
     pub fn set_cue_tap(&mut self, tap: CueTap) {
         self.cue_tap = tap;
     }

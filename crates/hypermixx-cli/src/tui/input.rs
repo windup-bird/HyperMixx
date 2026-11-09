@@ -340,6 +340,9 @@ fn apply_hit(app: &mut App, hit: Hit, dispatcher: &Dispatcher) {
                 }
                 PadMode::BeatLoop => {
                     if let Some(beats) = mode.loop_beats(index) {
+                        // The deck decides the pad toggle: the same length as the running loop
+                        // closes it, a different length re-times it. Sending `Beats` keeps the TUI
+                        // and a mapped controller pad on exactly the same path.
                         send(Command::Loop {
                             deck_id,
                             op: LoopOp::Beats(beats),
@@ -405,7 +408,7 @@ fn apply_hit(app: &mut App, hit: Hit, dispatcher: &Dispatcher) {
                 TransportHit::Sync => send(Command::Sync {
                     deck_id,
                     op: SyncOp::Phase {
-                        mode: PhaseMode::Pid,
+                        mode: PhaseMode::Instant,
                         t_seconds: None,
                     },
                 }),
@@ -856,7 +859,13 @@ fn load_browser_track(app: &mut App, dispatcher: &Dispatcher, deck: usize) {
         None => (None, None),
     };
     app.push_log(LogLine::info(format!("library: loading {title}")));
-    command::spawn_load_with(deck as u8, path, bpm, analysis, cues, dispatcher);
+    // Auto-analysis is the last resort: an imported Rekordbox/Serato/VDJ grid and the analysis
+    // cache both arrive as `analysis`, and either one skips another analysis run.
+    let auto = (analysis.is_none() && app.auto_analyse).then(|| command::AutoAnalysis {
+        backends: app.backends,
+        cache: app.library.clone().map(|db| (db, track_id)),
+    });
+    command::spawn_load_with(deck as u8, path, bpm, analysis, cues, auto, dispatcher);
 }
 
 /// Runs the analyser on the highlighted track and stores the result in the library cache.
@@ -1115,6 +1124,31 @@ mod tests {
         let command = sent(&rx);
         assert!(command.contains("BeatJump"), "{command}");
         assert!(command.contains("-16"), "{command}");
+    }
+
+    #[test]
+    fn beat_loop_pads_always_send_their_length_and_leave_the_toggle_to_the_deck() {
+        let (mut app, dispatcher, rx) = wired();
+        app.pad_mode[0] = crate::tui::app::PadMode::BeatLoop;
+
+        apply_hit(&mut app, Hit::Pad { deck: 0, index: 4 }, &dispatcher);
+        let command = sent(&rx);
+        assert!(command.contains("Beats"), "{command}");
+        assert!(command.contains("4"), "{command}");
+
+        app.states[0].loop_range = Some((0, 1));
+        app.states[0].loop_beats = hypermixx_core::BeatLen::beats(4);
+        apply_hit(&mut app, Hit::Pad { deck: 0, index: 4 }, &dispatcher);
+        let command = sent(&rx);
+        assert!(
+            command.contains("Beats"),
+            "the deck, not the UI, decides whether this is a toggle: {command}"
+        );
+
+        apply_hit(&mut app, Hit::Pad { deck: 0, index: 5 }, &dispatcher);
+        let command = sent(&rx);
+        assert!(command.contains("Beats"), "{command}");
+        assert!(command.contains("8"), "{command}");
     }
 
     #[test]

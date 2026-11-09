@@ -46,6 +46,8 @@ pub struct Session {
     pub deck_routes: DeckRoutes,
     /// One entry per `[[controller]]` instance, each with its own port, map and face routes.
     pub controller_sessions: Vec<crate::profile::ControllerSession>,
+    /// Analyse a browser-loaded track when it has neither an imported grid nor a cached analysis.
+    pub auto_analyse: bool,
     /// The library cache, opened once by `main` and shared by both front-ends.
     pub library: Option<Arc<LibraryDb>>,
 }

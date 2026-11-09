@@ -70,13 +70,15 @@ pub struct ControllerSession {
     pub routes: DeckRoutes,
 }
 
-/// The `[preference.analysis]` section: which backend runs which analysis path. Both keys are
-/// mandatory in spirit — an omitted key takes the timestretch default, and there is no `auto`:
-/// the config names its backends directly.
+/// The `[preference.analysis]` section: which backend runs which analysis path, and whether a
+/// browser load analyses a track that has no imported/cached grid yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnalysisBackends {
     pub beats: Backend,
     pub key: Backend,
+    /// Run the analyser after a browser load when neither the imported library nor the analysis
+    /// cache has a grid. Off by default: analysis takes seconds and should be an explicit choice.
+    pub auto_analyse: bool,
 }
 
 impl Default for AnalysisBackends {
@@ -84,6 +86,7 @@ impl Default for AnalysisBackends {
         Self {
             beats: Backend::default(),
             key: Backend::default(),
+            auto_analyse: false,
         }
     }
 }
@@ -94,18 +97,31 @@ fn analysis_section(value: &toml::Value) -> Result<AnalysisBackends, String> {
         .ok_or_else(|| "must be a table".to_owned())?;
     let mut section = AnalysisBackends::default();
     for (key, value) in table {
-        let text = value
-            .as_str()
-            .ok_or_else(|| format!("`{key}` must be a string"))?
-            .trim()
-            .to_owned();
-        let backend = Backend::parse(&text).ok_or_else(|| {
-            format!("`{key} = \"{text}\"` is not a backend (stratum | timestretch)")
-        })?;
         match key.as_str() {
-            "beats" => section.beats = backend,
-            "key" => section.key = backend,
-            other => return Err(format!("unknown key `{other}` (beats | key)")),
+            "beats" | "key" => {
+                let text = value
+                    .as_str()
+                    .ok_or_else(|| format!("`{key}` must be a string"))?
+                    .trim()
+                    .to_owned();
+                let backend = Backend::parse(&text).ok_or_else(|| {
+                    format!("`{key} = \"{text}\"` is not a backend (stratum | timestretch)")
+                })?;
+                if key == "beats" {
+                    section.beats = backend;
+                } else {
+                    section.key = backend;
+                }
+            }
+            "auto_analyse" => match value.as_bool() {
+                Some(auto) => section.auto_analyse = auto,
+                None => return Err(format!("`{key}` must be true | false")),
+            },
+            other => {
+                return Err(format!(
+                    "unknown key `{other}` (beats | key | auto_analyse)"
+                ))
+            }
         }
     }
     Ok(section)
@@ -284,9 +300,20 @@ fn parse(path: &Path, text: &str, mut notes: Vec<String>) -> Result<Config, Stri
             .map(controller_section)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|err| format!("{}: [[controller]]: {err}", path.display()))?,
-        Some(section) => vec![controller_section(section)
-            .map_err(|err| format!("{}: [controller]: {err}", path.display()))?],
-        None => vec![ControllerSection::default()],
+        Some(section) => {
+            let section = controller_section(section)
+                .map_err(|err| format!("{}: [controller]: {err}", path.display()))?;
+            // The shipped template keeps `[controller]` with every key commented out. That is
+            // "no controller configured", not one anonymous controller with no port: a phantom
+            // entry would make the TUI's F9 picker think a configured list already exists and
+            // silently skip the port the user just chose.
+            if section.id.is_none() && section.map.is_none() && section.device.is_none() {
+                Vec::new()
+            } else {
+                vec![section]
+            }
+        }
+        None => Vec::new(),
     };
     let dir = path
         .parent()
@@ -448,6 +475,51 @@ mod tests {
         assert_eq!(cfg.mixer.outputs.len(), 2);
         assert!(!cfg.mixer.autogain.enabled, "auto-gain is off in the template");
         assert_eq!(cfg.controller, Controller::default());
+        assert!(
+            cfg.controllers.is_empty(),
+            "the template's empty [controller] table means no controller, not a phantom session"
+        );
+    }
+
+    #[test]
+    fn an_empty_controller_table_is_no_controller_but_a_named_one_is_kept() {
+        let cfg = parse(
+            Path::new("config.toml"),
+            "[mixer]\n[[multideck.deck]]\nside = \"center\"\n[controller]\n",
+            Vec::new(),
+        )
+        .expect("parses");
+        assert!(cfg.controllers.is_empty());
+
+        let cfg = parse(
+            Path::new("config.toml"),
+            "[mixer]\n[[multideck.deck]]\nside = \"center\"\n[controller]\nid = \"ctl1\"\n",
+            Vec::new(),
+        )
+        .expect("parses");
+        assert_eq!(cfg.controllers.len(), 1);
+        assert_eq!(cfg.controllers[0].id, "ctl1");
+    }
+
+    #[test]
+    fn analysis_settings_include_the_auto_analyse_switch() {
+        let cfg = parse(
+            Path::new("config.toml"),
+            "[mixer]\n[[multideck.deck]]\nside = \"center\"\n[preference.analysis]\nbeats = \"stratum\"\nkey = \"timestretch\"\nauto_analyse = true\n",
+            Vec::new(),
+        )
+        .expect("parses");
+        assert_eq!(cfg.analysis.beats, Backend::Stratum);
+        assert_eq!(cfg.analysis.key, Backend::Timestretch);
+        assert!(cfg.analysis.auto_analyse);
+
+        let err = parse(
+            Path::new("config.toml"),
+            "[preference.analysis]\nauto_analyse = \"yes\"\n",
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("auto_analyse"), "{err}");
     }
 
     #[test]

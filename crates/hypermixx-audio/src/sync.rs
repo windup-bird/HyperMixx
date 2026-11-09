@@ -23,7 +23,7 @@
 //! * **`phase` includes `tempo`, `phaselock` includes `tempolock`.** Both locks are built the same
 //!   way; `phaselock` just stops the leader from being driven by the group.
 
-use hypermixx_core::{DeckId, NudgeOp, SyncOp};
+use hypermixx_core::{DeckId, NudgeOp, PhaseMode, SyncOp};
 
 use crate::deck::{LeaderSample, PhaseAlign, SyncCtx, MAX_RATE, MAX_TEMPO_RANGE, MIN_RATE};
 use crate::mixer::Mixer;
@@ -258,20 +258,34 @@ impl SyncGroup {
                 self.sync_tempo(mixer, deck_id)
             }
             SyncOp::Phase { mode, t_seconds } => {
+                // One-shot phase is only the jump: a controller belongs to a lock, where a deck
+                // keeps sampling the leader every block.
+                if mode != PhaseMode::Instant {
+                    return Err(
+                        "`sync phase` only supports instant; use `sync phaselock linear|pid`"
+                            .to_owned(),
+                    );
+                }
+                // The sync control is a toggle once a lock is running: pressing it again drops
+                // the lock (and its correction) instead of re-syncing a tempo the group owns.
+                if self.mode != SyncMode::Free {
+                    Self::require_track(mixer, deck_id)?;
+                    self.unlock(mixer, deck_id);
+                    return Ok(());
+                }
                 // Validate before mutating: a bogus duration must not half-apply a sync.
                 let align = PhaseAlign::from_mode(mode, t_seconds)?;
-                // Under a lock the group already owns the tempo, so a one-shot match would be
-                // written and then overwritten by the very next block's recompute. Re-check the
-                // direction and install the correction — nothing else.
-                if self.mode == SyncMode::Free {
-                    self.sync_tempo(mixer, deck_id)?;
-                } else {
-                    self.hold(mixer, deck_id)?;
-                }
+                self.sync_tempo(mixer, deck_id)?;
                 self.apply_align(mixer, deck_id, align)
             }
             SyncOp::TempoLock => self.sync_tempolock(mixer, deck_id),
             SyncOp::PhaseLock { mode, t_seconds } => {
+                if mode == PhaseMode::Instant {
+                    return Err(
+                        "`sync phaselock` needs linear|pid — use `sync phase` for an instant jump"
+                            .to_owned(),
+                    );
+                }
                 let align = PhaseAlign::from_mode(mode, t_seconds)?;
                 self.sync_phaselock(mixer, deck_id, align)
             }
@@ -311,14 +325,6 @@ impl SyncGroup {
              has nothing to do; `sync unlock` first",
             self.mode.label()
         ))
-    }
-
-    /// Re-checks the direction without touching any tempo: the branch a locked pair takes, where
-    /// changing the phase mode is meaningful but re-matching the tempo is not.
-    fn hold(&mut self, mixer: &Mixer, deck_id: DeckId) -> Result<(), String> {
-        Self::require_track(mixer, deck_id)?;
-        let leader = self.resolve_leader(mixer, deck_id)?;
-        self.track(leader, deck_id)
     }
 
     /// One-shot tempo match: nothing is locked afterwards, so a later fader move on the leader

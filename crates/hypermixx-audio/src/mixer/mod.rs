@@ -13,7 +13,7 @@
 //!   a signal went through from the source alone, which is what makes a click diagnosable.
 //! * **The safety limiter is not a chain slot.** [`MasterBus::limiter`] is a field the mixer owns
 //!   unconditionally, so a config cannot remove it by naming a bad FX list. Its ceiling is
-//!   configurable through `[mixer.master] ceiling_db`; the stage itself is part of the topology.
+//!   configurable through `[mixer.limiter] ceiling_db`; the stage itself is part of the topology.
 //!
 //! [`Mixer::process`] touches no device, which is what makes it unit-testable: build a mixer with
 //! `outputs: vec![]` and inspect the buses.
@@ -29,8 +29,8 @@ pub use channel::{
 };
 pub use config::{
     build_chain, build_chain_with_roles, build_slot, build_slots, reference_toml, simple_dj,
-    silent_test_channel, ChannelConfig, CrossfaderConfig, CueMixConfig, MixerConfig, MixerError,
-    OutputConfig,
+    silent_test_channel, ChannelConfig, CrossfaderConfig, CueMixConfig, EqConfig, MixerConfig,
+    MixerError, OutputConfig,
 };
 pub use hypermixx_core::{OutputRole, OutputState, OutputStatus};
 pub use output::{
@@ -169,7 +169,8 @@ impl Mixer {
             master: MasterBus {
                 sum: Bus::stereo(block_frames),
                 fx: master_fx,
-                fader: Fader::new(cfg.master_fader, MASTER_TAU),
+                // Master and cue trims are runtime values; a new mixer starts at unity.
+                fader: Fader::new(0.0, MASTER_TAU),
                 limiter,
                 outputs: routed.master_outputs,
                 peak: 0.0,
@@ -177,7 +178,7 @@ impl Mixer {
             cue: CueBus {
                 sum: Bus::stereo(block_frames),
                 mix: Bus::stereo(block_frames),
-                fader: Fader::new(cfg.cue_fader, MASTER_TAU),
+                fader: Fader::new(0.0, MASTER_TAU),
                 blend: cfg.cue.blend,
                 curve: cfg.cue.curve,
                 cut_width: cfg.cue.cut_width,
@@ -335,9 +336,8 @@ impl Mixer {
 
         self.channels = channels;
         self.master.fx = master_fx;
-        self.master.fader = Fader::new(cfg.master_fader, MASTER_TAU);
         self.master.limiter.set_enabled(cfg.master_limiter);
-        self.cue.fader = Fader::new(cfg.cue_fader, MASTER_TAU);
+        // The trims are runtime faders, not config values: a reload keeps what the user set.
         self.cue.blend = cfg.cue.blend;
         self.cue.curve = cfg.cue.curve;
         self.cue.cut_width = cfg.cue.cut_width;
@@ -754,7 +754,7 @@ impl Mixer {
                 Ok(flow_len + appended)
             }
             FxChainId::Stem { .. } => Err(
-                "the flow banks are declared in mixer.toml — use `fx kind <slot> <kind>` to change \
+                "the flow banks are declared in mixer.toml — use `fx select <slot> <kind>` to change \
                  an existing slot (or edit `[[channel.flow_fx]]`)"
                     .to_owned(),
             ),
@@ -779,11 +779,11 @@ impl Mixer {
                 let flow_len = channel.flow_len();
                 // Only the last slot of the whole flat space can go: anything else would renumber
                 // the slots after it, and a map is bound to those numbers. To empty a slot in
-                // place, `fx kind <slot> none` keeps the index.
+                // place, `fx select <slot> none` keeps the index.
                 if target.index + 1 != flow_len + channel.post_fx().len() {
                     return Err(
                         "only the last bank slot can be removed (removal renumbers the slots \
-                         after it); use `fx kind <slot> none` to empty a slot in place"
+                         after it); use `fx select <slot> none` to empty a slot in place"
                             .to_owned(),
                     );
                 }
@@ -813,7 +813,7 @@ impl Mixer {
                 // from the end of that flow's chain.
                 if target.index + 1 != channel.flow_len() {
                     return Err(
-                        "only the last flow slot can be removed; use `fx kind <slot> none` instead"
+                        "only the last flow slot can be removed; use `fx select <slot> none` instead"
                             .to_owned(),
                     );
                 }
@@ -1625,7 +1625,7 @@ mod tests {
     }
 
     /// A bank only grows at its end and only shrinks from its end, so a map's slot number never
-    /// moves; `fx kind <slot> none` is how a slot is emptied in place.
+    /// moves; `fx select <slot> none` is how a slot is emptied in place.
     #[test]
     fn removal_is_tail_only_and_none_empties_in_place() {
         use hypermixx_core::Command;
@@ -2104,6 +2104,8 @@ mod tests {
         let mut mixer = loaded(simple_dj(), 2);
         // Move a fader and start a deck, so both "kept" and "reset" are observable.
         mixer.set_fader(FaderTarget::Flow(0), -0.75).unwrap();
+        mixer.set_fader(FaderTarget::Master, -0.5).unwrap();
+        mixer.set_fader(FaderTarget::Cue, -0.25).unwrap();
         tick(&mut mixer, 3);
         let playing = mixer.deck(0).unwrap().current_frame();
         assert!(playing > 0, "the deck should be running");
@@ -2113,12 +2115,12 @@ mod tests {
         let statuses = mixer
             .reload(
                 r#"
-                [chain]
+                [mixer.fx]
                 knob_fx = ["gain"]
                 [[multideck.deck]]
                 side = "center"
                 gain = 1.0
-                [[output]]
+                [[mixer.output]]
                 name = "only"
                 role = "master"
                 device = "hypermixx-no-such-device"
@@ -2141,10 +2143,20 @@ mod tests {
             "gain",
             "the chain came from the file"
         );
+        assert_eq!(
+            mixer.master().fader.target(),
+            -0.5,
+            "the master trim is runtime state, not a config value"
+        );
+        assert_eq!(
+            mixer.cue().fader.target(),
+            -0.25,
+            "the cue trim is runtime state, not a config value"
+        );
 
         // A bad file changes nothing: an unknown effect is refused before any live state is touched.
         let err = mixer
-            .reload("[chain]\nknob_fx = [\"shimmer\"]\n[[multideck.deck]]\n")
+            .reload("[mixer.fx]\nknob_fx = [\"shimmer\"]\n[[multideck.deck]]\n")
             .unwrap_err();
         assert!(matches!(err, MixerError::UnknownFx(_)), "{err:?}");
         assert_eq!(mixer.channel_count(), 1);
@@ -2155,7 +2167,7 @@ mod tests {
         );
         // An empty file has no channels to mix, which is a refusal rather than silence.
         assert_eq!(
-            mixer.reload("[master]\nlimiter = true\n").unwrap_err(),
+            mixer.reload("[mixer]\n").unwrap_err(),
             MixerError::Empty
         );
     }

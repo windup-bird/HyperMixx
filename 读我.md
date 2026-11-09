@@ -29,7 +29,7 @@ PCM -> flows(stems) -> stretch(keylock) -> prefader -> eq -> filter flowfx -> de
 - 同一个音频按内容哈希合并，换路径、换块盘不会变成两首；U 盘只读，绝不写回。
 - 扫描在后台跑，界面先显示缓存，扫完自己刷新。缓存是一份可重建的 sqlite（`$HYPERMIXX_CACHE/library/`，默认 `.cache/library/`），删了最多重扫一次。
 
-加载时优先用导入的 grid，其次本地分析缓存，最后才看标签 BPM。导入时间会补偿解码器的 gapless 起点和各家的偏移（默认 Serato −16.5 ms），所以网格落点是对得上的。key 默认 Camelot（8A/8B），想换成 Am/C 改 `[preference.display] key = "classic"`。
+加载时优先用导入的 grid，其次本地分析缓存，最后才看标签 BPM；`[preference.analysis] auto_analyse = true` 时，前两者都没有才在后台自动分析。导入时间会补偿解码器的 gapless 起点和各家的偏移（默认 Serato −16.5 ms），所以网格落点是对得上的。key 默认 Camelot（8A/8B），想换成 Am/C 改 `[preference.display] key = "classic"`。
 
 ### 两分钟内驱动你的设备
 
@@ -143,7 +143,7 @@ deck1 fx add echo
 deck1 stem separate
 
 deck2 load ~/Music/nepture.mp3
-deck2 sync phase pid      # 先对 BPM，再用 PI 追相位
+deck2 sync phaselock pid  # 先对 BPM，再用 PI 持续追相位
 deck2 sync tempolock      # 两边共享一个 tempo
 deck1 sync set-leader     # 指定 master
 deck2 nudge 0.04 0.5      # 临时 +4%，半秒后自动松开

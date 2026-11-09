@@ -113,7 +113,7 @@ const STEM_VERBS: &[(&str, &str)] = &[
 const FX_SUBS: &[(&str, &str)] = &[
     ("add", "append an effect"),
     ("remove", "drop a slot"),
-    ("kind", "swap the effect in a slot"),
+    ("select", "swap the effect in a slot"),
     ("flows", "route a flowfx slot to some flows"),
     ("list", "show slots and names"),
     ("set", "set a parameter"),
@@ -422,9 +422,9 @@ fn fx_candidates(rel: &[String], partial: &str, chain: &str, ctx: &Ctx) -> Vec<C
     match (sub.as_str(), rel.len()) {
         ("add", 1) => fx_kinds(partial),
         ("remove" | "rm", 1) | ("on" | "off", 1) | ("trigger", 1) | ("set", 1) | ("pad", 1)
-        | ("kind", 1) | ("flows", 1) => slot_candidates(slots, partial),
+        | ("select", 1) | ("flows", 1) => slot_candidates(slots, partial),
         ("set", 2) => slot_param_candidates(slots, &rel[1], partial),
-        ("kind", 2) => fx_kinds(partial),
+        ("select", 2) => fx_kinds(partial),
         ("flows", 2) => pairs(
             &[
                 ("all", "every flow"),

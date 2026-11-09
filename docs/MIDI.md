@@ -6,7 +6,7 @@
 
 > 会话命令的语法见 [`COMMANDS.md`](COMMANDS.md)。本文只讲映射文件本身。
 >
-> **`action` 就是一条去掉目标的会话命令**：`"play"`、`"beatjump 4"`、`"sync phase pid"`、
+> **`action` 就是一条去掉目标的会话命令**：`"play"`、`"beatjump 4"`、`"sync phase"`、
 > `"loop 1/4"`、`"fx param value"`。目标由 unit 的 `deck`（或这一行的 `deck`）提供。
 
 ---
@@ -308,7 +308,7 @@ learn 模式下，同一个 slot 在 120ms 内收到两个相差 32 的控制器
 | `hotcue set\|trigger\|clear <1..8>` | 是 | hot cue |
 | `beatjump <±beats\|forward\|backward>` | 是 | 按整拍 seek；显式数字会更新 `jump_beats` |
 | `jumpbeats double\|halve` | 是 | 改 `jump_beats`（1..64） |
-| `loop <beats\|num/den>` | 是 | beat loop；同时更新 `loop_beats` |
+| `loop <beats\|num/den>` | 是 | beat loop；正在循环且长度相同 = 退出，不同 = 改成该长度 |
 | `loop toggle` | 是 | 用 `loop_beats` 开/关 loop |
 | `loopbeats double\|halve` | 是 | 改 `loop_beats`；正在 loop 时同步重设 |
 | `loop in` / `loop out` / `loop exit` / `loop cancel` | 是 | 手动 loop |
