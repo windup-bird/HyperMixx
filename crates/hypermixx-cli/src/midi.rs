@@ -75,7 +75,7 @@ impl MidiSession {
 }
 
 /// Reads a map file and compiles it twice: once with every controller face resolved to its normal
-/// deck, once to its mirror deck. The router swaps between these when the mirror toggle fires.
+/// deck, once to its mirror deck. Each unit chooses between them when its mirror toggle fires.
 pub fn read_map_pair(map_path: &str, routes: &DeckRoutes) -> Result<(Map, Map), String> {
     let text = std::fs::read_to_string(map_path).map_err(|err| format!("{map_path}: {err}"))?;
     let base = Path::new(map_path)

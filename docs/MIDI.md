@@ -206,7 +206,8 @@ action = "hotcue trigger 1"
 ```
 
 内置 preset：`browser`(global) `crossfader`(global) `deckfx1` `deckfx2` `deckfx3` `jog`
-`manualjump` `manualloop` `mixer` `outputfader`(global) `pad` `tempofader` `transport`。
+`manualjump` `manualloop` `mirror-deck` `mixer` `outputfader`(global) `pad` `tempofader`
+`transport`。`mirror-deck` 是 deck unit：每个 deck strip 可以有自己的 toggle，只镜像该 unit。
 
 - `browser` 只允许 global；slot 为 `choose` / `open` / `exit` / `load-1` / `load-2`。
 - `manualloop` 的 `toggleloop` 用 deck 的 `loop_beats`；`double`/`halve` 改这个值，

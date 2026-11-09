@@ -574,8 +574,9 @@ map = "mapping.toml"      # unit-map 文件指针，相对本文件所在目录
 
 - deck 编号分两层：audio 侧是 `deck1..deckN`（`[[multideck.deck]]` 的顺序），controller 侧是
   逻辑面 `A`/`B`/`C`/`D`（mapping 里 `deck = "A"`）。`source` 表把逻辑面映射到物理 deck。
-- mirror：`source = "ctl1.A"` 与 `source = "ctl1.A.mirror"` 分别占两个 deck；mapping 里的
-  `mirror-deck` preset 提供 toggle 按钮，按下整台控制器切到 mirror 面。
+- mirror：`source = "ctl1.A"` 与 `source = "ctl1.A.mirror"` 分别占两个 deck；`mirror-deck`
+  preset 是 **deck unit**，每个 deck strip 装一个 toggle，按下只切这一组控件到它的 mirror 面，
+  两条 deck strip 可以各自独立镜像。
 - crossfader 的左右组合由 controller 侧定义：mapping 的 `global.crossfader` 用多个 mode
   （`fader cross A B` / `fader cross Am Bm`）指定 deck 对；`[mixer.crossfader]` 只剩
   `curve` / `cut_width` / `start`（`place` 已固定为通道末端）。

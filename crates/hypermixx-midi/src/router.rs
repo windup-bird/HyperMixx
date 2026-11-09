@@ -17,7 +17,7 @@ use crate::translate::{apply, relative_delta, BindState, REL_SCALE};
 /// A snapshot of every unit's active mode, for the TUI and the `midi mode` command.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RouterState {
-    /// Whether the controller's faces currently resolve to their mirror decks.
+    /// Whether any unit is currently on its mirror deck.
     pub mirrored: bool,
     pub units: Vec<UnitModeState>,
 }
@@ -28,6 +28,8 @@ pub struct UnitModeState {
     pub deck: Option<DeckId>,
     pub current: String,
     pub modes: Vec<String>,
+    /// Whether this unit is currently using its mirror-face map.
+    pub mirrored: bool,
 }
 
 /// A command from the front-end into the running router.
@@ -86,6 +88,8 @@ struct ControlRuntime {
 
 struct UnitRuntime {
     current: usize,
+    /// Per-unit mirror state: two deck strips can be mirrored independently.
+    mirrored: bool,
     controls: Vec<ControlRuntime>,
     /// Parallel to `Unit::endpoints`: physical position, pickup mirror, edge flags.
     endpoints: Vec<BindState>,
@@ -94,16 +98,12 @@ struct UnitRuntime {
 }
 
 /// The live mapping. Owns the two compiled [`Map`]s (normal faces and mirror faces) plus the mode
-/// and per-endpoint state. The mirror toggle swaps which map is current; every deck id in the
-/// compiled actions is already a physical deck, so no retargeting is needed at runtime.
+/// and per-endpoint state. **Each unit chooses its own map at runtime**: a deck strip can be
+/// mirrored without dragging another deck's strip with it. Every deck id in the compiled actions
+/// is already a physical deck, so no retargeting is needed at runtime.
 pub struct Router {
-    /// The map whose face resolution is in effect right now. Keeping it a *field* (not a method)
-    /// lets `control_event` borrow it disjointly from `units`; the toggle swaps it with the other
-    /// variant rather than recomputing deck ids.
     map: Map,
-    /// The other variant, swapped in by the mirror toggle.
     mirror_map: Map,
-    mirrored: bool,
     units: Vec<UnitRuntime>,
     routes: HashMap<(EventKind, u8, u8), Route>,
 }
@@ -149,6 +149,7 @@ impl Router {
             }
             units.push(UnitRuntime {
                 current: unit.start,
+                mirrored: false,
                 controls: unit
                     .controls
                     .iter()
@@ -162,7 +163,6 @@ impl Router {
         Self {
             map,
             mirror_map,
-            mirrored: false,
             units,
             routes,
         }
@@ -172,20 +172,34 @@ impl Router {
         &self.map
     }
 
-    /// Flips every controller face to its mirror deck. The caller flushes its pending sweep
-    /// buffer (see [`Feed::mirror_changed`]) and the unit's continuous controls re-arm their
-    /// pickup mirrors, exactly as a mode change does.
-    fn toggle_mirror(&mut self) {
-        std::mem::swap(&mut self.map, &mut self.mirror_map);
-        self.mirrored = !self.mirrored;
+    /// Flips one unit to its mirror-face map. The caller flushes its pending sweep buffer (see
+    /// [`Feed::mirror_changed`]) and the unit's continuous controls re-arm their pickup mirrors,
+    /// exactly as a mode change does.
+    fn toggle_mirror(&mut self, unit: usize) {
+        self.units[unit].mirrored = !self.units[unit].mirrored;
+        self.rearm(unit);
+    }
+
+    /// The front-end's global mirror command flips every unit; a physical toggle flips only its
+    /// own unit, which is what makes two deck strips independent.
+    fn toggle_all_mirrors(&mut self) {
         for unit in 0..self.units.len() {
-            self.rearm(unit);
+            self.toggle_mirror(unit);
+        }
+    }
+
+    /// The map this unit's actions were compiled against.
+    fn map_for(&self, unit: usize) -> &Map {
+        if self.units[unit].mirrored {
+            &self.mirror_map
+        } else {
+            &self.map
         }
     }
 
     pub fn snapshot(&self) -> RouterState {
         RouterState {
-            mirrored: self.mirrored,
+            mirrored: self.units.iter().any(|unit| unit.mirrored),
             units: self
                 .map
                 .units
@@ -196,6 +210,7 @@ impl Router {
                     deck: unit.deck,
                     current: unit.modes[runtime.current].name.clone(),
                     modes: unit.modes.iter().map(|mode| mode.name.clone()).collect(),
+                    mirrored: runtime.mirrored,
                 })
                 .collect(),
         }
@@ -251,7 +266,7 @@ impl Router {
                 Ok(self.select(unit_index, next))
             }
             RouterCommand::MirrorToggle => {
-                self.toggle_mirror();
+                self.toggle_all_mirrors();
                 Ok(true)
             }
         }
@@ -290,7 +305,7 @@ impl Router {
                 (self.units[unit].current + 1) % modes
             }
             SelectorBehavior::MirrorToggle => {
-                self.toggle_mirror();
+                self.toggle_mirror(unit);
                 out.state_changed = true;
                 out.mirror_changed = true;
                 return;
@@ -317,6 +332,13 @@ impl Router {
         out: &mut Feed,
     ) {
         let spec = self.active_spec(unit, control, endpoint);
+        // Pick this unit's compiled map once: the action deck ids differ between the normal and
+        // mirror variants, while the routing table and endpoint state stay shared.
+        let map = if self.units[unit].mirrored {
+            &self.mirror_map
+        } else {
+            &self.map
+        };
         let was_held = self.units[unit].endpoints[endpoint].held;
         let was_down = self.units[unit].endpoints[endpoint].down;
         let edge = spec
@@ -332,7 +354,7 @@ impl Router {
                 if let Some(spec) = &spec {
                     let state = &mut self.units[unit].endpoints[endpoint];
                     apply(
-                        &self.map,
+                        map,
                         spec,
                         state,
                         event,
@@ -355,7 +377,7 @@ impl Router {
                 if let Some(spec) = chosen {
                     let state = &mut self.units[unit].endpoints[endpoint];
                     apply(
-                        &self.map,
+                        map,
                         &spec,
                         state,
                         event,
@@ -374,7 +396,7 @@ impl Router {
                         if let Some(spec) = &spec {
                             let state = &mut self.units[unit].endpoints[endpoint];
                             apply(
-                                &self.map,
+                                map,
                                 spec,
                                 state,
                                 event,
@@ -396,7 +418,7 @@ impl Router {
                         if let Some(spec) = chosen {
                             let state = &mut self.units[unit].endpoints[endpoint];
                             apply(
-                                &self.map,
+                                map,
                                 &spec,
                                 state,
                                 event,
@@ -416,7 +438,7 @@ impl Router {
                 } else if let Some(spec) = &spec {
                     let state = &mut self.units[unit].endpoints[endpoint];
                     apply(
-                        &self.map,
+                        map,
                         spec,
                         state,
                         event,
@@ -433,7 +455,7 @@ impl Router {
                 if let Some(spec) = &spec {
                     let state = &mut self.units[unit].endpoints[endpoint];
                     apply(
-                        &self.map,
+                        map,
                         spec,
                         state,
                         event,
@@ -452,7 +474,7 @@ impl Router {
     /// The binding a slot would use right now, if the current mode binds it.
     fn active_spec(&self, unit: usize, control: usize, endpoint: usize) -> Option<BindingSpec> {
         spec_in_mode(
-            &self.map.units[unit],
+            &self.map_for(unit).units[unit],
             self.units[unit].current,
             control,
             endpoint,
@@ -472,7 +494,11 @@ impl Router {
     /// physical position and the edge flags stay: a held pad still releases with the action it
     /// started on.
     fn rearm(&mut self, unit: usize) {
-        let unit_spec = &self.map.units[unit];
+        let unit_spec = if self.units[unit].mirrored {
+            &self.mirror_map.units[unit]
+        } else {
+            &self.map.units[unit]
+        };
         let current = self.units[unit].current;
         for (control_index, control) in unit_spec.controls.iter().enumerate() {
             for &endpoint_index in &control.endpoints {
@@ -598,6 +624,95 @@ action = "play"
             feed.commands.as_slice(),
             [Command::TogglePlay { deck_id: 2 }]
         ));
+    }
+
+    #[test]
+    fn two_deck_strips_mirror_independently() {
+        let text = r#"
+[[unit]]
+id = "a"
+deck = "A"
+
+[[unit.control]]
+slot = "play"
+type = "Button"
+endpoint = { midi = "note", channel = 0, id = 0 }
+
+[[unit.control]]
+slot = "mirror"
+type = "Button"
+role = "deck_mirror"
+endpoint = { midi = "note", channel = 0, id = 1 }
+
+[[unit.mode]]
+name = "default"
+[[unit.mode.bind]]
+slot = "play"
+action = "play"
+
+[[unit]]
+id = "b"
+deck = "B"
+
+[[unit.control]]
+slot = "play"
+type = "Button"
+endpoint = { midi = "note", channel = 0, id = 2 }
+
+[[unit.control]]
+slot = "mirror"
+type = "Button"
+role = "deck_mirror"
+endpoint = { midi = "note", channel = 0, id = 3 }
+
+[[unit.mode]]
+name = "default"
+[[unit.mode.bind]]
+slot = "play"
+action = "play"
+"#;
+        let mut routes = crate::map::DeckRoutes::default();
+        routes.insert("A", 0, Some(2));
+        routes.insert("B", 1, Some(3));
+        let base = std::path::Path::new(".");
+        let normal =
+            Map::from_toml_str_at_routes(text, base, &routes, false).expect("normal map");
+        let mirror =
+            Map::from_toml_str_at_routes(text, base, &routes, true).expect("mirror map");
+        let mut router = Router::new(normal, mirror);
+
+        // A's strip flips to deck 3, B's stays on deck 2.
+        router.feed(&note(0, 1, true));
+        router.feed(&note(0, 1, false));
+        let feed = router.feed(&note(0, 0, true));
+        assert!(matches!(
+            feed.commands.as_slice(),
+            [Command::TogglePlay { deck_id: 2 }]
+        ));
+        router.feed(&note(0, 0, false));
+        let feed = router.feed(&note(0, 2, true));
+        assert!(matches!(
+            feed.commands.as_slice(),
+            [Command::TogglePlay { deck_id: 1 }]
+        ));
+        router.feed(&note(0, 2, false));
+
+        // B flips too. A remains on its mirror deck, B moves to deck 4.
+        router.feed(&note(0, 3, true));
+        router.feed(&note(0, 3, false));
+        let feed = router.feed(&note(0, 0, true));
+        assert!(matches!(
+            feed.commands.as_slice(),
+            [Command::TogglePlay { deck_id: 2 }]
+        ));
+        router.feed(&note(0, 0, false));
+        let feed = router.feed(&note(0, 2, true));
+        assert!(matches!(
+            feed.commands.as_slice(),
+            [Command::TogglePlay { deck_id: 3 }]
+        ));
+        assert_eq!(router.snapshot().units[0].mirrored, true);
+        assert_eq!(router.snapshot().units[1].mirrored, true);
     }
 
     const TWO_MODES: &str = r#"

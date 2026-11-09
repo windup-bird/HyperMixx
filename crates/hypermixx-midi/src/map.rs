@@ -173,8 +173,8 @@ impl FaceRef {
 
 /// Which physical deck each controller face drives, in its normal and mirror variants. Built by
 /// the front-end from `[[multideck.deck]] source`. Compiling a map with `mirror = false` resolves
-/// every face to its normal deck, `mirror = true` to its mirror deck; the router swaps between the
-/// two compiled maps when the mirror toggle fires.
+/// every face to its normal deck, `mirror = true` to its mirror deck; each unit swaps between the
+/// two compiled maps when its own mirror toggle fires.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeckRoutes {
     faces: HashMap<String, (DeckId, Option<DeckId>)>,
@@ -306,7 +306,7 @@ pub enum SlotRole {
     ModeTrigger,
     /// Pressing advances to the next mode in the unit's order.
     ModeCycle,
-    /// Pressing flips the controller between its normal and mirror deck maps.
+    /// Pressing flips this unit between its normal and mirror deck maps.
     DeckMirror,
 }
 
@@ -563,7 +563,7 @@ impl Control {
 pub enum SelectorBehavior {
     Trigger { mode: usize },
     Cycle,
-    /// Flips every face to its mirror deck (the router swaps its compiled map).
+    /// Flips this unit to its mirror deck (the router swaps that unit's compiled map).
     MirrorToggle,
 }
 
@@ -1013,8 +1013,8 @@ impl Map {
     }
 
     /// The same parse, with controller faces resolved through `routes`. Compiling once with
-    /// `mirror = false` and once with `mirror = true` gives the router the two maps it swaps between
-    /// when the mirror toggle fires.
+    /// `mirror = false` and once with `mirror = true` gives the router the two maps each unit can
+    /// choose between when its mirror toggle fires.
     pub fn from_toml_str_at_routes(
         text: &str,
         base: &Path,

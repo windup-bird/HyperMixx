@@ -2829,6 +2829,7 @@ mod tests {
                 deck: Some(0),
                 current: "hotcue".to_owned(),
                 modes: vec!["hotcue".to_owned(), "loop".to_owned()],
+                mirrored: false,
             }],
         }));
         let (control_tx, control_rx) = unbounded();
