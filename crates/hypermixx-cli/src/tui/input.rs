@@ -236,7 +236,7 @@ fn apply_hit(app: &mut App, hit: Hit, dispatcher: &Dispatcher) {
         | Hit::Transport { deck, .. }
         | Hit::Knob { deck, .. }
         | Hit::Fader { deck, .. } => Some(deck),
-        Hit::Crossfader { .. } | Hit::Settings => None,
+        Hit::Crossfader { .. } | Hit::Settings | Hit::DeckSlot { .. } => None,
     };
     if let Some(deck) = deck {
         app.target = Target::Deck(deck);
@@ -249,6 +249,7 @@ fn apply_hit(app: &mut App, hit: Hit, dispatcher: &Dispatcher) {
     };
     match hit {
         Hit::Settings => app.overlay = Some(Overlay::Settings(Box::new(open_settings(app)))),
+        Hit::DeckSlot { column, delta } => app.cycle_slot(column, isize::from(delta)),
         Hit::PadMode { deck, mode } => {
             if let Some(slot) = app.pad_mode.get_mut(deck) {
                 *slot = mode;
@@ -1204,6 +1205,49 @@ mod tests {
             &dispatcher,
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_deck_toggle_pages_one_column_without_moving_the_target() {
+        let (mut app, dispatcher, _rx) = wired();
+        // `wired` builds two decks: one page, so the toggle has nothing to do.
+        apply_hit(&mut app, Hit::DeckSlot { column: 0, delta: 1 }, &dispatcher);
+        assert_eq!(app.slots, [0, 1]);
+        assert_eq!(app.target, Target::Browser);
+
+        // Four decks: each column cycles its own half and leaves the other column alone. The command
+        // target is untouched, so a typed command keeps meaning the deck it named.
+        let (command_tx, _command_rx) = crossbeam_channel::unbounded();
+        let (notice_tx, notice_rx) = crossbeam_channel::unbounded();
+        let (_event_tx, event_rx) = crossbeam_channel::unbounded();
+        let mut app = App::new(
+            4,
+            hypermixx_library::analyser::Backends::default(),
+            notice_rx,
+            event_rx,
+            Default::default(),
+            Default::default(),
+        );
+        let dispatcher = Dispatcher::new(command_tx, notice_tx);
+        app.target = Target::Deck(0);
+
+        apply_hit(&mut app, Hit::DeckSlot { column: 0, delta: 1 }, &dispatcher);
+        assert_eq!(app.slots, [2, 1], "only the left column moved, to deck 3");
+        assert_eq!(app.target, Target::Deck(0), "the toggle does not retarget");
+
+        apply_hit(&mut app, Hit::DeckSlot { column: 1, delta: 1 }, &dispatcher);
+        assert_eq!(app.slots, [2, 3], "the right column cycled to deck 4");
+
+        // Each column wraps within its own decks: left back to deck 1, right to deck 2.
+        apply_hit(&mut app, Hit::DeckSlot { column: 0, delta: 1 }, &dispatcher);
+        apply_hit(&mut app, Hit::DeckSlot { column: 1, delta: 1 }, &dispatcher);
+        assert_eq!(app.slots, [0, 1]);
+
+        // `Tab` on to a deck on the other page brings it into its own column.
+        app.target = Target::Deck(1);
+        app.cycle_target(1);
+        assert_eq!(app.target, Target::Deck(2));
+        assert_eq!(app.slots, [2, 1]);
     }
 
     #[test]

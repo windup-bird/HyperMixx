@@ -297,8 +297,9 @@ kind:`linear`/`moog`),`flowfx` 在合并前逐流跑,`knobfx`/`padfx` 在合并�
   时电平可达 2.0),DAC 实收 ~2.9 → 硬削波。Mixer 检测设备名重复,第二条降级 sink 不路由
   (设备选择 `[[output]] device` 字段是后续工作)
 - `simple_dj()` — 参考拓扑的薄别名:直接解析 `reference_toml()`。配置模板(`profile/config.toml`)
-  是唯一真源,`--print-config` 与首次启动复制都是同一份字节;deck 列表来自模板的
-  `[[multideck.deck]]`,总线来自 `[mixer]`(测试钉死"模板解析 == simple_dj()")
+  是唯一真源,首次启动复制与 `simple_dj()` 都是同一份字节;`[[multideck.deck]]` 只提供
+  controller 面映射,总线来自 `[mixer]`(测试钉死"模板解析 == simple_dj()");deck 数量由前端的
+  `--4-decks` 决定(`MixerConfig::set_channel_count` 补齐/截断,补出来的 deck 拿默认值并交错 crossfader 侧)
 
 **热加载**:`Command::MixerReload { text }`(文本而非路径 —— 文件 IO 属于前端)在 producer 线程上
 `Mixer::reload(&text)`:先解析+`build_chains` 全量校验,通过后才就地换掉 channels/chains/faders/
@@ -419,12 +420,12 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
 
 ## hypermixx-cli
 
-启动参数:默认启动 TUI(`--cli` 切行式 REPL)/ `--config <file>`(单文件多段落配置;
-不给则用平台默认路径,首次启动从内置模板复制)/`--print-config`(输出配置模板)/
-`--controller <port>`(打开控制器输入;
-映射文件由 config 的 `[[controller]].map` 指定,可声明多个独立会话;端口名或序号,`controller ports` 可列);
-`--guide [<file>]` 是 learn 模式编辑器(不启动引擎)。deck 数量启动时从引擎查询
-(`channel_count`,自定义拓扑可配任意通道)。
+启动参数只有四个:默认启动 TUI(`--cli` 切行式 REPL)/ `--config <file>`(单文件多段落配置;
+不给则用平台默认路径,首次启动从内置模板复制)/`--4-decks`(四碟;缺省双碟)/
+`--guide [<file>]`(learn 模式编辑器,不启动引擎)。控制器只能由 config 的 `[[controller]]`
+(`device`/`map`,可声明多个独立会话)描述,没有启动参数。deck 数量 = `--4-decks` 决定的 2 或 4,
+配置不参与(`MixerConfig::set_channel_count` 在引擎启动前把通道表调成该数量);
+`[[multideck.deck]]` 的行按下标给出 `<controller>.<face>[.mirror]`,多出来的 deck 没有控制器。
 
 会话命令(target-first:行首 `deck0`/`0`/`master` 选目标,缺省用焦点 deck):
 - `load <path> [bpm]` — 后台解码;给 bpm 则建常网格跳过分析
@@ -442,8 +443,9 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   解析错误(`linear 0`、非数字秒数)前端直接 `Failed`;引擎拒绝(无网格、反向同步)后到为 `Error`
 - TUI deck 信息行多一枚黄色徽标:`sync phaselock 122.0 BPM ← deck0 phase pid locked`,
   与 CLI 的 `deck_line` 共用 `response::sync_badge`(所以测它就同时覆盖两边)
-- `controller ports` — 列出控制器输入端口(`midi ports` 仍可；`--controller` 在启动时打开并把映射
-  翻译成 `Command`,接线在 `src/midi.rs`:translator 线程 + 1ms 合并 flush + `ListFx` 名字解析)
+- `controller ports` — 列出控制器输入端口(`midi ports` 仍可；`[[controller]]` 里写了 `device`
+  就在启动时打开并把映射翻译成 `Command`,否则 F9 里选;接线在 `src/midi.rs`:translator 线程 +
+  1ms 合并 flush + `ListFx` 名字解析)
 - TUI 布局(`src/tui/view.rs`):顶部一行全局 header;deck 区合计不超过屏幕一半,每个 deck
   只保留一行状态(文件名在边框标题,右侧是 `已播放 / -剩余`)+ 波形(左声道在上、右声道在下的
   三频段镜像;缩放单位是 frames/cell;分频点默认 200/4000Hz（随附 `config.toml` 用 250/4000），
@@ -453,11 +455,19 @@ master/cue 并重建输出。**配置值取"默认 ← 文件"(未定义即默�
   三频段颜色也在 `profile/config.toml`)。command
   上半是响应日志,下半输入带的顶线嵌入 `deck0 / deck1 / browser` 目标(`Tab` 循环;browser
   目前没有 CLI 前缀),目标文字与面板标题 `command` 左对齐
+- 多 deck(>2)的 TUI 布局(`--4-decks`):deck 区**按页纵向堆叠**,每页两个 deck(信息栏左右
+  两列 + 各一行波形),所以四个 deck 的波形全部在屏上;`trans | pads/fx | eq/beatctl | faders |
+  trans | …` 这一条控制带每列各自选 deck(`App::slots`),每列 trans 顶上多一枚写着
+  `deck{number}` 的按钮,点它只翻**自己这一列**(左列 deck1 ⇄ deck3,右列 deck2 ⇄ deck4),不动
+  command target;为腾出堆叠的那一行,堆叠时信息栏 `5 → 4` 行(pads `10 → 8` 行、每格 pad
+  `3 → 2` 行),被两列选中的 deck 信息边框用白色标出(焦点 deck 仍是 accent),`Tab` 落到别的
+  页的 deck 时会把它换进自己那一列。堆叠会让 deck 区超过“屏幕一半”那条旧规则,底部只保证
+  `MIN_BOTTOM_H` 的浏览器高度
 - TUI 设置界面(`src/tui/settings.rs`):`F9` 打开,选择控制器端口/映射文件、拓扑文件(`mixer`)、
   输出绑定(`output`,每条 `[[output]]` 的 device/channels,写入拓扑文件并立即重载)、
   live/preference 段(取代旧的 `F2`/`F3`);`load` 不带路径弹文件浏览器;`Load` 完成后
-  `App::connect_midi` 连上,`--controller` 仅是免选择的快捷方式
-- `--guide [<file>] [--controller <port>] [--decks <n>]` — learn 模式地图编辑器(`src/tui/guide.rs`),
+  `App::connect_midi` 连上,config 的 `[[controller]].device` 只是免选择的快捷方式
+- `--guide [<file>]` — learn 模式地图编辑器(`src/tui/guide.rs`),
   **不启动引擎**;`deck | unit | slot` 三栏、`info | watch dog`、灰色键位提示、居中 command
   (`Enter/Learn/Confirm` + `Delete/Connect/File/Save/Exit`)。方向键换栏/换行,Tab 切 command,
   Enter 下钻/学习,new 菜单负责 clone/new deck,add unit 只列内置 preset;逻辑在

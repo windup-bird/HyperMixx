@@ -16,17 +16,16 @@ cargo run -p hypermixx-cli -- [flags]
 |---|---|
 | `--cli` | 行式 REPL；不给则启动 TUI（默认） |
 | `--config <file>` | 指定配置文件（单文件多段落）；不给则用平台默认路径，首次启动从内置模板复制一份。`HYPERMIXX_CONFIG` 可覆盖路径 |
-| `--print-config` | 打印配置模板后退出（不启动引擎） |
 | `--backend auto\|stratum\|timestretch` | 离线分析后端，缺省 `auto`（stratum 优先，失败回落） |
-| `--controller <port>` | 启动时打开控制器输入（端口号或名字，`controller ports` 可列；`midi ports` 别名仍可）。映射文件由 config 的 `[[controller]].map` 指定 |
 | `--guide [<file>]` | learn 模式地图编辑器（**不启动音频引擎**）；缺省编辑 config 同目录的 `mapping.toml`，不存在则从内置模板创建 |
-| `--decks <n>` | 仅作用于 `--guide` 的 deck 栏宽度，缺省 1 |
+| `--4-decks` | 四碟界面：引擎起四条 deck，TUI 的 deck 区按页纵向堆叠，控制带每列各自翻页。不给就是双碟 |
 
 - 未知参数是硬错误（`error: unknown argument …`），不会静默忽略；
   `--profile` / `--live` / `--controller-map` / `--tui` / `--midi*` 已移除。
-- `--guide` 即使不跟端口也能在 TUI 里选端口/文件；给了路径/端口时启动即尝试打开，
-  失败会留在 watch dog 里等待 `File` / `Connect`。
-- deck 数量启动时从引擎查询（自定义拓扑可配任意通道数），不是固定常量。
+- 控制器只由配置文件描述（`[[controller]]` 的 `device`/`map`），没有命令行参数；`--guide` 打开
+  地图后按 `Connect` 选端口，失败会留在 watch dog 里等下一次。
+- deck 数量由 `--4-decks` 决定（缺省 2）；配置里的 `[[multideck.deck]]` 只提供
+  `<controller>.<face>[.mirror]` 映射，不决定有几个 deck。
 
 ---
 
@@ -477,7 +476,8 @@ controller ports    列出可用控制器输入端口（`midi ports` / `list` �
 controller mode     查看/切换已接入映射的 unit 模式
 ```
 
-只有查询与模式切换走会话命令：打开端口在启动时（`--controller`）或 TUI 的 `F9` 设置界面完成——
+只有查询与模式切换走会话命令：打开端口在启动时（`[[controller]].device`/映射文件里的 device）
+或 TUI 的 `F9` 设置界面完成——
 映射是对运行中引擎接线一次，会话中途不重新打开输入。映射表格式与全部 action 见
 [`MIDI.md`](MIDI.md)。
 

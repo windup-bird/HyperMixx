@@ -4,18 +4,18 @@
 #   Linux / Termux : $XDG_CONFIG_HOME/hypermixx/config.toml  (or ~/.config/hypermixx/config.toml)
 #   Windows        : %APPDATA%/Hypermixx/config.toml
 # On the first start this template is copied there; an existing file is never overwritten.
-# `HYPERMIXX_CONFIG` overrides the path. `--print-config` prints this template.
+# `HYPERMIXX_CONFIG` overrides the path. Four decks: start with `--4-decks`.
 #
 # Every section is optional: a missing key takes its built-in default. Paths inside the config are
 # relative to this file's folder.
 
 [multideck]
-# The deck list: one [[multideck.deck]] per deck, in deck-id order (deck1, deck2, ...). Each entry
-# carries its controller mapping and the parameters a DJ sets per deck; everything that is the
-# same on every deck lives in `[mixer.chain]`.
+# Controller mapping only: the deck count comes from the front-end (`--4-decks`, two by default),
+# not from this list. Row 1 is deck1, row 2 is deck2, and so on; `[mixer]` holds the audio topology
+# every deck shares, and the few fields here are the values a DJ sets per deck.
 # `source` names the controller surface that drives a deck: <controller-id>.<face>[.mirror].
 # Omit `.mirror` for the normal variant; omit `source` for a deck no controller owns. A two-deck
-# controller driving four decks adds two more entries, e.g.
+# controller driving four decks maps the extra two to its mirror faces, e.g.
 #   source = "ctl1.A.mirror"   (deck3)
 #   source = "ctl1.B.mirror"   (deck4)
 [[multideck.deck]]

@@ -255,10 +255,10 @@ FX 链要用 `chain = "vocals"` / `chain = "deck1/vocals"`，这次不提供 ste
 
 ## 9. 打开与编辑
 
-- `--controller <port>`：启动时打开端口并按映射翻译；映射文件由 config 的 `[[controller]].map` 指定（可声明多个，各自独立）。
-  （旧的 `--profile` / `--live` / `--controller-map` / `--midi*` 拼写已移除；会话里 `controller ports` 仍接受 `midi ports` 别名。）
+- 控制器只有配置文件一条路：`[[controller]]` 的 `device` / `map`（可声明多个，各自独立），没有启动参数。
+  （旧的 `--controller` / `--profile` / `--live` / `--controller-map` / `--midi*` 拼写已移除；会话里 `controller ports` 仍接受 `midi ports` 别名。）
 - TUI 下 `F9` 打开设置界面选端口与映射文件（取代旧的 `F2`/`F3`）。
-- `--guide [<file>] [--controller <port>] [--decks <n>]`：learn 模式编辑器，不启动音频引擎。
+- `--guide [<file>]`：learn 模式编辑器，不启动音频引擎；`--4-decks` 会让它显示四组 deck。
   顶栏显示 file/controller；下面是带边框的 `deck | unit | slot`、`info | watch dog`、
   灰色键位提示和居中 command 按钮。
 
