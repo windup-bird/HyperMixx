@@ -1,9 +1,15 @@
 //! [`Param`]: the only way a parameter crosses from the command thread to the audio thread.
 //!
 //! Two atomics and a smoothing time constant. The command thread stores a target; the audio thread
-//! walks the current value toward it, one step per block ([`Param::next_block`]) or per sample
-//! ([`Param::next_sample`]). No lock, no allocation, no discontinuity — which is the entire reason
-//! a cutoff sweep through this type does not click and a fader move does not zip.
+//! reads it through [`Param::ramp`], which advances one block and returns a [`Ramp`]. No lock, no
+//! allocation.
+//!
+//! [`Ramp`] is the single place that knows how a smoothed value is spread over a block: it starts
+//! where the previous block ended and ends at this block's settled value, so a gain read with
+//! [`Ramp::at`] is continuous at every block boundary (applying one block-quantised value instead
+//! steps by up to `alpha` every 5.8 ms and zips on a fast fader move). Coefficients that only need
+//! the settled value read [`Ramp::end`] — the same entry point, so there is no second API to
+//! remember and no effect has to implement interpolation itself.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -65,13 +71,25 @@ impl Param {
         self.target.store(sanitize(value).to_bits(), Ordering::Relaxed);
     }
 
-    /// One block-quantised step: the value that holds for this block of `frames` frames.
+    /// The settled value after one block: exactly [`Ramp::end`] of [`Param::ramp`]. Kept as a
+    /// short-hand for callers and tests that only need the endpoint; the audio path should use
+    /// `ramp` so it cannot accidentally apply a whole block at once.
     ///
     /// Mathematically identical to `frames` calls to [`Param::next_sample`], in one exp.
     #[inline]
     pub fn next_block(&self, frames: usize, sr: u32) -> f32 {
         let alpha = approach_factor(self.tau, frames, sr);
         self.step(alpha)
+    }
+
+    /// Advances one block and returns the [`Ramp`] describing it. This is the *only* way the audio
+    /// thread should read a moving parameter: gains use [`Ramp::at`] inside the DSP loop,
+    /// coefficients use [`Ramp::end`] once per block.
+    #[inline]
+    pub fn ramp(&self, frames: usize, sr: u32) -> Ramp {
+        let start = self.get();
+        let end = self.next_block(frames, sr);
+        Ramp::new(start, end, frames)
     }
 
     /// One per-sample step, for parameters that must move *within* a block (filter sweeps).
@@ -127,6 +145,84 @@ impl Param {
         };
         self.current.store(next.to_bits(), Ordering::Relaxed);
         next
+    }
+}
+
+/// One parameter's value across a single block.
+///
+/// `start` is where the previous block ended, `end` is where this block ends. [`Ramp::at`]
+/// interpolates linearly between them, which is what keeps a gain continuous at block boundaries;
+/// [`Ramp::end`] is the settled value for coefficients computed once per block. A `Ramp` is a plain
+/// `Copy` value, so reading it in a DSP loop costs one multiply-add per sample and no atomics.
+#[derive(Clone, Copy, Debug)]
+pub struct Ramp {
+    start: f32,
+    end: f32,
+    span: f32,
+    frames: usize,
+    last: usize,
+    inv_last: f32,
+}
+
+impl Ramp {
+    /// Builds a ramp over `frames` samples. `frames == 0` is harmless: `at` then just returns
+    /// `start` and `end` is still the settled value.
+    pub fn new(start: f32, end: f32, frames: usize) -> Self {
+        let last = frames.saturating_sub(1).max(1);
+        Self {
+            start,
+            end,
+            span: end - start,
+            frames,
+            last,
+            inv_last: 1.0 / last as f32,
+        }
+    }
+
+    /// The value at sample `sample`, clamped to the block so an out-of-range index cannot run the
+    /// interpolation past `end`.
+    #[inline]
+    pub fn at(&self, sample: usize) -> f32 {
+        self.start + self.span * (sample.min(self.last) as f32 * self.inv_last)
+    }
+
+    /// The value the previous block ended on (and this block's first sample).
+    #[inline]
+    pub fn start(&self) -> f32 {
+        self.start
+    }
+
+    /// This block's settled value — the last sample, and the value a coefficient should use.
+    #[inline]
+    pub fn end(&self) -> f32 {
+        self.end
+    }
+
+    /// True when the parameter did not move this block, so a caller can fall back to a constant
+    /// gain (and keep the unity no-op).
+    #[inline]
+    pub fn is_constant(&self) -> bool {
+        self.start == self.end
+    }
+
+    /// Clamps both endpoints to a range. Do this once at the boundary instead of clamping every
+    /// sample inside the loop.
+    #[inline]
+    pub fn clamped(self, lo: f32, hi: f32) -> Self {
+        Self::new(
+            self.start.clamp(lo, hi),
+            self.end.clamp(lo, hi),
+            self.frames,
+        )
+    }
+
+    /// Maps both endpoints through a derived law (`fader_amp`, `db_to_amp`, a crossfader curve,
+    /// `size → feedback`). For a linear law this is exact; for a nonlinear one the ramp runs
+    /// between the mapped endpoints rather than `f(at(i))`, which differs only within one 5.8 ms
+    /// block and stays continuous either way.
+    #[inline]
+    pub fn map(self, f: impl Fn(f32) -> f32) -> Self {
+        Self::new(f(self.start), f(self.end), self.frames)
     }
 }
 
@@ -227,6 +323,50 @@ mod tests {
         assert_eq!(p.next_block(BLOCK_SIZE, 44_100), 0.0);
         let p = Param::new(f32::NAN, 0.0);
         assert_eq!(p.get(), 0.0);
+    }
+
+    #[test]
+    fn block_ramps_join_without_a_step() {
+        // A fast fader move used to jump by ~50% of the remaining distance at every block
+        // boundary. Consecutive ramps must meet exactly, and each block's gain must move.
+        let p = Param::new(0.0, 0.008);
+        p.set(1.0);
+        let mut previous_end = None;
+        for _ in 0..4 {
+            let ramp = p.ramp(BLOCK_SIZE, 44_100);
+            if let Some(previous) = previous_end {
+                assert_eq!(
+                    ramp.start(),
+                    previous,
+                    "a block must start where the last one ended"
+                );
+            }
+            assert!(
+                ramp.end() > ramp.start(),
+                "the gain must still be moving in this block"
+            );
+            assert_eq!(ramp.at(0), ramp.start());
+            assert_eq!(ramp.at(BLOCK_SIZE - 1), ramp.end());
+            previous_end = Some(ramp.end());
+        }
+    }
+
+    #[test]
+    fn ramp_helpers_clamp_and_map_endpoints() {
+        let ramp = Ramp::new(-0.5, 1.5, 8);
+        let clamped = ramp.clamped(0.0, 1.0);
+        assert_eq!(clamped.start(), 0.0);
+        assert_eq!(clamped.end(), 1.0);
+        // A linear law is exact under `map`.
+        let doubled = clamped.map(|v| v * 2.0);
+        assert_eq!(doubled.start(), 0.0);
+        assert_eq!(doubled.end(), 2.0);
+        assert_eq!(doubled.at(7), 2.0);
+        assert!(!ramp.is_constant());
+        assert!(Ramp::new(0.3, 0.3, 8).is_constant());
+        // An out-of-range index cannot run past the end, and a zero-frame ramp does not divide by 0.
+        assert_eq!(ramp.at(999), ramp.end());
+        assert_eq!(Ramp::new(0.0, 1.0, 0).at(0), 0.0);
     }
 
     #[test]

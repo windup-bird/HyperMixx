@@ -144,15 +144,18 @@ fn eq_sections(
 impl Fx for Eq {
     fn process(&mut self, bus: &mut Bus, ctx: &FxContext) {
         let (frames, sr) = (ctx.block_frames, ctx.sample_rate);
+        // Biquad coefficients are designed once per block, so every control only needs `end()` —
+        // the same `Param::ramp` entry the gain effects use. Recomputing a design per sample would
+        // cost far more than it saves, and a coefficient change does not step the output amplitude.
         let (low_pos, mid_pos, high_pos) = (
-            self.low.next_block(frames, sr),
-            self.mid.next_block(frames, sr),
-            self.high.next_block(frames, sr),
+            self.low.ramp(frames, sr).end(),
+            self.mid.ramp(frames, sr).end(),
+            self.high.ramp(frames, sr).end(),
         );
         let hertz = [
-            self.low_hz.next_block(frames, sr),
-            self.mid_hz.next_block(frames, sr),
-            self.high_hz.next_block(frames, sr),
+            self.low_hz.ramp(frames, sr).end(),
+            self.mid_hz.ramp(frames, sr).end(),
+            self.high_hz.ramp(frames, sr).end(),
         ];
         let db = [
             band_db_of(low_pos),

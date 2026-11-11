@@ -8,6 +8,7 @@
 //! Buffers are allocated once at construction. Nothing in this module allocates, which is what lets
 //! the mixer run on the producer thread without ever hitting a malloc.
 
+use crate::fx::Ramp;
 use crate::CHANNELS;
 
 /// One block of de-interleaved stereo audio.
@@ -123,15 +124,38 @@ impl Bus {
     }
 
     /// Per-sample gain, for a fader that moves inside the block (a crossfader ramp).
+    /// `next` is called once per sample index and applied to both planes, so left and right always
+    /// see the same gain curve.
     #[inline]
     pub fn scale_ramped(&mut self, mut next: impl FnMut(usize) -> f32) {
-        for (i, s) in self.l.iter_mut().enumerate() {
+        for ((i, l), r) in self.l.iter_mut().enumerate().zip(self.r.iter_mut()) {
             let g = next(i);
-            *s *= g;
+            *l *= g;
+            *r *= g;
         }
-        for (i, s) in self.r.iter_mut().enumerate() {
-            let g = next(i);
-            *s *= g;
+    }
+
+    /// Applies one [`Ramp`] as a per-sample gain. A stationary ramp falls back to [`Bus::scale`],
+    /// so a settled unity gain keeps its no-op. The ramp already starts where the previous block
+    /// ended, which is what makes the gain continuous at every boundary — no zip on a fast move.
+    #[inline]
+    pub fn scale_ramp(&mut self, ramp: &Ramp) {
+        if ramp.is_constant() {
+            self.scale(ramp.end());
+            return;
+        }
+        self.scale_ramped(|i| ramp.at(i));
+    }
+
+    /// `self += other * ramp.at(i)`. The cue send uses this so a fast send move does not step at
+    /// block boundaries.
+    #[inline]
+    pub fn add_scaled_ramp(&mut self, other: &Bus, ramp: &Ramp) {
+        let n = self.frames().min(other.frames());
+        for i in 0..n {
+            let g = ramp.at(i);
+            self.l[i] += other.l[i] * g;
+            self.r[i] += other.r[i] * g;
         }
     }
 
@@ -265,6 +289,54 @@ mod tests {
         // 0 → 1 across four frames.
         a.scale_ramped(|i| i as f32 / 3.0);
         assert_eq!(a.l, vec![0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]);
+        assert_eq!(a.r, a.l, "both planes see the same gain curve");
+    }
+
+    #[test]
+    fn scale_ramp_spreads_the_step_over_the_block() {
+        let mut a = bus(&[1.0; 4], &[1.0; 4]);
+        a.scale_ramp(&Ramp::new(0.25, 1.0, 4));
+        assert_eq!(a.l[0], 0.25);
+        assert_eq!(a.l[3], 1.0);
+        assert!(a.l[0] < a.l[1] && a.l[1] < a.l[2] && a.l[2] < a.l[3]);
+        assert_eq!(a.l, a.r);
+        // A stationary ramp is just a plain scale.
+        let mut b = bus(&[0.5; 4], &[0.5; 4]);
+        b.scale_ramp(&Ramp::new(2.0, 2.0, 4));
+        assert_eq!(b.l, vec![1.0; 4]);
+    }
+
+    #[test]
+    fn add_scaled_ramp_ramps_the_added_copy() {
+        let mut cue = bus(&[0.0; 4], &[0.0; 4]);
+        cue.add_scaled_ramp(&bus(&[1.0; 4], &[1.0; 4]), &Ramp::new(0.0, 1.0, 4));
+        assert_eq!(cue.l[0], 0.0);
+        assert_eq!(cue.l[3], 1.0);
+        assert_eq!(cue.l, cue.r);
+    }
+
+    #[test]
+    fn a_fast_full_travel_fader_move_joins_across_block_boundaries() {
+        use crate::fx::Param;
+        use crate::BLOCK_SIZE;
+        // FADER_TAU = 8 ms: the old path applied each block's *end* gain to the whole block,
+        // stepping ~50% at every 5.8 ms boundary. Ramp endpoints must meet exactly.
+        let p = Param::new(0.0, 0.008);
+        p.set(1.0);
+        let mut previous_last = None;
+        for _ in 0..4 {
+            let ramp = p.ramp(BLOCK_SIZE, 44_100);
+            if let Some(previous) = previous_last {
+                assert_eq!(ramp.start(), previous, "a block boundary must not step");
+            }
+            let mut b = Bus::new(BLOCK_SIZE);
+            b.fill_from(1.0, 1.0);
+            b.scale_ramp(&ramp);
+            assert_eq!(b.l[0], ramp.start());
+            assert_eq!(b.l[BLOCK_SIZE - 1], ramp.end());
+            assert_ne!(b.l[0], b.l[BLOCK_SIZE - 1], "gain must move within a block");
+            previous_last = Some(ramp.end());
+        }
     }
 
     #[test]

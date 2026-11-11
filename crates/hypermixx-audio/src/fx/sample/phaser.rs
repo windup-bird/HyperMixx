@@ -159,17 +159,22 @@ impl Fx for Phaser {
             self.prepare(rate);
         }
 
-        let mix = self.mix.next_block(frames, rate).clamp(0.0, 1.0);
-        let depth = self.depth.next_block(frames, rate).clamp(0.0, 1.0);
-        let lfo_rate = self.rate.next_block(frames, rate).clamp(MIN_RATE, MAX_RATE);
-        let feedback = self
-            .feedback
-            .next_block(frames, rate)
-            .clamp(0.0, MAX_FEEDBACK);
+        // Gains use `at(i)`; LFO rate and depth pick the all-pass coefficient once per block, so
+        // they only need `end()`. All four come from the same `Param::ramp` entry point.
+        let mix = self.mix.ramp(frames, rate).clamped(0.0, 1.0);
+        let feedback = self.feedback.ramp(frames, rate).clamped(0.0, MAX_FEEDBACK);
+        let depth = self.depth.ramp(frames, rate).end().clamp(0.0, 1.0);
+        let lfo_rate = self
+            .rate
+            .ramp(frames, rate)
+            .end()
+            .clamp(MIN_RATE, MAX_RATE);
         let increment = f64::from(lfo_rate) * ctx.beats_per_second() / f64::from(rate);
-        let dry = 1.0 - mix;
 
         for i in 0..frames {
+            let mix = mix.at(i);
+            let feedback = feedback.at(i);
+            let dry = 1.0 - mix;
             let left_lfo = f64::from(self.lfo.value());
             let right_lfo = f64::from(self.lfo.value_at(STEREO_OFFSET));
             self.lfo.advance(increment);

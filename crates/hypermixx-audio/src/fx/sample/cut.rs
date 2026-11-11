@@ -109,13 +109,17 @@ impl Fx for Cut {
             self.prepare(rate);
         }
 
-        let depth = self.depth.next_block(frames, rate).clamp(0.0, 1.0);
-        let div = self.div.next_block(frames, rate).clamp(MIN_DIV, MAX_DIV);
+        // Every control goes through `Param::ramp` — the one entry point. Depth is a gain, so the
+        // loop reads `at(i)`; div/width/edge set the gate's shape and only need `end()`. The gate
+        // phase already advances per sample, so those coefficients produce no amplitude step.
+        let depth = self.depth.ramp(frames, rate).clamped(0.0, 1.0);
+        let div = self.div.ramp(frames, rate).end().clamp(MIN_DIV, MAX_DIV);
         let width = self
             .width
-            .next_block(frames, rate)
+            .ramp(frames, rate)
+            .end()
             .clamp(MIN_WIDTH, MAX_WIDTH);
-        let edge_ms = self.edge.next_block(frames, rate).clamp(0.0, MAX_EDGE_MS);
+        let edge_ms = self.edge.ramp(frames, rate).end().clamp(0.0, MAX_EDGE_MS);
 
         let period = (f64::from(div) * ctx.beat_frames()).max(2.0);
         // The fade is a fraction of the cycle, bounded so the two ramps can never meet.
@@ -131,9 +135,9 @@ impl Fx for Cut {
             Some(beat) => (beat / f64::from(div)).rem_euclid(1.0),
             None => self.phase,
         };
-        let floor = 1.0 - depth;
-
         for i in 0..frames {
+            let depth = depth.at(i);
+            let floor = 1.0 - depth;
             let gain = floor + depth * gate_gain(phase, width, fade) as f32;
             bus.l[i] *= gain;
             bus.r[i] *= gain;

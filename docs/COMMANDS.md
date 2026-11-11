@@ -16,12 +16,13 @@ cargo run -p hypermixx-cli -- [flags]
 |---|---|
 | `--cli` | 行式 REPL；不给则启动 TUI（默认） |
 | `--config <file>` | 指定配置文件（单文件多段落）；不给则用平台默认路径，首次启动从内置模板复制一份。`HYPERMIXX_CONFIG` 可覆盖路径 |
-| `--backend auto\|stratum\|timestretch` | 离线分析后端，缺省 `auto`（stratum 优先，失败回落） |
 | `--guide [<file>]` | learn 模式地图编辑器（**不启动音频引擎**）；缺省编辑 config 同目录的 `mapping.toml`，不存在则从内置模板创建 |
 | `--4-decks` | 四碟界面：引擎起四条 deck，TUI 的 deck 区按页纵向堆叠，控制带每列各自翻页。不给就是双碟 |
 
 - 未知参数是硬错误（`error: unknown argument …`），不会静默忽略；
-  `--profile` / `--live` / `--controller-map` / `--tui` / `--midi*` 已移除。
+  `--profile` / `--live` / `--controller-map` / `--tui` / `--midi*` / `--backend` 已移除。
+  离线分析后端只由配置决定：`[preference.analysis]` 的 `beats` / `key`（`stratum` | `timestretch`），
+  没有启动参数、也没有 `auto` 回落。
 - 控制器只由配置文件描述（`[[controller]]` 的 `device`/`map`），没有命令行参数；`--guide` 打开
   地图后按 `Connect` 选端口，失败会留在 watch dog 里等下一次。
 - deck 数量由 `--4-decks` 决定（缺省 2）；配置里的 `[[multideck.deck]]` 只提供
@@ -74,7 +75,7 @@ cargo run -p hypermixx-cli -- [flags]
 
 - `load` 的 `bpm` 非数字 → 前端直接报 `bpm must be a number`。
 - TUI 里 `load` **不带路径**会弹文件浏览器（支持 mp3/wav/flac/ogg/m4a 等）。
-- `analyse` 用 `--backend` 选定的后端；完成提示形如
+- `analyse` 只用配置 `[preference.analysis]` 指定的后端（`beats` / `key`），没有命令行覆盖；完成提示形如
   `[analyse] deck0: 122.0 BPM, 8A`。
 - 装载是后台线程，立即回 `[load] deck0: decoding …`；完成回
   `deck0 loaded: 18462369 frames (7:00.648)`。

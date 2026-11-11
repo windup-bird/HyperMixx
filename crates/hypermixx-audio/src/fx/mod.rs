@@ -28,7 +28,7 @@ mod registry;
 pub mod sample;
 
 pub use chain::{FxChain, FxSlot, FxTarget, FLOW_ALL};
-pub use param::Param;
+pub use param::{Param, Ramp};
 pub use registry::{FxKind, ParamSpec};
 
 use crate::mixer::Bus;

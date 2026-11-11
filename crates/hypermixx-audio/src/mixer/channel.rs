@@ -42,7 +42,7 @@ use super::config::{ChannelConfig, CrossfaderConfig};
 use crate::deck::Deck;
 use crate::fx::dsp::trim_amp;
 use crate::fx::sample::Fader;
-use crate::fx::{FxChain, FxSlot, Param};
+use crate::fx::{FxChain, FxSlot, Param, Ramp};
 use crate::BLOCK_SIZE;
 
 /// Which half of the crossfader a channel is on.
@@ -575,11 +575,12 @@ impl Channel {
 
         // The cue send and the crossfader are *advancing* smoothers: one step per block. Stepping
         // either once per stream would shorten its time constant by the stream count, so both are
-        // taken here and passed in.
-        let cue_gain = self.cue_send.next_block(ctx.block_frames, ctx.sample_rate);
-        let cross_position = self.crossfader.next_position(ctx);
+        // taken here as [`Ramp`]s and reused. A ramp starts where the previous block ended, which
+        // is what keeps every gain continuous instead of stepping once at the boundary.
+        let cue = self.cue_send.ramp(ctx.block_frames, ctx.sample_rate);
+        let cross = self.crossfader.position_ramp(ctx);
         let side = DeckSide::from_u8(self.crossfader_side.load(Ordering::Relaxed));
-        let side_gain = side.gain_at(cross_position, self.cross.curve, self.cross.cut_width);
+        let cross_gain = cross.map(|p| side.gain_at(p, self.cross.curve, self.cross.cut_width));
 
         let frames = ctx.block_frames;
         let live = streams.min(stream_buses.len());
@@ -594,30 +595,24 @@ impl Channel {
         // inserts see the gained and trimmed signal.
         self.autogain
             .set(self.autogain_settings.gain_db(self.deck.loudness_db()));
-        let autogain_db = self.autogain.next_block(ctx.block_frames, ctx.sample_rate);
-        let autogain_gain = if autogain_db != 0.0 {
-            10f32.powf(autogain_db / 20.0)
-        } else {
-            1.0
-        };
-        let trim = self.gain.next_block(ctx.block_frames, ctx.sample_rate);
-        let trim_gain = if trim != 0.0 { trim_amp(trim) } else { 1.0 };
+        let autogain = self
+            .autogain
+            .ramp(ctx.block_frames, ctx.sample_rate)
+            .map(|db| if db != 0.0 { 10f32.powf(db / 20.0) } else { 1.0 });
+        let trim = self
+            .gain
+            .ramp(ctx.block_frames, ctx.sample_rate)
+            .map(trim_amp);
 
         for (stream, sb) in stream_buses[..live].iter_mut().enumerate() {
             // The source gate is the stem mute/solo decision: exactly 1.0 or 0.0, smoothed so a mute
             // is a fade rather than a step. Before the flow chain, so a muted stem's reverb tail goes
             // with it.
-            let gate = self.source_gate[stream].next_block(ctx.block_frames, ctx.sample_rate);
-            if gate != 1.0 {
-                sb.scale(gate);
-            }
-            sb.scale(self.flow_fader[stream].next_amp(ctx));
-            if autogain_gain != 1.0 {
-                sb.scale(autogain_gain);
-            }
-            if trim != 0.0 {
-                sb.scale(trim_gain);
-            }
+            let gate = self.source_gate[stream].ramp(ctx.block_frames, ctx.sample_rate);
+            sb.scale_ramp(&gate);
+            sb.scale_ramp(&self.flow_fader[stream].amp_ramp(ctx));
+            sb.scale_ramp(&autogain);
+            sb.scale_ramp(&trim);
             // The tone prefix and the per-flow inserts run after the flow fader and the trim, before
             // the sum.
             // The chain is driven even when every slot is bypassed or masked out: the per-slot
@@ -638,15 +633,15 @@ impl Channel {
         // track in with its fader down possible; `post` hands the monitor the faded signal. Either
         // way the crossfader stays outside the tap.
         if self.cue_tap == CueTap::Pre {
-            self.take_cue_into(&bus, cue_gain);
+            self.take_cue_into(&bus, &cue);
         }
-        bus.scale(self.fader.next_amp(ctx));
+        bus.scale_ramp(&self.fader.amp_ramp(ctx));
         if self.cue_tap == CueTap::Post {
-            self.take_cue_into(&bus, cue_gain);
+            self.take_cue_into(&bus, &cue);
         }
         // The crossfader is last, so a crossfade is a routing decision taken after the tone controls
         // and the levels rather than a level change that recolours them.
-        bus.scale(side_gain);
+        bus.scale_ramp(&cross_gain);
 
         self.stream_buses = stream_buses;
         self.bus = bus;
@@ -670,11 +665,12 @@ impl Channel {
         self.refresh_stem_faders();
     }
 
-    /// Copies `source` into the channel's cue bus at the current send level.
-    fn take_cue_into(&mut self, source: &Bus, gain: f32) {
+    /// Copies `source` into the channel's cue bus through one [`Ramp`], so a fast cue-send move
+    /// does not step at the block boundary.
+    fn take_cue_into(&mut self, source: &Bus, ramp: &Ramp) {
         self.cue.clear();
-        if gain > 0.0 {
-            self.cue.add_scaled(source, gain);
+        if ramp.start() > 0.0 || ramp.end() > 0.0 {
+            self.cue.add_scaled_ramp(source, ramp);
         }
     }
 

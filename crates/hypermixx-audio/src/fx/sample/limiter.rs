@@ -147,10 +147,16 @@ impl Fx for Limiter {
         // handed. Leaving a tail behind would let un-shaped audio reach the DAC.
         let frames = bus.frames();
         let sr = ctx.sample_rate;
-        let target_ceiling = sanitize_ceiling(self.ceiling.next_block(frames, sr));
-        let release = self.release.next_block(frames, sr).max(0.001);
-        let recovery = self.recovery.next_block(frames, sr).max(0.01);
-        let backoff = self.backoff.next_block(frames, sr).clamp(0.0, RELEASE_RANGE_DB);
+        // The gain envelope (`env` below) already advances per sample, so the threshold and time
+        // constants only need `end()` — the same `Param::ramp` entry as every other effect.
+        let target_ceiling = sanitize_ceiling(self.ceiling.ramp(frames, sr).end());
+        let release = self.release.ramp(frames, sr).end().max(0.001);
+        let recovery = self.recovery.ramp(frames, sr).end().max(0.01);
+        let backoff = self
+            .backoff
+            .ramp(frames, sr)
+            .end()
+            .clamp(0.0, RELEASE_RANGE_DB);
 
         let block_peak = bus
             .l

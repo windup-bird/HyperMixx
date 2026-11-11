@@ -1143,7 +1143,7 @@ impl MasterBus {
         if !self.fx.is_empty() {
             self.fx.process(&mut self.sum, ctx);
         }
-        self.sum.scale(self.fader.next_amp(ctx));
+        self.sum.scale_ramp(&self.fader.amp_ramp(ctx));
         // The safety stage runs whenever it is engaged, bypassing the chain-skip optimisation: a
         // limiter that is "not active" is a limiter that let a transient through.
         self.limiter.process(&mut self.sum, ctx);
@@ -1165,7 +1165,7 @@ impl MasterBus {
 
 impl CueBus {
     fn render(&mut self, ctx: &FxContext) {
-        self.sum.scale(self.fader.next_amp(ctx));
+        self.sum.scale_ramp(&self.fader.amp_ramp(ctx));
         self.peak = self.sum.peak();
     }
 

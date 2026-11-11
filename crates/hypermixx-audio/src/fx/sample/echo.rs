@@ -165,16 +165,16 @@ impl Fx for Echo {
             self.prepare(rate);
         }
 
-        let mix = self.mix.next_block(frames, rate).clamp(0.0, 1.0);
-        let feedback = self
-            .feedback
-            .next_block(frames, rate)
-            .clamp(0.0, MAX_FEEDBACK);
-        let tone = self.tone.next_block(frames, rate);
-        let pingpong = self.pingpong.next_block(frames, rate).clamp(0.0, 1.0);
+        // Every control reads through `Param::ramp`. Gains use `at(i)` inside the loop; delay time
+        // and tone set the buffer/coefficients once per block, so they only need `end()`.
+        let mix = self.mix.ramp(frames, rate).clamped(0.0, 1.0);
+        let feedback = self.feedback.ramp(frames, rate).clamped(0.0, MAX_FEEDBACK);
+        let pingpong = self.pingpong.ramp(frames, rate).clamped(0.0, 1.0);
+        let tone = self.tone.ramp(frames, rate).end();
         let beats = f64::from(
             self.time
-                .next_block(frames, rate)
+                .ramp(frames, rate)
+                .end()
                 .clamp(MIN_BEATS, MAX_BEATS),
         );
         let delay = ((beats * ctx.beat_frames()) as f32).clamp(1.0, self.left.max_delay());
@@ -184,8 +184,11 @@ impl Fx for Echo {
         self.damp_left.set_cutoff(cutoff, rate);
         self.damp_right.set_cutoff(cutoff, rate);
 
-        let dry = 1.0 - mix;
         for i in 0..frames {
+            let mix = mix.at(i);
+            let feedback = feedback.at(i);
+            let pingpong = pingpong.at(i);
+            let dry = 1.0 - mix;
             let wet_left = self.left.read(delay);
             let wet_right = self.right.read(delay);
             // Damp the copy that goes back around, not the copy that is heard now: the first repeat

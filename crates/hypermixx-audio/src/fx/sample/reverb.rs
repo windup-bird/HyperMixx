@@ -175,19 +175,32 @@ impl Fx for Reverb {
             self.prepare(rate);
         }
 
-        let mix = self.mix.next_block(frames, rate).clamp(0.0, 1.0);
-        let size = self.size.next_block(frames, rate).clamp(0.0, 1.0);
-        let damping = self.damping.next_block(frames, rate).clamp(0.0, 1.0);
-        let width = self.width.next_block(frames, rate).clamp(0.0, 1.0);
-
-        let feedback = ROOM_OFFSET + ROOM_SCALE * size;
-        let damp = DAMP_SCALE * damping;
-        let wet = mix * WET_GAIN;
-        let dry = 1.0 - mix;
-        let wet1 = wet * (width * 0.5 + 0.5);
-        let wet2 = wet * ((1.0 - width) * 0.5);
+        // Every one of these four ends up as a gain on the samples (dry/wet, comb feedback, comb
+        // damping, stereo width): read `at(i)` so a fast move does not step at the boundary. The
+        // comb/all-pass state is continuous, so changing its gains per sample is safe. Derived laws
+        // are linear, so they can be mapped once with `Ramp::map` instead of recomputed per sample.
+        let mix = self.mix.ramp(frames, rate).clamped(0.0, 1.0);
+        let feedback = self
+            .size
+            .ramp(frames, rate)
+            .clamped(0.0, 1.0)
+            .map(|size| ROOM_OFFSET + ROOM_SCALE * size);
+        let damp = self
+            .damping
+            .ramp(frames, rate)
+            .clamped(0.0, 1.0)
+            .map(|damping| DAMP_SCALE * damping);
+        let width = self.width.ramp(frames, rate).clamped(0.0, 1.0);
 
         for i in 0..frames {
+            let mix = mix.at(i);
+            let feedback = feedback.at(i);
+            let damp = damp.at(i);
+            let width = width.at(i);
+            let wet = mix * WET_GAIN;
+            let dry = 1.0 - mix;
+            let wet1 = wet * (width * 0.5 + 0.5);
+            let wet2 = wet * ((1.0 - width) * 0.5);
             let input = (bus.l[i] + bus.r[i]) * INPUT_GAIN;
             let mut left = 0.0;
             for comb in &mut self.combs_left {

@@ -325,8 +325,10 @@ impl Svf {
 impl Fx for Filter {
     fn process(&mut self, bus: &mut Bus, ctx: &FxContext) {
         let (frames, sr) = (ctx.block_frames.min(bus.frames()), ctx.sample_rate.max(1));
-        let value = self.value.next_block(frames, sr);
-        let resonance = self.resonance.next_block(frames, sr);
+        // Coefficients are designed once per block; the output crossfade (`weight` below) already
+        // advances per sample, so these only need `end()`.
+        let value = self.value.ramp(frames, sr).end();
+        let resonance = self.resonance.ramp(frames, sr).end();
 
         if (value, resonance) != self.cached || sr != self.cached_rate {
             self.design(sr, value, resonance);

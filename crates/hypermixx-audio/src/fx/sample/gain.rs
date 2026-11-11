@@ -6,7 +6,7 @@
 
 use std::sync::atomic::Ordering;
 
-use super::super::{Fx, FxContext, FxError, Param};
+use super::super::{Fx, FxContext, FxError, Param, Ramp};
 use crate::mixer::Bus;
 
 /// Linear gain with per-block smoothing.
@@ -46,11 +46,10 @@ const GAIN_TAU_SECONDS: f32 = 0.005;
 
 impl Fx for Gain {
     fn process(&mut self, bus: &mut Bus, ctx: &FxContext) {
-        let gain = self.gain.next_block(ctx.block_frames, ctx.sample_rate);
-        if gain == 1.0 {
-            return;
-        }
-        bus.scale(gain);
+        // A ramp, not one value for the whole block: a fast gain move otherwise steps at every
+        // block boundary. `scale_ramp` keeps the unity no-op and costs one multiply-add per sample
+        // only while the value is moving.
+        bus.scale_ramp(&self.gain.ramp(ctx.block_frames, ctx.sample_rate));
     }
 
     fn reset(&mut self) {
@@ -123,22 +122,19 @@ impl Fader {
         self.moving.store(false, Ordering::Relaxed);
     }
 
-    /// Steps the fader and reports the raw bipolar position, for a stage that applies its own law
-    /// (a crossfader's pan curve, a cue send's mono fold).
+    /// Advances one block and returns the bipolar position [`Ramp`], for a stage that applies its
+    /// own law (a crossfader's pan curve). Use [`Ramp::map`] to derive that law.
     #[inline]
-    pub fn next_position(&self, ctx: &FxContext) -> f32 {
-        let position = self.position.next_block(ctx.block_frames, ctx.sample_rate);
+    pub fn position_ramp(&self, ctx: &FxContext) -> Ramp {
+        let ramp = self.position.ramp(ctx.block_frames, ctx.sample_rate);
         self.moving.store(!self.position.is_settled(), Ordering::Relaxed);
-        position
+        ramp
     }
 
-    /// Steps the fader and reports the resulting linear gain.
+    /// Advances one block and returns the linear-gain [`Ramp`], ready for [`Bus::scale_ramp`].
     #[inline]
-    pub fn next_amp(&self, ctx: &FxContext) -> f32 {
-        let position = self.position.next_block(ctx.block_frames, ctx.sample_rate);
-        self.moving
-            .store(!self.position.is_settled(), Ordering::Relaxed);
-        crate::fx::dsp::fader_amp(position)
+    pub fn amp_ramp(&self, ctx: &FxContext) -> Ramp {
+        self.position_ramp(ctx).map(crate::fx::dsp::fader_amp)
     }
 
     pub fn is_moving(&self) -> bool {
@@ -199,16 +195,41 @@ mod tests {
         for block in 0..200 {
             let mut b = bus_with(1.0, BLOCK_SIZE);
             gain.process(&mut b, &ctx(BLOCK_SIZE));
+            // The block's *end* is the settled value now: the ramp starts where the previous
+            // block ended and reaches it on the last sample.
             if block == 0 {
-                first = b.l[0];
+                first = b.l[BLOCK_SIZE - 1];
             }
-            settled = b.l[0];
+            settled = b.l[BLOCK_SIZE - 1];
         }
         assert!(first > 1.0 && first < 4.0, "first block jumped to {first}");
         assert!(
             (settled - 4.0).abs() < 0.01,
             "never settled at the target: {settled}"
         );
+    }
+
+    #[test]
+    fn a_fast_gain_move_is_continuous_across_blocks() {
+        // The old path scaled a whole block by one value. A fast move must now spread its step
+        // inside the block, and consecutive blocks must join exactly.
+        let mut gain = Gain::new(1.0);
+        gain.set_param("gain", 4.0).unwrap();
+        let mut previous_last = None;
+        for _ in 0..4 {
+            let mut b = bus_with(1.0, BLOCK_SIZE);
+            gain.process(&mut b, &ctx(BLOCK_SIZE));
+            if let Some(previous) = previous_last {
+                assert_eq!(b.l[0], previous, "a block boundary must not step");
+            }
+            assert_ne!(
+                b.l[0],
+                b.l[BLOCK_SIZE - 1],
+                "the gain must move within a block"
+            );
+            assert_eq!(b.l, b.r, "both planes see the same ramp");
+            previous_last = Some(b.l[BLOCK_SIZE - 1]);
+        }
     }
 
     #[test]
@@ -240,15 +261,19 @@ mod tests {
         assert!(!fader.is_moving());
         fader.set(1.0);
         let ctx = ctx(BLOCK_SIZE);
-        assert!(fader.next_amp(&ctx) > 0.0);
+        assert!(fader.amp_ramp(&ctx).end() > 0.0);
         assert!(fader.is_moving());
         for _ in 0..300 {
-            fader.next_amp(&ctx);
+            fader.amp_ramp(&ctx);
         }
         assert!(!fader.is_moving());
-        assert_eq!(fader.next_amp(&ctx), 1.0, "the top of the travel is 0 dB");
+        assert_eq!(
+            fader.amp_ramp(&ctx).end(),
+            1.0,
+            "the top of the travel is 0 dB"
+        );
         fader.snap(-1.0);
         assert!(fader.is_closed());
-        assert!(fader.next_amp(&ctx) < 1e-3);
+        assert!(fader.amp_ramp(&ctx).end() < 1e-3);
     }
 }

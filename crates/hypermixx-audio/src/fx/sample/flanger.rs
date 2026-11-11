@@ -105,23 +105,31 @@ impl Fx for Flanger {
             self.prepare(rate);
         }
 
-        let mix = self.mix.next_block(frames, rate).clamp(0.0, 1.0);
-        let depth = self.depth.next_block(frames, rate).clamp(0.0, 1.0);
-        let lfo_rate = self.rate.next_block(frames, rate).clamp(MIN_RATE, MAX_RATE);
+        // Gains use `at(i)`; LFO rate and depth shape the delay modulation once per block, so they
+        // only need `end()`. All four come from the same `Param::ramp` entry point.
+        let mix = self.mix.ramp(frames, rate).clamped(0.0, 1.0);
         let feedback = self
             .feedback
-            .next_block(frames, rate)
-            .clamp(-MAX_FEEDBACK, MAX_FEEDBACK);
+            .ramp(frames, rate)
+            .clamped(-MAX_FEEDBACK, MAX_FEEDBACK);
+        let depth = self.depth.ramp(frames, rate).end().clamp(0.0, 1.0);
+        let lfo_rate = self
+            .rate
+            .ramp(frames, rate)
+            .end()
+            .clamp(MIN_RATE, MAX_RATE);
 
         let rate_hz = f64::from(lfo_rate) * ctx.beats_per_second();
         let increment = rate_hz / f64::from(rate);
         let centre = f64::from(rate) * f64::from(CENTRE_SECONDS);
         let swing = f64::from(rate) * f64::from(SWING_SECONDS) * f64::from(depth);
         let max_delay = self.left.max_delay();
-        let dry = 1.0 - mix;
         let mut last_delay = 0.0f32;
 
         for i in 0..frames {
+            let mix = mix.at(i);
+            let feedback = feedback.at(i);
+            let dry = 1.0 - mix;
             let left_lfo = f64::from(self.lfo.value());
             let right_lfo = f64::from(self.lfo.value_at(STEREO_OFFSET));
             self.lfo.advance(increment);
