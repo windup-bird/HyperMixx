@@ -68,9 +68,10 @@ pub struct ScanService {
     request_tx: Option<Sender<ScanRequest>>,
     progress_tx: Sender<ScanProgress>,
     progress_rx: Receiver<ScanProgress>,
-    /// Sources the worker has started but whose `SourceDone`/`Failed` has not been polled yet.
-    /// The worker increments, [`ScanService::poll_next`] decrements, so a front-end can tell
-    /// "no scan in flight" without tracking sources itself.
+    /// Terminal events (`SourceDone`/`Failed`) emitted but not yet polled. Every emission is
+    /// counted once — including worker-level failures that have no source of their own — and
+    /// [`ScanService::poll_next`] decrements once per event, so a front-end can tell "no result
+    /// outstanding / no scan in flight" without tracking sources itself.
     pending: Arc<AtomicUsize>,
     db_path: Option<PathBuf>,
     calibration: ImportCalibration,
@@ -144,7 +145,8 @@ impl ScanService {
             event,
             ScanProgress::SourceDone { .. } | ScanProgress::Failed { .. }
         ) {
-            // Saturating: a worker-side failure can emit `Failed` for a source it never counted.
+            // Every terminal event is counted when it is emitted, so this always has a matching
+            // increment. Saturating anyway: a defensive guard against a double decrement.
             let _ = self
                 .pending
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
@@ -186,7 +188,9 @@ impl ScanService {
                 let scan_db = match LibraryDb::open(&path) {
                     Ok(db) => db,
                     Err(err) => {
-                        // No source id to attach: report through the generic failure slot.
+                        // No source id to attach, but this is still a terminal event the front-end
+                        // will poll: count it so `pending` stays balanced.
+                        pending.fetch_add(1, Ordering::Relaxed);
                         let _ = progress_tx.send(ScanProgress::Failed {
                             source_id: 0,
                             name: "library".to_owned(),
@@ -235,6 +239,8 @@ impl ScanService {
         match spawned {
             Ok(_) => self.request_tx = Some(request_tx),
             Err(err) => {
+                // Counted like any other terminal event: the front-end polls this failure too.
+                self.pending.fetch_add(1, Ordering::Relaxed);
                 let _ = self.progress_tx.send(ScanProgress::Failed {
                     source_id: 0,
                     name: "library".to_owned(),
@@ -272,6 +278,10 @@ fn handle_usb(
                         registered.push(source);
                     }
                     Err(err) => {
+                        // Registration never started a scan, but the failure is a terminal event
+                        // the front-end will poll: count it so it cannot consume another scan's
+                        // slot in `pending`.
+                        pending.fetch_add(1, Ordering::Relaxed);
                         let _ = progress_tx.send(ScanProgress::Failed {
                             source_id: 0,
                             name: root.display().to_string(),
@@ -465,6 +475,38 @@ mod tests {
         }
         assert!(failed, "the malformed export is reported as a failure");
         assert!(done, "the worker still scans the next source after a panic");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A worker-level failure has no source of its own, but the front-end still polls it. It must
+    /// be counted when emitted, or polling it decrements `pending` and falsely marks an unrelated
+    /// in-flight source as finished.
+    #[test]
+    fn a_startup_failure_does_not_consume_an_in_flight_scan() {
+        let dir = temp_dir("startup-failure");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut service = ScanService::new();
+        // A database path that is itself a directory cannot be opened by sqlite, so the worker
+        // fails at startup and reports through the generic failure slot.
+        service.db_path = Some(dir.clone());
+        // One source's result is still outstanding when that failure arrives.
+        service.pending.fetch_add(1, Ordering::Relaxed);
+
+        service.start_worker();
+        assert!(
+            wait_for(&service, |event| matches!(
+                event,
+                ScanProgress::Failed { source_id: 0, .. }
+            )),
+            "the worker reports that it could not open its connection"
+        );
+        assert_eq!(
+            service.pending(),
+            1,
+            "polling the startup failure must not clear the in-flight source"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

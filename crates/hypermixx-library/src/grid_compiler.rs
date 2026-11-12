@@ -30,7 +30,13 @@ impl GridCompiler {
         }
     }
 
+    /// Frames in one beat, or `0.0` for a tempo that cannot describe a beat. Every caller already
+    /// skips a width below one frame, so an unrepresentable segment is simply left out instead of
+    /// producing `inf`/`NaN` frames (which used to make the tail-fill loop never terminate).
     fn frames_per_beat(&self, bpm: f64) -> f64 {
+        if !bpm.is_finite() || bpm <= 0.0 || self.sample_rate == 0 {
+            return 0.0;
+        }
         f64::from(self.sample_rate) * 60.0 / bpm
     }
 
@@ -45,10 +51,11 @@ impl GridCompiler {
 
         // 1. front-fill: negative beats from the first segment back toward frame 0.
         let fpb0 = self.frames_per_beat(first.bpm);
-        if fpb0 >= 1.0 {
+        if fpb0.is_finite() && fpb0 >= 1.0 {
             let back = (first.start_frame as f64 / fpb0).ceil() as i64;
             for k in (1..=back).rev() {
-                let frame = first.start_frame as i64 - (k as f64 * fpb0).round() as i64;
+                let offset = (k as f64 * fpb0).round() as i64;
+                let frame = (first.start_frame as i64).saturating_sub(offset);
                 if frame >= 0 {
                     beats.push(frame as u64);
                 }
@@ -58,7 +65,8 @@ impl GridCompiler {
         // 2. even spacing per segment, clipped to the next segment's start (or track end).
         for (i, seg) in spec.segments.iter().enumerate() {
             let fpb = self.frames_per_beat(seg.bpm);
-            if fpb < 1.0 {
+            // A degenerate tempo (0, negative, NaN, or so small the width overflows) is left out.
+            if !fpb.is_finite() || fpb < 1.0 {
                 continue;
             }
             let end = spec
@@ -70,14 +78,16 @@ impl GridCompiler {
             let span_beats = (((end.saturating_sub(seg.start_frame)) as f64) / fpb).floor() as u64;
             let count = seg.beats.unwrap_or(span_beats).min(span_beats);
             for k in 0..=count {
-                beats.push(seg.start_frame + (k as f64 * fpb).round() as u64);
+                let offset = (k as f64 * fpb).round() as u64;
+                beats.push(seg.start_frame.saturating_add(offset));
             }
 
             // 3a. tail-fill only after the last segment: extend at its tempo to the track end.
             if i + 1 == spec.segments.len() {
                 let mut k = count + 1;
                 loop {
-                    let frame = seg.start_frame + (k as f64 * fpb).round() as u64;
+                    let offset = (k as f64 * fpb).round() as u64;
+                    let frame = seg.start_frame.saturating_add(offset);
                     if frame > self.total_frames {
                         break;
                     }
@@ -246,5 +256,48 @@ mod tests {
     fn empty_spec_yields_empty_grid() {
         let g = compiler(48_000).compile(&BeatSpec::default());
         assert!(g.is_empty());
+    }
+
+    /// A tempo that cannot describe a beat must not produce infinite/NaN frames. Those used to
+    /// make the tail-fill loop never terminate (release: hang; debug: overflow panic).
+    #[test]
+    fn an_unrepresentable_tempo_is_skipped_not_a_hang() {
+        for bpm in [0.0, -120.0, f64::NAN, f64::INFINITY] {
+            let spec = BeatSpec {
+                segments: vec![Segment {
+                    bpm,
+                    start_frame: 5_000,
+                    beats: None,
+                }],
+            };
+            // The call returning at all is the assertion; the grid must stay finite.
+            let g = compiler(48_000 * 5).compile(&spec);
+            assert!(
+                g.beat_frames.iter().all(|&f| f <= 48_000 * 5),
+                "bpm {bpm} produced out-of-range beats"
+            );
+        }
+    }
+
+    /// One broken segment must not take the good ones with it.
+    #[test]
+    fn a_bad_segment_does_not_poison_a_good_one() {
+        let spec = BeatSpec {
+            segments: vec![
+                Segment {
+                    bpm: 0.0,
+                    start_frame: 0,
+                    beats: None,
+                },
+                Segment {
+                    bpm: 120.0,
+                    start_frame: 44_100,
+                    beats: None,
+                },
+            ],
+        };
+        let g = compiler(48_000 * 5).compile(&spec);
+        assert!(!g.is_empty(), "the good segment still compiles");
+        assert!(g.beat_frames.windows(2).all(|w| w[0] < w[1]));
     }
 }

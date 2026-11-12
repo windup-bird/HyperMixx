@@ -36,8 +36,9 @@ pub fn resolve(seek: &Seek, grid: &BeatGrid, current: u64) -> Option<u64> {
             let floor = grid.floor_beat(*frame);
             let here = grid.frame_at_beat(floor);
             let next = grid.frame_at_beat(floor + 1);
-            // Snap to whichever beat head is closer.
-            Some(if next - *frame < *frame - here {
+            // Snap to whichever beat head is closer. `saturating_sub`: a frame before the first
+            // beat leaves `frame - here` at zero rather than wrapping u64.
+            Some(if next.saturating_sub(*frame) < frame.saturating_sub(here) {
                 next
             } else {
                 here
@@ -117,6 +118,18 @@ mod tests {
         assert_eq!(
             resolve(&Seek::Quantized { frame: just_before }, &g, 0),
             Some(g.frame_at_beat(4))
+        );
+    }
+
+    /// A frame before the first beat head must not underflow `frame - here` (debug panic /
+    /// release wrap). The first beat here is at 3 s, so frame 0 is before it.
+    #[test]
+    fn quantize_before_the_first_beat_does_not_underflow() {
+        let g = BeatGrid::from_constant_bpm(122.0, 3 * 48_000, 48_000 * 10, SAMPLE_RATE);
+        assert_eq!(
+            resolve(&Seek::Quantized { frame: 0 }, &g, 0),
+            Some(g.frame_at_beat(0)),
+            "it snaps forward to the first beat"
         );
     }
 

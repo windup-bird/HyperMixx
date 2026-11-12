@@ -361,7 +361,14 @@ fn read_serato_tags(path: &Path) -> std::result::Result<SeratoTagData, String> {
     if major != 3 && major != 4 {
         return Ok(SeratoTagData::default());
     }
-    let size = syncsafe(&header[6..10]);
+    // An ID3 size field is 28 bits, so a corrupt (or hostile) header can claim up to 256 MB. Never
+    // allocate more than the bytes the file actually holds after its 10-byte header.
+    let declared = syncsafe(&header[6..10]);
+    let available = file
+        .metadata()
+        .map(|meta| (meta.len() as usize).saturating_sub(10))
+        .unwrap_or(declared);
+    let size = declared.min(available);
     let mut body = vec![0u8; size];
     file.read_exact(&mut body)
         .map_err(|err| format!("{}: {err}", path.display()))?;
@@ -558,5 +565,26 @@ mod tests {
         assert_eq!(cues[0].index, 0);
         assert_eq!(cues[0].time_ms, 63004.0);
         assert_eq!(cues[0].color, Some([204, 0, 0]));
+    }
+
+    /// The ID3 size field can claim up to 256 MB; a tiny file that declares one must not allocate
+    /// it. Reading returns whatever is actually there (here: no frames).
+    #[test]
+    fn a_hostile_id3_size_is_capped_to_the_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "hypermixx-serato-id3-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge-header.mp3");
+        // ID3v2.3 header declaring the maximum 28-bit body size, followed by a few real bytes.
+        let mut bytes = b"ID3\x03\x00\x00\x7f\x7f\x7f\x7f".to_vec();
+        bytes.extend_from_slice(&[0u8; 10]);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let tags = read_serato_tags(&path).expect("a truncated tag reads as empty, not an allocation");
+        assert!(tags.beat_markers.is_empty());
+        assert!(tags.cues.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

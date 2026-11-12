@@ -290,8 +290,11 @@ fn parse_bpm(raw: &str) -> Option<f32> {
     if !value.is_finite() || value <= 0.0 {
         return None;
     }
-    // VirtualDJ writes seconds per beat in its database.xml (`0.483871` = 124 BPM).
-    Some(if value < 10.0 { 60.0 / value } else { value })
+    // VirtualDJ writes seconds per beat in its database.xml (`0.483871` = 124 BPM). A near-zero
+    // value would divide into a nonsense tempo, so the result is range-checked too, not just the
+    // input.
+    let bpm = if value < 10.0 { 60.0 / value } else { value };
+    (bpm.is_finite() && (1.0..=1000.0).contains(&bpm)).then_some(bpm)
 }
 
 fn parse_m3u(path: &Path) -> Vec<String> {
@@ -354,5 +357,17 @@ mod tests {
     fn virtualdj_bpm_is_seconds_per_beat() {
         assert!((parse_bpm("0.483871").unwrap() - 124.0).abs() < 0.01);
         assert!((parse_bpm("124").unwrap() - 124.0).abs() < 0.01);
+    }
+
+    /// A near-zero "seconds per beat" divides into a nonsensical tempo and must be rejected, not
+    /// stored as a six-figure BPM.
+    #[test]
+    fn an_absurd_bpm_is_rejected() {
+        assert_eq!(parse_bpm("0.0000001"), None);
+        assert_eq!(parse_bpm("1e-30"), None);
+        assert_eq!(parse_bpm("5000"), None);
+        assert_eq!(parse_bpm("0"), None);
+        assert_eq!(parse_bpm("-0.5"), None);
+        assert_eq!(parse_bpm("NaN"), None);
     }
 }

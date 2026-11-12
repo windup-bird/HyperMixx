@@ -94,21 +94,32 @@ impl Decoder {
         }
         if byte & 0x80 != 0 {
             self.len = 0;
-            if byte == 0xF0 {
+            match byte {
                 // Start of sysex: no channel voice messages until 0xF7.
-                self.sysex = true;
-                self.status = None;
-            } else {
-                self.status = Some(byte);
+                0xF0 => {
+                    self.sysex = true;
+                    self.status = None;
+                }
+                // System Common with data bytes. They cancel running status, so a data byte after
+                // one must not be mistaken for a continuation.
+                0xF1 | 0xF3 => self.status = Some(byte), // MTC quarter frame / song select: 1 byte
+                0xF2 => self.status = Some(byte),        // song position: 2 bytes
+                // Tune request, EOX, and the undefined 0xF4/0xF5 carry no data and set no running
+                // status; swallowing a following status byte as data is what desynced the stream.
+                0xF4..=0xF7 => self.status = None,
+                _ => self.status = Some(byte),
             }
             return;
         }
         let Some(status) = self.status else {
             return;
         };
-        // Program change and channel pressure carry one data byte; everything we decode carries two.
-        let needed = match status & 0xF0 {
-            0xC0 | 0xD0 => 1,
+        // Program change, channel pressure, MTC quarter frame and song select carry one data byte;
+        // song position and every channel-voice message we decode carry two.
+        let needed = match status {
+            0xF1 | 0xF3 => 1,
+            0xF2 => 2,
+            s if s & 0xF0 == 0xC0 || s & 0xF0 == 0xD0 => 1,
             _ => 2,
         };
         self.data[self.len] = byte;
@@ -148,8 +159,14 @@ impl Decoder {
                     value: raw - 8192,
                 });
             }
-            // 0xA0 poly aftertouch and 0xD0 channel pressure are not mapped in v1.
+            // 0xA0 poly aftertouch, 0xD0 channel pressure and every System Common message are not
+            // mapped in v1.
             _ => {}
+        }
+        // System Common (0xF1..=0xF7) has no running status: the next data byte must not be read
+        // as another one. Channel-voice status stays put for running status.
+        if status & 0xF0 == 0xF0 {
+            self.status = None;
         }
     }
 }
@@ -253,5 +270,37 @@ mod tests {
             decoder.feed(&[0xC0, 5, 0xB0, 7, 9]),
             vec![Event::ControlChange { channel: 0, controller: 7, value: 9 }]
         );
+    }
+
+    /// A System Common status cancels running status and must consume only its own data bytes.
+    /// 0xF6 (tune request) carries none, so a following channel message must still decode.
+    #[test]
+    fn system_common_does_not_swallow_the_next_message() {
+        let mut decoder = Decoder::new();
+        assert_eq!(
+            decoder.feed(&[0xF6, 0x90, 60, 100]),
+            vec![Event::NoteOn { channel: 0, key: 60, velocity: 100 }],
+            "tune request has no data byte; the note-on must survive"
+        );
+        // Song position pointer (0xF2) carries exactly two data bytes.
+        assert_eq!(
+            decoder.feed(&[0xF2, 0x00, 0x10, 0x90, 61, 100]),
+            vec![Event::NoteOn { channel: 0, key: 61, velocity: 100 }]
+        );
+        // MTC quarter frame (0xF1) carries one.
+        assert_eq!(
+            decoder.feed(&[0xF1, 0x12, 0xB0, 7, 9]),
+            vec![Event::ControlChange { channel: 0, controller: 7, value: 9 }]
+        );
+    }
+
+    /// After a System Common message, a bare data byte must be ignored (no running status).
+    #[test]
+    fn system_common_cancels_running_status() {
+        let mut decoder = Decoder::new();
+        assert!(decoder.feed(&[0x90, 60, 100]).len() == 1);
+        assert!(decoder.feed(&[0xF1, 0x12]).is_empty());
+        // Without running status this data byte belongs to nothing.
+        assert!(decoder.feed(&[61, 100]).is_empty());
     }
 }
