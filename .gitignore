@@ -5,3 +5,4 @@
 /.model
 # Machine-local native toolchain paths (see README "Windows（MSVC）"); they are absolute.
 /.cargo/config.toml
+/.workbuddy
