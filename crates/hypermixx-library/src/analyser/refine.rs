@@ -291,7 +291,7 @@ fn temporal_coverage(times: &[f64], residuals: &[f64], inlier_cut: f64) -> f64 {
     if span <= 0.0 {
         return 0.0;
     }
-    let mut bins = vec![false; WINDOWS];
+    let mut bins = [false; WINDOWS];
     for (&t, &e) in times.iter().zip(residuals) {
         if e >= inlier_cut {
             continue;
@@ -306,7 +306,8 @@ fn temporal_coverage(times: &[f64], residuals: &[f64], inlier_cut: f64) -> f64 {
 /// octaves (`+1` = doubled). Guarded against a degenerate band.
 fn fold_bpm(bpm: f64, band: (f64, f64)) -> (f64, i32) {
     let (lo, hi) = band;
-    if !(hi > lo) {
+    // `!(hi > lo)` also rejects a NaN bound; `hi <= lo` would not, so keep the partial ordering.
+    if hi.partial_cmp(&lo) != Some(std::cmp::Ordering::Greater) {
         return (bpm, 0);
     }
     let mut b = bpm;

@@ -10,7 +10,7 @@
 //! where it is scrollable and survives, and the terminal is left alone. Purely a Unix mechanism; on
 //! other platforms stderr keeps its usual behaviour.
 
-use crossbeam_channel::{unbounded, Receiver};
+use crossbeam_channel::Receiver;
 
 /// A live redirection. Dropping it puts fd 2 back and lets the reader finish.
 pub struct Capture {
@@ -28,7 +28,8 @@ pub fn start() -> Option<(Capture, Receiver<String>)> {
 
 #[cfg(unix)]
 mod imp {
-    use super::{unbounded, Capture, Receiver};
+    use super::{Capture, Receiver};
+    use crossbeam_channel::unbounded;
     use std::io::{BufRead, BufReader};
     use std::os::fd::FromRawFd;
 

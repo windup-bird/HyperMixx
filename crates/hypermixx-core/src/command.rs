@@ -63,7 +63,7 @@ pub struct FxParamStatus {
     /// * `n > 0`  → `n` beats (`1`, `2`, `4`, ...)
     /// * `n < 0`  → `1 / -n` beat (`-2` = half a beat, `-4` = a quarter, `-32` = a 1/32)
     /// * `0`      → this parameter is not a beat division (the field is still present, so every
-    ///              effect has the same shape)
+    ///   effect has the same shape)
     ///
     /// The value itself stays `f32`: the DSP still takes a fractional beat length.
     pub beats: i32,

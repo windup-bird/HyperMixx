@@ -1405,6 +1405,9 @@ fn render_fx(frame: &mut Frame, area: Rect, app: &App, deck: usize, hits: &mut V
     );
 }
 
+// Drawing one parameter needs the frame, its rectangle, the shared app state and the hit list at
+// once. Bundling them into a context struct would only hide the same eight values behind a name.
+#[allow(clippy::too_many_arguments)]
 fn render_fx_param(
     frame: &mut Frame,
     rect: Rect,

@@ -74,13 +74,13 @@ pub fn from_command(command: &Command, slots: &SlotBook) -> Option<UiIntent> {
             deck: *deck_id as usize,
             mode: BeatMode::Tempo,
         }),
-        Command::SetFader { target, .. } => match target {
-            // The trim is drawn as the first EQ knob.
-            FaderTarget::Gain(deck) => Some(UiIntent::Eq {
-                deck: *deck as usize,
-            }),
-            _ => None,
-        },
+        Command::SetFader {
+            // The trim is drawn as the first EQ knob; other faders do not move the panels.
+            target: FaderTarget::Gain(deck),
+            ..
+        } => Some(UiIntent::Eq {
+            deck: *deck as usize,
+        }),
         Command::ToggleCueSend { deck_id } => Some(UiIntent::Eq {
             deck: *deck_id as usize,
         }),

@@ -212,7 +212,7 @@ impl MixerConfig {
             let index = self.channels.len();
             self.channels.push(ChannelConfig {
                 cue_send: 1.0,
-                side: if index % 2 == 0 {
+                side: if index.is_multiple_of(2) {
                     DeckSide::Left
                 } else {
                     DeckSide::Right
