@@ -127,8 +127,8 @@ fn main() -> std::process::ExitCode {
     };
 
     println!(
-        "\n{:>5} {:24} {:>8} {:>8} {:>9} {:>8} {:>3} {:>8} {:>8} {:>9}  {}",
-        "track", "title", "ref", "oracle", "oΔms", "int", "oct", "ratio", "phase", "med/p95", "verdict"
+        "\n{:>5} {:24} {:>8} {:>8} {:>9} {:>8} {:>3} {:>8} {:>8} {:>9}  verdict",
+        "track", "title", "ref", "oracle", "oΔms", "int", "oct", "ratio", "phase", "med/p95"
     );
     let (mut pass, mut fail, mut skip) = (0usize, 0usize, 0usize);
     for grid in &refs {
@@ -429,9 +429,7 @@ fn compare_track(
         paired.get(idx).copied().unwrap_or(f64::INFINITY)
     };
 
-    let verdict = if octave.abs() > 0.5 {
-        "FAIL"
-    } else if bpm_rel > BPM_SLACK {
+    let verdict = if octave.abs() > 0.5 || bpm_rel > BPM_SLACK {
         "FAIL"
     } else {
         "ok"
@@ -456,7 +454,7 @@ fn compare_track(
         med_ms,
         p95_ms,
         if verdict == "ok" {
-            format!("ok")
+            "ok".to_string()
         } else {
             format!("FAIL: {reason}")
         }

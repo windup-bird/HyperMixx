@@ -72,23 +72,13 @@ pub struct ControllerSession {
 
 /// The `[preference.analysis]` section: which backend runs which analysis path, and whether a
 /// browser load analyses a track that has no imported/cached grid yet.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AnalysisBackends {
     pub beats: Backend,
     pub key: Backend,
     /// Run the analyser after a browser load when neither the imported library nor the analysis
     /// cache has a grid. Off by default: analysis takes seconds and should be an explicit choice.
     pub auto_analyse: bool,
-}
-
-impl Default for AnalysisBackends {
-    fn default() -> Self {
-        Self {
-            beats: Backend::default(),
-            key: Backend::default(),
-            auto_analyse: false,
-        }
-    }
 }
 
 fn analysis_section(value: &toml::Value) -> Result<AnalysisBackends, String> {

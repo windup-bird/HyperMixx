@@ -19,21 +19,12 @@ use std::sync::Arc;
 
 /// Which backend runs which analysis path. Beats and key are configured separately; every
 /// backend is named directly — there is no auto fallback.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Backends {
     /// The grid path: beat detection + rigid fit.
     pub beats: Backend,
     /// The key path: key detection only.
     pub key: Backend,
-}
-
-impl Default for Backends {
-    fn default() -> Self {
-        Self {
-            beats: Backend::default(),
-            key: Backend::default(),
-        }
-    }
 }
 
 /// Raw, uncompiled analysis output: beat times in seconds plus a tempo hint and key, and the

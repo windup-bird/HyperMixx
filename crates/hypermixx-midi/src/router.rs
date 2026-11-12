@@ -711,8 +711,8 @@ action = "play"
             feed.commands.as_slice(),
             [Command::TogglePlay { deck_id: 3 }]
         ));
-        assert_eq!(router.snapshot().units[0].mirrored, true);
-        assert_eq!(router.snapshot().units[1].mirrored, true);
+        assert!(router.snapshot().units[0].mirrored);
+        assert!(router.snapshot().units[1].mirrored);
     }
 
     const TWO_MODES: &str = r#"
