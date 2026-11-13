@@ -142,7 +142,7 @@ fn output_line(status: &OutputStatus) -> String {
 }
 
 /// The BPM the deck is *actually playing at*: the local grid BPM scaled by the stable tempo.
-/// `None` without a grid. Deliberately excludes `playing_rate`'s nudge and phase correction —
+/// `None` without a grid. Deliberately excludes `playing_rate`'s rate bend and phase correction —
 /// those are transient, not the tempo.
 pub fn current_bpm(state: &DeckState) -> Option<f32> {
     (state.bpm_at_frame > 0.0).then_some(state.bpm_at_frame * state.tempo)
@@ -315,7 +315,7 @@ pub fn stem_report(state: &DeckState) -> Vec<String> {
     out
 }
 
-/// The sync/nudge tail of a deck line: its shared-tempo mode, the group BPM, who it tracks, the
+/// The sync/bend tail of a deck line: its shared-tempo mode, the group BPM, who it tracks, the
 /// running phase correction and any bend. `None` for a deck with nothing to report, so an idle
 /// `state` line stays exactly as short as it always was (and `phase_probe.sh`'s parsing is unchanged).
 pub fn sync_label(state: &DeckState) -> &'static str {
@@ -358,8 +358,8 @@ pub fn help_text(decks: usize) -> String {
   [deck] sync unlock           drop the lock and the correction, keeping the tempo
   [deck] fader <stage> <pos>   levels: flow (per-stem) |deck (the channel fader) |gain|cuesend,
                                cross|master|cue shared
-  [deck] nudge <delta> <sec>   temporary rate bend to hand-align phase (0.04 = 4% fast)
-  [deck] nudge off             release the bend (it ramps back, no click)
+  [deck] bend <delta> <sec>    temporary rate bend to hand-align phase (0.04 = 4% fast)
+  [deck] bend off              release the bend (it ramps back, no click)
   [deck] keylock on|off        keylock profile (default: on; window in live.toml)
   [deck] key <semitones>       pitch shift (placeholder: stored, not yet audible)
   [deck] loop in | out         manual loop: arm at the beat, engage at the quantized out

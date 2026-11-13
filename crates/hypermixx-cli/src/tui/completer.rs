@@ -60,7 +60,7 @@ const VERBS: &[(&str, &str)] = &[
     ("loop", "loop family"),
     ("loopbeats", "scale the persistent loop length"),
     ("sync", "beat-sync against the other deck"),
-    ("nudge", "temporary rate bend"),
+    ("bend", "temporary rate bend"),
     (
         "fader",
         "channel/master/cue levels (flow|deck|gain|cuesend|cross|master|cue)",
@@ -381,7 +381,7 @@ fn candidates(prior: &[String], partial: &str, ctx: &Ctx) -> Vec<Candidate> {
                 Vec::new()
             }
         }
-        "nudge" => {
+        "bend" | "nudge" => {
             if rest.len() == 1 {
                 pairs(
                     &[

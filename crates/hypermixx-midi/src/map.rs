@@ -422,6 +422,12 @@ pub struct RawModeBind {
     /// A jog's turn action; overrides `action` for the turn endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<String>,
+    /// A jog's not-held bend, as a `bend <delta> [seconds]` line. Separate from `turn` because a
+    /// wheel tick means two different things depending on whether a hand is on the platter, and
+    /// only the deck knows which; `turn` scrubs, `bend` bends. Only valid on a `JogWheel` whose
+    /// turn carries `vinyl`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bend: Option<String>,
     /// The reverse direction of a `RelKnob`: one action per negative detent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub down: Option<String>,
@@ -620,6 +626,9 @@ impl ActionSet {
 pub struct ModeBinding {
     pub deck: Option<DeckId>,
     pub actions: ActionSet,
+    /// The not-held bend of a `vinyl` jog turn, `(delta, seconds)`. `None` keeps the engine's
+    /// default; deliberately outside `ActionSet`, which is about what an endpoint emits.
+    pub bend: Option<(f32, f64)>,
     /// The slot kind decides the centre of an absolute `BipolKnob`.
     pub kind: SlotKind,
     pub min: f32,
@@ -633,9 +642,10 @@ impl ModeBinding {
     /// endpoint has no action in this mode, so the router treats it as unbound.
     pub fn spec(&self, endpoint: &Endpoint) -> Option<BindingSpec> {
         let action = self.actions.for_role(endpoint.role)?.clone();
-        let down = match endpoint.role {
-            EndpointRole::Main => self.actions.down.clone(),
-            _ => None,
+        let (down, bend) = match endpoint.role {
+            EndpointRole::Main => (self.actions.down.clone(), None),
+            EndpointRole::Turn => (None, self.bend),
+            _ => (None, None),
         };
         Some(BindingSpec {
             kind: endpoint.kind,
@@ -652,6 +662,7 @@ impl ModeBinding {
             deck: self.deck,
             action,
             down,
+            bend,
             min: self.min,
             max: self.max,
             curve: self.curve,
@@ -711,6 +722,8 @@ pub struct BindingSpec {
     pub action: Action,
     /// The reverse direction of a `RelKnob`; `None` means the delta is continuous.
     pub down: Option<Action>,
+    /// The not-held bend of a `vinyl` jog turn, `(delta, seconds)`; `None` uses the engine default.
+    pub bend: Option<(f32, f64)>,
     /// Value at normalised position 0.
     pub min: f32,
     /// Value at normalised position 1.
@@ -929,7 +942,7 @@ impl FxAction {
 /// the session command lines a front-end takes (minus the target).
 pub use hypermixx_core::action::{ActionSpec, ACTIONS};
 
-/// The baseline nudge, as a rate: one wheel message bends by this much (`0.15` = 15 % fast).
+/// The baseline bend, as a rate: one wheel message bends by this much (`0.15` = 15 % fast).
 pub const DEFAULT_NUDGE_STEP: f32 = 0.15;
 
 /// How long a bend started by a relative-encoder tick lasts when the line omits a duration.
@@ -1606,9 +1619,50 @@ fn compile_mode_binding(
         None => Edge::Press,
     };
 
+    // `bend` is the other half of a `vinyl` turn: the deck bends the rate when nobody is on the
+    // platter, and scrubs when somebody is. The line is a `bend` so it reuses that action's
+    // `delta`/`seconds` instead of inventing a second parameter grammar.
+    let bend = match raw.bend.as_deref() {
+        None => None,
+        Some(line) => {
+            if control.kind != SlotKind::JogWheel {
+                return Err(format!(
+                    "slot `{}`: `bend` is for a JogWheel, not `{:?}`",
+                    raw.slot, control.kind
+                ));
+            }
+            if !actions
+                .for_role(EndpointRole::Turn)
+                .is_some_and(|turn| matches!(turn, Action::Vinyl { .. }))
+            {
+                return Err(format!(
+                    "slot `{}`: `bend` needs a `vinyl` turn action",
+                    raw.slot
+                ));
+            }
+            let action = parse_action(line, &ctx)
+                .map_err(|message| format!("slot `{}` bend `{line}`: {message}", raw.slot))?;
+            let Action::Nudge { delta, seconds } = action else {
+                return Err(format!(
+                    "slot `{}` bend: expected `bend <delta> [seconds]`, got {action:?}",
+                    raw.slot
+                ));
+            };
+            let seconds = seconds.unwrap_or(DEFAULT_NUDGE_SECONDS);
+            if !seconds.is_finite() || seconds <= 0.0 {
+                return Err(format!(
+                    "slot `{}` bend: seconds must be a positive number",
+                    raw.slot
+                ));
+            }
+            Some((delta, seconds))
+        }
+    };
+
     Ok(ModeBinding {
         deck: raw.deck.or(unit_deck),
         actions,
+        bend,
         kind: control.kind,
         min,
         max,
@@ -1654,7 +1708,7 @@ fn validate_binding(
         if let Some(turn) = &actions.turn {
             if !matches!(turn, Action::Vinyl { .. } | Action::Nudge { .. }) {
                 return Err(format!(
-                    "slot `{slot}`: a jog turn carries `vinyl` or `nudge`, not {turn:?}"
+                    "slot `{slot}`: a jog turn carries `vinyl` or `bend`, not {turn:?}"
                 ));
             }
         }
@@ -1713,7 +1767,7 @@ fn validate_binding(
                 Action::Nudge { .. } | Action::Vinyl { .. } | Action::Slip
             ) {
                 return Err(format!(
-                    "slot `{slot}`: a Knob drives a continuous action, `nudge`, or `vinyl`; not {main:?}"
+                    "slot `{slot}`: a Knob drives a continuous action, `bend`, or `vinyl`; not {main:?}"
                 ));
             }
             if actions.down.is_some() {
@@ -1757,7 +1811,7 @@ fn validate_binding(
         SlotKind::JogWheel => {
             if !main.is_jog_action() {
                 return Err(format!(
-                    "slot `{slot}`: a JogWheel carries `vinyl`, `vinyl slip`, or `nudge`, not {main:?}"
+                    "slot `{slot}`: a JogWheel carries `vinyl`, `vinyl slip`, or `bend`, not {main:?}"
                 ));
             }
         }
@@ -1970,16 +2024,16 @@ fn parse_action(line: &str, ctx: &ActionCtx<'_>) -> Result<Action, String> {
             deck("tempofader")?;
             Ok(Action::TempoFader)
         }
-        ["nudge"] | ["nudge", _] | ["nudge", _, _] => {
-            deck("nudge")?;
-            let delta = match number(words.get(1).copied(), "nudge delta")? {
+        ["bend"] | ["bend", _] | ["bend", _, _] => {
+            deck("bend")?;
+            let delta = match number(words.get(1).copied(), "bend delta")? {
                 Some(delta) => delta as f32,
                 None => DEFAULT_NUDGE_STEP,
             };
             if !delta.is_finite() || delta == 0.0 {
-                return Err("a nudge delta must be non-zero".to_owned());
+                return Err("a bend delta must be non-zero".to_owned());
             }
-            let seconds = number(words.get(2).copied(), "nudge seconds")?;
+            let seconds = number(words.get(2).copied(), "bend seconds")?;
             Ok(Action::Nudge { delta, seconds })
         }
         ["loop", what @ ("in" | "out" | "exit" | "cancel" | "halve" | "double" | "toggle")] => {
@@ -2327,10 +2381,10 @@ press = "vinyl slip"
 turn = "vinyl"
 
 [[unit.mode]]
-name = "nudge"
+name = "bend"
 [[unit.mode.bind]]
 slot = "jog"
-turn = "nudge 0.15"
+turn = "bend 0.15"
 "#,
         );
         let map = parse(&text).expect("jog");
@@ -2350,12 +2404,222 @@ turn = "nudge 0.15"
             Some(Action::Slip)
         ));
 
-        let nudge = unit.binding(2, 0).expect("nudge");
-        assert!(nudge.spec(&unit.endpoints[0]).is_none(), "press is inert");
+        let bend = unit.binding(2, 0).expect("bend");
+        assert!(bend.spec(&unit.endpoints[0]).is_none(), "press is inert");
         assert!(matches!(
-            nudge.spec(&unit.endpoints[1]).map(|spec| spec.action),
+            bend.spec(&unit.endpoints[1]).map(|spec| spec.action),
             Some(Action::Nudge { .. })
         ));
+    }
+
+    #[test]
+    fn a_jog_bend_is_a_separate_line() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "jog"
+type = "JogWheel"
+endpoint = [
+  { role = "press", midi = "note", channel = 0, id = 80 },
+  { role = "turn", midi = "cc", encoding = "two_point", channel = 0, id = 6 },
+]
+
+[[unit.mode]]
+name = "vinyl"
+[[unit.mode.bind]]
+slot = "jog"
+action = "vinyl 234"
+bend = "bend 0.02 0.06"
+
+[[unit.mode]]
+name = "plain"
+[[unit.mode.bind]]
+slot = "jog"
+action = "vinyl 234"
+"#,
+        );
+        let map = parse(&text).expect("jog bend");
+        let unit = &map.units[0];
+        let vinyl = unit.binding(0, 0).expect("vinyl binding");
+        assert_eq!(vinyl.bend, Some((0.02, 0.06)));
+        assert_eq!(
+            vinyl.spec(&unit.endpoints[1]).expect("turn spec").bend,
+            Some((0.02, 0.06))
+        );
+        // The press half is a note; it never carries a bend.
+        assert_eq!(vinyl.spec(&unit.endpoints[0]).expect("press spec").bend, None);
+        // A line without `bend` keeps the engine's own default.
+        let plain = unit.binding(1, 0).expect("plain binding");
+        assert_eq!(plain.bend, None);
+        assert_eq!(plain.spec(&unit.endpoints[1]).unwrap().bend, None);
+    }
+
+    /// `nudge` was the old name of the `bend` action; `canonical` keeps old maps and session lines
+    /// working, both as a turn action and as the value of a jog's `bend` field.
+    #[test]
+    fn the_old_nudge_spelling_still_parses_as_bend() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "jog"
+type = "JogWheel"
+endpoint = [
+  { role = "press", midi = "note", channel = 0, id = 80 },
+  { role = "turn", midi = "cc", encoding = "two_point", channel = 0, id = 6 },
+]
+
+[[unit.mode]]
+name = "vinyl"
+[[unit.mode.bind]]
+slot = "jog"
+action = "vinyl 234"
+bend = "nudge 0.03 0.09"
+
+[[unit.mode]]
+name = "bend"
+[[unit.mode.bind]]
+slot = "jog"
+turn = "nudge 0.15"
+"#,
+        );
+        let map = parse(&text).expect("old nudge spelling");
+        let unit = &map.units[0];
+        assert_eq!(
+            unit.binding(0, 0).expect("vinyl mode").bend,
+            Some((0.03, 0.09))
+        );
+        let plain = unit.binding(1, 0).expect("bend mode");
+        assert!(matches!(
+            plain.spec(&unit.endpoints[1]).map(|spec| spec.action),
+            Some(Action::Nudge { .. })
+        ));
+    }
+
+    #[test]
+    fn the_shipped_jog_preset_carries_the_bend() {
+        let text = r#"
+[[unit]]
+id = "deck1.jog"
+preset = "jog"
+deck = 1
+
+[[unit.control]]
+slot = "jog"
+type = "JogWheel"
+endpoint = [
+  { role = "press", midi = "note", channel = 0, id = 80 },
+  { role = "turn", midi = "cc", encoding = "two_point", channel = 0, id = 6 },
+]
+"#;
+        let map = parse(text).expect("shipped jog preset");
+        let unit = &map.units[0];
+        assert_eq!(
+            unit.binding(0, 0).expect("vinyl mode").bend,
+            Some((0.05, 0.05))
+        );
+        assert_eq!(
+            unit.binding(1, 0).expect("slip mode").bend,
+            Some((0.05, 0.05))
+        );
+    }
+
+    #[test]
+    fn a_bend_needs_a_vinyl_turn() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "jog"
+type = "JogWheel"
+endpoint = [
+  { role = "press", midi = "note", channel = 0, id = 80 },
+  { role = "turn", midi = "cc", encoding = "two_point", channel = 0, id = 6 },
+]
+
+[[unit.mode]]
+name = "bend"
+[[unit.mode.bind]]
+slot = "jog"
+turn = "bend 0.15"
+bend = "bend 0.02"
+"#,
+        );
+        let error = parse(&text).expect_err("bend on a plain bend turn");
+        assert!(error.message().contains("needs a `vinyl` turn"), "{error}");
+    }
+
+    #[test]
+    fn a_bend_must_be_a_bend_line() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "jog"
+type = "JogWheel"
+endpoint = [
+  { role = "press", midi = "note", channel = 0, id = 80 },
+  { role = "turn", midi = "cc", encoding = "two_point", channel = 0, id = 6 },
+]
+
+[[unit.mode]]
+name = "vinyl"
+[[unit.mode.bind]]
+slot = "jog"
+action = "vinyl 234"
+bend = "play"
+"#,
+        );
+        let error = parse(&text).expect_err("bend is not a bend line");
+        assert!(
+            error.message().contains("expected `bend <delta> [seconds]`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_bend_is_only_for_a_jog_wheel() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "fader"
+type = "Knob"
+endpoint = { midi = "cc", channel = 0, id = 1 }
+
+[[unit.mode]]
+name = "default"
+[[unit.mode.bind]]
+slot = "fader"
+action = "fader flow"
+bend = "bend 0.02"
+"#,
+        );
+        let error = parse(&text).expect_err("bend on a knob");
+        assert!(error.message().contains("for a JogWheel"), "{error}");
+    }
+
+    #[test]
+    fn a_bend_seconds_must_be_positive() {
+        let text = deck_unit(
+            r#"
+[[unit.control]]
+slot = "jog"
+type = "JogWheel"
+endpoint = [
+  { role = "press", midi = "note", channel = 0, id = 80 },
+  { role = "turn", midi = "cc", encoding = "two_point", channel = 0, id = 6 },
+]
+
+[[unit.mode]]
+name = "vinyl"
+[[unit.mode.bind]]
+slot = "jog"
+action = "vinyl 234"
+bend = "bend 0.02 -1"
+"#,
+        );
+        let error = parse(&text).expect_err("negative seconds");
+        assert!(
+            error.message().contains("seconds must be a positive number"),
+            "{error}"
+        );
     }
 
     #[test]

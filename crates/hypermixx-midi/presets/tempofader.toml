@@ -21,7 +21,7 @@ slot = "fader"
 action = "tempofader"
 [[preset.mode.bind]]
 slot = "bend-backward"
-action = "nudge -0.08"
+action = "bend -0.08"
 [[preset.mode.bind]]
 slot = "bend-forward"
-action = "nudge 0.08"
+action = "bend 0.08"

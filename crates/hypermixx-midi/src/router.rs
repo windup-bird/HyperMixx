@@ -1106,8 +1106,12 @@ endpoint = [
             feed.commands.as_slice(),
             [Command::Vinyl {
                 deck_id: 0,
-                op: hypermixx_core::VinylOp::Turn { ticks: 1, .. }
-            }]
+                op: hypermixx_core::VinylOp::Turn {
+                    ticks: 1,
+                    bend: Some((delta, seconds)),
+                    ..
+                }
+            }] if (*delta - 0.05).abs() < 1e-6 && (*seconds - 0.05).abs() < 1e-9
         ));
         let feed = router.feed(&note(0, 80, false));
         assert!(matches!(
@@ -1120,13 +1124,13 @@ endpoint = [
     }
 
     #[test]
-    fn a_jog_nudge_mode_leaves_the_press_inert() {
+    fn a_jog_bend_mode_leaves_the_press_inert() {
         let text = r#"
 [[unit]]
 id = "deck1.jog"
 preset = "jog"
 deck = 1
-start = "nudge"
+start = "bend"
 
 [[unit.control]]
 slot = "jog"
@@ -1136,14 +1140,14 @@ endpoint = [
 ]
 
 [[unit.mode]]
-name = "nudge"
+name = "bend"
 [[unit.mode.bind]]
 slot = "jog"
-turn = "nudge 0.15"
+turn = "bend 0.15"
 "#;
         let mut router = router(text);
         let feed = router.feed(&note(0, 80, true));
-        assert!(feed.commands.is_empty(), "no press action in nudge mode");
+        assert!(feed.commands.is_empty(), "no press action in bend mode");
         let feed = router.feed(&cc(0, 6, 1));
         assert!(matches!(
             feed.commands.as_slice(),

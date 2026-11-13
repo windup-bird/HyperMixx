@@ -158,8 +158,10 @@ state                       打印全部 deck 的状态行
     裸 `vinyl` 的兜底默认是 1323 = 60 tick/圈，建议在映射里写明实际值）。**只有轮子动的那一块出声**：移动可闻、静止静音 —— 真唱盘静止时也没有信号（而不是
     把同一个颗粒反复播成嗡嗡声）。**暂停中的 deck 一样能搓**（照样出声），松手后仍是暂停。
     反向能搓（引擎只前进，位置由 deck 自己记账，所以后退不会被"格内前进"抵消）。
-  - **手不在盘上** → pitch bend：每条消息**重设**偏移并重新计时，不是无限累加；没有额外的
-    音乐上限（最终播放率仍受引擎 `tempo+nudgerate` 的安全范围约束）。
+  - **手不在盘上** → pitch bend：每条消息**重设**偏移并重新计时，不是无限累加。弯折的强度
+    与时长由映射里 bind 的 `bend` 字段决定（一条 `bend <delta> [seconds]`，写法见
+    [`MIDI.md`](MIDI.md)），`jog` preset 默认写 0.05 / 0.05；不写 `bend` 时用引擎缺省
+    0.15 / 0.06。没有额外的音乐上限（最终播放率仍受引擎 `tempo+nudgerate` 的安全范围约束）。
   - 松手恢复"被 touch 打断的那条走带"（本来在放 → 继续放，本来暂停 → 保持暂停）。
   - **保险**：任何显式 `play`/`pause`/`toggle` 都会先**松盘**，丢一个 note-off（拔线、控制器
     丢包）不会让 deck 永远卡在暂停里。
@@ -210,17 +212,17 @@ state                       打印全部 deck 的状态行
   `leader` 都保留。
 - 实测收敛特性见 README 的 `sync_phase.sh` 表格。
 
-### 3.4 手动微调 `nudge`
+### 3.4 手动微调 `bend`
 
 ```
-[deck] nudge <delta> <seconds>   临时速率弯折（0.04 = +4%），到点自动松开；**秒数必填**
-[deck] nudge off                 立即松开（ramp 回零，不咔哒；别名 stop/release/reset）
+[deck] bend <delta> <seconds>    临时速率弯折（0.04 = +4%），到点自动松开；**秒数必填**
+[deck] bend off                  立即松开（ramp 回零，不咔哒；别名 stop/release/reset）
 ```
 
-只动 `nudgerate`，结束时 `tempo` 原封不动。nudge 没有独立的强度上限；同步的 PID 控制器仍保留
+只动 `nudgerate`，结束时 `tempo` 原封不动。bend 没有独立的强度上限；同步的 PID 控制器仍保留
 自己的 ±5% 收敛兜底。
-MIDI 的按住弯折用 momentary `nudge` binding；要定时就把 `seconds` 写进 mapping（见
-[`MIDI.md`](MIDI.md)）。
+MIDI 的按住弯折用 momentary `bend` binding；要定时就把 `seconds` 写进 mapping（见
+[`MIDI.md`](MIDI.md)）。旧拼写 `nudge` 仍被接受，会自动归到 `bend`。
 
 ### 3.5 循环 `loop`
 
@@ -664,13 +666,13 @@ deck0  playing 1:23.456 / 7:00.648  [323456/18462369]  122.0 BPM → 128.1 BPM  
 ```
 
 - **当前 BPM** = `DeckState.bpm_at_frame × DeckState.tempo`（**不含** nudgerate/playing_rate——
-  nudge 与相位修正是瞬态，不是 tempo）。`grid` 取 audible 位置的局部网格 BPM；两者相差
+  bend 与相位修正是瞬态，不是 tempo）。`grid` 取 audible 位置的局部网格 BPM；两者相差
   ≥0.05 时才追加 `→ x.x BPM`，所以恒速（tempo=1）下状态行与原格式一字不差。
   `response::bpm_label` 同时给 `deck_line` 和 TUI deck 头用，两端永不脱节。
 - transport：`empty` / `playing` / `paused`。
-- sync 徽标（`sync_badge`）仅在有组速度、nudge 或 leader 时出现，包含
+- sync 徽标（`sync_badge`）仅在有组速度、bend 或 leader 时出现，包含
   `sync <mode>`、组 BPM、`← deckN`（leader 不显示箭头）、`phase <mode>`、
-  `nudge ±x.xxx`、`pll ±x.xxx`（纯相位校正）、`locked`。
+  `bend ±x.xxx`、`pll ±x.xxx`（纯相位校正）、`locked`。
 - 徽标永远排在 `[当前/总帧]` 之后，保脚本解析（`phase_probe.sh` / `sync_phase.sh`）。
 
 ---
@@ -690,7 +692,7 @@ hypermixx> master fx list
 hypermixx> deck1 sync phaselock pid
 hypermixx> deck1 sync tempolock
 hypermixx> deck0 sync set-leader
-hypermixx> deck1 nudge 0.04 0.5     # 临时 +4%，0.5s 后自动松开
+hypermixx> deck1 bend 0.04 0.5      # 临时 +4%，0.5s 后自动松开
 hypermixx> deck1 sync unlock         # 解锁，tempo 保留
 hypermixx> deck0 loop quantum eighth
 hypermixx> deck0 loop 8

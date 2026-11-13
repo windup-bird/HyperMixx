@@ -559,6 +559,7 @@ pub fn dispatch(
                     Some(ticks) => VinylOp::Turn {
                         ticks,
                         frames_per_tick: hypermixx_midi::map::DEFAULT_VINYL_FRAMES_PER_TICK,
+                        bend: None,
                     },
                     None => return Action::Failed("usage: [deck] vinyl turn <ticks>".into()),
                 },
@@ -574,7 +575,7 @@ pub fn dispatch(
             sync_command(&mut words, deck_id, command_tx)
         }),
         "fader" => fader_command(&mut words, target, command_tx),
-        "nudge" => with_deck(target, "nudge", |deck_id| {
+        "bend" | "nudge" => with_deck(target, "bend", |deck_id| {
             nudge_command(&mut words, deck_id, command_tx)
         }),
         "fx" => fx(&mut words, dispatcher, target),
@@ -1190,7 +1191,7 @@ fn cue_command<'a>(
     send(command_tx, Command::Cue { deck_id, op })
 }
 
-/// The `nudge` family: a temporary rate bend that changes phase while it runs and leaves the
+/// The `bend` family: a temporary rate bend that changes phase while it runs and leaves the
 /// tempo alone when it ends. The duration is mandatory — a bend with no end is a tempo change the
 /// user did not ask for (hold-to-bend lives in MIDI's momentary binding).
 fn nudge_command<'a>(
@@ -1198,7 +1199,7 @@ fn nudge_command<'a>(
     deck_id: u8,
     command_tx: &Sender<Command>,
 ) -> Action {
-    let usage = "usage: [deck] nudge <delta> <seconds> | [deck] nudge off";
+    let usage = "usage: [deck] bend <delta> <seconds> | [deck] bend off";
     let Some(raw) = words.next() else {
         return Action::Message(usage.into());
     };
@@ -1209,7 +1210,7 @@ fn nudge_command<'a>(
                 Ok(delta) => delta,
                 Err(_) => {
                     return Action::Failed(format!(
-                        "nudge needs a rate (0.04 = 4% fast), got `{other}`\n{usage}"
+                        "bend needs a rate (0.04 = 4% fast), got `{other}`\n{usage}"
                     ));
                 }
             };
@@ -1218,11 +1219,11 @@ fn nudge_command<'a>(
                     Ok(seconds) => seconds,
                     Err(_) => {
                         return Action::Failed(format!(
-                            "nudge duration must be a number of seconds, got `{raw_seconds}`"
+                            "bend duration must be a number of seconds, got `{raw_seconds}`"
                         ));
                     }
                 },
-                None => return Action::Failed(format!("nudge needs a duration\n{usage}")),
+                None => return Action::Failed(format!("bend needs a duration\n{usage}")),
             };
             NudgeOp::Start {
                 delta,
@@ -2990,7 +2991,7 @@ mod tests {
                 "tempofader" => "tempofader 0.5",
                 "keylock" => "keylock on",
                 "key" => "key 1",
-                "nudge" => "nudge 0.04 0.5",
+                "bend" => "bend 0.04 0.5",
                 "loop in" => "loop in",
                 "loop out" => "loop out",
                 "loop exit" => "loop exit",

@@ -287,6 +287,7 @@ impl<'a> BindingOut<'a> {
                         op: VinylOp::Turn {
                             ticks: i32::from(delta.signum()),
                             frames_per_tick,
+                            bend: self.spec.bend,
                         },
                     });
                 }
@@ -744,6 +745,7 @@ mod tests {
             deck: Some(0),
             action,
             down: None,
+            bend: None,
             min: -1.0,
             max: 1.0,
             curve: Curve::Linear,

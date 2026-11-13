@@ -207,7 +207,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         doc: "pitch shift in semitones (placeholder)",
     },
     ActionSpec {
-        name: "nudge",
+        name: "bend",
         deck: true,
         momentary: true,
         args: &[
@@ -403,6 +403,14 @@ pub const ACTIONS: &[ActionSpec] = &[
 /// stops working after an upgrade is worse than one that keeps a few old spellings.
 pub fn canonical(name: &str) -> Option<String> {
     let name = name.trim();
+    // `nudge` was the old spelling of the `bend` rate bend. Resolve the verb and its arguments to
+    // the new name so a map (or a session line) written before the rename keeps working.
+    if name == "nudge" {
+        return Some("bend".to_owned());
+    }
+    if let Some(args) = name.strip_prefix("nudge ") {
+        return Some(format!("bend {args}"));
+    }
     if ACTIONS.iter().any(|spec| spec.name == name) {
         return Some(name.to_owned());
     }

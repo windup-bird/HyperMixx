@@ -312,12 +312,14 @@ impl Deck {
         }
     }
 
-    /// A wheel turn while nobody is on the platter is a pitch bend. The shape matches a default
-    /// `nudge` binding ([`DEFAULT_NUDGE_STEP`]/[`DEFAULT_NUDGE_SECONDS`] in `hypermixx-midi`) because
-    /// it *is* the same gesture — a short, strong kick per message rather than a slow squeeze; the
-    /// numbers live here because the wheel's meaning is the deck's decision (it is the only thing that
-    /// knows whether the platter is held).
-    const VINYL_BEND: f64 = 0.15;
+    /// Fallback for a wheel turn while nobody is on the platter, used when the binding has no
+    /// `bend`. The shape matches a default `nudge` binding
+    /// ([`DEFAULT_NUDGE_STEP`]/[`DEFAULT_NUDGE_SECONDS`] in `hypermixx-midi`) because it *is* the
+    /// same gesture — a short, strong kick per message rather than a slow squeeze. A map overrides
+    /// both numbers per controller with `bend = "nudge <delta> [seconds]"`; these stay here as the
+    /// default because the wheel's meaning is the deck's decision (only it knows whether the platter
+    /// is held).
+    const VINYL_BEND: f32 = 0.15;
     /// See [`Deck::VINYL_BEND`].
     const VINYL_BEND_SECONDS: f64 = 0.06;
 
@@ -371,6 +373,7 @@ impl Deck {
             VinylOp::Turn {
                 ticks,
                 frames_per_tick,
+                bend,
             } => {
                 if self.vinyl_held {
                     let frames = f64::from(ticks) * f64::from(frames_per_tick);
@@ -378,10 +381,9 @@ impl Deck {
                     self.vinyl_frame = self.shift_position(self.vinyl_frame, frames as i64);
                     self.vinyl_moved = true;
                 } else {
-                    self.bend_nudge(
-                        Self::VINYL_BEND * f64::from(ticks),
-                        Self::VINYL_BEND_SECONDS,
-                    );
+                    let (delta, seconds) =
+                        bend.unwrap_or((Self::VINYL_BEND, Self::VINYL_BEND_SECONDS));
+                    self.bend_nudge(f64::from(delta) * f64::from(ticks), seconds);
                 }
             }
         }
@@ -1732,6 +1734,7 @@ mod tests {
         deck.apply_vinyl(VinylOp::Turn {
             ticks: 2,
             frames_per_tick: 441.0,
+            bend: None,
         });
         assert!(
             deck.process_block(&mut out) > 0,
@@ -1760,6 +1763,7 @@ mod tests {
         deck.apply_vinyl(VinylOp::Turn {
             ticks: -4,
             frames_per_tick: 441.0,
+            bend: None,
         });
         for _ in 0..60 {
             deck.process_block(&mut out);
@@ -1774,6 +1778,7 @@ mod tests {
         deck.apply_vinyl(VinylOp::Turn {
             ticks: -10_000,
             frames_per_tick: 441.0,
+            bend: None,
         });
         for _ in 0..60 {
             deck.process_block(&mut out);
@@ -1785,6 +1790,7 @@ mod tests {
             deck.apply_vinyl(VinylOp::Turn {
                 ticks: 1_000,
                 frames_per_tick: 441.0,
+                bend: None,
             });
             deck.process_block(&mut out);
         }
@@ -1816,6 +1822,7 @@ mod tests {
                 deck.apply_vinyl(VinylOp::Turn {
                     ticks: 1,
                     frames_per_tick: 441.0,
+                    bend: None,
                 });
             }
             if deck.process_block(&mut out) == 0 {
@@ -1885,6 +1892,7 @@ mod tests {
         deck.apply_vinyl(VinylOp::Turn {
             ticks: 120,
             frames_per_tick: 64.0,
+            bend: None,
         });
         for _ in 0..4 {
             deck.process_block(&mut out);
@@ -1920,6 +1928,7 @@ mod tests {
         deck.apply_vinyl(VinylOp::Turn {
             ticks: -1,
             frames_per_tick: 100.0,
+            bend: None,
         });
         assert!(
             deck.process_block(&mut out) > 0,
@@ -1950,6 +1959,7 @@ mod tests {
         deck.apply_vinyl(VinylOp::Turn {
             ticks: 1,
             frames_per_tick: 441.0,
+            bend: None,
         });
         for _ in 0..4 {
             deck.process_block(&mut out);
@@ -1961,6 +1971,7 @@ mod tests {
         deck.apply_vinyl(VinylOp::Turn {
             ticks: -1,
             frames_per_tick: 441.0,
+            bend: None,
         });
         for _ in 0..4 {
             deck.process_block(&mut out);
@@ -1974,10 +1985,12 @@ mod tests {
         deck.apply_vinyl(VinylOp::Turn {
             ticks: 1,
             frames_per_tick: 441.0,
+            bend: None,
         });
         deck.apply_vinyl(VinylOp::Turn {
             ticks: 1,
             frames_per_tick: 441.0,
+            bend: None,
         });
         for _ in 0..4 {
             deck.process_block(&mut out);
@@ -1988,6 +2001,40 @@ mod tests {
             deck.nudge_rate()
         );
         let _ = park;
+    }
+
+    /// Nobody on the platter: the not-held bend takes its strength from the binding's `bend`. A map
+    /// can slow that half of the wheel without changing how far a held scrub moves the playhead.
+    #[test]
+    fn a_vinyl_bend_comes_from_the_binding() {
+        let mut deck = tape_deck(pool(100_000));
+        deck.play();
+        let mut out = vec![0.0f32; 256 * CHANNELS];
+        deck.process_block(&mut out);
+
+        deck.apply_vinyl(VinylOp::Turn {
+            ticks: 1,
+            frames_per_tick: 441.0,
+            bend: Some((0.02, 0.06)),
+        });
+        for _ in 0..4 {
+            deck.process_block(&mut out);
+        }
+        let gentle = deck.nudge_rate();
+        assert!((gentle - 0.02).abs() < 0.005, "gentle bend: {gentle}");
+        assert!(gentle < 0.15, "the binding must slow it below the default");
+
+        // No `bend` in the binding: the engine keeps its own fallback.
+        deck.apply_vinyl(VinylOp::Turn {
+            ticks: 1,
+            frames_per_tick: 441.0,
+            bend: None,
+        });
+        for _ in 0..4 {
+            deck.process_block(&mut out);
+        }
+        let fallback = deck.nudge_rate();
+        assert!((fallback - 0.15).abs() < 0.01, "engine fallback: {fallback}");
     }
 
     /// What one scrub actually costs, because it repositions the *live* flow (the seek protocol
@@ -2018,12 +2065,14 @@ mod tests {
                 deck.apply_vinyl(VinylOp::Turn {
                     ticks: 1,
                     frames_per_tick: 441.0,
+                    bend: None,
                 });
                 deck.process_block(&mut out);
                 if index % 2 == 1 {
                     deck.apply_vinyl(VinylOp::Turn {
                         ticks: -1,
                         frames_per_tick: 441.0,
+                        bend: None,
                     });
                 }
             }

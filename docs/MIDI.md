@@ -103,10 +103,10 @@ endpoint = [
 | `type` | 端点 | 能带的 action |
 |---|---|---|
 | `Button` | 1 个（note 或绝对 CC） | 任意非连续 action |
-| `Knob` | 1 个绝对端点 | 连续 action；相对端点时可用 `nudge`/`vinyl` |
+| `Knob` | 1 个绝对端点 | 连续 action；相对端点时可用 `bend`/`vinyl` |
 | `BipolKnob` | 1 个绝对端点 | 连续 action，默认 `min = -1, max = 1`，中心 = 0 |
 | `RelKnob` | 1 个相对端点 | 连续 action，或 `action` + `down` 两个 edge action |
-| `JogWheel` | `press` + `turn` | `vinyl`、`vinyl slip`、`nudge` |
+| `JogWheel` | `press` + `turn` | `vinyl`、`vinyl slip`、`bend` |
 
 ## 5. mode bind
 
@@ -131,17 +131,19 @@ slot = "choose"
 action = "browser up"
 down = "browser down"
 
-# JogWheel：两半分别绑
+# JogWheel：两半分别绑，bend 是不贴盘时的另一半
 [[unit.mode.bind]]
 slot = "jog"
 press = "vinyl slip"
-turn = "vinyl"
+turn = "vinyl 234"
+bend = "bend 0.05 0.05"
 ```
 
 | 字段 | 说明 |
 |---|---|
 | `action` | 主端点的 action（JogWheel 下等于同时给 press 和 turn） |
 | `press` / `turn` | 只对 `JogWheel`：覆盖对应那一半 |
+| `bend` | 只对 `JogWheel` 且 `turn` 是 `vinyl`：不贴盘时的速率弯折，写一条 `bend <delta> [seconds]` |
 | `down` | 只对 `RelKnob`：反向 detent 的 action |
 | `deck` | 覆盖 unit 的 deck（全局 unit 控制某个 deck 时才需要） |
 | `min` / `max` | 归一化位置映射到的值域 |
@@ -149,15 +151,24 @@ turn = "vinyl"
 | `on` | `press`（默认）\| `release`；两边缘 action 不接受 |
 | `chain` / `fx` | FX 的地址：链（`master`、`deck1`、`deck1/vocals`）与效果名 |
 
-**action 的参数写在行内**，没有别的字段：
+**action 的参数写在行内**，不另开字段；唯一的例外是上面那个 `bend`：
 
 ```toml
 action = "loop 1/4"        # 分数拍长
 action = "beatjump -8"
-action = "nudge 0.01 0.02"
+action = "bend 0.01 0.02"
 action = "vinyl 234"       # frames/tick = 1.8s × 引擎采样率 / 轮子每圈 tick 数
 action = "fx param value"  # 参数名在行内，槽位名在 fx 字段
 ```
+
+`bend` 单独成字段，是因为一个轮子 tick 到底干什么由引擎按「手在不在盘上」决定，映射层
+无从得知：`turn` 管贴盘时每 tick 搓过多少帧，`bend` 管不贴盘时把速率弯多少，两个语义分开
+写才不会互相牵连。它的值就是一条 `bend` 命令，沿用 `delta` 和 `seconds`（前者是速率，后者
+是最后一条消息之后多少秒松开，省略秒数按 0.06）。只有 `JogWheel` 且 `turn` 是 `vinyl`
+时能写，写成别的 action、或放在别的 slot 上都会报错；不写时用引擎自己的缺省（0.15 / 0.06），
+旧映射的行为不变。`jog` preset 的 `vinyl` 和 `slip` 两个 mode 都写了
+`bend = "bend 0.05 0.05"`，嫌快嫌慢改这一行即可，贴盘搓盘不受影响。旧拼写 `nudge` 仍被
+接受，会自动归到 `bend`。
 
 ## 6. mode slot（模式键）
 
@@ -222,6 +233,8 @@ action = "hotcue trigger 1"
   `fx1` / `fx2` / `fx3`。参数按序号绑定（`fx param 1` / `fx param 2`），这样以后换掉指针
   指向的效果时 MIDI map 不用改。
 - `mixer` 没有 `load` slot；`cue` 叫 `cue-toggle`。
+- `jog` 的 `vinyl` / `slip` 两个 mode 都带 `bend` 字段，不贴盘转轮的弯折强度和时长在那里调；
+  `bend` mode 则是整条 turn 直接走 `bend`，两者别混。
 
 用户 preset 放在 `[meta] presets = ["presets/my.toml"]` 列出的文件里（相对 map 所在目录）；
 同名 preset 整体覆盖内置。
@@ -304,7 +317,7 @@ learn 模式下，同一个 slot 在 120ms 内收到两个相差 32 的控制器
 | `play` | 是 | 切换播放/暂停 |
 | `cue` | 是 | 按住式 cue：按下 cue，松开归位 |
 | `cue smart` | 是 | 只按一次：回 cue 或就地设 cue |
-| `vinyl [frames_per_tick]` | 是 | 唱盘：press = 贴盘/松手，turn = 转轮 |
+| `vinyl [frames_per_tick]` | 是 | 唱盘：press = 贴盘/松手，turn = 转轮；不贴盘时的弯折由 bind 的 `bend` 字段配置 |
 | `vinyl slip` | 是 | 下一次贴盘算 slip scratch |
 | `hotcue set\|trigger\|clear <1..8>` | 是 | hot cue |
 | `beatjump <±beats\|forward\|backward>` | 是 | 按整拍 seek；显式数字会更新 `jump_beats` |
@@ -321,7 +334,7 @@ learn 模式下，同一个 slot 在 120ms 内收到两个相差 32 的控制器
 | `tempofader` | 是 | 速度推子位置 |
 | `keylock [on\|off\|toggle]` | 是 | keylock |
 | `key <semitone>` | 是 | 变调（占位） |
-| `nudge [delta] [seconds]` | 是 | 临时速率弯折 |
+| `bend [delta] [seconds]` | 是 | 临时速率弯折 |
 | `sync tempo\|phase\|tempolock\|phaselock\|set-leader\|unlock` | 是 | 同步族 |
 | `fx on\|off\|toggle\|pad\|trigger` | 否 | 按 `chain` + `fx` 寻址 |
 | `fx param <name>` | 否 | 连续参数，值来自控制器 |

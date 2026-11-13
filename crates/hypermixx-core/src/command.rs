@@ -422,7 +422,13 @@ pub enum VinylOp {
     ///
     /// `frames_per_tick` comes from the binding, so the sensitivity is per controller: a wheel with
     /// 60 detents per revolution wants a very different number from one that only reports ±1 slowly.
-    Turn { ticks: i32, frames_per_tick: f32 },
+    /// `bend` is the not-held bend's `(delta, seconds)` from the binding's `bend` field; `None` leaves
+    /// the engine's own default in place, so a map without the field behaves exactly as before.
+    Turn {
+        ticks: i32,
+        frames_per_tick: f32,
+        bend: Option<(f32, f64)>,
+    },
 }
 
 /// One `cue` command. The cue point defaults to frame 0 (the loaded origin) and `Set` can move
